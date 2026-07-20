@@ -18,8 +18,14 @@ OVMF_URL := https://github.com/osdev0/edk2-ovmf-stable-bins/releases/latest/down
 OVMF_CODE := $(OVMF_DIR)/ovmf-code-x86_64.fd
 
 XORRISO ?= xorriso
+ifeq ($(OS),Windows_NT)
+WINDOWS_USERPROFILE := $(subst \,/,$(USERPROFILE))
+SCOOP_ROOT ?= $(if $(SCOOP),$(subst \,/,$(SCOOP)),$(WINDOWS_USERPROFILE)/scoop)
+QEMU ?= $(SCOOP_ROOT)/apps/qemu/current/qemu-system-x86_64.exe
+else
 QEMU ?= qemu-system-x86_64
-QEMU_FLAGS ?= -m 512M -M q35 -serial stdio -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 -no-reboot -no-shutdown
+endif
+QEMU_FLAGS ?= -m 512M -M q35,i8042=off -serial stdio -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 -no-reboot -no-shutdown
 
 .PHONY: all kernel iso qemu no-iso run check clean distclean
 
@@ -56,7 +62,7 @@ $(ISO): kernel $(LIMINE_DIR)/BOOTX64.EFI limine.conf
 
 qemu: $(OVMF_CODE)
 	@test -f $(ISO) || { echo "Missing $(ISO); create it first with 'make iso' (WSL is supported)."; exit 1; }
-	$(QEMU) $(QEMU_FLAGS) \
+	"$(QEMU)" $(QEMU_FLAGS) \
 		-drive if=pflash,unit=0,format=raw,file=$(OVMF_CODE),readonly=on \
 		-cdrom $(ISO) -boot d
 
@@ -66,12 +72,12 @@ no-iso: kernel $(LIMINE_DIR)/BOOTX64.EFI $(OVMF_CODE) limine.conf
 	cp $(KERNEL) $(NO_ISO_ROOT)/boot/kernel
 	cp limine.conf $(NO_ISO_ROOT)/boot/limine/limine.conf
 	cp $(LIMINE_DIR)/BOOTX64.EFI $(NO_ISO_ROOT)/EFI/BOOT/
-	$(QEMU) $(QEMU_FLAGS) \
+	"$(QEMU)" $(QEMU_FLAGS) \
 		-drive if=pflash,unit=0,format=raw,file=$(OVMF_CODE),readonly=on \
 		-drive file=fat:rw:$(NO_ISO_ROOT),format=raw -boot c
 
 run: $(OVMF_CODE) $(ISO)
-	$(QEMU) $(QEMU_FLAGS) \
+	"$(QEMU)" $(QEMU_FLAGS) \
 		-drive if=pflash,unit=0,format=raw,file=$(OVMF_CODE),readonly=on \
 		-cdrom $(ISO) -boot d
 

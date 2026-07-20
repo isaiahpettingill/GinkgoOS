@@ -27,6 +27,16 @@ const COMMON_MAGIC: [u64; 2] = [
     0x0a82_e883_a194_f07b,
 ];
 
+const STACK_SIZE_REQUEST_MAGIC: [u64; 2] = [
+    0x224e_f046_0a8e_8926,
+    0xe1cb_0fc2_5f46_ea3d,
+];
+
+const TSC_FREQUENCY_REQUEST_MAGIC: [u64; 2] = [
+    0x10f2_ee1d_87d1_95e4,
+    0xf747_a2b7_8f6d_db31,
+];
+
 const FRAMEBUFFER_REQUEST_MAGIC: [u64; 2] = [
     0x9d58_27dc_d881_dd75,
     0xa314_8604_f6fa_b11b,
@@ -73,6 +83,72 @@ impl BaseRevision {
     pub fn is_supported(&self) -> bool {
         unsafe { ptr::read_volatile(self.words.get().cast::<u64>().add(2)) == 0 }
     }
+}
+
+#[repr(C)]
+pub struct StackSizeRequest {
+    id: [u64; 4],
+    revision: u64,
+    response: UnsafeCell<*mut StackSizeResponse>,
+    pub stack_size: u64,
+}
+
+unsafe impl Sync for StackSizeRequest {}
+
+impl StackSizeRequest {
+    pub const fn new(stack_size: u64) -> Self {
+        Self {
+            id: [
+                COMMON_MAGIC[0],
+                COMMON_MAGIC[1],
+                STACK_SIZE_REQUEST_MAGIC[0],
+                STACK_SIZE_REQUEST_MAGIC[1],
+            ],
+            revision: 0,
+            response: UnsafeCell::new(ptr::null_mut()),
+            stack_size,
+        }
+    }
+}
+
+#[repr(C)]
+pub struct StackSizeResponse {
+    pub revision: u64,
+}
+
+#[repr(C)]
+pub struct TscFrequencyRequest {
+    id: [u64; 4],
+    revision: u64,
+    response: UnsafeCell<*mut TscFrequencyResponse>,
+}
+
+unsafe impl Sync for TscFrequencyRequest {}
+
+impl TscFrequencyRequest {
+    pub const fn new() -> Self {
+        Self {
+            id: [
+                COMMON_MAGIC[0],
+                COMMON_MAGIC[1],
+                TSC_FREQUENCY_REQUEST_MAGIC[0],
+                TSC_FREQUENCY_REQUEST_MAGIC[1],
+            ],
+            revision: 0,
+            response: UnsafeCell::new(ptr::null_mut()),
+        }
+    }
+
+    pub fn response(&self) -> Option<&'static TscFrequencyResponse> {
+        let response = unsafe { ptr::read_volatile(self.response.get()) };
+        unsafe { response.as_ref() }
+    }
+}
+
+#[repr(C)]
+pub struct TscFrequencyResponse {
+    pub revision: u64,
+    pub frequency: u64,
 }
 
 #[repr(C)]

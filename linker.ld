@@ -11,6 +11,7 @@ PHDRS
     text            PT_LOAD FLAGS(5); /* read + execute */
     rodata          PT_LOAD FLAGS(4); /* read */
     data            PT_LOAD FLAGS(6); /* read + write */
+    bootstrap_heap  PT_LOAD FLAGS(6); /* read + write */
 }
 
 SECTIONS
@@ -45,13 +46,17 @@ SECTIONS
     .data :
     {
         *(.data .data.*)
-    } :data
-
-    .bss :
-    {
         *(.bss .bss.*)
         *(COMMON)
+        . = ALIGN(CONSTANT(MAXPAGESIZE));
+        BYTE(0xa5)
     } :data
+
+    . = ALIGN(CONSTANT(MAXPAGESIZE));
+    .bootstrap_heap :
+    {
+        KEEP(*(.bootstrap_heap))
+    } :bootstrap_heap
 
     /DISCARD/ :
     {

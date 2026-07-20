@@ -1,8 +1,8 @@
 //! Physical and virtual address types plus a simple usable-frame allocator.
 
-use crate::limine::{
-    MemoryMapEntries, MemoryMapError, MemoryMapResponse, MEMORY_MAP_USABLE,
-};
+use alloc::vec::Vec;
+
+use crate::limine::{MemoryMapEntries, MemoryMapError, MemoryMapResponse, MEMORY_MAP_USABLE};
 
 pub const PAGE_SIZE: u64 = 4096;
 pub const MAX_PHYSICAL_ADDRESS: u64 = (1_u64 << 52) - 1;
@@ -113,6 +113,7 @@ pub struct UsableFrameAllocator<'a> {
     next: u64,
     current_end: u64,
     allocated: u64,
+    reserved: Vec<PhysFrame>,
     error: Option<FrameAllocatorError>,
 }
 
@@ -123,12 +124,26 @@ impl<'a> UsableFrameAllocator<'a> {
             next: 0,
             current_end: 0,
             allocated: 0,
+            reserved: Vec::new(),
             error: None,
         })
     }
 
     pub fn allocated_count(&self) -> u64 {
         self.allocated
+    }
+
+    /// Prevents a physical frame from being returned by future allocations.
+    pub fn reserve_frame(&mut self, frame: PhysFrame) -> Result<bool, FrameAllocatorError> {
+        if self.reserved.contains(&frame) {
+            return Ok(false);
+        }
+        self.reserved.push(frame);
+        Ok(true)
+    }
+
+    pub fn reserved_count(&self) -> usize {
+        self.reserved.len()
     }
 
     pub fn allocate_frame(&mut self) -> Result<Option<PhysFrame>, FrameAllocatorError> {
@@ -138,6 +153,14 @@ impl<'a> UsableFrameAllocator<'a> {
 
         loop {
             if self.next < self.current_end {
+                if self
+                    .reserved
+                    .iter()
+                    .any(|frame| frame.start_address().as_u64() == self.next)
+                {
+                    self.next += PAGE_SIZE;
+                    continue;
+                }
                 let address = PhysAddr::new(self.next).ok_or(
                     FrameAllocatorError::PhysicalAddressTooLarge {
                         base: self.next,

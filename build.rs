@@ -54,6 +54,7 @@ impl Disk for ImageDisk {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=linker.ld");
 
     let disk = ImageDisk::new(IMAGE_SIZE);
     let filesystem = FileSystem::create(disk, 0, 0)

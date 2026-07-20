@@ -7,7 +7,8 @@ use core::{
 };
 
 use crate::memory::{
-    FrameAllocator, FrameAllocatorError, PhysAddr, PhysFrame, VirtAddr, VirtPage, PAGE_SIZE,
+    FrameAllocator, FrameAllocatorError, PhysAddr, PhysFrame, UsableFrameAllocator, VirtAddr,
+    VirtPage, PAGE_SIZE,
 };
 
 const ENTRY_COUNT: usize = 512;
@@ -103,6 +104,78 @@ impl ActivePageTable {
         self.root
     }
 
+    /// Reserves every page-table frame reachable from the active root so an
+    /// allocate-only physical allocator cannot hand live paging structures to a
+    /// DMA user or zero them while creating another mapping.
+    pub fn reserve_active_frames(
+        &self,
+        allocator: &mut UsableFrameAllocator<'_>,
+    ) -> Result<usize, MapError> {
+        let mut reserved = usize::from(
+            allocator
+                .reserve_frame(self.root)
+                .map_err(MapError::FrameAllocator)?,
+        );
+        let root = self
+            .table_pointer(self.root)
+            .ok_or(MapError::AddressOverflow)?;
+
+        for pml4_index in 0..ENTRY_COUNT {
+            let pml4_entry = unsafe { read_entry(root, pml4_index) };
+            if pml4_entry & PRESENT == 0 {
+                continue;
+            }
+            if pml4_entry & HUGE_PAGE != 0 {
+                return Err(MapError::CorruptPageTable);
+            }
+            let pdpt_frame = frame_from_entry(pml4_entry).ok_or(MapError::CorruptPageTable)?;
+            let newly_reserved = allocator
+                .reserve_frame(pdpt_frame)
+                .map_err(MapError::FrameAllocator)?;
+            reserved += usize::from(newly_reserved);
+            if !newly_reserved {
+                continue;
+            }
+            let pdpt = self
+                .table_pointer(pdpt_frame)
+                .ok_or(MapError::AddressOverflow)?;
+
+            for pdpt_index in 0..ENTRY_COUNT {
+                let pdpt_entry = unsafe { read_entry(pdpt, pdpt_index) };
+                if pdpt_entry & PRESENT == 0 || pdpt_entry & HUGE_PAGE != 0 {
+                    continue;
+                }
+                let directory_frame =
+                    frame_from_entry(pdpt_entry).ok_or(MapError::CorruptPageTable)?;
+                let newly_reserved = allocator
+                    .reserve_frame(directory_frame)
+                    .map_err(MapError::FrameAllocator)?;
+                reserved += usize::from(newly_reserved);
+                if !newly_reserved {
+                    continue;
+                }
+                let directory = self
+                    .table_pointer(directory_frame)
+                    .ok_or(MapError::AddressOverflow)?;
+
+                for directory_index in 0..ENTRY_COUNT {
+                    let directory_entry = unsafe { read_entry(directory, directory_index) };
+                    if directory_entry & PRESENT == 0 || directory_entry & HUGE_PAGE != 0 {
+                        continue;
+                    }
+                    let table_frame =
+                        frame_from_entry(directory_entry).ok_or(MapError::CorruptPageTable)?;
+                    reserved += usize::from(
+                        allocator
+                            .reserve_frame(table_frame)
+                            .map_err(MapError::FrameAllocator)?,
+                    );
+                }
+            }
+        }
+        Ok(reserved)
+    }
+
     pub fn translate_addr(&self, address: VirtAddr) -> Option<PhysAddr> {
         let indexes = page_table_indexes(address);
         let mut table = self.table_pointer(self.root)?;
@@ -157,17 +230,10 @@ impl ActivePageTable {
             .table_pointer(self.root)
             .ok_or(MapError::AddressOverflow)?;
 
+        table = self.next_table_or_create(table, indexes[0], Level::Pml4, flags, allocator)?;
+        table = self.next_table_or_create(table, indexes[1], Level::Pdpt, flags, allocator)?;
         table =
-            self.next_table_or_create(table, indexes[0], Level::Pml4, flags, allocator)?;
-        table =
-            self.next_table_or_create(table, indexes[1], Level::Pdpt, flags, allocator)?;
-        table = self.next_table_or_create(
-            table,
-            indexes[2],
-            Level::PageDirectory,
-            flags,
-            allocator,
-        )?;
+            self.next_table_or_create(table, indexes[2], Level::PageDirectory, flags, allocator)?;
 
         let entry = read_entry(table, indexes[3]);
         if entry & PRESENT != 0 {
@@ -241,9 +307,7 @@ impl ActivePageTable {
             .allocate_frame()
             .map_err(MapError::FrameAllocator)?
             .ok_or(MapError::OutOfFrames)?;
-        let next_table = self
-            .table_pointer(frame)
-            .ok_or(MapError::AddressOverflow)?;
+        let next_table = self.table_pointer(frame).ok_or(MapError::AddressOverflow)?;
         ptr::write_bytes(next_table.cast::<u8>(), 0, PAGE_SIZE as usize);
         compiler_fence(Ordering::Release);
         write_entry(

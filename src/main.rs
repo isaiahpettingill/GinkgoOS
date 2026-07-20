@@ -6,18 +6,21 @@ mod font8x8;
 mod framebuffer;
 mod heap;
 
-use core::{arch::asm, cell::UnsafeCell, mem::MaybeUninit, panic::PanicInfo, ptr};
+use core::{arch::asm, panic::PanicInfo, ptr};
 use framebuffer::{FramebufferWriter, Rgb};
 use ginkgo_os::{
     fs::RedoxFs,
     hid::{ApplicationKind, Axis, InputEvent, AXIS_MAX, AXIS_MIN},
     input::{DeviceInputEvent, InputManager},
     io::SerialPort,
-    limine::{self, BaseRevision, FramebufferRequest, HhdmRequest, MemoryMapRequest},
+    limine::{
+        self, BaseRevision, FramebufferRequest, HhdmRequest, MemoryMapRequest, StackSizeRequest,
+        TscFrequencyRequest,
+    },
     memory::{UsableFrameAllocator, VirtAddr, VirtPage},
     paging::{ActivePageTable, PageFlags},
     task::{Scheduler, TaskPoll, TaskState},
-    usb::UsbError,
+    usb::{self, UsbError},
 };
 
 #[used]
@@ -27,6 +30,14 @@ static REQUESTS_START: [u64; 4] = limine::REQUESTS_START_MARKER;
 #[used]
 #[link_section = ".limine_requests"]
 static BASE_REVISION: BaseRevision = BaseRevision::new(6);
+
+#[used]
+#[link_section = ".limine_requests"]
+static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new(512 * 1024);
+
+#[used]
+#[link_section = ".limine_requests"]
+static TSC_FREQUENCY_REQUEST: TscFrequencyRequest = TscFrequencyRequest::new();
 
 #[used]
 #[link_section = ".limine_requests"]
@@ -71,13 +82,17 @@ pub extern "C" fn _start() -> ! {
     let Some(hhdm) = HHDM_REQUEST.response() else {
         halt_forever();
     };
-    let Ok(frames) = UsableFrameAllocator::new(memory_map) else {
+    let Ok(mut frames) = UsableFrameAllocator::new(memory_map) else {
         halt_forever();
     };
     let Ok(page_table) = (unsafe { ActivePageTable::from_current(hhdm.offset) }) else {
         halt_forever();
     };
-
+    if page_table.reserve_active_frames(&mut frames).is_err() {
+        ui.input_status = "Boot failure: could not reserve active page tables";
+        ui.render(&mut screen);
+        halt_forever();
+    }
     let serial = unsafe { SerialPort::new(SerialPort::COM1_BASE) };
     let Ok(fs) = RedoxFs::new() else {
         halt_forever();
@@ -97,6 +112,11 @@ pub extern "C" fn _start() -> ! {
     if !context.paging_verified {
         halt_forever();
     }
+    usb::configure_timestamp_frequency(
+        TSC_FREQUENCY_REQUEST
+            .response()
+            .map(|response| response.frequency),
+    );
     match unsafe {
         InputManager::initialize(
             &mut context.page_table,
@@ -127,8 +147,6 @@ pub extern "C" fn _start() -> ! {
     }
     context.ui.render(&mut context.screen);
 
-    // Single-core boot calls this exactly once while interrupts are disabled.
-    let context = unsafe { KERNEL_CONTEXT.initialize(context) };
     let mut scheduler = Scheduler::<KernelContext, 4>::new();
     if scheduler.spawn(filesystem_task).is_err()
         || scheduler.spawn(console_task).is_err()
@@ -139,7 +157,7 @@ pub extern "C" fn _start() -> ! {
     }
 
     loop {
-        scheduler.run_round(context);
+        scheduler.run_round(&mut context);
         unsafe { asm!("pause", options(nomem, nostack, preserves_flags)) };
     }
 }
@@ -386,23 +404,7 @@ impl ValidationUi {
     }
 }
 
-struct KernelContextStorage(UnsafeCell<MaybeUninit<KernelContext>>);
 
-unsafe impl Sync for KernelContextStorage {}
-
-impl KernelContextStorage {
-    const fn new() -> Self {
-        Self(UnsafeCell::new(MaybeUninit::uninit()))
-    }
-
-    /// The caller must initialize this storage exactly once, on the boot CPU,
-    /// before sharing or retaining any other reference to its contents.
-    unsafe fn initialize(&'static self, context: KernelContext) -> &'static mut KernelContext {
-        (&mut *self.0.get()).write(context)
-    }
-}
-
-static KERNEL_CONTEXT: KernelContextStorage = KernelContextStorage::new();
 
 fn verify_paging(context: &mut KernelContext) -> bool {
     const SCRATCH_CANDIDATES: [u64; 8] = [

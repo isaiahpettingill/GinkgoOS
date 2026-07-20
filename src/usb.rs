@@ -7,10 +7,11 @@
 
 use alloc::vec::Vec;
 use core::{
+    arch::{asm, x86_64::__cpuid},
     cmp,
     hint::spin_loop,
     ptr,
-    sync::atomic::{compiler_fence, Ordering},
+    sync::atomic::{compiler_fence, AtomicU64, Ordering},
 };
 
 use crate::{
@@ -32,7 +33,9 @@ pub const MAX_REPORTS_PER_POLL: usize = 64;
 const MAX_MMIO_SIZE: u64 = 16 * 1024 * 1024;
 const RING_TRBS: usize = 256;
 const RING_LINK_INDEX: usize = RING_TRBS - 1;
-const WAIT_ITERATIONS: usize = 10_000_000;
+const WAIT_SECONDS: u64 = 5;
+const FALLBACK_TSC_FREQUENCY: u64 = 1_000_000_000;
+static TSC_FREQUENCY: AtomicU64 = AtomicU64::new(FALLBACK_TSC_FREQUENCY);
 const POLL_EVENT_BUDGET: usize = 256;
 const MAX_EXTENDED_CAPABILITIES: usize = 64;
 
@@ -824,7 +827,8 @@ impl Xhci {
     }
 
     fn wait_port_reset(&mut self, offset: usize, bit: u32) -> Result<(), UsbError> {
-        for _ in 0..WAIT_ITERATIONS {
+        let deadline = wait_deadline();
+        while timestamp() < deadline {
             if self.mmio.read_u32(offset)? & bit == 0 {
                 return Ok(());
             }
@@ -904,7 +908,8 @@ impl Xhci {
     fn command(&mut self, trb: Trb) -> Result<Trb, UsbError> {
         let pointer = self.command_ring.enqueue(trb)?;
         self.ring_doorbell(0, 0)?;
-        for _ in 0..WAIT_ITERATIONS {
+        let deadline = wait_deadline();
+        while timestamp() < deadline {
             if let Some(event) = self.next_event()? {
                 if event.trb_type() != TRB_TYPE_COMMAND_COMPLETION_EVENT {
                     continue;
@@ -1021,7 +1026,8 @@ impl Xhci {
         let mut actual = length;
         let mut data_complete = data_pointer.is_none();
         let mut status_complete = false;
-        for _ in 0..WAIT_ITERATIONS {
+        let deadline = wait_deadline();
+        while timestamp() < deadline {
             if let Some(event) = self.next_event()? {
                 if event.trb_type() != TRB_TYPE_TRANSFER_EVENT
                     || (event.dword[3] >> 24) as u8 != device.slot_id
@@ -1437,8 +1443,59 @@ unsafe fn map_mmio_bar(
     Ok(Mmio { base, length })
 }
 
+/// Calibrates polling deadlines from Limine or architectural CPUID leaves.
+pub fn configure_timestamp_frequency(reported_frequency: Option<u64>) {
+    let frequency = reported_frequency
+        .filter(|frequency| *frequency != 0)
+        .or_else(detect_timestamp_frequency)
+        .unwrap_or(FALLBACK_TSC_FREQUENCY);
+    TSC_FREQUENCY.store(frequency, Ordering::Relaxed);
+}
+
+fn detect_timestamp_frequency() -> Option<u64> {
+    let maximum_leaf = __cpuid(0).eax;
+    if maximum_leaf >= 0x15 {
+        let ratio = __cpuid(0x15);
+        if ratio.eax != 0 && ratio.ebx != 0 && ratio.ecx != 0 {
+            return u64::from(ratio.ecx)
+                .checked_mul(u64::from(ratio.ebx))
+                .map(|frequency| frequency / u64::from(ratio.eax))
+                .filter(|frequency| *frequency != 0);
+        }
+    }
+    if maximum_leaf >= 0x16 {
+        let processor_frequency = __cpuid(0x16).eax;
+        if processor_frequency != 0 {
+            return Some(u64::from(processor_frequency) * 1_000_000);
+        }
+    }
+    None
+}
+
+fn timestamp() -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        asm!(
+            "rdtsc",
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    u64::from(low) | (u64::from(high) << 32)
+}
+
+fn wait_deadline() -> u64 {
+    let cycles = TSC_FREQUENCY
+        .load(Ordering::Relaxed)
+        .saturating_mul(WAIT_SECONDS);
+    timestamp().saturating_add(cycles)
+}
+
 fn wait_for_bit(mmio: &mut Mmio, register: usize, mask: u32, set: bool) -> Result<(), UsbError> {
-    for _ in 0..WAIT_ITERATIONS {
+    let deadline = wait_deadline();
+    while timestamp() < deadline {
         if (mmio.read_u32(register)? & mask != 0) == set {
             return Ok(());
         }
@@ -1464,7 +1521,8 @@ fn process_extended_capabilities(
             1 => {
                 mmio.write_u32(offset, header | (1 << 24))?;
                 if header & (1 << 16) != 0 {
-                    for _ in 0..WAIT_ITERATIONS {
+                    let deadline = wait_deadline();
+                    while timestamp() < deadline {
                         if mmio.read_u32(offset)? & (1 << 16) == 0 {
                             break;
                         }
