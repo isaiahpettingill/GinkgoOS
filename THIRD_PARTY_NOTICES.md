@@ -24,6 +24,18 @@ ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 ```
 
+## RedoxFS
+
+The filesystem core under `vendor/redoxfs` is adapted from RedoxFS commit `99bc185bf8ad8bd6f4d2562c424d800c2a3d310b`.
+
+- Project: RedoxFS
+- Source: https://github.com/redox-os/redoxfs
+- Copyright: 2016 Jeremy Soller and contributors
+- License: MIT
+- Local adaptations: `no_std` import fixes, deterministic unencrypted formatting, and removal of userspace/encryption-only dependencies
+
+The complete upstream license is retained at `vendor/redoxfs/LICENSE`.
+
 ## font8x8 basic ASCII font
 
 - Project: `dhepper/font8x8`

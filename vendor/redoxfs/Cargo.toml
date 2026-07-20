@@ -1,0 +1,28 @@
+[package]
+name = "redoxfs"
+description = "The Redox Filesystem, adapted for GinkgoOS no_std use"
+repository = "https://github.com/redox-os/redoxfs"
+version = "0.9.1-ginkgo.1"
+license-file = "LICENSE"
+edition = "2021"
+publish = false
+
+[lib]
+name = "redoxfs"
+path = "src/lib.rs"
+
+[dependencies]
+
+bitflags = "2"
+endian-num = "0.1"
+lz4_flex = { version = "0.11", default-features = false, features = ["checked-decode"] }
+redox_syscall = { version = "0.9.0", default-features = false }
+seahash = { version = "4.1.0", default-features = false }
+
+
+[features]
+default = []
+std = ["redox_syscall/std"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

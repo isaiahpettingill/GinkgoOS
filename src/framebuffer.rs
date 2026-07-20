@@ -1,6 +1,7 @@
 use core::ptr;
 
-use crate::{font8x8::BASIC_FONT, limine::Framebuffer};
+use crate::font8x8::BASIC_FONT;
+use rust_limine_framebuffer::limine::Framebuffer;
 
 #[derive(Clone, Copy)]
 pub struct Rgb {
@@ -22,10 +23,30 @@ pub struct FramebufferWriter<'a> {
 impl<'a> FramebufferWriter<'a> {
     pub fn new(framebuffer: &'a Framebuffer) -> Option<Self> {
         let bytes_per_pixel = bytes_per_pixel(framebuffer.bpp);
+        let width = usize::try_from(framebuffer.width).ok()?;
+        let height = usize::try_from(framebuffer.height).ok()?;
+        let pitch = usize::try_from(framebuffer.pitch).ok()?;
+        let row_bytes = width.checked_mul(bytes_per_pixel)?;
+        let mapped_bytes = pitch.checked_mul(height)?;
+        let valid_channel = |size: u8, shift: u8| {
+            size > 0
+                && u16::from(shift) + u16::from(size) <= framebuffer.bpp
+                && u16::from(shift) + u16::from(size) <= 32
+        };
+
         if framebuffer.address.is_null()
-            || framebuffer.width == 0
-            || framebuffer.height == 0
+            || width == 0
+            || height == 0
+            || framebuffer.memory_model != 1
             || !(3..=4).contains(&bytes_per_pixel)
+            || pitch < row_bytes
+            || mapped_bytes > isize::MAX as usize
+            || (framebuffer.address as usize)
+                .checked_add(mapped_bytes.saturating_sub(1))
+                .is_none()
+            || !valid_channel(framebuffer.red_mask_size, framebuffer.red_mask_shift)
+            || !valid_channel(framebuffer.green_mask_size, framebuffer.green_mask_shift)
+            || !valid_channel(framebuffer.blue_mask_size, framebuffer.blue_mask_shift)
         {
             return None;
         }

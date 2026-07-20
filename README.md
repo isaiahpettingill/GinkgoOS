@@ -1,18 +1,29 @@
-# Rust + Limine framebuffer kernel template
+# GinkgoOS
 
-A minimal, dependency-free `no_std` x86-64 kernel written in Rust. Limine boots it through UEFI, supplies a linear framebuffer, and the kernel renders text directly into that framebuffer.
+A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. The current groundwork includes framebuffer output, physical frame allocation, active page-table management, checked device-I/O capabilities, a kernel-adapted RedoxFS filesystem, and cooperative task scheduling.
 
 ## What is included
 
 - Stable Rust and the built-in `x86_64-unknown-none` target
-- Limine boot-protocol declarations for the framebuffer request
+- Limine framebuffer, memory-map, and higher-half direct-map requests
+- Allocate-only 4 KiB physical frame allocation from usable memory
+- Active four-level x86-64 page translation, mapping, and unmapping
+- Checked x86 port-I/O and volatile MMIO region capabilities
+- A nonblocking 16550 serial input/output device
+- RedoxFS transactions and on-disk format over a volatile memory-backed block device
+- Talc-backed dynamic allocation for RedoxFS and future kernel services
+- Fixed-capacity round-robin cooperative task scheduling
 - A high-half ELF linker script
-- A pitch-aware RGB framebuffer writer
-- A public-domain 8×8 ASCII bitmap font
-- A UEFI-only bootable ISO target
-- A QEMU + OVMF run target
+- A pitch-aware RGB framebuffer writer and public-domain 8×8 font
+- UEFI ISO and no-ISO QEMU boot targets
 
-No assembly source is required yet. The only inline assembly is the final `cli; hlt` loop.
+The scheduler is deliberately stackless and cooperative: each task performs one bounded step, stores its continuation in `TaskState`, and returns to yield. It does not yet provide independent task stacks, timer preemption, userspace, interrupts, SMP, or blocking waits.
+
+### Filesystem architecture
+
+The kernel uses the RedoxFS 0.9.1 transaction engine and filesystem format, adapted from upstream commit `99bc185bf8ad8bd6f4d2562c424d800c2a3d310b`. A host build script formats a deterministic 2 MiB seed image. At boot, the kernel copies that image into memory, opens it through a GinkgoOS `Disk` implementation, and performs normal RedoxFS node transactions.
+
+The current adapter intentionally supports unencrypted images only. Persistence across reboot requires replacing the memory disk with a block-device driver; the filesystem-facing code does not need to change.
 
 ## Dependencies
 
@@ -81,13 +92,22 @@ make check
 ## Project structure
 
 ```text
-src/main.rs         kernel entry point and Limine requests
-src/limine.rs       minimal boot-protocol structs
+src/main.rs         boot flow, paging smoke test, and initial kernel tasks
+src/lib.rs          reusable no_std kernel subsystem facade
+src/limine.rs       boot-protocol requests and validated response wrappers
+src/memory.rs       address types and usable physical-frame allocator
+src/paging.rs       active x86-64 four-level page-table management
+src/io.rs           checked port I/O, MMIO, and nonblocking serial device
+src/fs.rs           RedoxFS memory-disk and kernel API adapter
+src/heap.rs         Talc bootstrap heap
+src/task.rs         cooperative round-robin task scheduler
 src/framebuffer.rs  pixel, rectangle, font, and text rendering
 src/font8x8.rs      public-domain ASCII bitmap font
 src/crt.rs          freestanding memory routines LLVM may call
 linker.ld            high-half ELF layout and request retention
 limine.conf          Limine menu entry
+build.rs             deterministic RedoxFS seed-image formatter
+vendor/redoxfs/       pinned, no_std GinkgoOS adaptation of RedoxFS
 Makefile             build, ISO, and QEMU automation
 ```
 
@@ -109,4 +129,4 @@ The visible output is in `src/main.rs`:
 screen.draw_text(margin + 40, margin + 38, 4, "Hello, framebuffer!", primary);
 ```
 
-The next sensible milestones are serial logging, a panic screen, memory-map acquisition, and a physical-frame allocator.
+The next sensible milestones are exception/interrupt handling, a timer-driven stackful scheduler, frame deallocation, device discovery, and a panic screen with serial diagnostics.
