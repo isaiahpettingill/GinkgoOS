@@ -100,6 +100,40 @@ impl<'a> FramebufferWriter<'a> {
         }
     }
 
+    pub fn draw_text_wrapped(
+        &mut self,
+        mut x: usize,
+        mut y: usize,
+        width: usize,
+        scale: usize,
+        text: &str,
+        color: Rgb,
+    ) {
+        let origin_x = x;
+        let scale = scale.max(1);
+        let advance = 8 * scale;
+        let line_height = 9 * scale;
+        let right = origin_x.saturating_add(width);
+
+        for byte in text.bytes() {
+            match byte {
+                b'\n' => {
+                    x = origin_x;
+                    y = y.saturating_add(line_height);
+                }
+                b'\r' => x = origin_x,
+                _ => {
+                    if x != origin_x && x.saturating_add(advance) > right {
+                        x = origin_x;
+                        y = y.saturating_add(line_height);
+                    }
+                    self.draw_char(x, y, scale, byte, color);
+                    x = x.saturating_add(advance);
+                }
+            }
+        }
+    }
+
     fn draw_char(&mut self, x: usize, y: usize, scale: usize, byte: u8, color: Rgb) {
         let glyph = BASIC_FONT[usize::from(byte.min(127))];
 
@@ -109,26 +143,36 @@ impl<'a> FramebufferWriter<'a> {
                     continue;
                 }
 
-                self.fill_rect(
-                    x + column * scale,
-                    y + row * scale,
-                    scale,
-                    scale,
-                    color,
-                );
+                self.fill_rect(x + column * scale, y + row * scale, scale, scale, color);
             }
         }
     }
 
-    fn put_pixel(&mut self, x: usize, y: usize, color: Rgb) {
+    pub fn read_raw_pixel(&self, x: usize, y: usize) -> Option<u32> {
+        if x >= self.width() || y >= self.height() {
+            return None;
+        }
+
+        let bytes_per_pixel = bytes_per_pixel(self.framebuffer.bpp);
+        let offset = y * self.framebuffer.pitch as usize + x * bytes_per_pixel;
+        let mut packed = 0_u32;
+        unsafe {
+            for byte_index in 0..bytes_per_pixel {
+                packed |= u32::from(ptr::read_volatile(
+                    self.framebuffer.address.add(offset + byte_index),
+                )) << (byte_index * 8);
+            }
+        }
+        Some(packed)
+    }
+
+    pub fn write_raw_pixel(&mut self, x: usize, y: usize, packed: u32) {
         if x >= self.width() || y >= self.height() {
             return;
         }
 
         let bytes_per_pixel = bytes_per_pixel(self.framebuffer.bpp);
         let offset = y * self.framebuffer.pitch as usize + x * bytes_per_pixel;
-        let packed = self.pack_color(color);
-
         unsafe {
             for byte_index in 0..bytes_per_pixel {
                 ptr::write_volatile(
@@ -137,6 +181,10 @@ impl<'a> FramebufferWriter<'a> {
                 );
             }
         }
+    }
+
+    fn put_pixel(&mut self, x: usize, y: usize, color: Rgb) {
+        self.write_raw_pixel(x, y, self.pack_color(color));
     }
 
     fn pack_color(&self, color: Rgb) -> u32 {

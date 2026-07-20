@@ -6,17 +6,11 @@ mod font8x8;
 mod framebuffer;
 mod heap;
 
-use core::{
-    arch::asm,
-    cell::UnsafeCell,
-    mem::MaybeUninit,
-    panic::PanicInfo,
-    ptr,
-};
+use core::{arch::asm, cell::UnsafeCell, mem::MaybeUninit, panic::PanicInfo, ptr};
 use framebuffer::{FramebufferWriter, Rgb};
 use ginkgo_os::{
     fs::RedoxFs,
-    hid::{Axis, InputEvent},
+    hid::{ApplicationKind, Axis, InputEvent, AXIS_MAX, AXIS_MIN},
     input::{DeviceInputEvent, InputManager},
     io::SerialPort,
     limine::{self, BaseRevision, FramebufferRequest, HhdmRequest, MemoryMapRequest},
@@ -67,26 +61,8 @@ pub extern "C" fn _start() -> ! {
         halt_forever();
     };
 
-    let background = Rgb::new(18, 24, 38);
-    let panel = Rgb::new(31, 41, 61);
-    let primary = Rgb::new(232, 238, 247);
-    let accent = Rgb::new(110, 231, 183);
-
-    screen.clear(background);
-
-    let margin = 48;
-    let panel_width = screen.width().saturating_sub(margin * 2);
-    screen.fill_rect(margin, margin, panel_width, 180, panel);
-    screen.fill_rect(margin, margin, 12, 180, accent);
-
-    screen.draw_text(margin + 40, margin + 38, 4, "Hello, framebuffer!", primary);
-    screen.draw_text(
-        margin + 40,
-        margin + 110,
-        2,
-        "Rust x86_64 kernel booted by Limine over UEFI.",
-        accent,
-    );
+    let mut ui = ValidationUi::new(screen.width(), screen.height());
+    ui.render(&mut screen);
 
     let Some(memory_map) = MEMORY_MAP_REQUEST.response() else {
         halt_forever();
@@ -112,6 +88,8 @@ pub extern "C" fn _start() -> ! {
         fs,
         serial,
         input: None,
+        screen,
+        ui,
         paging_verified: false,
     };
     context.paging_verified = verify_paging(&mut context);
@@ -126,6 +104,9 @@ pub extern "C" fn _start() -> ! {
         )
         .ok()
     };
+    context.ui.input_initialized = true;
+    context.ui.input_available = context.input.is_some();
+    context.ui.render(&mut context.screen);
 
     // Single-core boot calls this exactly once while interrupts are disabled.
     let context = unsafe { KERNEL_CONTEXT.initialize(context) };
@@ -151,7 +132,232 @@ struct KernelContext {
     fs: RedoxFs,
     serial: Option<SerialPort>,
     input: Option<InputManager>,
+    screen: FramebufferWriter<'static>,
+    ui: ValidationUi,
     paging_verified: bool,
+}
+
+const TEXT_BUFFER_CAPACITY: usize = 512;
+const CURSOR_SIZE: usize = 19;
+
+struct ValidationUi {
+    text: [u8; TEXT_BUFFER_CAPACITY],
+    text_len: usize,
+    mouse_x: usize,
+    mouse_y: usize,
+    width: usize,
+    height: usize,
+    mouse_pressed: bool,
+    input_initialized: bool,
+    input_available: bool,
+    cursor_backing: [u32; CURSOR_SIZE * CURSOR_SIZE],
+    cursor_origin_x: usize,
+    cursor_origin_y: usize,
+    cursor_width: usize,
+    cursor_height: usize,
+    cursor_visible: bool,
+}
+
+impl ValidationUi {
+    fn new(width: usize, height: usize) -> Self {
+        Self {
+            text: [0; TEXT_BUFFER_CAPACITY],
+            text_len: 0,
+            mouse_x: width / 2,
+            mouse_y: height / 2,
+            width,
+            height,
+            mouse_pressed: false,
+            input_initialized: false,
+            input_available: false,
+            cursor_backing: [0; CURSOR_SIZE * CURSOR_SIZE],
+            cursor_origin_x: 0,
+            cursor_origin_y: 0,
+            cursor_width: 0,
+            cursor_height: 0,
+            cursor_visible: false,
+        }
+    }
+
+    fn push_byte(&mut self, byte: u8) -> bool {
+        if byte == 8 {
+            if self.text_len == 0 {
+                return false;
+            }
+            self.text_len -= 1;
+            return true;
+        }
+        if byte == b'\t' {
+            let mut changed = false;
+            for _ in 0..4 {
+                changed |= self.push_byte(b' ');
+            }
+            return changed;
+        }
+        if byte != b'\n' && !(0x20..=0x7e).contains(&byte) {
+            return false;
+        }
+        let Some(slot) = self.text.get_mut(self.text_len) else {
+            return false;
+        };
+        *slot = byte;
+        self.text_len += 1;
+        true
+    }
+
+    fn move_mouse(&mut self, axis: Axis, value: i32, relative: bool) -> bool {
+        let (coordinate, extent) = match axis {
+            Axis::X => (&mut self.mouse_x, self.width),
+            Axis::Y => (&mut self.mouse_y, self.height),
+            _ => return false,
+        };
+        if extent == 0 {
+            return false;
+        }
+        let next = if relative {
+            (*coordinate as i64 + i64::from(value)).clamp(0, extent.saturating_sub(1) as i64)
+                as usize
+        } else {
+            let normalized = i64::from(value)
+                .saturating_sub(i64::from(AXIS_MIN))
+                .clamp(0, i64::from(AXIS_MAX) - i64::from(AXIS_MIN));
+            (normalized * extent.saturating_sub(1) as i64
+                / (i64::from(AXIS_MAX) - i64::from(AXIS_MIN))) as usize
+        };
+        if next == *coordinate {
+            return false;
+        }
+        *coordinate = next;
+        true
+    }
+
+    fn set_mouse_button(&mut self, pressed: bool) -> bool {
+        if self.mouse_pressed == pressed {
+            return false;
+        }
+        self.mouse_pressed = pressed;
+        true
+    }
+
+    fn refresh_cursor(&mut self, screen: &mut FramebufferWriter<'_>) {
+        self.hide_cursor(screen);
+        self.show_cursor(screen);
+    }
+
+    fn hide_cursor(&mut self, screen: &mut FramebufferWriter<'_>) {
+        if !self.cursor_visible {
+            return;
+        }
+        for y in 0..self.cursor_height {
+            for x in 0..self.cursor_width {
+                screen.write_raw_pixel(
+                    self.cursor_origin_x + x,
+                    self.cursor_origin_y + y,
+                    self.cursor_backing[y * CURSOR_SIZE + x],
+                );
+            }
+        }
+        self.cursor_visible = false;
+    }
+
+    fn show_cursor(&mut self, screen: &mut FramebufferWriter<'_>) {
+        self.cursor_origin_x = self.mouse_x.saturating_sub(CURSOR_SIZE / 2);
+        self.cursor_origin_y = self.mouse_y.saturating_sub(CURSOR_SIZE / 2);
+        self.cursor_width = CURSOR_SIZE.min(self.width.saturating_sub(self.cursor_origin_x));
+        self.cursor_height = CURSOR_SIZE.min(self.height.saturating_sub(self.cursor_origin_y));
+        for y in 0..self.cursor_height {
+            for x in 0..self.cursor_width {
+                self.cursor_backing[y * CURSOR_SIZE + x] = screen
+                    .read_raw_pixel(self.cursor_origin_x + x, self.cursor_origin_y + y)
+                    .unwrap_or(0);
+            }
+        }
+
+        let color = if self.mouse_pressed {
+            Rgb::new(251, 191, 36)
+        } else {
+            Rgb::new(110, 231, 183)
+        };
+        screen.fill_rect(
+            self.mouse_x.saturating_sub(1),
+            self.mouse_y.saturating_sub(CURSOR_SIZE / 2),
+            3,
+            CURSOR_SIZE,
+            color,
+        );
+        screen.fill_rect(
+            self.mouse_x.saturating_sub(CURSOR_SIZE / 2),
+            self.mouse_y.saturating_sub(1),
+            CURSOR_SIZE,
+            3,
+            color,
+        );
+        self.cursor_visible = true;
+    }
+
+    fn render(&mut self, screen: &mut FramebufferWriter<'_>) {
+        let background = Rgb::new(18, 24, 38);
+        let panel = Rgb::new(31, 41, 61);
+        let primary = Rgb::new(232, 238, 247);
+        let muted = Rgb::new(148, 163, 184);
+        let accent = Rgb::new(110, 231, 183);
+        let warning = Rgb::new(251, 191, 36);
+        let margin = 40;
+
+        screen.clear(background);
+        screen.fill_rect(
+            margin,
+            margin,
+            screen.width().saturating_sub(margin * 2),
+            76,
+            panel,
+        );
+        screen.fill_rect(margin, margin, 10, 76, accent);
+        screen.draw_text(margin + 30, margin + 18, 3, "HID input validation", primary);
+        let status = if !self.input_initialized {
+            "USB HID: initializing..."
+        } else if self.input_available {
+            "USB HID: ready - move the mouse and type below"
+        } else {
+            "USB HID: xHCI controller or input device unavailable"
+        };
+        screen.draw_text(
+            margin + 30,
+            margin + 52,
+            1,
+            status,
+            if self.input_available {
+                accent
+            } else {
+                warning
+            },
+        );
+
+        let text_top = 148;
+        screen.draw_text(margin, text_top, 2, "Keyboard text buffer", muted);
+        screen.fill_rect(
+            margin,
+            text_top + 28,
+            screen.width().saturating_sub(margin * 2),
+            screen.height().saturating_sub(text_top + 68),
+            panel,
+        );
+        let text = unsafe { core::str::from_utf8_unchecked(&self.text[..self.text_len]) };
+        screen.draw_text_wrapped(
+            margin + 20,
+            text_top + 48,
+            screen.width().saturating_sub((margin + 20) * 2),
+            2,
+            text,
+            primary,
+        );
+        if self.text_len == 0 {
+            screen.draw_text(margin + 20, text_top + 48, 2, "Type here...", muted);
+        }
+
+        self.cursor_visible = false;
+        self.show_cursor(screen);
+    }
 }
 
 struct KernelContextStorage(UnsafeCell<MaybeUninit<KernelContext>>);
@@ -282,7 +488,11 @@ fn console_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll 
     if info.len >= CONSOLE_LIMIT && context.fs.truncate(file, 0).is_err() {
         return TaskPoll::Complete;
     }
-    let offset = if info.len >= CONSOLE_LIMIT { 0 } else { info.len };
+    let offset = if info.len >= CONSOLE_LIMIT {
+        0
+    } else {
+        info.len
+    };
     let _ = context.fs.write(file, offset, &[byte]);
     TaskPoll::Pending
 }
@@ -302,11 +512,28 @@ fn input_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
         state.set(0, 1);
     }
 
+    let old_cursor = (
+        context.ui.mouse_x,
+        context.ui.mouse_y,
+        context.ui.mouse_pressed,
+    );
+    let mut full_redraw = false;
     for _ in 0..32 {
         let Some(event) = context.input.as_mut().and_then(InputManager::pop_event) else {
             break;
         };
-        handle_input_event(context, state, event);
+        full_redraw |= handle_input_event(context, state, event);
+    }
+    if full_redraw {
+        context.ui.render(&mut context.screen);
+    } else if old_cursor
+        != (
+            context.ui.mouse_x,
+            context.ui.mouse_y,
+            context.ui.mouse_pressed,
+        )
+    {
+        context.ui.refresh_cursor(&mut context.screen);
     }
     TaskPoll::Pending
 }
@@ -315,34 +542,66 @@ fn handle_input_event(
     context: &mut KernelContext,
     state: &mut TaskState,
     device_event: DeviceInputEvent,
-) {
-    let shift = state.get(1).unwrap_or(0) != 0;
-    if let InputEvent::Key { usage, pressed, .. } = device_event.event {
-        if matches!(usage, 0xe1 | 0xe5) {
-            state.set(1, usize::from(pressed));
-        } else if pressed {
-            if let Some(byte) = keyboard_ascii(usage, shift) {
-                if let Some(serial) = context.serial.as_mut() {
-                    let _ = serial.try_write(byte);
+) -> bool {
+    let application = context
+        .input
+        .as_ref()
+        .and_then(|input| input.application_kind(device_event.interface));
+    let mut redraw = false;
+    match device_event.event {
+        InputEvent::Key { usage, pressed, .. } => {
+            if matches!(usage, 0xe1 | 0xe5) {
+                let bit = if usage == 0xe1 { 1 } else { 2 };
+                let shifts = state.get(1).unwrap_or(0);
+                state.set(1, if pressed { shifts | bit } else { shifts & !bit });
+            } else if usage == 0x39 && pressed {
+                state.set(2, state.get(2).unwrap_or(0) ^ 1);
+            } else if pressed {
+                let shift = state.get(1).unwrap_or(0) != 0;
+                let caps_lock = state.get(2).unwrap_or(0) != 0;
+                if let Some(byte) = keyboard_ascii(usage, shift, caps_lock) {
+                    if let Some(serial) = context.serial.as_mut() {
+                        let _ = serial.try_write(byte);
+                    }
+                    append_console_byte(&mut context.fs, byte);
+                    redraw |= context.ui.push_byte(byte);
                 }
-                append_console_byte(&mut context.fs, byte);
             }
         }
+        InputEvent::Axis {
+            axis,
+            value,
+            relative,
+            ..
+        } if application == Some(ApplicationKind::Mouse) => {
+            let _ = context.ui.move_mouse(axis, value, relative);
+        }
+        InputEvent::Button {
+            button: 1, pressed, ..
+        } if application == Some(ApplicationKind::Mouse) => {
+            let _ = context.ui.set_mouse_button(pressed);
+        }
+        _ => {}
     }
 
     let record = encode_input_event(device_event);
     let Ok(file) = context.fs.open("/input") else {
-        return;
+        return redraw;
     };
     let Ok(info) = context.fs.stat(file) else {
-        return;
+        return redraw;
     };
     const INPUT_LOG_LIMIT: u64 = 64 * 1024;
     if info.len >= INPUT_LOG_LIMIT && context.fs.truncate(file, 0).is_err() {
-        return;
+        return redraw;
     }
-    let offset = if info.len >= INPUT_LOG_LIMIT { 0 } else { info.len };
+    let offset = if info.len >= INPUT_LOG_LIMIT {
+        0
+    } else {
+        info.len
+    };
     let _ = context.fs.write(file, offset, &record);
+    redraw
 }
 
 fn append_console_byte(fs: &mut RedoxFs, byte: u8) {
@@ -357,11 +616,15 @@ fn append_console_byte(fs: &mut RedoxFs, byte: u8) {
     if info.len >= CONSOLE_LIMIT && fs.truncate(file, 0).is_err() {
         return;
     }
-    let offset = if info.len >= CONSOLE_LIMIT { 0 } else { info.len };
+    let offset = if info.len >= CONSOLE_LIMIT {
+        0
+    } else {
+        info.len
+    };
     let _ = fs.write(file, offset, &[byte]);
 }
 
-fn keyboard_ascii(usage: u16, shift: bool) -> Option<u8> {
+fn keyboard_ascii(usage: u16, shift: bool, caps_lock: bool) -> Option<u8> {
     let byte = match usage {
         0x04..=0x1d => b'a' + (usage - 0x04) as u8,
         0x1e..=0x26 => b'1' + (usage - 0x1e) as u8,
@@ -383,11 +646,13 @@ fn keyboard_ascii(usage: u16, shift: bool) -> Option<u8> {
         0x38 => b'/',
         _ => return None,
     };
+    if byte.is_ascii_lowercase() {
+        return Some(if shift ^ caps_lock { byte - 32 } else { byte });
+    }
     if !shift {
         return Some(byte);
     }
     Some(match byte {
-        b'a'..=b'z' => byte - 32,
         b'1'..=b'9' => b"!@#$%^&*("[(byte - b'1') as usize],
         b'0' => b')',
         b'-' => b'_',

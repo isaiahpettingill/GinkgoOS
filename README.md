@@ -24,7 +24,7 @@ The scheduler is deliberately stackless and cooperative: each task performs one 
 
 ### USB HID input
 
-At boot, GinkgoOS discovers the first PCI xHCI controller, enumerates directly attached root-port devices, configures each HID interrupt-IN endpoint, and parses its report descriptor. `InputManager` normalizes reports into device-tagged `InputEvent` values for keyboard keys, mouse buttons and relative axes, joystick/gamepad buttons, absolute axes, wheels, and hat switches. USB keyboard presses feed the serial and `/console` path, and every normalized event is recorded in `/input`. Report IDs and packed, signed, or non-byte-aligned fields are supported.
+At boot, GinkgoOS discovers the first PCI xHCI controller, enumerates directly attached root-port devices, configures each HID interrupt-IN endpoint, and parses its report descriptor. `InputManager` normalizes reports into device-tagged `InputEvent` values for keyboard keys, mouse buttons and relative axes, joystick/gamepad buttons, absolute axes, wheels, and hat switches. The framebuffer validation UI tracks relative mice and absolute USB tablets, displays mouse-button state through the cursor color, and provides a wrapped keyboard text buffer with Shift, Caps Lock, Enter, Tab, and Backspace handling. USB keyboard presses also feed the serial and `/console` path, and every normalized event is recorded in `/input`. Report IDs and packed, signed, or non-byte-aligned fields are supported.
 
 Input is currently limited to devices attached directly to xHCI root ports at boot. USB hubs and hotplug re-enumeration are not implemented yet. Enumeration failures are isolated per port so one malformed or unsupported device does not disable other input devices.
 
