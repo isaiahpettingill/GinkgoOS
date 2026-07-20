@@ -14,8 +14,10 @@ use core::{
     ptr,
 };
 use framebuffer::{FramebufferWriter, Rgb};
-use rust_limine_framebuffer::{
+use ginkgo_os::{
     fs::RedoxFs,
+    hid::{Axis, InputEvent},
+    input::{DeviceInputEvent, InputManager},
     io::SerialPort,
     limine::{self, BaseRevision, FramebufferRequest, HhdmRequest, MemoryMapRequest},
     memory::{UsableFrameAllocator, VirtAddr, VirtPage},
@@ -109,12 +111,21 @@ pub extern "C" fn _start() -> ! {
         hhdm_offset: hhdm.offset,
         fs,
         serial,
+        input: None,
         paging_verified: false,
     };
     context.paging_verified = verify_paging(&mut context);
     if !context.paging_verified {
         halt_forever();
     }
+    context.input = unsafe {
+        InputManager::initialize(
+            &mut context.page_table,
+            &mut context.frames,
+            context.hhdm_offset,
+        )
+        .ok()
+    };
 
     // Single-core boot calls this exactly once while interrupts are disabled.
     let context = unsafe { KERNEL_CONTEXT.initialize(context) };
@@ -122,6 +133,7 @@ pub extern "C" fn _start() -> ! {
     if scheduler.spawn(filesystem_task).is_err()
         || scheduler.spawn(console_task).is_err()
         || scheduler.spawn(accounting_task).is_err()
+        || scheduler.spawn(input_task).is_err()
     {
         halt_forever();
     }
@@ -138,6 +150,7 @@ struct KernelContext {
     hhdm_offset: u64,
     fs: RedoxFs,
     serial: Option<SerialPort>,
+    input: Option<InputManager>,
     paging_verified: bool,
 }
 
@@ -272,6 +285,184 @@ fn console_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll 
     let offset = if info.len >= CONSOLE_LIMIT { 0 } else { info.len };
     let _ = context.fs.write(file, offset, &[byte]);
     TaskPoll::Pending
+}
+
+fn input_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
+    let Some(input) = context.input.as_mut() else {
+        return TaskPoll::Complete;
+    };
+    if input.poll().is_err() {
+        return TaskPoll::Complete;
+    }
+
+    if state.get(0) == Some(0) {
+        if context.fs.create("/input").is_err() {
+            return TaskPoll::Complete;
+        }
+        state.set(0, 1);
+    }
+
+    for _ in 0..32 {
+        let Some(event) = context.input.as_mut().and_then(InputManager::pop_event) else {
+            break;
+        };
+        handle_input_event(context, state, event);
+    }
+    TaskPoll::Pending
+}
+
+fn handle_input_event(
+    context: &mut KernelContext,
+    state: &mut TaskState,
+    device_event: DeviceInputEvent,
+) {
+    let shift = state.get(1).unwrap_or(0) != 0;
+    if let InputEvent::Key { usage, pressed, .. } = device_event.event {
+        if matches!(usage, 0xe1 | 0xe5) {
+            state.set(1, usize::from(pressed));
+        } else if pressed {
+            if let Some(byte) = keyboard_ascii(usage, shift) {
+                if let Some(serial) = context.serial.as_mut() {
+                    let _ = serial.try_write(byte);
+                }
+                append_console_byte(&mut context.fs, byte);
+            }
+        }
+    }
+
+    let record = encode_input_event(device_event);
+    let Ok(file) = context.fs.open("/input") else {
+        return;
+    };
+    let Ok(info) = context.fs.stat(file) else {
+        return;
+    };
+    const INPUT_LOG_LIMIT: u64 = 64 * 1024;
+    if info.len >= INPUT_LOG_LIMIT && context.fs.truncate(file, 0).is_err() {
+        return;
+    }
+    let offset = if info.len >= INPUT_LOG_LIMIT { 0 } else { info.len };
+    let _ = context.fs.write(file, offset, &record);
+}
+
+fn append_console_byte(fs: &mut RedoxFs, byte: u8) {
+    let file = match fs.open("/console").or_else(|_| fs.create("/console")) {
+        Ok(file) => file,
+        Err(_) => return,
+    };
+    let Ok(info) = fs.stat(file) else {
+        return;
+    };
+    const CONSOLE_LIMIT: u64 = 64 * 1024;
+    if info.len >= CONSOLE_LIMIT && fs.truncate(file, 0).is_err() {
+        return;
+    }
+    let offset = if info.len >= CONSOLE_LIMIT { 0 } else { info.len };
+    let _ = fs.write(file, offset, &[byte]);
+}
+
+fn keyboard_ascii(usage: u16, shift: bool) -> Option<u8> {
+    let byte = match usage {
+        0x04..=0x1d => b'a' + (usage - 0x04) as u8,
+        0x1e..=0x26 => b'1' + (usage - 0x1e) as u8,
+        0x27 => b'0',
+        0x28 => b'\n',
+        0x2a => 8,
+        0x2b => b'\t',
+        0x2c => b' ',
+        0x2d => b'-',
+        0x2e => b'=',
+        0x2f => b'[',
+        0x30 => b']',
+        0x31 => b'\\',
+        0x33 => b';',
+        0x34 => b'\'',
+        0x35 => b'`',
+        0x36 => b',',
+        0x37 => b'.',
+        0x38 => b'/',
+        _ => return None,
+    };
+    if !shift {
+        return Some(byte);
+    }
+    Some(match byte {
+        b'a'..=b'z' => byte - 32,
+        b'1'..=b'9' => b"!@#$%^&*("[(byte - b'1') as usize],
+        b'0' => b')',
+        b'-' => b'_',
+        b'=' => b'+',
+        b'[' => b'{',
+        b']' => b'}',
+        b'\\' => b'|',
+        b';' => b':',
+        b'\'' => b'"',
+        b'`' => b'~',
+        b',' => b'<',
+        b'.' => b'>',
+        b'/' => b'?',
+        _ => byte,
+    })
+}
+
+fn encode_input_event(device_event: DeviceInputEvent) -> [u8; 24] {
+    let mut record = [0_u8; 24];
+    record[..4].copy_from_slice(&device_event.interface.device.to_le_bytes());
+    record[4] = device_event.interface.interface;
+    let (kind, usage_page, usage, value, raw_value) = match device_event.event {
+        InputEvent::Key { usage, pressed, .. } => (1, 0x07, usage, i32::from(pressed), 0),
+        InputEvent::Button {
+            button, pressed, ..
+        } => (2, 0x09, button, i32::from(pressed), 0),
+        InputEvent::Axis {
+            axis,
+            value,
+            raw_value,
+            relative,
+            ..
+        } => (
+            3 | (u8::from(relative) << 7),
+            0x01,
+            axis_usage(axis),
+            value,
+            raw_value,
+        ),
+        InputEvent::HatSwitch { position, .. } => {
+            (4, 0x01, 0x39, position.map_or(-1, i32::from), 0)
+        }
+        InputEvent::Value {
+            usage,
+            value,
+            relative,
+            ..
+        } => (
+            5 | (u8::from(relative) << 7),
+            usage.page,
+            usage.id,
+            value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            value,
+        ),
+    };
+    record[5] = kind;
+    record[6..8].copy_from_slice(&usage_page.to_le_bytes());
+    record[8..10].copy_from_slice(&usage.to_le_bytes());
+    record[12..16].copy_from_slice(&value.to_le_bytes());
+    record[16..24].copy_from_slice(&raw_value.to_le_bytes());
+    record
+}
+
+const fn axis_usage(axis: Axis) -> u16 {
+    match axis {
+        Axis::X => 0x30,
+        Axis::Y => 0x31,
+        Axis::Z => 0x32,
+        Axis::Rx => 0x33,
+        Axis::Ry => 0x34,
+        Axis::Rz => 0x35,
+        Axis::Slider => 0x36,
+        Axis::Dial => 0x37,
+        Axis::Wheel => 0x38,
+    }
 }
 
 fn accounting_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {

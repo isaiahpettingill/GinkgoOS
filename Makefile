@@ -1,10 +1,10 @@
 SHELL := /bin/sh
 
-IMAGE_NAME := rust-limine-framebuffer
+IMAGE_NAME := ginkgo-os
 BUILD_DIR := build
 ISO_ROOT := $(BUILD_DIR)/iso_root
 NO_ISO_ROOT := $(BUILD_DIR)/no_iso_root
-KERNEL := target/x86_64-unknown-none/debug/rust-limine-framebuffer
+KERNEL := target/x86_64-unknown-none/debug/ginkgo-os
 ISO := $(BUILD_DIR)/$(IMAGE_NAME).iso
 
 LIMINE_VERSION ?= v12.5.1
@@ -19,7 +19,7 @@ OVMF_CODE := $(OVMF_DIR)/ovmf-code-x86_64.fd
 
 XORRISO ?= xorriso
 QEMU ?= qemu-system-x86_64
-QEMU_FLAGS ?= -m 512M -M q35 -serial stdio -no-reboot -no-shutdown
+QEMU_FLAGS ?= -m 512M -M q35 -serial stdio -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 -no-reboot -no-shutdown
 
 .PHONY: all kernel iso qemu no-iso run check clean distclean
 

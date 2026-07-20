@@ -1,7 +1,7 @@
 use core::ptr;
 
 use crate::font8x8::BASIC_FONT;
-use rust_limine_framebuffer::limine::Framebuffer;
+use ginkgo_os::limine::Framebuffer;
 
 #[derive(Clone, Copy)]
 pub struct Rgb {
