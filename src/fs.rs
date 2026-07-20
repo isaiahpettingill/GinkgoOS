@@ -4,16 +4,20 @@
 //! memory-backed block device. A build script formats the seed image with the
 //! same adapted `no_std` RedoxFS core used by the kernel.
 
-use alloc::vec::Vec;
+use alloc::{collections::BTreeMap, vec::Vec};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use redoxfs::{Disk, FileSystem, Node, TreePtr, BLOCK_SIZE};
 use syscall::error::{Error, EEXIST, EINVAL, EIO, ENOENT, ENOSPC};
 
 const SEED_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/redoxfs.img"));
+static NEXT_FILESYSTEM_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileHandle {
+    filesystem_id: u64,
     node_id: u32,
+    generation: u32,
 }
 
 impl FileHandle {
@@ -21,8 +25,8 @@ impl FileHandle {
         self.node_id
     }
 
-    fn node_ptr(self) -> TreePtr<Node> {
-        TreePtr::new(self.node_id)
+    pub const fn generation(self) -> u32 {
+        self.generation
     }
 }
 
@@ -91,6 +95,8 @@ impl Disk for MemoryDisk {
 
 /// A RedoxFS instance backed by kernel memory.
 pub struct RedoxFs {
+    filesystem_id: u64,
+    generations: BTreeMap<u32, u32>,
     inner: FileSystem<MemoryDisk>,
 }
 
@@ -98,7 +104,12 @@ impl RedoxFs {
     pub fn new() -> Result<Self, FsError> {
         let disk = MemoryDisk::from_seed();
         let inner = FileSystem::open(disk, None, Some(0), false).map_err(map_error)?;
-        Ok(Self { inner })
+        let filesystem_id = NEXT_FILESYSTEM_ID.fetch_add(1, Ordering::Relaxed);
+        Ok(Self {
+            filesystem_id,
+            generations: BTreeMap::new(),
+            inner,
+        })
     }
 
     pub fn image_size(&mut self) -> Result<u64, FsError> {
@@ -127,8 +138,11 @@ impl RedoxFs {
                 )
             })
             .map_err(map_error)?;
+        let generation = *self.generations.entry(node.id()).or_insert(1);
         Ok(FileHandle {
+            filesystem_id: self.filesystem_id,
             node_id: node.id(),
+            generation,
         })
     }
 
@@ -141,8 +155,11 @@ impl RedoxFs {
         if node.data().is_dir() {
             return Err(FsError::InvalidHandle);
         }
+        let generation = *self.generations.entry(node.id()).or_insert(1);
         Ok(FileHandle {
+            filesystem_id: self.filesystem_id,
             node_id: node.id(),
+            generation,
         })
     }
 
@@ -152,8 +169,9 @@ impl RedoxFs {
         offset: u64,
         output: &mut [u8],
     ) -> Result<usize, FsError> {
+        let node = self.validate_handle(file)?;
         self.inner
-            .tx(|tx| tx.read_node(file.node_ptr(), offset, output, 0, 0))
+            .tx(|tx| tx.read_node(node, offset, output, 0, 0))
             .map_err(handle_error)
     }
 
@@ -166,21 +184,24 @@ impl RedoxFs {
         offset
             .checked_add(input.len() as u64)
             .ok_or(FsError::OffsetOverflow)?;
+        let node = self.validate_handle(file)?;
         self.inner
-            .tx(|tx| tx.write_node(file.node_ptr(), offset, input, 0, 0))
+            .tx(|tx| tx.write_node(node, offset, input, 0, 0))
             .map_err(handle_error)
     }
 
     pub fn truncate(&mut self, file: FileHandle, len: u64) -> Result<(), FsError> {
+        let node = self.validate_handle(file)?;
         self.inner
-            .tx(|tx| tx.truncate_node(file.node_ptr(), len, 0, 0))
+            .tx(|tx| tx.truncate_node(node, len, 0, 0))
             .map_err(handle_error)
     }
 
     pub fn stat(&mut self, file: FileHandle) -> Result<FileInfo, FsError> {
+        let pointer = self.validate_handle(file)?;
         let node = self
             .inner
-            .tx(|tx| tx.read_tree(file.node_ptr()))
+            .tx(|tx| tx.read_tree(pointer))
             .map_err(handle_error)?;
         Ok(FileInfo {
             len: node.data().size(),
@@ -188,20 +209,38 @@ impl RedoxFs {
     }
 
     pub fn remove(&mut self, file: FileHandle) -> Result<(), FsError> {
+        let node = self.validate_handle(file)?;
         self.inner
             .tx(|tx| {
                 let mut entries = Vec::new();
                 tx.child_nodes(TreePtr::root(), &mut entries)?;
                 let entry = entries
                     .iter()
-                    .find(|entry| entry.node_ptr().id() == file.node_id)
+                    .find(|entry| entry.node_ptr().id() == node.id())
                     .ok_or_else(|| Error::new(ENOENT))?;
                 let name = entry.name().ok_or_else(|| Error::new(EIO))?;
                 tx.remove_node(TreePtr::root(), name, Node::MODE_FILE)?;
                 Ok(())
             })
-            .map_err(handle_error)
+            .map_err(handle_error)?;
+        let generation = self.generations.entry(file.node_id).or_insert(1);
+        *generation = next_generation(*generation);
+        Ok(())
     }
+
+    fn validate_handle(&self, file: FileHandle) -> Result<TreePtr<Node>, FsError> {
+        if file.filesystem_id != self.filesystem_id
+            || self.generations.get(&file.node_id) != Some(&file.generation)
+        {
+            return Err(FsError::InvalidHandle);
+        }
+        Ok(TreePtr::new(file.node_id))
+    }
+}
+
+const fn next_generation(generation: u32) -> u32 {
+    let next = generation.wrapping_add(1);
+    if next == 0 { 1 } else { next }
 }
 
 fn parse_name(path: &str) -> Result<&str, FsError> {
@@ -290,6 +329,21 @@ mod tests {
         fs.remove(file).unwrap();
         assert_eq!(fs.stat(file), Err(FsError::InvalidHandle));
         assert_eq!(fs.open("/data"), Err(FsError::NotFound));
+
+        let replacement = fs.create("/replacement").unwrap();
+        assert_eq!(replacement.node_id(), file.node_id());
+        assert_ne!(replacement.generation(), file.generation());
+        assert_eq!(fs.write(file, 0, b"stale"), Err(FsError::InvalidHandle));
+    }
+
+    #[test]
+    fn rejects_handles_from_another_filesystem() {
+        let mut first = RedoxFs::new().unwrap();
+        let mut second = RedoxFs::new().unwrap();
+        let file = first.create("/first").unwrap();
+
+        assert_eq!(second.stat(file), Err(FsError::InvalidHandle));
+        assert_eq!(second.write(file, 0, b"wrong disk"), Err(FsError::InvalidHandle));
     }
 
     #[test]

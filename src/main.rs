@@ -278,17 +278,17 @@ fn accounting_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPo
     let ticks = state.get(0).unwrap_or(0).wrapping_add(1);
     state.set(0, ticks);
 
-    let file = match context.fs.open("/scheduler") {
-        Ok(file) => file,
-        Err(_) => match context.fs.create("/scheduler") {
+    if state.get(1) == Some(0) {
+        let file = match context.fs.create("/scheduler") {
             Ok(file) => file,
             Err(_) => return TaskPoll::Complete,
-        },
-    };
-    let bytes = ticks.to_le_bytes();
-    if context.fs.write(file, 0, &bytes).is_err() {
-        return TaskPoll::Complete;
+        };
+        if context.fs.write(file, 0, &ticks.to_le_bytes()).is_err() {
+            return TaskPoll::Complete;
+        }
+        state.set(1, 1);
     }
+
     TaskPoll::Pending
 }
 
