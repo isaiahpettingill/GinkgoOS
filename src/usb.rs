@@ -39,7 +39,9 @@ const MAX_EXTENDED_CAPABILITIES: usize = 64;
 const USBCMD_RUN_STOP: u32 = 1 << 0;
 const USBCMD_HOST_CONTROLLER_RESET: u32 = 1 << 1;
 const USBSTS_HOST_CONTROLLER_HALTED: u32 = 1 << 0;
+const USBSTS_HOST_SYSTEM_ERROR: u32 = 1 << 2;
 const USBSTS_CONTROLLER_NOT_READY: u32 = 1 << 11;
+const USBSTS_HOST_CONTROLLER_ERROR: u32 = 1 << 12;
 const PORTSC_CURRENT_CONNECT_STATUS: u32 = 1 << 0;
 const PORTSC_PORT_ENABLED: u32 = 1 << 1;
 const PORTSC_PORT_RESET: u32 = 1 << 4;
@@ -280,6 +282,7 @@ impl UsbHost {
     /// Drains a bounded number of xHCI events and immediately requeues every
     /// completed interrupt-IN transfer.  No interrupt or timer is required.
     pub fn poll(&mut self) -> Result<Vec<HidReport>, UsbError> {
+        self.controller.check_running()?;
         let mut reports = Vec::new();
         for _ in 0..POLL_EVENT_BUDGET {
             let Some(event) = self.controller.next_event()? else {
@@ -761,6 +764,19 @@ impl Xhci {
         })
     }
 
+    fn check_running(&mut self) -> Result<(), UsbError> {
+        let status = self.mmio.read_u32(self.operational + 0x04)?;
+        if status
+            & (USBSTS_HOST_CONTROLLER_HALTED
+                | USBSTS_HOST_SYSTEM_ERROR
+                | USBSTS_HOST_CONTROLLER_ERROR)
+            != 0
+        {
+            return Err(UsbError::ControllerError);
+        }
+        Ok(())
+    }
+
     fn port_status(&mut self, port: u8) -> Result<u32, UsbError> {
         let offset = self.port_offset(port)?;
         self.mmio.read_u32(offset)
@@ -970,14 +986,18 @@ impl Xhci {
         } else {
             2
         };
-        device.ep0_ring.enqueue(Trb {
+        let setup = Trb {
             dword: [
                 setup_low,
                 setup_high,
                 8,
                 trb_control(TRB_TYPE_SETUP_STAGE) | (1 << 6) | (transfer_type << 16),
             ],
-        })?;
+        };
+        // Withhold ownership of the first TRB until the complete control TD is
+        // present. A running endpoint may otherwise consume Setup before the
+        // Data and Status stages have been published.
+        let unpublished_setup = device.ep0_ring.enqueue_unpublished(setup)?;
 
         let data_pointer = if length != 0 {
             let pointer = device.ep0_ring.enqueue(Trb::new(
@@ -995,6 +1015,7 @@ impl Xhci {
             0,
             trb_control(TRB_TYPE_STATUS_STAGE) | ((status_direction_in as u32) << 16) | (1 << 5),
         ))?;
+        device.ep0_ring.publish(unpublished_setup)?;
         self.ring_doorbell(device.slot_id, 1)?;
 
         let mut actual = length;
@@ -1061,6 +1082,11 @@ fn trb_control(trb_type: u32) -> u32 {
     trb_type << 10
 }
 
+struct UnpublishedTrb {
+    index: usize,
+    control: u32,
+}
+
 struct ProducerRing {
     page: DmaPage,
     enqueue_index: usize,
@@ -1082,12 +1108,39 @@ impl ProducerRing {
         self.page.physical
     }
 
-    fn enqueue(&mut self, mut trb: Trb) -> Result<u64, UsbError> {
-        if self.enqueue_index >= RING_LINK_INDEX {
+    fn enqueue(&mut self, trb: Trb) -> Result<u64, UsbError> {
+        self.enqueue_with_cycle(trb, self.cycle)
+    }
+
+    fn enqueue_unpublished(&mut self, trb: Trb) -> Result<UnpublishedTrb, UsbError> {
+        let producer_cycle = self.cycle;
+        let index = self.enqueue_index;
+        let mut unpublished = trb;
+        unpublished.dword[3] = (unpublished.dword[3] & !1) | u32::from(!producer_cycle);
+        self.write_and_advance(index, unpublished)?;
+        Ok(UnpublishedTrb {
+            index,
+            control: (trb.dword[3] & !1) | u32::from(producer_cycle),
+        })
+    }
+
+    fn publish(&self, unpublished: UnpublishedTrb) -> Result<(), UsbError> {
+        compiler_fence(Ordering::Release);
+        self.page
+            .write_u32(unpublished.index * 16 + 12, unpublished.control)
+    }
+
+    fn enqueue_with_cycle(&mut self, mut trb: Trb, cycle: bool) -> Result<u64, UsbError> {
+        let index = self.enqueue_index;
+        trb.dword[3] = (trb.dword[3] & !1) | u32::from(cycle);
+        self.write_and_advance(index, trb)?;
+        Ok(self.page.physical + (index * 16) as u64)
+    }
+
+    fn write_and_advance(&mut self, index: usize, trb: Trb) -> Result<(), UsbError> {
+        if index >= RING_LINK_INDEX {
             return Err(UsbError::RingFull);
         }
-        trb.dword[3] = (trb.dword[3] & !1) | u32::from(self.cycle);
-        let index = self.enqueue_index;
         self.page.write_trb(index, trb)?;
         self.enqueue_index += 1;
         if self.enqueue_index == RING_LINK_INDEX {
@@ -1095,7 +1148,7 @@ impl ProducerRing {
             self.enqueue_index = 0;
             self.cycle = !self.cycle;
         }
-        Ok(self.page.physical + (index * 16) as u64)
+        Ok(())
     }
 
     fn write_link(&mut self) -> Result<(), UsbError> {
@@ -1817,6 +1870,32 @@ mod tests {
             parse_configuration_descriptor(&descriptor),
             Err(DescriptorError::InvalidLength)
         );
+    }
+
+    #[test]
+    fn publishes_a_complete_td_by_releasing_its_first_trb_last() {
+        #[repr(align(4096))]
+        struct AlignedPage([u8; PAGE_SIZE as usize]);
+
+        let mut backing = alloc::boxed::Box::new(AlignedPage([0; PAGE_SIZE as usize]));
+        let page = DmaPage {
+            physical: 0x1000,
+            virtual_pointer: backing.0.as_mut_ptr(),
+        };
+        let mut ring = ProducerRing::new(page).unwrap();
+        let first = ring
+            .enqueue_unpublished(Trb::new(1, 2, trb_control(TRB_TYPE_SETUP_STAGE)))
+            .unwrap();
+        ring.enqueue(Trb::new(3, 4, trb_control(TRB_TYPE_DATA_STAGE)))
+            .unwrap();
+        ring.enqueue(Trb::new(5, 6, trb_control(TRB_TYPE_STATUS_STAGE)))
+            .unwrap();
+
+        assert_eq!(ring.page.read_u32(12).unwrap() & 1, 0);
+        assert_eq!(ring.page.read_u32(28).unwrap() & 1, 1);
+        assert_eq!(ring.page.read_u32(44).unwrap() & 1, 1);
+        ring.publish(first).unwrap();
+        assert_eq!(ring.page.read_u32(12).unwrap() & 1, 1);
     }
 
     #[test]

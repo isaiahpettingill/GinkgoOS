@@ -183,6 +183,10 @@ impl InputManager {
         self.host.interface_count()
     }
 
+    pub fn usable_interface_count(&self) -> usize {
+        self.decoders.len()
+    }
+
     pub fn interface_info(&self, index: usize) -> Option<&HidInterfaceInfo> {
         self.host.interface_info(index)
     }
@@ -201,5 +205,12 @@ impl InputManager {
 
     pub fn enumeration_failures(&self) -> &[PortFailure] {
         self.host.enumeration_failures()
+    }
+
+    pub fn first_transfer_error(&self) -> Option<u8> {
+        (0..self.host.interface_count()).find_map(|index| {
+            let id = self.host.interface_info(index)?.id;
+            self.host.interface_transfer_error(id)
+        })
     }
 }

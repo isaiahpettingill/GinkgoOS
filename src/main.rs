@@ -17,6 +17,7 @@ use ginkgo_os::{
     memory::{UsableFrameAllocator, VirtAddr, VirtPage},
     paging::{ActivePageTable, PageFlags},
     task::{Scheduler, TaskPoll, TaskState},
+    usb::UsbError,
 };
 
 #[used]
@@ -96,16 +97,34 @@ pub extern "C" fn _start() -> ! {
     if !context.paging_verified {
         halt_forever();
     }
-    context.input = unsafe {
+    match unsafe {
         InputManager::initialize(
             &mut context.page_table,
             &mut context.frames,
             context.hhdm_offset,
         )
-        .ok()
-    };
-    context.ui.input_initialized = true;
-    context.ui.input_available = context.input.is_some();
+    } {
+        Ok(input) => {
+            context.ui.input_available = input.usable_interface_count() != 0;
+            context.ui.completion_code = None;
+            context.ui.input_status = if context.ui.input_available {
+                "USB HID: ready - move the mouse and type below"
+            } else if let Some(failure) = input.enumeration_failures().first() {
+                context.ui.completion_code = usb_error_completion_code(failure.error);
+                usb_error_status(failure.error)
+            } else if !input.descriptor_failures().is_empty() {
+                "USB HID: report descriptor parsing failed"
+            } else {
+                "USB HID: controller ready, but no HID interfaces found"
+            };
+            context.input = Some(input);
+        }
+        Err(error) => {
+            context.ui.input_available = false;
+            context.ui.completion_code = usb_error_completion_code(error);
+            context.ui.input_status = usb_error_status(error);
+        }
+    }
     context.ui.render(&mut context.screen);
 
     // Single-core boot calls this exactly once while interrupts are disabled.
@@ -148,8 +167,9 @@ struct ValidationUi {
     width: usize,
     height: usize,
     mouse_pressed: bool,
-    input_initialized: bool,
     input_available: bool,
+    input_status: &'static str,
+    completion_code: Option<u8>,
     cursor_backing: [u32; CURSOR_SIZE * CURSOR_SIZE],
     cursor_origin_x: usize,
     cursor_origin_y: usize,
@@ -168,8 +188,9 @@ impl ValidationUi {
             width,
             height,
             mouse_pressed: false,
-            input_initialized: false,
             input_available: false,
+            input_status: "USB HID: initializing...",
+            completion_code: None,
             cursor_backing: [0; CURSOR_SIZE * CURSOR_SIZE],
             cursor_origin_x: 0,
             cursor_origin_y: 0,
@@ -314,24 +335,29 @@ impl ValidationUi {
         );
         screen.fill_rect(margin, margin, 10, 76, accent);
         screen.draw_text(margin + 30, margin + 18, 3, "HID input validation", primary);
-        let status = if !self.input_initialized {
-            "USB HID: initializing..."
-        } else if self.input_available {
-            "USB HID: ready - move the mouse and type below"
-        } else {
-            "USB HID: xHCI controller or input device unavailable"
-        };
         screen.draw_text(
             margin + 30,
             margin + 52,
             1,
-            status,
+            self.input_status,
             if self.input_available {
                 accent
             } else {
                 warning
             },
         );
+        if let Some(code) = self.completion_code {
+            let digits = [hex_digit(code >> 4), hex_digit(code & 0x0f)];
+            screen.draw_text(
+                margin + 30,
+                margin + 64,
+                1,
+                "xHCI completion code: 0x",
+                muted,
+            );
+            let digits = unsafe { core::str::from_utf8_unchecked(&digits) };
+            screen.draw_text(margin + 30 + 24 * 8, margin + 64, 1, digits, warning);
+        }
 
         let text_top = 148;
         screen.draw_text(margin, text_top, 2, "Keyboard text buffer", muted);
@@ -501,7 +527,21 @@ fn input_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
     let Some(input) = context.input.as_mut() else {
         return TaskPoll::Complete;
     };
-    if input.poll().is_err() {
+    let summary = match input.poll() {
+        Ok(summary) => summary,
+        Err(error) => {
+            context.ui.input_available = false;
+            context.ui.completion_code = usb_error_completion_code(error);
+            context.ui.input_status = usb_error_status(error);
+            context.ui.render(&mut context.screen);
+            return TaskPoll::Complete;
+        }
+    };
+    if let Some(code) = input.first_transfer_error() {
+        context.ui.input_available = false;
+        context.ui.completion_code = Some(code);
+        context.ui.input_status = "USB HID: interrupt endpoint stopped with a transfer error";
+        context.ui.render(&mut context.screen);
         return TaskPoll::Complete;
     }
 
@@ -517,7 +557,12 @@ fn input_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
         context.ui.mouse_y,
         context.ui.mouse_pressed,
     );
-    let mut full_redraw = false;
+    let receiving_status = "USB HID: receiving reports - mouse and keyboard active";
+    let mut full_redraw = summary.reports != 0 && context.ui.input_status != receiving_status;
+    if full_redraw {
+        context.ui.input_status = receiving_status;
+        context.ui.completion_code = None;
+    }
     for _ in 0..32 {
         let Some(event) = context.input.as_mut().and_then(InputManager::pop_event) else {
             break;
@@ -714,6 +759,49 @@ fn encode_input_event(device_event: DeviceInputEvent) -> [u8; 24] {
     record[12..16].copy_from_slice(&value.to_le_bytes());
     record[16..24].copy_from_slice(&raw_value.to_le_bytes());
     record
+}
+
+const fn hex_digit(value: u8) -> u8 {
+    match value {
+        0..=9 => b'0' + value,
+        _ => b'A' + (value - 10),
+    }
+}
+
+const fn usb_error_completion_code(error: UsbError) -> Option<u8> {
+    match error {
+        UsbError::CommandFailed(code) | UsbError::TransferFailed(code) => Some(code),
+        _ => None,
+    }
+}
+
+fn usb_error_status(error: UsbError) -> &'static str {
+    match error {
+        UsbError::Pci(_) => "USB HID: no usable PCI xHCI controller",
+        UsbError::Paging(_)
+        | UsbError::FrameAllocator(_)
+        | UsbError::OutOfFrames
+        | UsbError::AddressOverflow
+        | UsbError::InvalidMmioBar
+        | UsbError::MmioOutOfRange
+        | UsbError::UnsupportedDmaAddress => "USB HID: controller memory setup failed",
+        UsbError::UnsupportedPageSize | UsbError::InvalidCapability => {
+            "USB HID: unsupported xHCI controller capabilities"
+        }
+        UsbError::ControllerTimeout => "USB HID: xHCI operation timed out",
+        UsbError::ControllerError => "USB HID: xHCI controller halted or reported a fatal error",
+        UsbError::NoSlots | UsbError::InvalidSlot => "USB HID: xHCI device slot setup failed",
+        UsbError::InvalidPort | UsbError::PortDisconnected | UsbError::PortResetFailed => {
+            "USB HID: connected root port failed to reset"
+        }
+        UsbError::RingFull => "USB HID: xHCI transfer ring exhausted",
+        UsbError::CommandFailed(_) => "USB HID: xHCI enumeration command failed",
+        UsbError::TransferFailed(_) => "USB HID: USB control or input transfer failed",
+        UsbError::InvalidEndpoint => "USB HID: interrupt endpoint configuration failed",
+        UsbError::Descriptor(_) => "USB HID: USB configuration descriptor was rejected",
+        UsbError::TooManyInterfaces => "USB HID: too many HID interfaces",
+        UsbError::ReportTooLarge => "USB HID: device report is too large",
+    }
 }
 
 const fn axis_usage(axis: Axis) -> u16 {
