@@ -1,0 +1,13 @@
+[package]
+name = "ginkgo-sysapi"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+bitflags.workspace = true
+zerocopy.workspace = true

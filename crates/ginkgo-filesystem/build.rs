@@ -54,12 +54,11 @@ impl Disk for ImageDisk {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=linker.ld");
 
     let disk = ImageDisk::new(IMAGE_SIZE);
-    let filesystem = FileSystem::create(disk, 0, 0)
-        .expect("failed to format the embedded RedoxFS seed image");
-    let output = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is missing"))
-        .join("redoxfs.img");
+    let filesystem =
+        FileSystem::create(disk, 0, 0).expect("failed to format the embedded RedoxFS seed image");
+    let output =
+        PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is missing")).join("redoxfs.img");
     fs::write(output, filesystem.disk.data).expect("failed to write RedoxFS seed image");
 }

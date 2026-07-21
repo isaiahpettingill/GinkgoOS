@@ -1,4 +1,8 @@
-use core::{convert::Infallible, ptr::NonNull};
+#![no_std]
+
+//! Framebuffer drawing primitives shared by the kernel and future userspace.
+
+use core::{convert::Infallible, marker::PhantomData, ptr::NonNull};
 
 use embedded_graphics::{
     draw_target::DrawTarget,
@@ -9,20 +13,44 @@ use embedded_graphics::{
     primitives::Rectangle,
     text::{Baseline, Text},
 };
-use ginkgo_os::limine::Framebuffer;
 use profont::{PROFONT_14_POINT, PROFONT_24_POINT, PROFONT_7_POINT};
 use volatile::VolatilePtr;
 
 pub type Rgb = Rgb888;
 
-/// An embedded-graphics draw target over a Limine RGB framebuffer.
+/// Raw RGB framebuffer geometry and pixel-channel layout.
+#[derive(Clone, Copy, Debug)]
+pub struct FramebufferConfig {
+    pub address: *mut u8,
+    pub width: u64,
+    pub height: u64,
+    pub pitch: u64,
+    pub bits_per_pixel: u16,
+    pub memory_model: u8,
+    pub red_mask_size: u8,
+    pub red_mask_shift: u8,
+    pub green_mask_size: u8,
+    pub green_mask_shift: u8,
+    pub blue_mask_size: u8,
+    pub blue_mask_shift: u8,
+}
+
+/// An embedded-graphics draw target over a packed RGB framebuffer.
 pub struct FramebufferWriter<'a> {
-    framebuffer: &'a Framebuffer,
+    framebuffer: FramebufferConfig,
+    marker: PhantomData<&'a mut [u8]>,
 }
 
 impl<'a> FramebufferWriter<'a> {
-    pub fn new(framebuffer: &'a Framebuffer) -> Option<Self> {
-        let bytes_per_pixel = bytes_per_pixel(framebuffer.bpp);
+    /// Validates and claims a raw framebuffer.
+    ///
+    /// # Safety
+    ///
+    /// `framebuffer.address` must identify writable mapped memory covering at
+    /// least `pitch * height` bytes, and that memory must remain exclusively
+    /// borrowed for `'a`.
+    pub unsafe fn from_raw(framebuffer: FramebufferConfig) -> Option<Self> {
+        let bytes_per_pixel = bytes_per_pixel(framebuffer.bits_per_pixel);
         let width = usize::try_from(framebuffer.width).ok()?;
         let height = usize::try_from(framebuffer.height).ok()?;
         u32::try_from(width).ok()?;
@@ -31,10 +59,15 @@ impl<'a> FramebufferWriter<'a> {
         let row_bytes = width.checked_mul(bytes_per_pixel)?;
         let mapped_bytes = pitch.checked_mul(height)?;
         let valid_channel = |size: u8, shift: u8| {
-            size > 0
-                && u16::from(shift) + u16::from(size) <= framebuffer.bpp
-                && u16::from(shift) + u16::from(size) <= 32
+            size > 0 && u16::from(shift) + u16::from(size) <= framebuffer.bits_per_pixel
         };
+        let red_mask = packed_channel_mask(framebuffer.red_mask_size, framebuffer.red_mask_shift)?;
+        let green_mask =
+            packed_channel_mask(framebuffer.green_mask_size, framebuffer.green_mask_shift)?;
+        let blue_mask =
+            packed_channel_mask(framebuffer.blue_mask_size, framebuffer.blue_mask_shift)?;
+        let overlapping_channels =
+            red_mask & green_mask != 0 || red_mask & blue_mask != 0 || green_mask & blue_mask != 0;
 
         if framebuffer.address.is_null()
             || width == 0
@@ -49,11 +82,15 @@ impl<'a> FramebufferWriter<'a> {
             || !valid_channel(framebuffer.red_mask_size, framebuffer.red_mask_shift)
             || !valid_channel(framebuffer.green_mask_size, framebuffer.green_mask_shift)
             || !valid_channel(framebuffer.blue_mask_size, framebuffer.blue_mask_shift)
+            || overlapping_channels
         {
             return None;
         }
 
-        Some(Self { framebuffer })
+        Some(Self {
+            framebuffer,
+            marker: PhantomData,
+        })
     }
 
     pub fn width(&self) -> usize {
@@ -137,7 +174,7 @@ impl<'a> FramebufferWriter<'a> {
             return None;
         }
 
-        let bytes_per_pixel = bytes_per_pixel(self.framebuffer.bpp);
+        let bytes_per_pixel = bytes_per_pixel(self.framebuffer.bits_per_pixel);
         let offset = y * self.framebuffer.pitch as usize + x * bytes_per_pixel;
         let mut packed = 0_u32;
         for byte_index in 0..bytes_per_pixel {
@@ -153,7 +190,7 @@ impl<'a> FramebufferWriter<'a> {
             return;
         }
 
-        let bytes_per_pixel = bytes_per_pixel(self.framebuffer.bpp);
+        let bytes_per_pixel = bytes_per_pixel(self.framebuffer.bits_per_pixel);
         let offset = y * self.framebuffer.pitch as usize + x * bytes_per_pixel;
         for byte_index in 0..bytes_per_pixel {
             let Some(pointer) =
@@ -256,9 +293,80 @@ fn scale_channel(value: u8, bits: u8) -> u32 {
         (1_u32 << bits) - 1
     };
 
-    (u32::from(value) * maximum + 127) / 255
+    ((u64::from(value) * u64::from(maximum) + 127) / 255) as u32
+}
+
+fn packed_channel_mask(bits: u8, shift: u8) -> Option<u32> {
+    if bits == 0 || u16::from(bits) + u16::from(shift) > 32 {
+        return None;
+    }
+    let unshifted = if bits == 32 {
+        u32::MAX
+    } else {
+        (1_u32 << bits) - 1
+    };
+    unshifted.checked_shl(u32::from(shift))
 }
 
 fn bytes_per_pixel(bits_per_pixel: u16) -> usize {
     (usize::from(bits_per_pixel) + 7) / 8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rgb_config(address: *mut u8) -> FramebufferConfig {
+        FramebufferConfig {
+            address,
+            width: 2,
+            height: 1,
+            pitch: 8,
+            bits_per_pixel: 32,
+            memory_model: 1,
+            red_mask_size: 8,
+            red_mask_shift: 16,
+            green_mask_size: 8,
+            green_mask_shift: 8,
+            blue_mask_size: 8,
+            blue_mask_shift: 0,
+        }
+    }
+
+    #[test]
+    fn packs_rgb_channels_and_writes_framebuffer_memory() {
+        let mut bytes = [0_u8; 8];
+        let mut writer = unsafe { FramebufferWriter::from_raw(rgb_config(bytes.as_mut_ptr())) }
+            .expect("valid framebuffer");
+
+        writer.fill_rect(0, 0, 1, 1, Rgb::new(0x12, 0x34, 0x56));
+        assert_eq!(writer.read_raw_pixel(0, 0), Some(0x0012_3456));
+        drop(writer);
+        assert_eq!(&bytes[..4], &[0x56, 0x34, 0x12, 0x00]);
+    }
+
+    #[test]
+    fn rejects_invalid_framebuffer_layouts() {
+        let mut bytes = [0_u8; 8];
+        let mut config = rgb_config(bytes.as_mut_ptr());
+        config.memory_model = 0;
+        assert!(unsafe { FramebufferWriter::from_raw(config) }.is_none());
+
+        config = rgb_config(core::ptr::null_mut());
+        assert!(unsafe { FramebufferWriter::from_raw(config) }.is_none());
+
+        config = rgb_config(bytes.as_mut_ptr());
+        config.pitch = 4;
+        assert!(unsafe { FramebufferWriter::from_raw(config) }.is_none());
+
+        config = rgb_config(bytes.as_mut_ptr());
+        config.green_mask_shift = config.red_mask_shift;
+        assert!(unsafe { FramebufferWriter::from_raw(config) }.is_none());
+    }
+
+    #[test]
+    fn scales_wide_color_channels_without_overflow() {
+        assert_eq!(scale_channel(255, 30), (1_u32 << 30) - 1);
+        assert_eq!(scale_channel(255, 32), u32::MAX);
+    }
 }

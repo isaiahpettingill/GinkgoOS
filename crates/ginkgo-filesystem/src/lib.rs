@@ -1,8 +1,12 @@
+#![no_std]
+
 //! GinkgoOS adapter for the RedoxFS transaction engine.
 //!
 //! The filesystem uses the upstream RedoxFS on-disk format over a mutable
 //! memory-backed block device. A build script formats the seed image with the
 //! same adapted `no_std` RedoxFS core used by the kernel.
+
+extern crate alloc;
 
 use alloc::{collections::BTreeMap, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -68,21 +72,13 @@ impl MemoryDisk {
 }
 
 impl Disk for MemoryDisk {
-    unsafe fn read_at(
-        &mut self,
-        block: u64,
-        buffer: &mut [u8],
-    ) -> syscall::error::Result<usize> {
+    unsafe fn read_at(&mut self, block: u64, buffer: &mut [u8]) -> syscall::error::Result<usize> {
         let range = disk_range(block, buffer.len(), self.data.len())?;
         buffer.copy_from_slice(&self.data[range]);
         Ok(buffer.len())
     }
 
-    unsafe fn write_at(
-        &mut self,
-        block: u64,
-        buffer: &[u8],
-    ) -> syscall::error::Result<usize> {
+    unsafe fn write_at(&mut self, block: u64, buffer: &[u8]) -> syscall::error::Result<usize> {
         let range = disk_range(block, buffer.len(), self.data.len())?;
         self.data[range].copy_from_slice(buffer);
         Ok(buffer.len())
@@ -128,15 +124,7 @@ impl RedoxFs {
         let name = parse_name(path)?;
         let node = self
             .inner
-            .tx(|tx| {
-                tx.create_node(
-                    TreePtr::root(),
-                    name,
-                    Node::MODE_FILE | 0o644,
-                    0,
-                    0,
-                )
-            })
+            .tx(|tx| tx.create_node(TreePtr::root(), name, Node::MODE_FILE | 0o644, 0, 0))
             .map_err(map_error)?;
         let generation = *self.generations.entry(node.id()).or_insert(1);
         Ok(FileHandle {
@@ -175,12 +163,7 @@ impl RedoxFs {
             .map_err(handle_error)
     }
 
-    pub fn write(
-        &mut self,
-        file: FileHandle,
-        offset: u64,
-        input: &[u8],
-    ) -> Result<usize, FsError> {
+    pub fn write(&mut self, file: FileHandle, offset: u64, input: &[u8]) -> Result<usize, FsError> {
         offset
             .checked_add(input.len() as u64)
             .ok_or(FsError::OffsetOverflow)?;
@@ -240,7 +223,11 @@ impl RedoxFs {
 
 const fn next_generation(generation: u32) -> u32 {
     let next = generation.wrapping_add(1);
-    if next == 0 { 1 } else { next }
+    if next == 0 {
+        1
+    } else {
+        next
+    }
 }
 
 fn parse_name(path: &str) -> Result<&str, FsError> {
@@ -269,9 +256,7 @@ fn disk_range(
         .checked_mul(BLOCK_SIZE)
         .and_then(|value| usize::try_from(value).ok())
         .ok_or_else(|| Error::new(EIO))?;
-    let end = offset
-        .checked_add(length)
-        .ok_or_else(|| Error::new(EIO))?;
+    let end = offset.checked_add(length).ok_or_else(|| Error::new(EIO))?;
     if end > disk_length {
         return Err(Error::new(EIO));
     }
@@ -343,7 +328,10 @@ mod tests {
         let file = first.create("/first").unwrap();
 
         assert_eq!(second.stat(file), Err(FsError::InvalidHandle));
-        assert_eq!(second.write(file, 0, b"wrong disk"), Err(FsError::InvalidHandle));
+        assert_eq!(
+            second.write(file, 0, b"wrong disk"),
+            Err(FsError::InvalidHandle)
+        );
     }
 
     #[test]

@@ -32,7 +32,7 @@ QEMU_FLAGS ?= -m 512M -M q35,i8042=off -serial stdio -device qemu-xhci,id=xhci -
 all: iso
 
 kernel:
-	cargo build
+	cargo build -p ginkgo-kernel --bin ginkgo-os
 
 $(LIMINE_DIR)/BOOTX64.EFI:
 	mkdir -p $(BUILD_DIR)
@@ -82,7 +82,7 @@ run: $(OVMF_CODE) $(ISO)
 		-cdrom $(ISO) -boot d
 
 check:
-	cargo check
+	cargo check -p ginkgo-kernel --bin ginkgo-os
 
 clean:
 	cargo clean

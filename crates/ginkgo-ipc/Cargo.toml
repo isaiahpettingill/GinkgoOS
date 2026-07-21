@@ -1,0 +1,20 @@
+[package]
+name = "ginkgo-ipc"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[features]
+default = ["kernel"]
+kernel = ["dep:spinning_top"]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ginkgo-sysapi.workspace = true
+postcard.workspace = true
+serde.workspace = true
+spinning_top = { workspace = true, optional = true }
+zerocopy.workspace = true

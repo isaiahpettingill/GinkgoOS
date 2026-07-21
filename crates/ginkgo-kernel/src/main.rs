@@ -8,9 +8,9 @@ mod heap;
 
 use core::{panic::PanicInfo, ptr::NonNull};
 use framebuffer::{FramebufferWriter, Rgb};
-use ginkgo_os::{
-    fs::RedoxFs,
-    hid::{ApplicationKind, Axis, InputEvent, AXIS_MAX, AXIS_MIN},
+use ginkgo_filesystem::RedoxFs;
+use ginkgo_hid::{ApplicationKind, Axis, InputEvent, AXIS_MAX, AXIS_MIN};
+use ginkgo_kernel::{
     input::{DeviceInputEvent, InputManager},
     io::SerialPort,
     limine::{
@@ -71,7 +71,7 @@ pub extern "C" fn _start() -> ! {
     let Some(framebuffer) = response.first() else {
         halt_forever();
     };
-    let Some(mut screen) = FramebufferWriter::new(framebuffer) else {
+    let Some(mut screen) = (unsafe { framebuffer::from_limine(framebuffer) }) else {
         halt_forever();
     };
 

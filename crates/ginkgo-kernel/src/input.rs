@@ -5,11 +5,12 @@
 
 use alloc::{collections::VecDeque, vec::Vec};
 
+use ginkgo_hid::{
+    ApplicationKind, DecodeError, DescriptorError as HidDescriptorError, DeviceLayout, EventBuffer,
+    InputEvent, ReportDecoder,
+};
+
 use crate::{
-    hid::{
-        ApplicationKind, DecodeError, DescriptorError as HidDescriptorError, DeviceLayout,
-        EventBuffer, InputEvent, ReportDecoder,
-    },
     memory::UsableFrameAllocator,
     paging::ActivePageTable,
     usb::{HidInterfaceId, HidInterfaceInfo, PortFailure, UsbError, UsbHost},

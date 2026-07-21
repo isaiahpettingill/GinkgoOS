@@ -1,3 +1,5 @@
+#![no_std]
+
 //! Transport-independent USB HID input report parsing and decoding.
 //!
 //! Descriptor parsing allocates metadata once. [`ReportDecoder::decode_into`]

@@ -1,0 +1,29 @@
+[package]
+name = "ginkgo-kernel"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "ginkgo-os"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+bitflags.workspace = true
+ginkgo-filesystem.workspace = true
+ginkgo-graphics.workspace = true
+ginkgo-hid.workspace = true
+ginkgo-ipc = { workspace = true, features = ["kernel"] }
+ginkgo-sysapi.workspace = true
+spinning_top.workspace = true
+talc.workspace = true
+uart_16550.workspace = true
+volatile.workspace = true
+x86_64.workspace = true

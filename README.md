@@ -13,6 +13,7 @@ A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. Th
 - PCI discovery and a polling xHCI USB host controller
 - USB HID keyboards, mice, joysticks, and gamepads, including DragonRise Generic USB Joystick reports
 - Descriptor-driven keyboard, button, axis, wheel, and hat-switch events in a bounded kernel input queue
+- Process-local capability handles and bounded bidirectional datagram channels with atomic handle transfer
 - RedoxFS transactions and on-disk format over a volatile memory-backed block device
 - Talc-backed dynamic allocation for RedoxFS and future kernel services
 - Fixed-capacity round-robin cooperative task scheduling
@@ -21,6 +22,12 @@ A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. Th
 - UEFI ISO and no-ISO QEMU boot targets
 
 The scheduler is deliberately stackless and cooperative: each task performs one bounded step, stores its continuation in `TaskState`, and returns to yield. USB input follows the same model and polls xHCI without interrupts. The kernel does not yet provide independent task stacks, timer preemption, userspace, interrupts, SMP, or blocking waits.
+
+### IPC groundwork
+
+`ginkgo-ipc::HandleTable` models the capability table that will belong to each future process. Handles are opaque generation-tagged integers carrying explicit rights. Channel endpoints are asynchronous and bidirectional, preserve datagram boundaries and ordering, and maintain a bounded queue in each direction. Messages carry up to 16 KiB and 16 atomically moved handles; failed writes leave all source handles unchanged. Level-triggered `READABLE`, `WRITABLE`, and `PEER_CLOSED` state supports nonblocking wait-many scans under the current cooperative scheduler.
+
+`ginkgo-sysapi` defines the fixed-layout handle, rights, signal, status, wait, and RPC-header contract shared with future userspace. Structured messages use a 24-byte `zerocopy` RPC header followed by a `postcard` payload; the kernel channel remains unaware of application protocols. `ginkgo-userspace` currently exposes this ABI and codec without pulling in the kernel channel backend. Actual syscall entry and blocking waits remain future work because GinkgoOS does not yet have userspace, process isolation, or stackful threads.
 
 ### USB HID input
 
@@ -101,26 +108,16 @@ make check
 ## Project structure
 
 ```text
-src/main.rs         boot flow, paging smoke test, and initial kernel tasks
-src/lib.rs          reusable no_std kernel subsystem facade
-src/limine.rs       boot-protocol requests and validated response wrappers
-src/memory.rs       x86_64 address types and usable physical-frame allocator
-src/paging.rs       x86_64 OffsetPageTable wrapper and active-frame reservation
-src/io.rs           crate-backed checked port I/O, MMIO, and serial device
-src/pci.rs          PCI mechanism #1 discovery and xHCI BAR claiming
-src/usb.rs          polling xHCI host, USB enumeration, and HID report transport
-src/hid.rs          HID report descriptor parsing and normalized event decoding
-src/input.rs        USB/HID integration and bounded kernel input event queue
-src/fs.rs           RedoxFS memory-disk and kernel API adapter
-src/heap.rs         Talc bootstrap heap
-src/task.rs         cooperative round-robin task scheduler
-src/framebuffer.rs  Limine framebuffer draw target using embedded-graphics and ProFont
-src/crt.rs          freestanding memory routines LLVM may call
-linker.ld            high-half ELF layout and request retention
-limine.conf          Limine menu entry
-build.rs             deterministic RedoxFS seed-image formatter
-vendor/redoxfs/       pinned, no_std GinkgoOS adaptation of RedoxFS
-Makefile             build, ISO, and QEMU automation
+crates/ginkgo-kernel/      boot binary, hardware, memory, USB transport, input queue, and scheduler
+crates/ginkgo-userspace/   no_std userspace ABI and IPC-codec facade
+crates/ginkgo-ipc/         postcard/zerocopy framing plus the kernel channel and handle backend
+crates/ginkgo-hid/         transport-independent HID descriptor parser and report decoder
+crates/ginkgo-filesystem/  RedoxFS memory-disk adapter and deterministic seed-image build
+crates/ginkgo-graphics/    framebuffer draw target, RGB pixel packing, shapes, and ProFont text
+crates/ginkgo-sysapi/      fixed-layout handles, rights, signals, statuses, waits, and RPC header
+vendor/redoxfs/            pinned no_std GinkgoOS adaptation of RedoxFS
+limine.conf                 Limine menu entry
+Makefile                    kernel build, ISO, and QEMU automation
 ```
 
 ## Hardware boot
@@ -135,7 +132,7 @@ Disable Secure Boot unless you sign the Limine EFI executable and configure its 
 
 ## First code to change
 
-The visible output is in `src/main.rs`:
+The visible output is in `crates/ginkgo-kernel/src/main.rs`:
 
 ```rust
 screen.draw_text(margin + 40, margin + 38, 4, "Hello, framebuffer!", primary);

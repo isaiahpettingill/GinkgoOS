@@ -2,8 +2,6 @@
 
 extern crate alloc;
 
-pub mod fs;
-pub mod hid;
 pub mod input;
 pub mod io;
 pub mod limine;

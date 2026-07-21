@@ -1,24 +1,41 @@
-[package]
-name = "ginkgo-os"
+[workspace]
+members = [
+    "crates/ginkgo-kernel",
+    "crates/ginkgo-userspace",
+    "crates/ginkgo-ipc",
+    "crates/ginkgo-hid",
+    "crates/ginkgo-filesystem",
+    "crates/ginkgo-graphics",
+    "crates/ginkgo-sysapi",
+]
+default-members = ["crates/ginkgo-kernel"]
+exclude = ["vendor/redoxfs"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "MIT"
 
-[dependencies]
+[workspace.dependencies]
 bitflags = { version = "2.13.1", default-features = false }
 embedded-graphics = { version = "0.8.2", default-features = false }
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 profont = "0.7.0"
-redoxfs = { path = "vendor/redoxfs", default-features = false }
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 spinning_top = "0.3"
-syscall = { package = "redox_syscall", version = "0.9.0", default-features = false }
 talc = "5.0.4"
 uart_16550 = { version = "0.6.0", default-features = false }
 volatile = { version = "0.6.1", default-features = false }
 x86_64 = { version = "0.15.5", default-features = false, features = ["instructions"] }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 
-[build-dependencies]
-redoxfs = { path = "vendor/redoxfs", default-features = false }
-syscall = { package = "redox_syscall", version = "0.9.0" }
+ginkgo-filesystem = { path = "crates/ginkgo-filesystem" }
+ginkgo-graphics = { path = "crates/ginkgo-graphics" }
+ginkgo-hid = { path = "crates/ginkgo-hid" }
+ginkgo-ipc = { path = "crates/ginkgo-ipc", default-features = false }
+ginkgo-sysapi = { path = "crates/ginkgo-sysapi" }
 
 [profile.dev]
 panic = "abort"
