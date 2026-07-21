@@ -1,100 +1,18 @@
-//! Physical and virtual address types plus a simple usable-frame allocator.
+//! Physical frame allocation backed by the Limine memory map.
 
 use alloc::vec::Vec;
 
+use x86_64::structures::paging::{FrameAllocator, Page, PhysFrame as GenericPhysFrame, Size4KiB};
+
 use crate::limine::{MemoryMapEntries, MemoryMapError, MemoryMapResponse, MEMORY_MAP_USABLE};
 
+pub use x86_64::{PhysAddr, VirtAddr};
+
+pub type PhysFrame = GenericPhysFrame<Size4KiB>;
+pub type VirtPage = Page<Size4KiB>;
 pub const PAGE_SIZE: u64 = 4096;
 pub const MAX_PHYSICAL_ADDRESS: u64 = (1_u64 << 52) - 1;
 const PHYSICAL_ADDRESS_SPACE_SIZE: u64 = 1_u64 << 52;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PhysAddr(u64);
-
-impl PhysAddr {
-    pub const fn new(address: u64) -> Option<Self> {
-        if address <= MAX_PHYSICAL_ADDRESS {
-            Some(Self(address))
-        } else {
-            None
-        }
-    }
-
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
-
-    pub const fn checked_add(self, offset: u64) -> Option<Self> {
-        match self.0.checked_add(offset) {
-            Some(address) => Self::new(address),
-            None => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct VirtAddr(u64);
-
-impl VirtAddr {
-    pub const fn new(address: u64) -> Option<Self> {
-        let upper = address >> 48;
-        let sign = (address >> 47) & 1;
-        if (sign == 0 && upper == 0) || (sign == 1 && upper == 0xffff) {
-            Some(Self(address))
-        } else {
-            None
-        }
-    }
-
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
-
-    pub const fn checked_add(self, offset: u64) -> Option<Self> {
-        match self.0.checked_add(offset) {
-            Some(address) => Self::new(address),
-            None => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PhysFrame {
-    start: PhysAddr,
-}
-
-impl PhysFrame {
-    pub const fn from_start_address(address: PhysAddr) -> Option<Self> {
-        if address.as_u64() % PAGE_SIZE == 0 {
-            Some(Self { start: address })
-        } else {
-            None
-        }
-    }
-
-    pub const fn start_address(self) -> PhysAddr {
-        self.start
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct VirtPage {
-    start: VirtAddr,
-}
-
-impl VirtPage {
-    pub const fn from_start_address(address: VirtAddr) -> Option<Self> {
-        if address.as_u64() % PAGE_SIZE == 0 {
-            Some(Self { start: address })
-        } else {
-            None
-        }
-    }
-
-    pub const fn start_address(self) -> VirtAddr {
-        self.start
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameAllocatorError {
@@ -102,10 +20,6 @@ pub enum FrameAllocatorError {
     InvalidUsableRegion { base: u64, length: u64 },
     UsableRegionOverflow { base: u64, length: u64 },
     PhysicalAddressTooLarge { base: u64, length: u64 },
-}
-
-pub trait FrameAllocator {
-    fn allocate_frame(&mut self) -> Result<Option<PhysFrame>, FrameAllocatorError>;
 }
 
 pub struct UsableFrameAllocator<'a> {
@@ -131,6 +45,10 @@ impl<'a> UsableFrameAllocator<'a> {
 
     pub fn allocated_count(&self) -> u64 {
         self.allocated
+    }
+
+    pub fn error(&self) -> Option<FrameAllocatorError> {
+        self.error
     }
 
     /// Prevents a physical frame from being returned by future allocations.
@@ -161,18 +79,25 @@ impl<'a> UsableFrameAllocator<'a> {
                     self.next += PAGE_SIZE;
                     continue;
                 }
-                let address = PhysAddr::new(self.next).ok_or(
-                    FrameAllocatorError::PhysicalAddressTooLarge {
-                        base: self.next,
-                        length: PAGE_SIZE,
-                    },
-                )?;
-                let frame = PhysFrame::from_start_address(address).ok_or(
-                    FrameAllocatorError::InvalidUsableRegion {
-                        base: self.next,
-                        length: PAGE_SIZE,
-                    },
-                )?;
+
+                let address = match PhysAddr::try_new(self.next) {
+                    Ok(address) => address,
+                    Err(_) => {
+                        return self.fail(FrameAllocatorError::PhysicalAddressTooLarge {
+                            base: self.next,
+                            length: PAGE_SIZE,
+                        })
+                    }
+                };
+                let frame = match PhysFrame::from_start_address(address) {
+                    Ok(frame) => frame,
+                    Err(_) => {
+                        return self.fail(FrameAllocatorError::InvalidUsableRegion {
+                            base: self.next,
+                            length: PAGE_SIZE,
+                        })
+                    }
+                };
 
                 self.next += PAGE_SIZE;
                 self.allocated += 1;
@@ -224,8 +149,10 @@ impl<'a> UsableFrameAllocator<'a> {
     }
 }
 
-impl FrameAllocator for UsableFrameAllocator<'_> {
-    fn allocate_frame(&mut self) -> Result<Option<PhysFrame>, FrameAllocatorError> {
-        UsableFrameAllocator::allocate_frame(self)
+// SAFETY: Limine marks the source regions usable, allocation advances monotonically,
+// and `reserved` excludes every live frame discovered before allocation begins.
+unsafe impl FrameAllocator<Size4KiB> for UsableFrameAllocator<'_> {
+    fn allocate_frame(&mut self) -> Option<PhysFrame> {
+        UsableFrameAllocator::allocate_frame(self).ok().flatten()
     }
 }

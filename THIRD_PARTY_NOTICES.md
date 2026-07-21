@@ -36,9 +36,9 @@ The filesystem core under `vendor/redoxfs` is adapted from RedoxFS commit `99bc1
 
 The complete upstream license is retained at `vendor/redoxfs/LICENSE`.
 
-## font8x8 basic ASCII font
+## ProFont
 
-- Project: `dhepper/font8x8`
-- File: `font8x8_basic.h`
-- Author: Daniel Hepper; based on public-domain IBM VGA fonts
-- License: Public Domain
+- Project: ProFont for embedded-graphics
+- Source: https://github.com/wezm/profont
+- Copyright: 2018 Wes M
+- License: MIT

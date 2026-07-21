@@ -5,10 +5,13 @@
 //! region exists, individual accesses are range- and alignment-checked.
 
 use core::{
-    arch::asm,
     mem::{align_of, size_of},
-    ptr::{self, NonNull},
+    ptr::NonNull,
 };
+
+use uart_16550::{backend::PioBackend, Config, Uart16550};
+use volatile::VolatilePtr;
+use x86_64::instructions::port::Port;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IoError {
@@ -52,110 +55,42 @@ impl PortRegion {
     }
 
     pub fn read_u8(&mut self, offset: u16) -> Result<u8, IoError> {
-        let port = self.checked_port(offset, size_of::<u8>())?;
-        let value: u8;
-
-        // SAFETY: `new` establishes ownership and I/O privilege; the checked
-        // port lies within the declared range and `in` does not touch the stack.
-        unsafe {
-            asm!(
-                "in al, dx",
-                in("dx") port,
-                lateout("al") value,
-                options(nostack, preserves_flags),
-            );
-        }
-        Ok(value)
+        let mut port = Port::new(self.checked_port(offset, size_of::<u8>())?);
+        Ok(unsafe { port.read() })
     }
 
     pub fn read_u16(&mut self, offset: u16) -> Result<u16, IoError> {
-        let port = self.checked_port(offset, size_of::<u16>())?;
-        let value: u16;
-
-        // SAFETY: See `read_u8`; this access additionally passed the u16 width
-        // check performed by `checked_port`.
-        unsafe {
-            asm!(
-                "in ax, dx",
-                in("dx") port,
-                lateout("ax") value,
-                options(nostack, preserves_flags),
-            );
-        }
-        Ok(value)
+        let mut port = Port::new(self.checked_port(offset, size_of::<u16>())?);
+        Ok(unsafe { port.read() })
     }
 
     pub fn read_u32(&mut self, offset: u16) -> Result<u32, IoError> {
-        let port = self.checked_port(offset, size_of::<u32>())?;
-        let value: u32;
-
-        // SAFETY: See `read_u8`; this access additionally passed the u32 width
-        // check performed by `checked_port`.
-        unsafe {
-            asm!(
-                "in eax, dx",
-                in("dx") port,
-                lateout("eax") value,
-                options(nostack, preserves_flags),
-            );
-        }
-        Ok(value)
+        let mut port = Port::new(self.checked_port(offset, size_of::<u32>())?);
+        Ok(unsafe { port.read() })
     }
 
     pub fn write_u8(&mut self, offset: u16, value: u8) -> Result<(), IoError> {
-        let port = self.checked_port(offset, size_of::<u8>())?;
-
-        // SAFETY: `new` establishes ownership and I/O privilege; the checked
-        // port lies within the declared range and `out` does not touch the stack.
-        unsafe {
-            asm!(
-                "out dx, al",
-                in("dx") port,
-                in("al") value,
-                options(nostack, preserves_flags),
-            );
-        }
+        let mut port = Port::new(self.checked_port(offset, size_of::<u8>())?);
+        unsafe { port.write(value) };
         Ok(())
     }
 
     pub fn write_u16(&mut self, offset: u16, value: u16) -> Result<(), IoError> {
-        let port = self.checked_port(offset, size_of::<u16>())?;
-
-        // SAFETY: See `write_u8`; this access additionally passed the u16 width
-        // check performed by `checked_port`.
-        unsafe {
-            asm!(
-                "out dx, ax",
-                in("dx") port,
-                in("ax") value,
-                options(nostack, preserves_flags),
-            );
-        }
+        let mut port = Port::new(self.checked_port(offset, size_of::<u16>())?);
+        unsafe { port.write(value) };
         Ok(())
     }
 
     pub fn write_u32(&mut self, offset: u16, value: u32) -> Result<(), IoError> {
-        let port = self.checked_port(offset, size_of::<u32>())?;
-
-        // SAFETY: See `write_u8`; this access additionally passed the u32 width
-        // check performed by `checked_port`.
-        unsafe {
-            asm!(
-                "out dx, eax",
-                in("dx") port,
-                in("eax") value,
-                options(nostack, preserves_flags),
-            );
-        }
+        let mut port = Port::new(self.checked_port(offset, size_of::<u32>())?);
+        unsafe { port.write(value) };
         Ok(())
     }
 
     fn checked_port(&self, offset: u16, width: usize) -> Result<u16, IoError> {
         let offset = u32::from(offset);
         let width = u32::try_from(width).map_err(|_| IoError::AddressOverflow)?;
-        let relative_end = offset
-            .checked_add(width)
-            .ok_or(IoError::AddressOverflow)?;
+        let relative_end = offset.checked_add(width).ok_or(IoError::AddressOverflow)?;
 
         if relative_end > u32::from(self.count) {
             return Err(IoError::OutOfRange);
@@ -174,76 +109,42 @@ impl PortRegion {
     }
 }
 
-/// An exclusively owned, virtually mapped MMIO byte range.
-/// A nonblocking 16550-compatible serial device backed by an I/O-port range.
+/// A nonblocking 16550-compatible serial device.
 pub struct SerialPort {
-    ports: PortRegion,
+    uart: Uart16550<PioBackend>,
 }
 
 impl SerialPort {
     pub const COM1_BASE: u16 = 0x3f8;
 
-    /// Claims and initializes a 16550-compatible serial port.
+    /// Claims, detects, and initializes a 16550 UART.
     ///
     /// # Safety
     ///
     /// The caller must ensure exclusive ownership of the eight ports beginning
     /// at `base` and that a compatible UART is present there.
     pub unsafe fn new(base: u16) -> Option<Self> {
-        let ports = PortRegion::new(base, 8)?;
-        let mut serial = Self { ports };
-        serial.initialize().ok()?;
-        Some(serial)
+        let mut uart = unsafe { Uart16550::new_port(base) }.ok()?;
+        uart.init(Config::default()).ok()?;
+        Some(Self { uart })
     }
 
     pub fn try_read(&mut self) -> Result<Option<u8>, IoError> {
-        if self.ports.read_u8(5)? & 1 == 0 {
-            return Ok(None);
-        }
-        self.ports.read_u8(0).map(Some)
+        Ok(self.uart.try_receive_byte().ok())
     }
 
     pub fn try_write(&mut self, byte: u8) -> Result<bool, IoError> {
-        if self.ports.read_u8(5)? & (1 << 5) == 0 {
-            return Ok(false);
-        }
-        self.ports.write_u8(0, byte)?;
-        Ok(true)
+        Ok(self.uart.try_send_byte(byte).is_ok())
     }
 
     /// Writes every byte that the UART can accept immediately and returns the
     /// number written. It never spins waiting for the device.
     pub fn write_available(&mut self, bytes: &[u8]) -> Result<usize, IoError> {
-        let mut written = 0;
-        for &byte in bytes {
-            if !self.try_write(byte)? {
-                break;
-            }
-            written += 1;
-        }
-        Ok(written)
-    }
-
-    fn initialize(&mut self) -> Result<(), IoError> {
-        self.ports.write_u8(1, 0x00)?;
-        self.ports.write_u8(3, 0x80)?;
-        self.ports.write_u8(0, 0x03)?;
-        self.ports.write_u8(1, 0x00)?;
-        self.ports.write_u8(3, 0x03)?;
-        self.ports.write_u8(2, 0xc7)?;
-
-        // Probe the UART in loopback mode so an absent legacy port (which
-        // commonly reads as 0xff) is not mistaken for a stream of input.
-        self.ports.write_u8(4, 0x1e)?;
-        self.ports.write_u8(0, 0xae)?;
-        if self.ports.read_u8(0)? != 0xae {
-            return Err(IoError::DeviceNotPresent);
-        }
-        self.ports.write_u8(4, 0x0f)?;
-        Ok(())
+        Ok(self.uart.send_bytes(bytes))
     }
 }
 
+/// An exclusively owned, virtually mapped MMIO byte range.
 pub struct MmioRegion {
     base: NonNull<u8>,
     len: usize,
@@ -308,22 +209,16 @@ impl MmioRegion {
 
     fn read<T: Copy>(&mut self, offset: usize) -> Result<T, IoError> {
         let pointer = self.checked_pointer::<T>(offset)?;
-
-        // SAFETY: Construction guarantees a valid MMIO mapping and exclusive
-        // ownership. `checked_pointer` verifies range and alignment for `T`.
-        Ok(unsafe { ptr::read_volatile(pointer.cast_const()) })
+        Ok(unsafe { VolatilePtr::new(pointer) }.read())
     }
 
-    fn write<T>(&mut self, offset: usize, value: T) -> Result<(), IoError> {
+    fn write<T: Copy>(&mut self, offset: usize, value: T) -> Result<(), IoError> {
         let pointer = self.checked_pointer::<T>(offset)?;
-
-        // SAFETY: Construction guarantees a valid MMIO mapping and exclusive
-        // ownership. `checked_pointer` verifies range and alignment for `T`.
-        unsafe { ptr::write_volatile(pointer, value) };
+        unsafe { VolatilePtr::new(pointer) }.write(value);
         Ok(())
     }
 
-    fn checked_pointer<T>(&self, offset: usize) -> Result<*mut T, IoError> {
+    fn checked_pointer<T>(&self, offset: usize) -> Result<NonNull<T>, IoError> {
         let end = offset
             .checked_add(size_of::<T>())
             .ok_or(IoError::AddressOverflow)?;
@@ -338,8 +233,7 @@ impl MmioRegion {
             return Err(IoError::Misaligned);
         }
 
-        // SAFETY: The constructor's contract makes the whole byte range valid,
-        // and the range check above proves that this `T` lies inside it.
-        Ok(unsafe { self.base.as_ptr().add(offset).cast::<T>() })
+        NonNull::new(unsafe { self.base.as_ptr().add(offset).cast::<T>() })
+            .ok_or(IoError::AddressOverflow)
     }
 }

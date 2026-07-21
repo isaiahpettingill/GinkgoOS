@@ -2,11 +2,11 @@
 #![no_main]
 
 mod crt;
-mod font8x8;
+
 mod framebuffer;
 mod heap;
 
-use core::{arch::asm, panic::PanicInfo, ptr};
+use core::{panic::PanicInfo, ptr::NonNull};
 use framebuffer::{FramebufferWriter, Rgb};
 use ginkgo_os::{
     fs::RedoxFs,
@@ -18,10 +18,12 @@ use ginkgo_os::{
         TscFrequencyRequest,
     },
     memory::{UsableFrameAllocator, VirtAddr, VirtPage},
-    paging::{ActivePageTable, PageFlags},
+    paging::{ActivePageTable, PageTableFlags},
     task::{Scheduler, TaskPoll, TaskState},
     usb::{self, UsbError},
 };
+use volatile::VolatilePtr;
+use x86_64::instructions::{hlt, interrupts};
 
 #[used]
 #[link_section = ".limine_requests_start"]
@@ -57,7 +59,7 @@ static REQUESTS_END: [u64; 2] = limine::REQUESTS_END_MARKER;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    unsafe { asm!("cli", options(nomem, nostack, preserves_flags)) };
+    interrupts::disable();
 
     if !BASE_REVISION.is_supported() {
         halt_forever();
@@ -107,6 +109,11 @@ pub extern "C" fn _start() -> ! {
         screen,
         ui,
         paging_verified: false,
+        pending_console: [0; CONSOLE_BATCH_CAPACITY],
+        pending_console_len: 0,
+        pending_input: [0; INPUT_BATCH_CAPACITY],
+        pending_input_len: 0,
+        log_flush_deadline: 0,
     };
     context.paging_verified = verify_paging(&mut context);
     if !context.paging_verified {
@@ -147,10 +154,11 @@ pub extern "C" fn _start() -> ! {
     }
     context.ui.render(&mut context.screen);
 
-    let mut scheduler = Scheduler::<KernelContext, 4>::new();
+    let mut scheduler = Scheduler::<KernelContext, 5>::new();
     if scheduler.spawn(filesystem_task).is_err()
         || scheduler.spawn(console_task).is_err()
         || scheduler.spawn(accounting_task).is_err()
+        || scheduler.spawn(log_flush_task).is_err()
         || scheduler.spawn(input_task).is_err()
     {
         halt_forever();
@@ -158,7 +166,7 @@ pub extern "C" fn _start() -> ! {
 
     loop {
         scheduler.run_round(&mut context);
-        unsafe { asm!("pause", options(nomem, nostack, preserves_flags)) };
+        core::hint::spin_loop();
     }
 }
 
@@ -172,10 +180,29 @@ struct KernelContext {
     screen: FramebufferWriter<'static>,
     ui: ValidationUi,
     paging_verified: bool,
+    pending_console: [u8; CONSOLE_BATCH_CAPACITY],
+    pending_console_len: usize,
+    pending_input: [u8; INPUT_BATCH_CAPACITY],
+    pending_input_len: usize,
+    log_flush_deadline: u64,
 }
 
+const CONSOLE_BATCH_CAPACITY: usize = 256;
+const CONSOLE_FLUSH_THRESHOLD: usize = CONSOLE_BATCH_CAPACITY - 32;
+const INPUT_RECORD_SIZE: usize = 24;
+const INPUT_BATCH_RECORDS: usize = 512;
+const INPUT_BATCH_CAPACITY: usize = INPUT_RECORD_SIZE * INPUT_BATCH_RECORDS;
+const INPUT_FLUSH_THRESHOLD: usize = INPUT_RECORD_SIZE * (INPUT_BATCH_RECORDS - 32);
+const LOG_FLUSH_DELAY_SECONDS: u64 = 2;
 const TEXT_BUFFER_CAPACITY: usize = 512;
 const CURSOR_SIZE: usize = 19;
+const UI_MARGIN: usize = 40;
+const TEXT_TOP: usize = 148;
+const TEXT_ORIGIN_X: usize = UI_MARGIN + 20;
+const TEXT_ORIGIN_Y: usize = TEXT_TOP + 48;
+const TEXT_SCALE: usize = 2;
+const TEXT_ADVANCE: usize = 10;
+const TEXT_LINE_HEIGHT: usize = 17;
 
 struct ValidationUi {
     text: [u8; TEXT_BUFFER_CAPACITY],
@@ -218,30 +245,34 @@ impl ValidationUi {
         }
     }
 
-    fn push_byte(&mut self, byte: u8) -> bool {
+    fn push_byte(&mut self, byte: u8) -> Option<(usize, usize)> {
+        let previous_len = self.text_len;
         if byte == 8 {
             if self.text_len == 0 {
-                return false;
+                return None;
             }
             self.text_len -= 1;
-            return true;
-        }
-        if byte == b'\t' {
-            let mut changed = false;
+        } else if byte == b'\t' {
             for _ in 0..4 {
-                changed |= self.push_byte(b' ');
+                let Some(slot) = self.text.get_mut(self.text_len) else {
+                    break;
+                };
+                *slot = b' ';
+                self.text_len += 1;
             }
-            return changed;
+        } else {
+            if byte != b'\n' && !(0x20..=0x7e).contains(&byte) {
+                return None;
+            }
+            let slot = self.text.get_mut(self.text_len)?;
+            *slot = byte;
+            self.text_len += 1;
         }
-        if byte != b'\n' && !(0x20..=0x7e).contains(&byte) {
-            return false;
-        }
-        let Some(slot) = self.text.get_mut(self.text_len) else {
-            return false;
-        };
-        *slot = byte;
-        self.text_len += 1;
-        true
+
+        (self.text_len != previous_len).then_some((
+            self.text_len.min(previous_len),
+            self.text_len.max(previous_len),
+        ))
     }
 
     fn move_mouse(&mut self, axis: Axis, value: i32, relative: bool) -> bool {
@@ -281,6 +312,113 @@ impl ValidationUi {
     fn refresh_cursor(&mut self, screen: &mut FramebufferWriter<'_>) {
         self.hide_cursor(screen);
         self.show_cursor(screen);
+    }
+
+    fn render_status(&mut self, screen: &mut FramebufferWriter<'_>) {
+        self.hide_cursor(screen);
+        let panel = Rgb::new(31, 41, 61);
+        let accent = Rgb::new(110, 231, 183);
+        let warning = Rgb::new(251, 191, 36);
+        let muted = Rgb::new(148, 163, 184);
+        screen.fill_rect(UI_MARGIN + 30, UI_MARGIN + 52, 72 * 5, 10, panel);
+        screen.fill_rect(UI_MARGIN + 30, UI_MARGIN + 64, 30 * 5, 10, panel);
+        screen.draw_text(
+            UI_MARGIN + 30,
+            UI_MARGIN + 52,
+            1,
+            self.input_status,
+            if self.input_available {
+                accent
+            } else {
+                warning
+            },
+        );
+        if let Some(code) = self.completion_code {
+            let digits = [hex_digit(code >> 4), hex_digit(code & 0x0f)];
+            screen.draw_text(
+                UI_MARGIN + 30,
+                UI_MARGIN + 64,
+                1,
+                "xHCI completion code: 0x",
+                muted,
+            );
+            let digits = unsafe { core::str::from_utf8_unchecked(&digits) };
+            screen.draw_text(UI_MARGIN + 30 + 24 * 5, UI_MARGIN + 64, 1, digits, warning);
+        }
+        self.show_cursor(screen);
+    }
+
+    fn render_text_range(
+        &mut self,
+        screen: &mut FramebufferWriter<'_>,
+        dirty_start: usize,
+        dirty_end: usize,
+    ) {
+        self.hide_cursor(screen);
+        let panel = Rgb::new(31, 41, 61);
+        let primary = Rgb::new(232, 238, 247);
+        let muted = Rgb::new(148, 163, 184);
+
+        if dirty_start == 0 {
+            screen.fill_rect(
+                TEXT_ORIGIN_X,
+                TEXT_ORIGIN_Y,
+                12 * TEXT_ADVANCE,
+                TEXT_LINE_HEIGHT,
+                panel,
+            );
+        }
+        for index in dirty_start..dirty_end {
+            let (x, y) = self.text_position(index);
+            screen.fill_rect(x, y, TEXT_ADVANCE, TEXT_LINE_HEIGHT, panel);
+        }
+        for index in dirty_start..self.text_len {
+            let byte = self.text[index];
+            if byte == b'\n' {
+                continue;
+            }
+            let (x, y) = self.text_position(index);
+            let bytes = [byte];
+            let glyph = unsafe { core::str::from_utf8_unchecked(&bytes) };
+            screen.draw_text(x, y, TEXT_SCALE, glyph, primary);
+        }
+        if self.text_len == 0 {
+            screen.draw_text(
+                TEXT_ORIGIN_X,
+                TEXT_ORIGIN_Y,
+                TEXT_SCALE,
+                "Type here...",
+                muted,
+            );
+        }
+        self.show_cursor(screen);
+    }
+
+    fn text_position(&self, index: usize) -> (usize, usize) {
+        let mut x = TEXT_ORIGIN_X;
+        let mut y = TEXT_ORIGIN_Y;
+        let right = self.width.saturating_sub(TEXT_ORIGIN_X);
+        for byte in self.text[..index.min(TEXT_BUFFER_CAPACITY)].iter().copied() {
+            match byte {
+                b'\n' => {
+                    x = TEXT_ORIGIN_X;
+                    y = y.saturating_add(TEXT_LINE_HEIGHT);
+                }
+                b'\r' => x = TEXT_ORIGIN_X,
+                _ => {
+                    if x != TEXT_ORIGIN_X && x.saturating_add(TEXT_ADVANCE) > right {
+                        x = TEXT_ORIGIN_X;
+                        y = y.saturating_add(TEXT_LINE_HEIGHT);
+                    }
+                    x = x.saturating_add(TEXT_ADVANCE);
+                }
+            }
+        }
+        if x != TEXT_ORIGIN_X && x.saturating_add(TEXT_ADVANCE) > right {
+            x = TEXT_ORIGIN_X;
+            y = y.saturating_add(TEXT_LINE_HEIGHT);
+        }
+        (x, y)
     }
 
     fn hide_cursor(&mut self, screen: &mut FramebufferWriter<'_>) {
@@ -341,21 +479,25 @@ impl ValidationUi {
         let muted = Rgb::new(148, 163, 184);
         let accent = Rgb::new(110, 231, 183);
         let warning = Rgb::new(251, 191, 36);
-        let margin = 40;
-
         screen.clear(background);
         screen.fill_rect(
-            margin,
-            margin,
-            screen.width().saturating_sub(margin * 2),
+            UI_MARGIN,
+            UI_MARGIN,
+            screen.width().saturating_sub(UI_MARGIN * 2),
             76,
             panel,
         );
-        screen.fill_rect(margin, margin, 10, 76, accent);
-        screen.draw_text(margin + 30, margin + 18, 3, "HID input validation", primary);
+        screen.fill_rect(UI_MARGIN, UI_MARGIN, 10, 76, accent);
         screen.draw_text(
-            margin + 30,
-            margin + 52,
+            UI_MARGIN + 30,
+            UI_MARGIN + 18,
+            3,
+            "HID input validation",
+            primary,
+        );
+        screen.draw_text(
+            UI_MARGIN + 30,
+            UI_MARGIN + 52,
             1,
             self.input_status,
             if self.input_available {
@@ -367,44 +509,47 @@ impl ValidationUi {
         if let Some(code) = self.completion_code {
             let digits = [hex_digit(code >> 4), hex_digit(code & 0x0f)];
             screen.draw_text(
-                margin + 30,
-                margin + 64,
+                UI_MARGIN + 30,
+                UI_MARGIN + 64,
                 1,
                 "xHCI completion code: 0x",
                 muted,
             );
             let digits = unsafe { core::str::from_utf8_unchecked(&digits) };
-            screen.draw_text(margin + 30 + 24 * 8, margin + 64, 1, digits, warning);
+            screen.draw_text(UI_MARGIN + 30 + 24 * 5, UI_MARGIN + 64, 1, digits, warning);
         }
 
-        let text_top = 148;
-        screen.draw_text(margin, text_top, 2, "Keyboard text buffer", muted);
+        screen.draw_text(UI_MARGIN, TEXT_TOP, 2, "Keyboard text buffer", muted);
         screen.fill_rect(
-            margin,
-            text_top + 28,
-            screen.width().saturating_sub(margin * 2),
-            screen.height().saturating_sub(text_top + 68),
+            UI_MARGIN,
+            TEXT_TOP + 28,
+            screen.width().saturating_sub(UI_MARGIN * 2),
+            screen.height().saturating_sub(TEXT_TOP + 68),
             panel,
         );
         let text = unsafe { core::str::from_utf8_unchecked(&self.text[..self.text_len]) };
         screen.draw_text_wrapped(
-            margin + 20,
-            text_top + 48,
-            screen.width().saturating_sub((margin + 20) * 2),
-            2,
+            TEXT_ORIGIN_X,
+            TEXT_ORIGIN_Y,
+            screen.width().saturating_sub(TEXT_ORIGIN_X * 2),
+            TEXT_SCALE,
             text,
             primary,
         );
         if self.text_len == 0 {
-            screen.draw_text(margin + 20, text_top + 48, 2, "Type here...", muted);
+            screen.draw_text(
+                TEXT_ORIGIN_X,
+                TEXT_ORIGIN_Y,
+                TEXT_SCALE,
+                "Type here...",
+                muted,
+            );
         }
 
         self.cursor_visible = false;
         self.show_cursor(screen);
     }
 }
-
-
 
 fn verify_paging(context: &mut KernelContext) -> bool {
     const SCRATCH_CANDIDATES: [u64; 8] = [
@@ -420,7 +565,7 @@ fn verify_paging(context: &mut KernelContext) -> bool {
     const TEST_VALUE: u64 = 0x4749_4e4b_474f_4f53;
 
     let Some(address) = SCRATCH_CANDIDATES.into_iter().find_map(|candidate| {
-        let address = VirtAddr::new(candidate)?;
+        let address = VirtAddr::try_new(candidate).ok()?;
         context
             .page_table
             .translate_addr(address)
@@ -429,7 +574,7 @@ fn verify_paging(context: &mut KernelContext) -> bool {
     }) else {
         return false;
     };
-    let Some(page) = VirtPage::from_start_address(address) else {
+    let Ok(page) = VirtPage::from_start_address(address) else {
         return false;
     };
 
@@ -439,7 +584,7 @@ fn verify_paging(context: &mut KernelContext) -> bool {
     if unsafe {
         context
             .page_table
-            .map_4k(page, frame, PageFlags::WRITABLE, &mut context.frames)
+            .map_4k(page, frame, PageTableFlags::WRITABLE, &mut context.frames)
     }
     .is_err()
     {
@@ -449,9 +594,15 @@ fn verify_paging(context: &mut KernelContext) -> bool {
     let verified = context
         .hhdm_offset
         .checked_add(frame.start_address().as_u64())
-        .map(|direct_address| unsafe {
-            ptr::write_volatile(direct_address as *mut u64, TEST_VALUE);
-            ptr::read_volatile(address.as_u64() as *const u64) == TEST_VALUE
+        .map(|direct_address| {
+            let Some(direct_pointer) = NonNull::new(direct_address as *mut u64) else {
+                return false;
+            };
+            let Some(mapped_pointer) = NonNull::new(address.as_mut_ptr::<u64>()) else {
+                return false;
+            };
+            unsafe { VolatilePtr::new(direct_pointer) }.write(TEST_VALUE);
+            unsafe { VolatilePtr::new(mapped_pointer) }.read() == TEST_VALUE
         })
         .unwrap_or(false);
 
@@ -505,23 +656,7 @@ fn console_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll 
         Err(_) => return TaskPoll::Complete,
     };
     let _ = serial.try_write(byte);
-
-    let Ok(file) = context.fs.open("/console") else {
-        return TaskPoll::Complete;
-    };
-    let Ok(info) = context.fs.stat(file) else {
-        return TaskPoll::Complete;
-    };
-    const CONSOLE_LIMIT: u64 = 64 * 1024;
-    if info.len >= CONSOLE_LIMIT && context.fs.truncate(file, 0).is_err() {
-        return TaskPoll::Complete;
-    }
-    let offset = if info.len >= CONSOLE_LIMIT {
-        0
-    } else {
-        info.len
-    };
-    let _ = context.fs.write(file, offset, &[byte]);
+    queue_console_byte(context, byte);
     TaskPoll::Pending
 }
 
@@ -547,33 +682,31 @@ fn input_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
         return TaskPoll::Complete;
     }
 
-    if state.get(0) == Some(0) {
-        if context.fs.create("/input").is_err() {
-            return TaskPoll::Complete;
-        }
-        state.set(0, 1);
-    }
-
     let old_cursor = (
         context.ui.mouse_x,
         context.ui.mouse_y,
         context.ui.mouse_pressed,
     );
     let receiving_status = "USB HID: receiving reports - mouse and keyboard active";
-    let mut full_redraw = summary.reports != 0 && context.ui.input_status != receiving_status;
-    if full_redraw {
+    let status_dirty = summary.reports != 0 && context.ui.input_status != receiving_status;
+    if status_dirty {
         context.ui.input_status = receiving_status;
         context.ui.completion_code = None;
+    }
+    if status_dirty {
+        context.ui.render_status(&mut context.screen);
     }
     for _ in 0..32 {
         let Some(event) = context.input.as_mut().and_then(InputManager::pop_event) else {
             break;
         };
-        full_redraw |= handle_input_event(context, state, event);
+        if let Some((start, end)) = handle_input_event(context, state, event) {
+            context
+                .ui
+                .render_text_range(&mut context.screen, start, end);
+        }
     }
-    if full_redraw {
-        context.ui.render(&mut context.screen);
-    } else if old_cursor
+    if old_cursor
         != (
             context.ui.mouse_x,
             context.ui.mouse_y,
@@ -589,12 +722,12 @@ fn handle_input_event(
     context: &mut KernelContext,
     state: &mut TaskState,
     device_event: DeviceInputEvent,
-) -> bool {
+) -> Option<(usize, usize)> {
     let application = context
         .input
         .as_ref()
         .and_then(|input| input.application_kind(device_event.interface));
-    let mut redraw = false;
+    let mut text_dirty = None;
     match device_event.event {
         InputEvent::Key { usage, pressed, .. } => {
             if matches!(usage, 0xe1 | 0xe5) {
@@ -610,8 +743,8 @@ fn handle_input_event(
                     if let Some(serial) = context.serial.as_mut() {
                         let _ = serial.try_write(byte);
                     }
-                    append_console_byte(&mut context.fs, byte);
-                    redraw |= context.ui.push_byte(byte);
+                    queue_console_byte(context, byte);
+                    text_dirty = context.ui.push_byte(byte);
                 }
             }
         }
@@ -631,44 +764,96 @@ fn handle_input_event(
         _ => {}
     }
 
-    let record = encode_input_event(device_event);
-    let Ok(file) = context.fs.open("/input") else {
-        return redraw;
-    };
-    let Ok(info) = context.fs.stat(file) else {
-        return redraw;
-    };
-    const INPUT_LOG_LIMIT: u64 = 64 * 1024;
-    if info.len >= INPUT_LOG_LIMIT && context.fs.truncate(file, 0).is_err() {
-        return redraw;
-    }
-    let offset = if info.len >= INPUT_LOG_LIMIT {
-        0
-    } else {
-        info.len
-    };
-    let _ = context.fs.write(file, offset, &record);
-    redraw
+    queue_input_record(context, encode_input_event(device_event));
+    text_dirty
 }
 
-fn append_console_byte(fs: &mut RedoxFs, byte: u8) {
-    let file = match fs.open("/console").or_else(|_| fs.create("/console")) {
+fn queue_console_byte(context: &mut KernelContext, byte: u8) {
+    let Some(slot) = context.pending_console.get_mut(context.pending_console_len) else {
+        return;
+    };
+    *slot = byte;
+    context.pending_console_len += 1;
+    schedule_log_flush(context);
+}
+
+fn queue_input_record(context: &mut KernelContext, record: [u8; INPUT_RECORD_SIZE]) {
+    let Some(end) = context.pending_input_len.checked_add(INPUT_RECORD_SIZE) else {
+        return;
+    };
+    let Some(destination) = context
+        .pending_input
+        .get_mut(context.pending_input_len..end)
+    else {
+        return;
+    };
+    destination.copy_from_slice(&record);
+    context.pending_input_len = end;
+    schedule_log_flush(context);
+}
+
+fn schedule_log_flush(context: &mut KernelContext) {
+    let delay = usb::timestamp_frequency().saturating_mul(LOG_FLUSH_DELAY_SECONDS);
+    context.log_flush_deadline = usb::timestamp().saturating_add(delay);
+}
+
+fn log_flush_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll {
+    let now = usb::timestamp();
+    let inactivity_elapsed = context.log_flush_deadline != 0 && now >= context.log_flush_deadline;
+    if context.pending_console_len < CONSOLE_FLUSH_THRESHOLD
+        && context.pending_input_len < INPUT_FLUSH_THRESHOLD
+        && !inactivity_elapsed
+    {
+        return TaskPoll::Pending;
+    }
+
+    if context.pending_console_len != 0
+        && append_log(
+            &mut context.fs,
+            "/console",
+            &context.pending_console[..context.pending_console_len],
+        )
+    {
+        context.pending_console_len = 0;
+    }
+    if context.pending_input_len != 0
+        && append_log(
+            &mut context.fs,
+            "/input",
+            &context.pending_input[..context.pending_input_len],
+        )
+    {
+        context.pending_input_len = 0;
+    }
+    context.log_flush_deadline =
+        if context.pending_console_len == 0 && context.pending_input_len == 0 {
+            0
+        } else {
+            now.saturating_add(usb::timestamp_frequency().saturating_mul(LOG_FLUSH_DELAY_SECONDS))
+        };
+    TaskPoll::Pending
+}
+
+fn append_log(fs: &mut RedoxFs, path: &str, bytes: &[u8]) -> bool {
+    const LOG_LIMIT: u64 = 64 * 1024;
+    let file = match fs.open(path).or_else(|_| fs.create(path)) {
         Ok(file) => file,
-        Err(_) => return,
+        Err(_) => return false,
     };
     let Ok(info) = fs.stat(file) else {
-        return;
+        return false;
     };
-    const CONSOLE_LIMIT: u64 = 64 * 1024;
-    if info.len >= CONSOLE_LIMIT && fs.truncate(file, 0).is_err() {
-        return;
+    let incoming = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let reset = info.len >= LOG_LIMIT
+        || info
+            .len
+            .checked_add(incoming)
+            .is_none_or(|end| end > LOG_LIMIT);
+    if reset && fs.truncate(file, 0).is_err() {
+        return false;
     }
-    let offset = if info.len >= CONSOLE_LIMIT {
-        0
-    } else {
-        info.len
-    };
-    let _ = fs.write(file, offset, &[byte]);
+    let offset = if reset { 0 } else { info.len };
+    fs.write(file, offset, bytes).is_ok()
 }
 
 fn keyboard_ascii(usage: u16, shift: bool, caps_lock: bool) -> Option<u8> {
@@ -717,8 +902,8 @@ fn keyboard_ascii(usage: u16, shift: bool, caps_lock: bool) -> Option<u8> {
     })
 }
 
-fn encode_input_event(device_event: DeviceInputEvent) -> [u8; 24] {
-    let mut record = [0_u8; 24];
+fn encode_input_event(device_event: DeviceInputEvent) -> [u8; INPUT_RECORD_SIZE] {
+    let mut record = [0_u8; INPUT_RECORD_SIZE];
     record[..4].copy_from_slice(&device_event.interface.device.to_le_bytes());
     record[4] = device_event.interface.interface;
     let (kind, usage_page, usage, value, raw_value) = match device_event.event {
@@ -844,7 +1029,8 @@ fn panic(_info: &PanicInfo) -> ! {
 }
 
 fn halt_forever() -> ! {
+    interrupts::disable();
     loop {
-        unsafe { asm!("cli; hlt", options(nomem, nostack)) };
+        hlt();
     }
 }

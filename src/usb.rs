@@ -6,20 +6,22 @@
 //! and report interpretation belong in a higher layer.
 
 use alloc::vec::Vec;
+use bitflags::bitflags;
 use core::{
-    arch::{asm, x86_64::__cpuid},
+    arch::x86_64::{__cpuid, _rdtsc},
     cmp,
     hint::spin_loop,
-    ptr,
+    ptr::{self, NonNull},
     sync::atomic::{compiler_fence, AtomicU64, Ordering},
 };
+use volatile::VolatilePtr;
 
 use crate::{
     memory::{
         FrameAllocatorError, PhysAddr, PhysFrame, UsableFrameAllocator, VirtAddr, VirtPage,
         PAGE_SIZE,
     },
-    paging::{ActivePageTable, MapError, PageFlags},
+    paging::{ActivePageTable, MapError, PageTableFlags},
     pci::{self, PciBar, PciDevice, PciError},
 };
 
@@ -45,11 +47,22 @@ const USBSTS_HOST_CONTROLLER_HALTED: u32 = 1 << 0;
 const USBSTS_HOST_SYSTEM_ERROR: u32 = 1 << 2;
 const USBSTS_CONTROLLER_NOT_READY: u32 = 1 << 11;
 const USBSTS_HOST_CONTROLLER_ERROR: u32 = 1 << 12;
-const PORTSC_CURRENT_CONNECT_STATUS: u32 = 1 << 0;
-const PORTSC_PORT_ENABLED: u32 = 1 << 1;
-const PORTSC_PORT_RESET: u32 = 1 << 4;
-const PORTSC_PORT_POWER: u32 = 1 << 9;
-const PORTSC_WARM_PORT_RESET: u32 = 1 << 31;
+bitflags! {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct PortStatus: u32 {
+        const CURRENT_CONNECT_STATUS = 1 << 0;
+        const PORT_ENABLED = 1 << 1;
+        const PORT_RESET = 1 << 4;
+        const PORT_POWER = 1 << 9;
+        const WARM_PORT_RESET = 1 << 31;
+    }
+}
+
+impl PortStatus {
+    fn speed(self) -> u8 {
+        ((self.bits() >> 10) & 0x0f) as u8
+    }
+}
 
 const TRB_TYPE_NORMAL: u32 = 1;
 const TRB_TYPE_SETUP_STAGE: u32 = 2;
@@ -212,10 +225,10 @@ impl UsbHost {
                         continue;
                     }
                 };
-                if status & PORTSC_CURRENT_CONNECT_STATUS == 0 {
+                if !status.contains(PortStatus::CURRENT_CONNECT_STATUS) {
                     continue;
                 }
-                let speed = ((status >> 10) & 0x0f) as u8;
+                let speed = status.speed();
                 if (speed <= 3) != usb2_pass {
                     continue;
                 }
@@ -780,56 +793,59 @@ impl Xhci {
         Ok(())
     }
 
-    fn port_status(&mut self, port: u8) -> Result<u32, UsbError> {
+    fn port_status(&mut self, port: u8) -> Result<PortStatus, UsbError> {
         let offset = self.port_offset(port)?;
-        self.mmio.read_u32(offset)
+        self.mmio.read_u32(offset).map(PortStatus::from_bits_retain)
     }
 
     fn reset_port(&mut self, port: u8) -> Result<u8, UsbError> {
         let offset = self.port_offset(port)?;
-        let mut status = self.mmio.read_u32(offset)?;
-        if status & PORTSC_CURRENT_CONNECT_STATUS == 0 {
+        let mut status = PortStatus::from_bits_retain(self.mmio.read_u32(offset)?);
+        if !status.contains(PortStatus::CURRENT_CONNECT_STATUS) {
             return Err(UsbError::PortDisconnected);
         }
-        if status & PORTSC_PORT_POWER == 0 {
-            self.mmio.write_u32(offset, PORTSC_PORT_POWER)?;
+        if !status.contains(PortStatus::PORT_POWER) {
+            self.mmio.write_u32(offset, PortStatus::PORT_POWER.bits())?;
             for _ in 0..10_000 {
                 spin_loop();
             }
-            status = self.mmio.read_u32(offset)?;
+            status = PortStatus::from_bits_retain(self.mmio.read_u32(offset)?);
         }
-        let speed = ((status >> 10) & 0x0f) as u8;
+        let speed = status.speed();
         if speed >= 4 {
-            if status & PORTSC_PORT_ENABLED == 0 {
+            if !status.contains(PortStatus::PORT_ENABLED) {
                 self.mmio.write_u32(
                     offset,
-                    (status & PORTSC_PORT_POWER) | PORTSC_WARM_PORT_RESET,
+                    (status & PortStatus::PORT_POWER | PortStatus::WARM_PORT_RESET).bits(),
                 )?;
-                self.wait_port_reset(offset, PORTSC_WARM_PORT_RESET)?;
+                self.wait_port_reset(offset, PortStatus::WARM_PORT_RESET)?;
             }
         } else {
-            self.mmio
-                .write_u32(offset, (status & PORTSC_PORT_POWER) | PORTSC_PORT_RESET)?;
-            self.wait_port_reset(offset, PORTSC_PORT_RESET)?;
+            self.mmio.write_u32(
+                offset,
+                (status & PortStatus::PORT_POWER | PortStatus::PORT_RESET).bits(),
+            )?;
+            self.wait_port_reset(offset, PortStatus::PORT_RESET)?;
         }
-        status = self.mmio.read_u32(offset)?;
-        if status & PORTSC_CURRENT_CONNECT_STATUS == 0 {
+        status = PortStatus::from_bits_retain(self.mmio.read_u32(offset)?);
+        if !status.contains(PortStatus::CURRENT_CONNECT_STATUS) {
             return Err(UsbError::PortDisconnected);
         }
-        if status & PORTSC_PORT_ENABLED == 0 {
+        if !status.contains(PortStatus::PORT_ENABLED) {
             return Err(UsbError::PortResetFailed);
         }
-        let speed = ((status >> 10) & 0x0f) as u8;
+        let speed = status.speed();
         if speed == 0 {
             return Err(UsbError::PortResetFailed);
         }
         Ok(speed)
     }
 
-    fn wait_port_reset(&mut self, offset: usize, bit: u32) -> Result<(), UsbError> {
+    fn wait_port_reset(&mut self, offset: usize, bit: PortStatus) -> Result<(), UsbError> {
         let deadline = wait_deadline();
         while timestamp() < deadline {
-            if self.mmio.read_u32(offset)? & bit == 0 {
+            let status = PortStatus::from_bits_retain(self.mmio.read_u32(offset)?);
+            if !status.intersects(bit) {
                 return Ok(());
             }
             spin_loop();
@@ -1226,7 +1242,7 @@ impl DmaPage {
         let virtual_address = hhdm_offset
             .checked_add(physical)
             .ok_or(UsbError::AddressOverflow)?;
-        VirtAddr::new(virtual_address).ok_or(UsbError::AddressOverflow)?;
+        VirtAddr::try_new(virtual_address).map_err(|_| UsbError::AddressOverflow)?;
         let virtual_pointer =
             usize::try_from(virtual_address).map_err(|_| UsbError::AddressOverflow)? as *mut u8;
         // SAFETY: The initialization contract says HHDM covers allocated
@@ -1264,7 +1280,9 @@ impl DmaPage {
         }
         // SAFETY: Bounds and alignment were checked; volatile access prevents
         // the compiler from caching controller-owned DMA memory.
-        Ok(unsafe { ptr::read_volatile(self.virtual_pointer.add(offset).cast::<u32>()) })
+        let pointer =
+            unsafe { NonNull::new_unchecked(self.virtual_pointer.add(offset).cast::<u32>()) };
+        Ok(unsafe { VolatilePtr::new(pointer) }.read())
     }
 
     fn write_u32(&self, offset: usize, value: u32) -> Result<(), UsbError> {
@@ -1272,7 +1290,9 @@ impl DmaPage {
         if offset & 3 != 0 {
             return Err(UsbError::AddressOverflow);
         }
-        unsafe { ptr::write_volatile(self.virtual_pointer.add(offset).cast::<u32>(), value) };
+        let pointer =
+            unsafe { NonNull::new_unchecked(self.virtual_pointer.add(offset).cast::<u32>()) };
+        unsafe { VolatilePtr::new(pointer) }.write(value);
         Ok(())
     }
 
@@ -1281,39 +1301,40 @@ impl DmaPage {
         if offset & 7 != 0 {
             return Err(UsbError::AddressOverflow);
         }
-        unsafe { ptr::write_volatile(self.virtual_pointer.add(offset).cast::<u64>(), value) };
+        let pointer =
+            unsafe { NonNull::new_unchecked(self.virtual_pointer.add(offset).cast::<u64>()) };
+        unsafe { VolatilePtr::new(pointer) }.write(value);
         Ok(())
     }
 
     fn write_trb(&self, index: usize, trb: Trb) -> Result<(), UsbError> {
         let offset = index.checked_mul(16).ok_or(UsbError::AddressOverflow)?;
         self.check(offset, 16)?;
-        let pointer = unsafe { self.virtual_pointer.add(offset).cast::<u32>() };
-        // Publish cycle/control last.  x86 DMA is coherent; the compiler fence
-        // supplies the ordering required around volatile stores.
-        unsafe {
-            ptr::write_volatile(pointer, trb.dword[0]);
-            ptr::write_volatile(pointer.add(1), trb.dword[1]);
-            ptr::write_volatile(pointer.add(2), trb.dword[2]);
+        let pointer =
+            unsafe { NonNull::new_unchecked(self.virtual_pointer.add(offset).cast::<u32>()) };
+        // Publish cycle/control last. x86 DMA is coherent; the compiler fence
+        // supplies the ordering required around the volatile stores.
+        for (word, value) in trb.dword[..3].iter().copied().enumerate() {
+            let pointer = unsafe { NonNull::new_unchecked(pointer.as_ptr().add(word)) };
+            unsafe { VolatilePtr::new(pointer) }.write(value);
         }
         compiler_fence(Ordering::Release);
-        unsafe { ptr::write_volatile(pointer.add(3), trb.dword[3]) };
+        let control = unsafe { NonNull::new_unchecked(pointer.as_ptr().add(3)) };
+        unsafe { VolatilePtr::new(control) }.write(trb.dword[3]);
         Ok(())
     }
 
     fn read_trb(&self, index: usize) -> Result<Trb, UsbError> {
         let offset = index.checked_mul(16).ok_or(UsbError::AddressOverflow)?;
         self.check(offset, 16)?;
-        let pointer = unsafe { self.virtual_pointer.add(offset).cast::<u32>() };
+        let pointer =
+            unsafe { NonNull::new_unchecked(self.virtual_pointer.add(offset).cast::<u32>()) };
+        let read_word = |index| {
+            let pointer = unsafe { NonNull::new_unchecked(pointer.as_ptr().add(index)) };
+            unsafe { VolatilePtr::new(pointer) }.read()
+        };
         Ok(Trb {
-            dword: unsafe {
-                [
-                    ptr::read_volatile(pointer),
-                    ptr::read_volatile(pointer.add(1)),
-                    ptr::read_volatile(pointer.add(2)),
-                    ptr::read_volatile(pointer.add(3)),
-                ]
-            },
+            dword: [read_word(0), read_word(1), read_word(2), read_word(3)],
         })
     }
 
@@ -1322,7 +1343,8 @@ impl DmaPage {
         compiler_fence(Ordering::Acquire);
         let mut bytes = Vec::with_capacity(length);
         for index in 0..length {
-            bytes.push(unsafe { ptr::read_volatile(self.virtual_pointer.add(index)) });
+            let pointer = unsafe { NonNull::new_unchecked(self.virtual_pointer.add(index)) };
+            bytes.push(unsafe { VolatilePtr::new(pointer) }.read());
         }
         Ok(bytes)
     }
@@ -1348,7 +1370,8 @@ impl Mmio {
 
     fn read_u8(&mut self, offset: usize) -> Result<u8, UsbError> {
         self.check(offset, 1)?;
-        Ok(unsafe { ptr::read_volatile(self.base.add(offset).cast_const()) })
+        let pointer = unsafe { NonNull::new_unchecked(self.base.add(offset)) };
+        Ok(unsafe { VolatilePtr::new(pointer) }.read())
     }
 
     fn read_u32(&mut self, offset: usize) -> Result<u32, UsbError> {
@@ -1356,7 +1379,8 @@ impl Mmio {
         if (self.base as usize + offset) & 3 != 0 {
             return Err(UsbError::InvalidMmioBar);
         }
-        Ok(unsafe { ptr::read_volatile(self.base.add(offset).cast::<u32>().cast_const()) })
+        let pointer = unsafe { NonNull::new_unchecked(self.base.add(offset).cast::<u32>()) };
+        Ok(unsafe { VolatilePtr::new(pointer) }.read())
     }
 
     fn write_u32(&mut self, offset: usize, value: u32) -> Result<(), UsbError> {
@@ -1364,7 +1388,8 @@ impl Mmio {
         if (self.base as usize + offset) & 3 != 0 {
             return Err(UsbError::InvalidMmioBar);
         }
-        unsafe { ptr::write_volatile(self.base.add(offset).cast::<u32>(), value) };
+        let pointer = unsafe { NonNull::new_unchecked(self.base.add(offset).cast::<u32>()) };
+        unsafe { VolatilePtr::new(pointer) }.write(value);
         Ok(())
     }
 
@@ -1406,7 +1431,8 @@ unsafe fn map_mmio_bar(
     'candidate: for base in candidates {
         let mut offset = 0;
         while offset < mapped_length {
-            let address = VirtAddr::new(base + offset).ok_or(UsbError::AddressOverflow)?;
+            let address =
+                VirtAddr::try_new(base + offset).map_err(|_| UsbError::AddressOverflow)?;
             if page_table.translate_addr(address).is_some() {
                 continue 'candidate;
             }
@@ -1416,24 +1442,25 @@ unsafe fn map_mmio_bar(
         break;
     }
     let virtual_page = selected.ok_or(UsbError::InvalidMmioBar)?;
-    let flags = PageFlags::WRITABLE.union(PageFlags::CACHE_DISABLE);
+    let flags = PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
     let mut offset = 0;
     while offset < mapped_length {
-        let physical_address = PhysAddr::new(
+        let physical_address = PhysAddr::try_new(
             physical_page
                 .checked_add(offset)
                 .ok_or(UsbError::AddressOverflow)?,
         )
-        .ok_or(UsbError::AddressOverflow)?;
-        let frame =
-            PhysFrame::from_start_address(physical_address).ok_or(UsbError::InvalidMmioBar)?;
-        let virtual_address = VirtAddr::new(
+        .map_err(|_| UsbError::AddressOverflow)?;
+        let frame = PhysFrame::from_start_address(physical_address)
+            .map_err(|_| UsbError::InvalidMmioBar)?;
+        let virtual_address = VirtAddr::try_new(
             virtual_page
                 .checked_add(offset)
                 .ok_or(UsbError::AddressOverflow)?,
         )
-        .ok_or(UsbError::AddressOverflow)?;
-        let page = VirtPage::from_start_address(virtual_address).ok_or(UsbError::InvalidMmioBar)?;
+        .map_err(|_| UsbError::AddressOverflow)?;
+        let page =
+            VirtPage::from_start_address(virtual_address).map_err(|_| UsbError::InvalidMmioBar)?;
         page_table.map_4k(page, frame, flags, frames)?;
         offset += PAGE_SIZE;
     }
@@ -1472,18 +1499,12 @@ fn detect_timestamp_frequency() -> Option<u64> {
     None
 }
 
-fn timestamp() -> u64 {
-    let low: u32;
-    let high: u32;
-    unsafe {
-        asm!(
-            "rdtsc",
-            out("eax") low,
-            out("edx") high,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-    u64::from(low) | (u64::from(high) << 32)
+pub fn timestamp() -> u64 {
+    unsafe { _rdtsc() }
+}
+
+pub fn timestamp_frequency() -> u64 {
+    TSC_FREQUENCY.load(Ordering::Relaxed)
 }
 
 fn wait_deadline() -> u64 {

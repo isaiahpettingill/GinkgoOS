@@ -7,9 +7,9 @@ A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. Th
 - Stable Rust and the built-in `x86_64-unknown-none` target
 - Limine framebuffer, memory-map, and higher-half direct-map requests
 - Allocate-only 4 KiB physical frame allocation from usable memory
-- Active four-level x86-64 page translation, mapping, and unmapping
-- Checked x86 port-I/O and volatile MMIO region capabilities
-- A nonblocking 16550 serial input/output device
+- `x86_64`-backed address types, active page-table translation, mapping, and unmapping
+- `x86_64` port I/O plus `volatile`-backed checked MMIO capabilities
+- A nonblocking serial device built on `uart_16550`
 - PCI discovery and a polling xHCI USB host controller
 - USB HID keyboards, mice, joysticks, and gamepads, including DragonRise Generic USB Joystick reports
 - Descriptor-driven keyboard, button, axis, wheel, and hat-switch events in a bounded kernel input queue
@@ -17,14 +17,14 @@ A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. Th
 - Talc-backed dynamic allocation for RedoxFS and future kernel services
 - Fixed-capacity round-robin cooperative task scheduling
 - A high-half ELF linker script
-- A pitch-aware RGB framebuffer writer and public-domain 8×8 font
+- An embedded-graphics RGB draw target with ProFont text rendering
 - UEFI ISO and no-ISO QEMU boot targets
 
 The scheduler is deliberately stackless and cooperative: each task performs one bounded step, stores its continuation in `TaskState`, and returns to yield. USB input follows the same model and polls xHCI without interrupts. The kernel does not yet provide independent task stacks, timer preemption, userspace, interrupts, SMP, or blocking waits.
 
 ### USB HID input
 
-At boot, GinkgoOS discovers the first PCI xHCI controller, enumerates directly attached root-port devices, configures each HID interrupt-IN endpoint, and parses its report descriptor. `InputManager` normalizes reports into device-tagged `InputEvent` values for keyboard keys, mouse buttons and relative axes, joystick/gamepad buttons, absolute axes, wheels, and hat switches. The framebuffer validation UI tracks relative mice and absolute USB tablets, displays mouse-button state through the cursor color, and provides a wrapped keyboard text buffer with Shift, Caps Lock, Enter, Tab, and Backspace handling. USB keyboard presses also feed the serial and `/console` path, and every normalized event is recorded in `/input`. Report IDs and packed, signed, or non-byte-aligned fields are supported.
+At boot, GinkgoOS discovers the first PCI xHCI controller, enumerates directly attached root-port devices, configures each HID interrupt-IN endpoint, and parses its report descriptor. `InputManager` normalizes reports into device-tagged `InputEvent` values for keyboard keys, mouse buttons and relative axes, joystick/gamepad buttons, absolute axes, wheels, and hat switches. The embedded-graphics validation UI tracks relative mice and absolute USB tablets, displays mouse-button state through the cursor color, and provides a wrapped ProFont keyboard text buffer with Shift, Caps Lock, Enter, Tab, and Backspace handling. USB keyboard presses also feed the serial and `/console` path, and every normalized event is recorded in `/input`; both filesystem streams are flushed in batches so RedoxFS transactions do not stall USB polling. Report IDs and packed, signed, or non-byte-aligned fields are supported.
 
 Input is currently limited to devices attached directly to xHCI root ports at boot. USB hubs and hotplug re-enumeration are not implemented yet. Enumeration failures are isolated per port so one malformed or unsupported device does not disable other input devices.
 
@@ -104,9 +104,9 @@ make check
 src/main.rs         boot flow, paging smoke test, and initial kernel tasks
 src/lib.rs          reusable no_std kernel subsystem facade
 src/limine.rs       boot-protocol requests and validated response wrappers
-src/memory.rs       address types and usable physical-frame allocator
-src/paging.rs       active x86-64 four-level page-table management
-src/io.rs           checked port I/O, MMIO, and nonblocking serial device
+src/memory.rs       x86_64 address types and usable physical-frame allocator
+src/paging.rs       x86_64 OffsetPageTable wrapper and active-frame reservation
+src/io.rs           crate-backed checked port I/O, MMIO, and serial device
 src/pci.rs          PCI mechanism #1 discovery and xHCI BAR claiming
 src/usb.rs          polling xHCI host, USB enumeration, and HID report transport
 src/hid.rs          HID report descriptor parsing and normalized event decoding
@@ -114,8 +114,7 @@ src/input.rs        USB/HID integration and bounded kernel input event queue
 src/fs.rs           RedoxFS memory-disk and kernel API adapter
 src/heap.rs         Talc bootstrap heap
 src/task.rs         cooperative round-robin task scheduler
-src/framebuffer.rs  pixel, rectangle, font, and text rendering
-src/font8x8.rs      public-domain ASCII bitmap font
+src/framebuffer.rs  Limine framebuffer draw target using embedded-graphics and ProFont
 src/crt.rs          freestanding memory routines LLVM may call
 linker.ld            high-half ELF layout and request retention
 limine.conf          Limine menu entry
