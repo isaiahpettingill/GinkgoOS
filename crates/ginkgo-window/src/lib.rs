@@ -4,15 +4,17 @@
 //! machine.
 //!
 //! The crate intentionally owns its wire geometry and keeps transport attachment
-//! indices out of public events. It can be used with in-memory mocks today and a
-//! channel/syscall transport later without changing frame lifecycle semantics.
+//! indices out of public events. It supports in-memory transports directly; the
+//! syscall-backed channel transport is provided by `ginkgo-userspace`.
 
 extern crate alloc;
 
+mod channel;
 mod client;
 mod geometry;
 mod protocol;
 
+pub use channel::*;
 pub use client::*;
 pub use geometry::*;
 pub use protocol::*;

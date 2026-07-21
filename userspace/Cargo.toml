@@ -15,6 +15,7 @@ license = "MIT"
 
 [workspace.dependencies]
 ginkgo-desktop = { path = "../crates/ginkgo-desktop" }
+ginkgo-graphics = { path = "../crates/ginkgo-graphics" }
 ginkgo-runtime = { path = "ginkgo-runtime" }
 ginkgo-userspace = { path = "../crates/ginkgo-userspace" }
 ginkgo-window = { path = "../crates/ginkgo-window" }

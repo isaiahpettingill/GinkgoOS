@@ -6,17 +6,30 @@ mod crt;
 mod framebuffer;
 mod heap;
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use core::{
     fmt::{self, Write as _},
     panic::PanicInfo,
     ptr::{self, NonNull},
 };
+use embedded_graphics::{
+    image::Image,
+    prelude::{Drawable, Point as GraphicsPoint},
+};
+use embedded_icon::{
+    mdi::size24px::{CubeOutline, Magnify},
+    NewIcon,
+};
 use framebuffer::{FramebufferWriter, Rgb};
+use ginkgo_desktop::ClientId;
 use ginkgo_filesystem::RedoxFs;
 use ginkgo_hid::{ApplicationKind, Axis, InputEvent, AXIS_MAX, AXIS_MIN};
-use ginkgo_ipc::{channel_create_between, Handle, HandleTable, IpcError};
+use ginkgo_ipc::IpcError;
 use ginkgo_kernel::{
     arch::{self, CpuPrivilegeState, KernelExit, PrivilegeStackTops},
+    desktop_runtime::{DesktopBroker, DesktopBrokerError, DesktopRuntimeEvent},
     input::{DeviceInputEvent, InputManager},
     io::SerialPort,
     limine::{
@@ -31,6 +44,9 @@ use ginkgo_kernel::{
     usb::{self, UsbError},
 };
 use ginkgo_program_registry::Registry;
+use ginkgo_window::{
+    ButtonState, KeyboardEvent, Modifiers, Point as WindowPoint, PointerButton, PointerEventKind,
+};
 use volatile::VolatilePtr;
 use x86_64::instructions::{hlt, interrupts};
 
@@ -67,56 +83,101 @@ static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 static REQUESTS_END: [u64; 2] = limine::REQUESTS_END_MARKER;
 
 static DESKTOP_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-desktop.elf"));
+static MINIMAL_CLIENT_ELF: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-minimal-client.elf"));
 static PROGRAM_REGISTRY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/programs.gkr"));
 
 const DESKTOP_PATH: &str = "/desktop.elf";
+const MINIMAL_CLIENT_PATH: &str = "/minimal-client.elf";
 const PROGRAM_REGISTRY_PATH: &str = "/programs.gkr";
-const DESKTOP_READY_MESSAGE: &[u8; 8] = b"GKREADY\0";
-const TOGGLE_LAUNCHER_MESSAGE: &[u8; 8] = b"GKTOGGLE";
-const LAUNCHER_STATE_PREFIX: &[u8; 7] = b"GKLSTAT";
+const MAX_EXECUTABLE_BYTES: usize = 512 * 1024;
+const MAX_LAUNCHER_PROGRAMS: usize = 6;
 
-const BOOT_EXECUTABLE_MAX_BYTES: usize = 4096;
+#[derive(Clone, Copy)]
+struct ProgramSummary {
+    name: [u8; 48],
+    name_len: usize,
+    path: [u8; 64],
+    path_len: usize,
+}
 
-fn install_and_load_system_programs(
-    fs: &mut RedoxFs,
-) -> Option<([u8; BOOT_EXECUTABLE_MAX_BYTES], usize, usize)> {
+impl ProgramSummary {
+    const EMPTY: Self = Self {
+        name: [0; 48],
+        name_len: 0,
+        path: [0; 64],
+        path_len: 0,
+    };
+
+    fn name(&self) -> &str {
+        unsafe { core::str::from_utf8_unchecked(&self.name[..self.name_len]) }
+    }
+
+    fn path(&self) -> &str {
+        unsafe { core::str::from_utf8_unchecked(&self.path[..self.path_len]) }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProgramCatalog {
+    programs: [ProgramSummary; MAX_LAUNCHER_PROGRAMS],
+    len: usize,
+}
+
+impl ProgramCatalog {
+    const EMPTY: Self = Self {
+        programs: [ProgramSummary::EMPTY; MAX_LAUNCHER_PROGRAMS],
+        len: 0,
+    };
+
+    fn get(&self, index: usize) -> Option<ProgramSummary> {
+        self.programs
+            .get(index)
+            .copied()
+            .filter(|_| index < self.len)
+    }
+}
+
+fn install_and_load_system_programs(fs: &mut RedoxFs) -> Option<(Vec<u8>, ProgramCatalog)> {
     install_system_file(fs, DESKTOP_PATH, DESKTOP_ELF)?;
+    install_system_file(fs, MINIMAL_CLIENT_PATH, MINIMAL_CLIENT_ELF)?;
     install_system_file(fs, PROGRAM_REGISTRY_PATH, PROGRAM_REGISTRY)?;
 
-    let registry_file = fs.open(PROGRAM_REGISTRY_PATH).ok()?;
-    let registry_info = fs.stat(registry_file).ok()?;
-    let registry_len = usize::try_from(registry_info.len).ok()?;
-    let mut registry_bytes = [0u8; 512];
-    if registry_len > registry_bytes.len()
-        || fs
-            .read(registry_file, 0, &mut registry_bytes[..registry_len])
-            .ok()?
-            != registry_len
-    {
-        return None;
-    }
-    let registry = Registry::parse(&registry_bytes[..registry_len]).ok()?;
+    let registry_bytes = read_system_file(fs, PROGRAM_REGISTRY_PATH, 16 * 1024)?;
+    let registry = Registry::parse(&registry_bytes).ok()?;
     let desktop = registry.entries().find(|entry| entry.app_id == "desktop")?;
     if desktop.executable_path != DESKTOP_PATH || desktop.is_visible() {
         return None;
     }
-    let visible_programs = registry.visible_entries().count();
 
-    let executable = fs.open(desktop.executable_path).ok()?;
-    let executable_info = fs.stat(executable).ok()?;
-    let executable_len = usize::try_from(executable_info.len).ok()?;
-    if executable_len == 0 || executable_len > BOOT_EXECUTABLE_MAX_BYTES {
+    let mut catalog = ProgramCatalog::EMPTY;
+    for entry in registry.visible_entries().take(MAX_LAUNCHER_PROGRAMS) {
+        let slot = &mut catalog.programs[catalog.len];
+        slot.name_len = copy_program_string(&mut slot.name, entry.display_name)?;
+        slot.path_len = copy_program_string(&mut slot.path, entry.executable_path)?;
+        catalog.len += 1;
+    }
+
+    let desktop_image = read_system_file(fs, desktop.executable_path, MAX_EXECUTABLE_BYTES)?;
+    Some((desktop_image, catalog))
+}
+
+fn read_system_file(fs: &mut RedoxFs, path: &str, maximum: usize) -> Option<Vec<u8>> {
+    let file = fs.open(path).ok()?;
+    let length = usize::try_from(fs.stat(file).ok()?.len).ok()?;
+    if length == 0 || length > maximum {
         return None;
     }
-    let mut executable_bytes = [0u8; BOOT_EXECUTABLE_MAX_BYTES];
-    if fs
-        .read(executable, 0, &mut executable_bytes[..executable_len])
-        .ok()?
-        != executable_len
-    {
-        return None;
-    }
-    Some((executable_bytes, executable_len, visible_programs))
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(length).ok()?;
+    bytes.resize(length, 0);
+    (fs.read(file, 0, &mut bytes).ok()? == length).then_some(bytes)
+}
+
+fn copy_program_string<const N: usize>(output: &mut [u8; N], value: &str) -> Option<usize> {
+    let destination = output.get_mut(..value.len())?;
+    destination.copy_from_slice(value.as_bytes());
+    Some(value.len())
 }
 
 fn install_system_file(fs: &mut RedoxFs, path: &str, bytes: &[u8]) -> Option<()> {
@@ -177,13 +238,11 @@ pub extern "C" fn _start() -> ! {
     let Ok(mut fs) = RedoxFs::new() else {
         halt_forever();
     };
-    let Some((desktop_image, desktop_image_len, visible_programs)) =
-        install_and_load_system_programs(&mut fs)
-    else {
+    let Some((desktop_image, catalog)) = install_and_load_system_programs(&mut fs) else {
         ui.render_boot_log(&mut screen, "redoxfs: system program installation failed");
         halt_forever();
     };
-    ui.visible_programs = visible_programs;
+    ui.catalog = catalog;
     ui.render_boot_log(&mut screen, "redoxfs: desktop ELF and registry loaded");
 
     let mut context = KernelContext {
@@ -197,8 +256,10 @@ pub extern "C" fn _start() -> ! {
         ui,
         paging_verified: false,
         processes: ProcessTable::new(),
-        desktop_handles: HandleTable::new(),
-        desktop_channel: Handle::INVALID,
+        desktop: None,
+        process_clients: Vec::new(),
+        next_client_id: 1,
+        launch_requested: None,
         launcher_toggle_pending: false,
         pending_console: [0; CONSOLE_BATCH_CAPACITY],
         pending_console_len: 0,
@@ -275,39 +336,35 @@ pub extern "C" fn _start() -> ! {
         .render_boot_log(&mut context.screen, "userspace: privilege state ready");
     context.ui.render_splash(&mut context.screen);
 
-    let mut process = match Process::from_elf(
-        &desktop_image[..desktop_image_len],
-        &context.page_table,
-        &mut context.frames,
-    ) {
-        Ok(process) => process,
-        Err(error) => {
-            let mut sink = SerialDebugSink::new(&mut context.serial);
-            let _ = writeln!(sink, "desktop: ELF load failed: {error:?}\r");
-            context
-                .ui
-                .render_failure(&mut context.screen, "Desktop ELF validation failed");
-            halt_forever();
-        }
-    };
-    let (desktop_channel, process_channel) =
-        match channel_create_between(&mut context.desktop_handles, process.handles_mut()) {
-            Ok(channels) => channels,
+    let mut process =
+        match Process::from_elf(&desktop_image, &context.page_table, &mut context.frames) {
+            Ok(process) => process,
             Err(error) => {
                 let mut sink = SerialDebugSink::new(&mut context.serial);
-                let _ = writeln!(sink, "desktop: bootstrap channel failed: {error:?}\r");
+                let _ = writeln!(sink, "desktop: ELF load failed: {error:?}\r");
                 context
                     .ui
-                    .render_failure(&mut context.screen, "Desktop channel creation failed");
+                    .render_failure(&mut context.screen, "Desktop ELF validation failed");
                 halt_forever();
             }
         };
+    let (desktop, process_channel) = match DesktopBroker::create(process.handles_mut()) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let mut sink = SerialDebugSink::new(&mut context.serial);
+            let _ = writeln!(sink, "desktop: bootstrap channel failed: {error:?}\r");
+            context
+                .ui
+                .render_failure(&mut context.screen, "Desktop channel creation failed");
+            halt_forever();
+        }
+    };
     process.set_start_arguments([
         u64::from(process_channel.raw()),
         context.screen.width() as u64,
         context.screen.height() as u64,
     ]);
-    context.desktop_channel = desktop_channel;
+    context.desktop = Some(desktop);
 
     let process_id = match context.processes.insert(process) {
         Ok(process_id) => process_id,
@@ -340,12 +397,7 @@ pub extern "C" fn _start() -> ! {
     {
         halt_forever();
     }
-    let mut process_state = TaskState::new();
-    process_state.set(0, process_id.raw() as usize);
-    if scheduler
-        .spawn_with_state(process_task, process_state)
-        .is_err()
-    {
+    if scheduler.spawn(process_task).is_err() {
         halt_forever();
     }
 
@@ -366,8 +418,10 @@ struct KernelContext {
     ui: ValidationUi,
     paging_verified: bool,
     processes: ProcessTable,
-    desktop_handles: HandleTable,
-    desktop_channel: Handle,
+    desktop: Option<DesktopBroker>,
+    process_clients: Vec<(ProcessId, ClientId)>,
+    next_client_id: u64,
+    launch_requested: Option<usize>,
     launcher_toggle_pending: bool,
     pending_console: [u8; CONSOLE_BATCH_CAPACITY],
     pending_console_len: usize,
@@ -433,12 +487,10 @@ impl fmt::Write for SerialDebugSink<'_> {
     }
 }
 const UI_MARGIN: usize = 40;
-const TEXT_TOP: usize = 148;
-const TEXT_ORIGIN_X: usize = UI_MARGIN + 20;
-const TEXT_ORIGIN_Y: usize = TEXT_TOP + 48;
-const TEXT_SCALE: usize = 2;
-const TEXT_ADVANCE: usize = 10;
-const TEXT_LINE_HEIGHT: usize = 17;
+const LAUNCHER_MAX_WIDTH: usize = 620;
+const LAUNCHER_SEARCH_HEIGHT: usize = 58;
+const LAUNCHER_ROW_HEIGHT: usize = 66;
+const LAUNCHER_GAP: usize = 10;
 
 struct ValidationUi {
     text: [u8; TEXT_BUFFER_CAPACITY],
@@ -454,7 +506,9 @@ struct ValidationUi {
     desktop_ready: bool,
     desktop_failed: bool,
     launcher_visible: bool,
-    visible_programs: usize,
+    catalog: ProgramCatalog,
+    launcher_backing: Vec<u32>,
+    launcher_backing_geometry: Option<(usize, usize, usize, usize)>,
     cursor_backing: [u32; CURSOR_SIZE * CURSOR_SIZE],
     cursor_origin_x: usize,
     cursor_origin_y: usize,
@@ -480,7 +534,9 @@ impl ValidationUi {
             desktop_ready: false,
             desktop_failed: false,
             launcher_visible: false,
-            visible_programs: 0,
+            catalog: ProgramCatalog::EMPTY,
+            launcher_backing: Vec::new(),
+            launcher_backing_geometry: None,
             cursor_backing: [0; CURSOR_SIZE * CURSOR_SIZE],
             cursor_origin_x: 0,
             cursor_origin_y: 0,
@@ -514,26 +570,40 @@ impl ValidationUi {
     }
 
     fn render_splash(&mut self, screen: &mut FramebufferWriter<'_>) {
-        let background = Rgb::new(14, 20, 32);
-        let panel = Rgb::new(31, 41, 61);
-        let primary = Rgb::new(232, 238, 247);
-        let muted = Rgb::new(148, 163, 184);
-        let accent = Rgb::new(110, 231, 183);
-        screen.clear(background);
-        let panel_width = 520usize.min(self.width.saturating_sub(UI_MARGIN * 2));
-        let panel_height = 190usize.min(self.height.saturating_sub(UI_MARGIN * 2));
-        let x = self.width.saturating_sub(panel_width) / 2;
-        let y = self.height.saturating_sub(panel_height) / 2;
-        screen.fill_rect(x, y, panel_width, panel_height, panel);
-        screen.fill_rect(x, y, 12, panel_height, accent);
-        screen.draw_text(x + 46, y + 38, 4, "GinkgoOS", primary);
-        screen.draw_text(
-            x + 48,
-            y + 105,
-            2,
-            "Starting the protected desktop service...",
-            muted,
-        );
+        const LEAF: [u16; 14] = [
+            0b000_0110_0110_000,
+            0b000_1111_1111_000,
+            0b001_1111_1111_100,
+            0b011_1111_1111_110,
+            0b111_1111_1111_111,
+            0b111_1111_1111_111,
+            0b011_1111_1111_110,
+            0b001_1111_1111_100,
+            0b000_1111_1111_000,
+            0b000_0111_1110_000,
+            0b000_0011_1100_000,
+            0b000_0001_1000_000,
+            0b000_0001_1000_000,
+            0b000_0001_1000_000,
+        ];
+        const SCALE: usize = 10;
+        const COLUMNS: usize = 15;
+
+        screen.clear(Rgb::new(14, 20, 32));
+        let x = self.width.saturating_sub(COLUMNS * SCALE) / 2;
+        let y = self.height.saturating_sub(LEAF.len() * SCALE) / 2;
+        for (row, bits) in LEAF.into_iter().enumerate() {
+            let color = if row < 6 {
+                Rgb::new(110, 231, 183)
+            } else {
+                Rgb::new(52, 211, 153)
+            };
+            for column in 0..COLUMNS {
+                if bits & (1 << (COLUMNS - column - 1)) != 0 {
+                    screen.fill_rect(x + column * SCALE, y + row * SCALE, SCALE, SCALE, color);
+                }
+            }
+        }
         self.cursor_visible = false;
     }
 
@@ -630,107 +700,155 @@ impl ValidationUi {
         self.show_cursor(screen);
     }
 
-    fn render_status(&mut self, screen: &mut FramebufferWriter<'_>) {
-        if !self.desktop_ready {
-            return;
-        }
-        self.hide_cursor(screen);
-        let panel = Rgb::new(31, 41, 61);
-        let muted = Rgb::new(148, 163, 184);
-        let warning = Rgb::new(251, 191, 36);
-        let x = UI_MARGIN + 30;
-        let y = UI_MARGIN + 64;
-        screen.fill_rect(
-            x,
-            y,
-            screen.width().saturating_sub(x + UI_MARGIN + 190),
-            10,
-            panel,
-        );
-        screen.draw_text(
-            x,
-            y,
-            1,
-            self.input_status,
-            if self.input_available { muted } else { warning },
-        );
-        self.show_cursor(screen);
-    }
+    fn render_status(&mut self, _screen: &mut FramebufferWriter<'_>) {}
 
     fn render_text_range(
         &mut self,
         screen: &mut FramebufferWriter<'_>,
-        dirty_start: usize,
-        dirty_end: usize,
+        _dirty_start: usize,
+        _dirty_end: usize,
     ) {
+        if !self.launcher_visible {
+            return;
+        }
         self.hide_cursor(screen);
-        let elevated = Rgb::new(41, 53, 78);
-        let primary = Rgb::new(232, 238, 247);
-        let muted = Rgb::new(148, 163, 184);
-
-        if dirty_start == 0 {
-            screen.fill_rect(
-                TEXT_ORIGIN_X.saturating_sub(10),
-                TEXT_ORIGIN_Y.saturating_sub(10),
-                screen
-                    .width()
-                    .saturating_sub(TEXT_ORIGIN_X * 2)
-                    .saturating_add(20),
-                42,
-                elevated,
-            );
-        }
-        for index in dirty_start..dirty_end {
-            let (x, y) = self.text_position(index);
-            screen.fill_rect(x, y, TEXT_ADVANCE, TEXT_LINE_HEIGHT, elevated);
-        }
-        for index in dirty_start..self.text_len {
-            let byte = self.text[index];
-            if byte == b'\n' {
-                continue;
-            }
-            let (x, y) = self.text_position(index);
-            let bytes = [byte];
-            let glyph = unsafe { core::str::from_utf8_unchecked(&bytes) };
-            screen.draw_text(x, y, TEXT_SCALE, glyph, primary);
-        }
-        if self.text_len == 0 {
-            screen.draw_text(
-                TEXT_ORIGIN_X,
-                TEXT_ORIGIN_Y,
-                TEXT_SCALE,
-                "Search programs...",
-                muted,
-            );
-        }
+        self.render_launcher_search(screen);
         self.show_cursor(screen);
     }
 
-    fn text_position(&self, index: usize) -> (usize, usize) {
-        let mut x = TEXT_ORIGIN_X;
-        let mut y = TEXT_ORIGIN_Y;
-        let right = self.width.saturating_sub(TEXT_ORIGIN_X);
-        for byte in self.text[..index.min(TEXT_BUFFER_CAPACITY)].iter().copied() {
-            match byte {
-                b'\n' => {
-                    x = TEXT_ORIGIN_X;
-                    y = y.saturating_add(TEXT_LINE_HEIGHT);
-                }
-                b'\r' => x = TEXT_ORIGIN_X,
-                _ => {
-                    if x != TEXT_ORIGIN_X && x.saturating_add(TEXT_ADVANCE) > right {
-                        x = TEXT_ORIGIN_X;
-                        y = y.saturating_add(TEXT_LINE_HEIGHT);
-                    }
-                    x = x.saturating_add(TEXT_ADVANCE);
-                }
+    fn launcher_geometry(&self) -> (usize, usize, usize, usize) {
+        let width = LAUNCHER_MAX_WIDTH.min(self.width.saturating_sub(UI_MARGIN * 2));
+        let rows = self.catalog.len.min(MAX_LAUNCHER_PROGRAMS);
+        let result_height = rows.saturating_mul(LAUNCHER_ROW_HEIGHT);
+        let height = LAUNCHER_SEARCH_HEIGHT.saturating_add(if rows == 0 {
+            0
+        } else {
+            LAUNCHER_GAP + result_height
+        });
+        let x = self.width.saturating_sub(width) / 2;
+        let y = self.height.saturating_sub(height) / 3;
+        (x, y, width, height)
+    }
+
+    fn launcher_backing_geometry(&self) -> (usize, usize, usize, usize) {
+        let (x, y, width, height) = self.launcher_geometry();
+        let margin = 6;
+        let left = x.saturating_sub(margin);
+        let top = y.saturating_sub(margin);
+        let right = x
+            .saturating_add(width)
+            .saturating_add(margin)
+            .min(self.width);
+        let bottom = y
+            .saturating_add(height)
+            .saturating_add(margin)
+            .min(self.height);
+        (
+            left,
+            top,
+            right.saturating_sub(left),
+            bottom.saturating_sub(top),
+        )
+    }
+
+    fn capture_launcher_background(&mut self, screen: &FramebufferWriter<'_>) {
+        let geometry = self.launcher_backing_geometry();
+        let Some(pixel_count) = geometry.2.checked_mul(geometry.3) else {
+            self.launcher_backing_geometry = None;
+            return;
+        };
+        self.launcher_backing.clear();
+        if self
+            .launcher_backing
+            .try_reserve_exact(pixel_count)
+            .is_err()
+        {
+            self.launcher_backing_geometry = None;
+            return;
+        }
+        for y in 0..geometry.3 {
+            for x in 0..geometry.2 {
+                self.launcher_backing.push(
+                    screen
+                        .read_raw_pixel(geometry.0 + x, geometry.1 + y)
+                        .unwrap_or(0),
+                );
             }
         }
-        if x != TEXT_ORIGIN_X && x.saturating_add(TEXT_ADVANCE) > right {
-            x = TEXT_ORIGIN_X;
-            y = y.saturating_add(TEXT_LINE_HEIGHT);
+        self.launcher_backing_geometry = Some(geometry);
+    }
+
+    fn restore_launcher_background(&mut self, screen: &mut FramebufferWriter<'_>) {
+        let Some((left, top, width, height)) = self.launcher_backing_geometry.take() else {
+            return;
+        };
+        if self.launcher_backing.len() != width.saturating_mul(height) {
+            self.launcher_backing.clear();
+            return;
         }
-        (x, y)
+        for y in 0..height {
+            for x in 0..width {
+                screen.write_raw_pixel(left + x, top + y, self.launcher_backing[y * width + x]);
+            }
+        }
+        self.launcher_backing.clear();
+    }
+
+    fn hide_launcher(&mut self, screen: &mut FramebufferWriter<'_>) {
+        self.hide_cursor(screen);
+        self.restore_launcher_background(screen);
+        self.show_cursor(screen);
+    }
+
+    fn launcher_program_at(&self, x: usize, y: usize) -> Option<usize> {
+        if !self.launcher_visible {
+            return None;
+        }
+        let (launcher_x, launcher_y, width, _) = self.launcher_geometry();
+        let results_y = launcher_y + LAUNCHER_SEARCH_HEIGHT + LAUNCHER_GAP;
+        if x < launcher_x || x >= launcher_x.saturating_add(width) || y < results_y {
+            return None;
+        }
+        let row = (y - results_y) / LAUNCHER_ROW_HEIGHT;
+        (row < self.catalog.len).then_some(row)
+    }
+
+    fn render_launcher_search(&self, screen: &mut FramebufferWriter<'_>) {
+        let (x, y, width, _) = self.launcher_geometry();
+        let border = Rgb::new(232, 238, 247);
+        let field = Rgb::new(31, 41, 61);
+        let text_color = Rgb::new(232, 238, 247);
+        let placeholder = Rgb::new(148, 163, 184);
+        screen.fill_rect(x, y, width, LAUNCHER_SEARCH_HEIGHT, border);
+        screen.fill_rect(
+            x + 4,
+            y + 4,
+            width.saturating_sub(8),
+            LAUNCHER_SEARCH_HEIGHT.saturating_sub(8),
+            field,
+        );
+        let text = unsafe { core::str::from_utf8_unchecked(&self.text[..self.text_len]) };
+        screen.draw_text(
+            x + 22,
+            y + 18,
+            2,
+            if self.text_len == 0 { "Search" } else { text },
+            if self.text_len == 0 {
+                placeholder
+            } else {
+                text_color
+            },
+        );
+
+        let icon = Magnify::new(placeholder);
+        let _ = Image::new(
+            &icon,
+            GraphicsPoint::new(
+                i32::try_from(x + width.saturating_sub(38)).unwrap_or(i32::MAX),
+                i32::try_from(y + 17).unwrap_or(i32::MAX),
+            ),
+        )
+        .draw(screen);
     }
 
     fn hide_cursor(&mut self, screen: &mut FramebufferWriter<'_>) {
@@ -785,182 +903,62 @@ impl ValidationUi {
     }
 
     fn render(&mut self, screen: &mut FramebufferWriter<'_>) {
-        let background = Rgb::new(14, 20, 32);
-        let panel = Rgb::new(31, 41, 61);
-        let primary = Rgb::new(232, 238, 247);
-        let muted = Rgb::new(148, 163, 184);
-        let accent = Rgb::new(110, 231, 183);
-        let warning = Rgb::new(251, 191, 36);
-        screen.clear(background);
-        screen.fill_rect(
-            UI_MARGIN,
-            UI_MARGIN,
-            screen.width().saturating_sub(UI_MARGIN * 2),
-            76,
-            panel,
-        );
-        screen.fill_rect(UI_MARGIN, UI_MARGIN, 10, 76, accent);
-        screen.draw_text(UI_MARGIN + 30, UI_MARGIN + 16, 3, "GinkgoOS", primary);
-        screen.draw_text(
-            UI_MARGIN + 30,
-            UI_MARGIN + 50,
-            1,
-            if self.desktop_failed {
-                "Protected desktop service stopped"
-            } else if self.desktop_ready {
-                "Protected userland desktop is running"
-            } else {
-                "Starting protected userland desktop..."
-            },
-            if self.desktop_ready && !self.desktop_failed {
-                accent
-            } else {
-                warning
-            },
-        );
-        screen.draw_text(
-            UI_MARGIN + 30,
-            UI_MARGIN + 64,
-            1,
-            self.input_status,
-            if self.input_available { muted } else { warning },
-        );
-        screen.draw_text(
-            screen.width().saturating_sub(UI_MARGIN + 170),
-            UI_MARGIN + 26,
-            1,
-            "META+N  Launcher",
-            muted,
-        );
-
+        screen.clear(Rgb::new(14, 20, 32));
+        self.launcher_backing.clear();
+        self.launcher_backing_geometry = None;
         self.cursor_visible = false;
-        self.render_content(screen);
+        self.show_cursor(screen);
     }
 
     fn render_content(&mut self, screen: &mut FramebufferWriter<'_>) {
         self.hide_cursor(screen);
-        let background = Rgb::new(14, 20, 32);
-        let panel = Rgb::new(31, 41, 61);
-        let elevated = Rgb::new(41, 53, 78);
-        let primary = Rgb::new(232, 238, 247);
-        let muted = Rgb::new(148, 163, 184);
-        let accent = Rgb::new(110, 231, 183);
-        screen.fill_rect(
-            0,
-            TEXT_TOP.saturating_sub(18),
-            self.width,
-            self.height.saturating_sub(TEXT_TOP.saturating_sub(18)),
-            background,
-        );
+        self.capture_launcher_background(screen);
+        let (x, y, width, _) = self.launcher_geometry();
 
-        if self.desktop_failed {
-            let card_y = TEXT_TOP + 36;
-            screen.fill_rect(
-                UI_MARGIN,
-                card_y,
-                screen.width().saturating_sub(UI_MARGIN * 2),
-                150,
-                panel,
-            );
-            screen.draw_text(
-                UI_MARGIN + 30,
-                card_y + 30,
-                3,
-                "Desktop service unavailable",
-                primary,
-            );
-            screen.draw_text(
-                UI_MARGIN + 30,
-                card_y + 86,
-                2,
-                "Restart GinkgoOS to relaunch protected userland.",
-                muted,
-            );
-        } else if self.launcher_visible {
-            screen.draw_text(UI_MARGIN, TEXT_TOP, 2, "Launcher", primary);
-            screen.draw_text(
-                UI_MARGIN + 110,
-                TEXT_TOP + 4,
-                1,
-                "type to search installed programs",
-                muted,
-            );
-            screen.fill_rect(
-                UI_MARGIN,
-                TEXT_TOP + 28,
-                screen.width().saturating_sub(UI_MARGIN * 2),
-                screen.height().saturating_sub(TEXT_TOP + 68),
-                panel,
-            );
-            screen.fill_rect(
-                TEXT_ORIGIN_X.saturating_sub(10),
-                TEXT_ORIGIN_Y.saturating_sub(10),
-                screen
-                    .width()
-                    .saturating_sub(TEXT_ORIGIN_X * 2)
-                    .saturating_add(20),
-                42,
-                elevated,
-            );
-            let text = unsafe { core::str::from_utf8_unchecked(&self.text[..self.text_len]) };
-            screen.draw_text_wrapped(
-                TEXT_ORIGIN_X,
-                TEXT_ORIGIN_Y,
-                screen.width().saturating_sub(TEXT_ORIGIN_X * 2),
-                TEXT_SCALE,
-                text,
-                primary,
-            );
-            if self.text_len == 0 {
-                screen.draw_text(
-                    TEXT_ORIGIN_X,
-                    TEXT_ORIGIN_Y,
-                    TEXT_SCALE,
-                    "Search programs...",
-                    muted,
-                );
+        if self.launcher_visible && !self.desktop_failed {
+            self.render_launcher_search(screen);
+            let rows = self.catalog.len.min(MAX_LAUNCHER_PROGRAMS);
+            if rows != 0 {
+                let result_y = y + LAUNCHER_SEARCH_HEIGHT + LAUNCHER_GAP;
+                let border = Rgb::new(232, 238, 247);
+                let panel = Rgb::new(31, 41, 61);
+                let accent = Rgb::new(52, 211, 153);
+                screen.fill_rect(x, result_y, width, rows * LAUNCHER_ROW_HEIGHT, border);
+                for row in 0..rows {
+                    let row_y = result_y + row * LAUNCHER_ROW_HEIGHT;
+                    screen.fill_rect(
+                        x + 4,
+                        row_y + 4,
+                        width.saturating_sub(8),
+                        LAUNCHER_ROW_HEIGHT.saturating_sub(8),
+                        panel,
+                    );
+                    if row != 0 {
+                        screen.fill_rect(x, row_y, width, 3, border);
+                    }
+                    screen.fill_rect(x + 16, row_y + 14, 38, 38, accent);
+                    screen.fill_rect(x + 20, row_y + 18, 30, 30, panel);
+                    let icon = CubeOutline::new(accent);
+                    let _ = Image::new(
+                        &icon,
+                        GraphicsPoint::new(
+                            i32::try_from(x + 23).unwrap_or(i32::MAX),
+                            i32::try_from(row_y + 21).unwrap_or(i32::MAX),
+                        ),
+                    )
+                    .draw(screen);
+                    if let Some(program) = self.catalog.get(row) {
+                        screen.draw_text(x + 72, row_y + 16, 2, program.name(), border);
+                        screen.draw_text(
+                            x + 72,
+                            row_y + 42,
+                            1,
+                            program.path(),
+                            Rgb::new(148, 163, 184),
+                        );
+                    }
+                }
             }
-            screen.draw_text(
-                TEXT_ORIGIN_X,
-                TEXT_ORIGIN_Y + 70,
-                2,
-                if self.visible_programs == 0 {
-                    "No applications installed"
-                } else {
-                    "Applications are registered"
-                },
-                muted,
-            );
-        } else {
-            let card_y = TEXT_TOP + 36;
-            screen.fill_rect(
-                UI_MARGIN,
-                card_y,
-                screen.width().saturating_sub(UI_MARGIN * 2),
-                180,
-                panel,
-            );
-            screen.draw_text(
-                UI_MARGIN + 30,
-                card_y + 30,
-                3,
-                "Welcome to GinkgoOS",
-                primary,
-            );
-            screen.draw_text(
-                UI_MARGIN + 30,
-                card_y + 82,
-                2,
-                "The window manager and launcher are running in ring 3.",
-                muted,
-            );
-            screen.draw_text(
-                UI_MARGIN + 30,
-                card_y + 120,
-                2,
-                "Press META+N to open the launcher.",
-                accent,
-            );
         }
         self.show_cursor(screen);
     }
@@ -1027,10 +1025,12 @@ fn verify_paging(context: &mut KernelContext) -> bool {
     verified && unmapped && context.page_table.translate_addr(address).is_none()
 }
 
-fn process_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
-    let process_id = ProcessId::from_raw(state.get(0).unwrap_or(0) as u64);
+fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll {
+    let Some(process_id) = context.processes.next_id() else {
+        return TaskPoll::Pending;
+    };
     let Some(process) = context.processes.get_mut(process_id) else {
-        return TaskPoll::Complete;
+        return TaskPoll::Pending;
     };
 
     if process.is_runnable() {
@@ -1073,19 +1073,30 @@ fn process_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll 
 
     unsafe { context.page_table.activate() };
     let Some(final_state) = context.processes.get(process_id).map(Process::state) else {
-        return TaskPoll::Complete;
+        return TaskPoll::Pending;
     };
     if final_state.is_runnable() {
         return TaskPoll::Pending;
     }
 
     let Some(process) = context.processes.take_for_retirement(process_id) else {
-        return TaskPoll::Complete;
+        return TaskPoll::Pending;
     };
     let retired = match process.retire() {
         Ok(retired) => retired,
         Err(_) => halt_forever(),
     };
+    if let Some(index) = context
+        .process_clients
+        .iter()
+        .position(|(known_process, _)| *known_process == process_id)
+    {
+        let (_, client_id) = context.process_clients.swap_remove(index);
+        if let Some(desktop) = context.desktop.as_mut() {
+            let _ = desktop.cleanup_client(client_id);
+        }
+    }
+
     let mut sink = SerialDebugSink::new(&mut context.serial);
     match retired.final_state() {
         ProcessState::Exited(status) => {
@@ -1108,7 +1119,7 @@ fn process_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll 
         }
         ProcessState::Ready => unreachable!("runnable process reached retirement"),
     }
-    TaskPoll::Complete
+    TaskPoll::Pending
 }
 
 fn filesystem_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
@@ -1159,55 +1170,124 @@ fn console_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll 
     TaskPoll::Pending
 }
 
+fn launch_registered_program(context: &mut KernelContext, program_index: usize) -> Result<(), ()> {
+    let program = context.ui.catalog.get(program_index).ok_or(())?;
+    let image = read_system_file(&mut context.fs, program.path(), MAX_EXECUTABLE_BYTES).ok_or(())?;
+    let mut process =
+        Process::from_elf(&image, &context.page_table, &mut context.frames).map_err(|_| ())?;
+    let client_id = ClientId::new(context.next_client_id).ok_or(())?;
+    context.next_client_id = context.next_client_id.checked_add(1).ok_or(())?;
+    context.process_clients.try_reserve(1).map_err(|_| ())?;
+    let channel = context
+        .desktop
+        .as_mut()
+        .ok_or(())?
+        .connect_client(client_id, process.handles_mut())
+        .map_err(|_| ())?;
+    process.set_start_arguments([u64::from(channel.raw()), 0, 0]);
+    let process_id = context.processes.insert(process).map_err(|_| ())?;
+    context.process_clients.push((process_id, client_id));
+    let mut sink = SerialDebugSink::new(&mut context.serial);
+    let _ = writeln!(
+        sink,
+        "launcher: loaded {} pid={} client={}\r",
+        program.path(),
+        process_id.raw(),
+        client_id.get()
+    );
+    Ok(())
+}
+
+fn redraw_desktop(context: &mut KernelContext) {
+    context.ui.hide_cursor(&mut context.screen);
+    if let Some(desktop) = context.desktop.as_ref() {
+        let _ = desktop.redraw(&mut context.screen);
+    }
+    if context.ui.launcher_visible {
+        context.ui.render_content(&mut context.screen);
+    } else {
+        context.ui.show_cursor(&mut context.screen);
+    }
+}
+
 fn desktop_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll {
     if context.launcher_toggle_pending {
-        match context.desktop_handles.channel_write(
-            context.desktop_channel,
-            TOGGLE_LAUNCHER_MESSAGE,
-            &[],
-        ) {
+        let result = context
+            .desktop
+            .as_mut()
+            .ok_or(DesktopBrokerError::Ipc(IpcError::PeerClosed))
+            .and_then(DesktopBroker::send_toggle_launcher);
+        match result {
             Ok(()) => context.launcher_toggle_pending = false,
-            Err(IpcError::ShouldWait) => {}
+            Err(DesktopBrokerError::Ipc(IpcError::ShouldWait)) => {}
             Err(_) => context.launcher_toggle_pending = false,
         }
     }
 
-    let mut message = [0u8; 8];
-    let result =
-        context
-            .desktop_handles
-            .channel_read(context.desktop_channel, &mut message, &mut []);
-    match result {
-        Ok(info) if info.byte_count == message.len() as u32 && info.handle_count == 0 => {
-            if &message == DESKTOP_READY_MESSAGE {
-                if !context.ui.desktop_ready {
-                    context.ui.desktop_ready = true;
-                    context.ui.desktop_failed = false;
-                    {
-                        let mut sink = SerialDebugSink::new(&mut context.serial);
-                        let _ = writeln!(sink, "desktop: protected userland ready\r");
-                    }
-                    context.ui.render(&mut context.screen);
-                }
-            } else if &message[..7] == LAUNCHER_STATE_PREFIX && message[7] <= 1 {
-                let launcher_visible = message[7] != 0;
-                if context.ui.launcher_visible != launcher_visible {
-                    context.ui.launcher_visible = launcher_visible;
-                    context.ui.render_content(&mut context.screen);
-                }
-            }
-            TaskPoll::Pending
-        }
-        Ok(_) | Err(IpcError::ShouldWait) => TaskPoll::Pending,
-        Err(IpcError::PeerClosed) => {
+    let event = match context.desktop.as_mut().map(DesktopBroker::poll_desktop) {
+        Some(Ok(event)) => event,
+        Some(Err(DesktopBrokerError::Ipc(IpcError::PeerClosed))) | None => {
             context.ui.desktop_ready = false;
             context.ui.desktop_failed = true;
             context.ui.launcher_visible = false;
             context.ui.render(&mut context.screen);
-            TaskPoll::Complete
+            return TaskPoll::Complete;
         }
-        Err(_) => TaskPoll::Pending,
+        Some(Err(_)) => return TaskPoll::Pending,
+    };
+
+    if let Some(event) = event {
+        match event {
+            DesktopRuntimeEvent::ServiceReady => {
+                if !context.ui.desktop_ready {
+                    context.ui.desktop_ready = true;
+                    context.ui.desktop_failed = false;
+                    context.ui.render(&mut context.screen);
+                    let mut sink = SerialDebugSink::new(&mut context.serial);
+                    let _ = writeln!(sink, "desktop: protected Rust userland ready\r");
+                }
+            }
+            DesktopRuntimeEvent::LauncherVisibility(visible) => {
+                if context.ui.launcher_visible != visible {
+                    context.ui.launcher_visible = visible;
+                    if visible {
+                        context.ui.render_content(&mut context.screen);
+                    } else {
+                        context.ui.hide_launcher(&mut context.screen);
+                    }
+                }
+            }
+            DesktopRuntimeEvent::PlacementsChanged { .. }
+            | DesktopRuntimeEvent::WindowDestroyed { .. } => redraw_desktop(context),
+            DesktopRuntimeEvent::PresentationQueued { window_id, .. } => {
+                context.ui.hide_cursor(&mut context.screen);
+                if let Some(desktop) = context.desktop.as_mut() {
+                    let _ = desktop.compose_window(&mut context.screen, window_id);
+                }
+                if context.ui.launcher_visible {
+                    context.ui.render_content(&mut context.screen);
+                } else {
+                    context.ui.show_cursor(&mut context.screen);
+                }
+            }
+            DesktopRuntimeEvent::SurfaceConfigured { .. }
+            | DesktopRuntimeEvent::PresentationRejected { .. } => {}
+        }
     }
+
+    if let Some(program_index) = context.launch_requested.take() {
+        if launch_registered_program(context, program_index).is_err() {
+            let mut sink = SerialDebugSink::new(&mut context.serial);
+            let _ = writeln!(
+                sink,
+                "launcher: failed to start program index={}\r",
+                program_index
+            );
+        } else if context.ui.launcher_visible {
+            request_launcher_toggle(context);
+        }
+    }
+    TaskPoll::Pending
 }
 
 fn request_launcher_toggle(context: &mut KernelContext) {
@@ -1215,11 +1295,12 @@ fn request_launcher_toggle(context: &mut KernelContext) {
         context.launcher_toggle_pending = false;
         return;
     }
-    if context
-        .desktop_handles
-        .channel_write(context.desktop_channel, TOGGLE_LAUNCHER_MESSAGE, &[])
-        == Err(IpcError::ShouldWait)
-    {
+    let result = context
+        .desktop
+        .as_mut()
+        .ok_or(DesktopBrokerError::Ipc(IpcError::PeerClosed))
+        .and_then(DesktopBroker::send_toggle_launcher);
+    if matches!(result, Err(DesktopBrokerError::Ipc(IpcError::ShouldWait))) {
         context.launcher_toggle_pending = true;
     }
 }
@@ -1282,6 +1363,39 @@ fn input_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
     TaskPoll::Pending
 }
 
+fn update_modifier_bits(state: &mut TaskState, word: usize, left: bool, pressed: bool) {
+    let bit = if left { 1 } else { 2 };
+    let current = state.get(word).unwrap_or(0);
+    state.set(
+        word,
+        if pressed {
+            current | bit
+        } else {
+            current & !bit
+        },
+    );
+}
+
+fn current_modifiers(state: &TaskState) -> Modifiers {
+    Modifiers {
+        shift: state.get(1).unwrap_or(0) != 0,
+        control: state.get(4).unwrap_or(0) != 0,
+        alt: state.get(5).unwrap_or(0) != 0,
+        logo: state.get(3).unwrap_or(0) != 0,
+        caps_lock: state.get(2).unwrap_or(0) != 0,
+        num_lock: state.get(6).unwrap_or(0) != 0,
+    }
+}
+
+fn pointer_button(button: u16) -> Option<PointerButton> {
+    Some(match button {
+        1 => PointerButton::Primary,
+        2 => PointerButton::Secondary,
+        3 => PointerButton::Middle,
+        other => PointerButton::Other(other),
+    })
+}
+
 fn handle_input_event(
     context: &mut KernelContext,
     state: &mut TaskState,
@@ -1295,23 +1409,43 @@ fn handle_input_event(
     match device_event.event {
         InputEvent::Key { usage, pressed, .. } => {
             if matches!(usage, 0xe1 | 0xe5) {
-                let bit = if usage == 0xe1 { 1 } else { 2 };
-                let shifts = state.get(1).unwrap_or(0);
-                state.set(1, if pressed { shifts | bit } else { shifts & !bit });
+                update_modifier_bits(state, 1, usage == 0xe1, pressed);
+            } else if matches!(usage, 0xe0 | 0xe4) {
+                update_modifier_bits(state, 4, usage == 0xe0, pressed);
+            } else if matches!(usage, 0xe2 | 0xe6) {
+                update_modifier_bits(state, 5, usage == 0xe2, pressed);
             } else if matches!(usage, 0xe3 | 0xe7) {
-                let bit = if usage == 0xe3 { 1 } else { 2 };
-                let logos = state.get(3).unwrap_or(0);
-                state.set(3, if pressed { logos | bit } else { logos & !bit });
+                update_modifier_bits(state, 3, usage == 0xe3, pressed);
             } else if usage == 0x39 && pressed {
                 state.set(2, state.get(2).unwrap_or(0) ^ 1);
-            } else if pressed && usage == 0x11 && state.get(3).unwrap_or(0) != 0 {
+            } else if usage == 0x53 && pressed {
+                state.set(6, state.get(6).unwrap_or(0) ^ 1);
+            }
+
+            let logo = state.get(3).unwrap_or(0) != 0;
+            if pressed && usage == 0x11 && logo {
                 request_launcher_toggle(context);
-            } else if pressed && context.ui.launcher_visible {
-                let shift = state.get(1).unwrap_or(0) != 0;
-                let caps_lock = state.get(2).unwrap_or(0) != 0;
-                if let Some(byte) = keyboard_ascii(usage, shift, caps_lock) {
-                    text_dirty = context.ui.push_byte(byte);
+            } else if context.ui.launcher_visible {
+                if pressed && usage == 0x28 && context.ui.catalog.len != 0 {
+                    context.launch_requested = Some(0);
+                } else if pressed {
+                    let modifiers = current_modifiers(state);
+                    if let Some(byte) = keyboard_ascii(usage, modifiers.shift, modifiers.caps_lock)
+                    {
+                        text_dirty = context.ui.push_byte(byte);
+                    }
                 }
+            } else if let Some(desktop) = context.desktop.as_mut() {
+                let _ = desktop.send_keyboard_input(KeyboardEvent {
+                    usage,
+                    state: if pressed {
+                        ButtonState::Pressed
+                    } else {
+                        ButtonState::Released
+                    },
+                    repeat: false,
+                    modifiers: current_modifiers(state),
+                });
             }
         }
         InputEvent::Axis {
@@ -1320,12 +1454,53 @@ fn handle_input_event(
             relative,
             ..
         } if application == Some(ApplicationKind::Mouse) => {
-            let _ = context.ui.move_mouse(axis, value, relative);
+            if axis == Axis::Wheel {
+                if !context.ui.launcher_visible {
+                    if let Some(desktop) = context.desktop.as_mut() {
+                        let _ = desktop.send_pointer_input(
+                            WindowPoint::new(context.ui.mouse_x as i32, context.ui.mouse_y as i32),
+                            PointerEventKind::Scrolled {
+                                delta: WindowPoint::new(0, value),
+                            },
+                        );
+                    }
+                }
+            } else if context.ui.move_mouse(axis, value, relative) && !context.ui.launcher_visible {
+                if let Some(desktop) = context.desktop.as_mut() {
+                    let _ = desktop.send_pointer_input(
+                        WindowPoint::new(context.ui.mouse_x as i32, context.ui.mouse_y as i32),
+                        PointerEventKind::Moved,
+                    );
+                }
+            }
         }
         InputEvent::Button {
-            button: 1, pressed, ..
+            button, pressed, ..
         } if application == Some(ApplicationKind::Mouse) => {
-            let _ = context.ui.set_mouse_button(pressed);
+            if button == 1 {
+                let _ = context.ui.set_mouse_button(pressed);
+            }
+            if context.ui.launcher_visible {
+                if button == 1 && pressed {
+                    context.launch_requested = context
+                        .ui
+                        .launcher_program_at(context.ui.mouse_x, context.ui.mouse_y);
+                }
+            } else if let Some(pointer_button) = pointer_button(button) {
+                if let Some(desktop) = context.desktop.as_mut() {
+                    let _ = desktop.send_pointer_input(
+                        WindowPoint::new(context.ui.mouse_x as i32, context.ui.mouse_y as i32),
+                        PointerEventKind::Button {
+                            button: pointer_button,
+                            state: if pressed {
+                                ButtonState::Pressed
+                            } else {
+                                ButtonState::Released
+                            },
+                        },
+                    );
+                }
+            }
         }
         _ => {}
     }

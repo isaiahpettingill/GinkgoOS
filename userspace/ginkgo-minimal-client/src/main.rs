@@ -5,18 +5,15 @@ extern crate alloc;
 
 use alloc::{string::String, vec::Vec};
 
+use ginkgo_graphics::Rgb;
 use ginkgo_userspace::{
-    debug_write,
-    process_yield,
-    window::{
-        ButtonState, ClientError, Event, WindowClient, WindowOptions,
-    },
+    debug_write, process_yield,
+    window::{ButtonState, ClientError, Event, WindowClient, WindowOptions},
     Handle, Status, WindowTransport, WindowTransportError,
 };
 
 const F11_USAGE: u16 = 0x44;
-const INITIAL_FRAMES: usize = 2;
-const RELEASE_LIFECYCLE_FRAMES: usize = 4;
+const INITIAL_FRAMES: usize = 1;
 const MAX_EVENTS_PER_TURN: usize = 32;
 
 ginkgo_runtime::entry!(process_main);
@@ -53,11 +50,7 @@ extern "C" fn process_main(channel_raw: u64, _arg1: u64, _arg2: u64) -> ! {
                 Event::Configured { .. } => {
                     pending_frames = pending_frames.max(INITIAL_FRAMES);
                 }
-                Event::BufferReleased { .. } => {
-                    if submitted_frames < RELEASE_LIFECYCLE_FRAMES {
-                        pending_frames = pending_frames.saturating_add(1);
-                    }
-                }
+                Event::BufferReleased { .. } => {}
                 Event::Keyboard { event, .. }
                     if event.usage == F11_USAGE
                         && event.state == ButtonState::Pressed
@@ -97,8 +90,8 @@ extern "C" fn process_main(channel_raw: u64, _arg1: u64, _arg2: u64) -> ! {
             }
         }
 
-        if submitted_frames >= RELEASE_LIFECYCLE_FRAMES && !lifecycle_reported {
-            let _ = debug_write(b"minimal-client: frame lifecycle complete\n");
+        if submitted_frames >= INITIAL_FRAMES && !lifecycle_reported {
+            let _ = debug_write(b"minimal-client: initial frame submitted\n");
             lifecycle_reported = true;
         }
         let _ = process_yield();
@@ -141,7 +134,7 @@ enum SubmitResult {
     Fatal,
 }
 
-fn submit_frame(client: &mut WindowClient<WindowTransport>, phase: usize) -> SubmitResult {
+fn submit_frame(client: &mut WindowClient<WindowTransport>, _phase: usize) -> SubmitResult {
     let mut frame = match client.acquire_frame() {
         Ok(Some(frame)) => frame,
         Ok(None) => return SubmitResult::RetryLater,
@@ -153,20 +146,17 @@ fn submit_frame(client: &mut WindowClient<WindowTransport>, phase: usize) -> Sub
     };
     let width = surface.width();
     let height = surface.height();
-    for y in 0..height {
-        for x in 0..width {
-            let checker = ((x / 24) + (y / 24) + phase) & 1;
-            let diagonal = ((x + y + phase * 13) % 97) < 4;
-            let color = if diagonal {
-                0x00f4_d35e
-            } else if checker == 0 {
-                0x001d_3557
-            } else {
-                0x0045_7b9d
-            };
-            surface.write_raw_pixel(x, y, color);
-        }
-    }
+    surface.as_bytes_mut().fill(18);
+    let text_width = 176;
+    let text_height = 24;
+    let text_y = height.saturating_sub(text_height) / 2;
+    surface.draw_text(
+        width.saturating_sub(text_width) / 2,
+        text_y.saturating_sub(48),
+        3,
+        "Hello World",
+        Rgb::new(110, 231, 183),
+    );
 
     match frame.present(Vec::new()) {
         Ok(_) => SubmitResult::Submitted,

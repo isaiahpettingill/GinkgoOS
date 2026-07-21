@@ -5,6 +5,10 @@ BUILD_DIR := build
 ISO_ROOT := $(BUILD_DIR)/iso_root
 NO_ISO_ROOT := $(BUILD_DIR)/no_iso_root
 KERNEL := target/x86_64-unknown-none/debug/ginkgo-os
+USERSPACE_MANIFEST := userspace/Cargo.toml
+USERSPACE_TARGET := userspace/target/x86_64-unknown-none/release
+DESKTOP_ELF := $(USERSPACE_TARGET)/ginkgo-desktop-service
+MINIMAL_CLIENT_ELF := $(USERSPACE_TARGET)/ginkgo-minimal-client
 ISO := $(BUILD_DIR)/$(IMAGE_NAME).iso
 
 LIMINE_VERSION ?= v12.5.1
@@ -27,12 +31,15 @@ QEMU ?= qemu-system-x86_64
 endif
 QEMU_FLAGS ?= -m 512M -M q35,i8042=off -serial stdio -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 -no-reboot -no-shutdown
 
-.PHONY: all kernel iso qemu no-iso run check clean distclean
+.PHONY: all userspace kernel iso qemu no-iso run check clean distclean
 
 all: iso
 
-kernel:
-	cargo build -p ginkgo-kernel --bin ginkgo-os
+userspace:
+	cargo build --manifest-path $(USERSPACE_MANIFEST) --release --target x86_64-unknown-none -p ginkgo-desktop-service -p ginkgo-minimal-client
+
+kernel: userspace
+	GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" cargo build -p ginkgo-kernel --bin ginkgo-os
 
 $(LIMINE_DIR)/BOOTX64.EFI:
 	mkdir -p $(BUILD_DIR)
@@ -81,8 +88,8 @@ run: $(OVMF_CODE) $(ISO)
 		-drive if=pflash,unit=0,format=raw,file=$(OVMF_CODE),readonly=on \
 		-cdrom $(ISO) -boot d
 
-check:
-	cargo check -p ginkgo-kernel --bin ginkgo-os
+check: userspace
+	GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" cargo check -p ginkgo-kernel --bin ginkgo-os
 
 clean:
 	cargo clean

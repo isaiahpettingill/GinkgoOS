@@ -11,6 +11,7 @@ name = "ginkgo-minimal-client"
 path = "src/main.rs"
 
 [dependencies]
+ginkgo-graphics.workspace = true
 ginkgo-runtime.workspace = true
 ginkgo-userspace.workspace = true
 ginkgo-window.workspace = true

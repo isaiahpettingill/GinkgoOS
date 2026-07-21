@@ -3,7 +3,7 @@
 use spinning_top::RawSpinlock;
 use talc::{source::Claim, TalcLock};
 
-pub const HEAP_SIZE: usize = 4 * 1024 * 1024;
+pub const HEAP_SIZE: usize = 32 * 1024 * 1024;
 
 #[global_allocator]
 static ALLOCATOR: TalcLock<RawSpinlock, Claim> = TalcLock::new(unsafe {

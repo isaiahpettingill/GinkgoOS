@@ -11,3 +11,5 @@ path = "src/lib.rs"
 [dependencies]
 ginkgo-scroll-layout.workspace = true
 ginkgo-window.workspace = true
+postcard.workspace = true
+serde.workspace = true

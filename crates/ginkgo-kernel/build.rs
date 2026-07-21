@@ -38,6 +38,8 @@ fn main() {
     let linker = manifest.join("linker.ld");
     println!("cargo:rerun-if-changed={}", linker.display());
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=GINKGO_DESKTOP_ELF");
+    println!("cargo:rerun-if-env-changed=GINKGO_MINIMAL_CLIENT_ELF");
     println!("cargo:rustc-link-arg-bin=ginkgo-os=-T{}", linker.display());
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("build output directory"));
@@ -46,10 +48,26 @@ fn main() {
         build_userspace_smoke_elf(),
     )
     .expect("write ginkgo userspace smoke ELF");
-    fs::write(out_dir.join("ginkgo-desktop.elf"), build_desktop_elf())
-        .expect("write ginkgo desktop ELF");
+    let desktop = read_userspace_artifact("GINKGO_DESKTOP_ELF").unwrap_or_else(build_desktop_elf);
+    let minimal_client = read_userspace_artifact("GINKGO_MINIMAL_CLIENT_ELF")
+        .unwrap_or_else(build_userspace_smoke_elf);
+    fs::write(out_dir.join("ginkgo-desktop.elf"), desktop).expect("write ginkgo desktop ELF");
+    fs::write(out_dir.join("ginkgo-minimal-client.elf"), minimal_client)
+        .expect("write Ginkgo minimal client ELF");
     fs::write(out_dir.join("programs.gkr"), build_program_registry())
         .expect("write Ginkgo program registry");
+}
+
+fn read_userspace_artifact(variable: &str) -> Option<Vec<u8>> {
+    let path = PathBuf::from(env::var_os(variable)?);
+    println!("cargo:rerun-if-changed={}", path.display());
+    Some(fs::read(&path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read {} from {}: {error}",
+            variable,
+            path.display()
+        )
+    }))
 }
 
 struct Fixup {
@@ -438,12 +456,20 @@ fn validate_userspace_elf(elf: &[u8]) {
 }
 
 fn build_program_registry() -> Vec<u8> {
-    let registry = encode(&[EncodeEntry {
-        app_id: "desktop",
-        display_name: "Ginkgo Desktop",
-        executable_path: "/desktop.elf",
-        flags: EntryFlags::HIDDEN,
-    }])
+    let registry = encode(&[
+        EncodeEntry {
+            app_id: "desktop",
+            display_name: "Ginkgo Desktop",
+            executable_path: "/desktop.elf",
+            flags: EntryFlags::HIDDEN,
+        },
+        EncodeEntry {
+            app_id: "minimal-client",
+            display_name: "Ginkgo Demo",
+            executable_path: "/minimal-client.elf",
+            flags: EntryFlags::EMPTY,
+        },
+    ])
     .expect("desktop registry metadata is valid");
     let parsed = Registry::parse(&registry).expect("generated program registry is valid");
     let desktop = parsed

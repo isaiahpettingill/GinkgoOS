@@ -4,6 +4,7 @@ extern crate alloc;
 
 pub mod arch;
 pub mod compositor;
+pub mod desktop_runtime;
 pub mod elf;
 pub mod input;
 pub mod io;

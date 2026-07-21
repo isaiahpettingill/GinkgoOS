@@ -601,6 +601,70 @@ impl<'a> FramebufferWriter<'a> {
         }
     }
 
+    /// Publishes a complete tightly packed XRGB8888 scene to the framebuffer.
+    ///
+    /// Standard 32-bit RGB framebuffers use paired volatile stores. Other RGB
+    /// layouts fall back to mask-aware pixel conversion. The framebuffer is not
+    /// accessed when `pixels` does not contain the complete scene.
+    pub fn write_xrgb8888_scene(&mut self, pixels: &[SurfacePixel]) -> bool {
+        let Some(required) = self.width().checked_mul(self.height()) else {
+            return false;
+        };
+        if pixels.len() < required {
+            return false;
+        }
+
+        let native_xrgb = self.framebuffer.bits_per_pixel == 32
+            && self.framebuffer.red_mask_size == 8
+            && self.framebuffer.red_mask_shift == 16
+            && self.framebuffer.green_mask_size == 8
+            && self.framebuffer.green_mask_shift == 8
+            && self.framebuffer.blue_mask_size == 8
+            && self.framebuffer.blue_mask_shift == 0;
+        if !native_xrgb {
+            for (index, pixel) in pixels[..required].iter().copied().enumerate() {
+                let x = index % self.width();
+                let y = index / self.width();
+                if !self.write_rgb_pixel(x, y, Rgb::new(pixel.red, pixel.green, pixel.blue)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        let pitch = self.framebuffer.pitch as usize;
+        let width = self.width();
+        for y in 0..self.height() {
+            let source = &pixels[y * width..(y + 1) * width];
+            let destination = unsafe { self.framebuffer.address.add(y * pitch) };
+            let mut x = 0;
+            while x < width
+                && (unsafe { destination.add(x * 4) } as usize) % core::mem::align_of::<u128>() != 0
+            {
+                let output = unsafe { destination.add(x * 4) }.cast::<u32>();
+                unsafe { ptr::write_volatile(output, source[x].raw()) };
+                x += 1;
+            }
+            while x + 3 < width {
+                let pixels = unsafe { ptr::read_unaligned(source.as_ptr().add(x).cast::<u128>()) };
+                let output = unsafe { destination.add(x * 4) }.cast::<u128>();
+                unsafe { ptr::write_volatile(output, pixels) };
+                x += 4;
+            }
+            while x + 1 < width {
+                let pair = unsafe { ptr::read_unaligned(source.as_ptr().add(x).cast::<u64>()) };
+                let output = unsafe { destination.add(x * 4) }.cast::<u64>();
+                unsafe { ptr::write_volatile(output, pair) };
+                x += 2;
+            }
+            if x < width {
+                let output = unsafe { destination.add(x * 4) }.cast::<u32>();
+                unsafe { ptr::write_volatile(output, source[x].raw()) };
+            }
+        }
+        true
+    }
+
     fn put_pixel(&mut self, x: usize, y: usize, color: Rgb) {
         self.write_raw_pixel(x, y, self.pack_color(color));
     }
@@ -971,6 +1035,22 @@ mod tests {
         assert_eq!(writer.read_raw_pixel(0, 0), Some(0x0012_3456));
         drop(writer);
         assert_eq!(&bytes[..4], &[0x56, 0x34, 0x12, 0x00]);
+    }
+
+    #[test]
+    fn publishes_complete_xrgb_scene_with_paired_writes() {
+        let mut bytes = [0xAA_u8; 8];
+        let mut writer = unsafe { FramebufferWriter::from_raw(rgb_config(bytes.as_mut_ptr())) }
+            .expect("valid framebuffer");
+        let scene = [
+            SurfacePixel::xrgb(0x12, 0x34, 0x56),
+            SurfacePixel::xrgb(0x78, 0x9A, 0xBC),
+        ];
+
+        assert!(!writer.write_xrgb8888_scene(&scene[..1]));
+        assert_eq!(bytes, [0xAA; 8]);
+        assert!(writer.write_xrgb8888_scene(&scene));
+        assert_eq!(bytes, [0x56, 0x34, 0x12, 0, 0xBC, 0x9A, 0x78, 0]);
     }
 
     #[test]

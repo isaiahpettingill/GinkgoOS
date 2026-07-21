@@ -10,7 +10,6 @@ path = "src/lib.rs"
 
 [dependencies]
 ginkgo-graphics.workspace = true
-serde.workspace = true
-
-[dev-dependencies]
+ginkgo-ipc = { workspace = true, default-features = false }
 postcard.workspace = true
+serde.workspace = true

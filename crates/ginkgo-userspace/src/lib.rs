@@ -10,12 +10,17 @@
 #[cfg(not(target_arch = "x86_64"))]
 compile_error!("ginkgo-userspace supports only the x86_64 GinkgoOS syscall ABI");
 
+extern crate alloc;
+
+mod window_transport;
+
 use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 
 pub use ginkgo_ipc::{decode_structured, encode_structured, StructuredMessageError};
 pub use ginkgo_sysapi::*;
 pub use ginkgo_window as window;
+pub use window_transport::*;
 
 /// Result type used by ergonomic syscall wrappers.
 pub type SyscallResult<T> = Result<T, Status>;

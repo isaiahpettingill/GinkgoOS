@@ -10,18 +10,24 @@
 
 extern crate alloc;
 
+mod runtime;
+
+pub use runtime::*;
+
 use alloc::vec::Vec;
 use core::cmp::min;
 
 use ginkgo_scroll_layout::{
-    Direction, Insets, Layout, LayoutError, Proportion, Rect as LayoutRect, Size as LayoutSize,
+    Direction, Layout, LayoutError, Proportion, Rect as LayoutRect, Size as LayoutSize,
     WindowId as LayoutWindowId,
 };
+pub use ginkgo_scroll_layout::{HorizontalAlignment, Insets};
 use ginkgo_window::{
     BufferId, Generation, KeyboardEvent, PixelFormat, Point, PointerEvent, PointerEventKind, Rect,
     RequestId, ScaleFactor, ServerErrorCode, Size, SurfaceConfiguration, WindowId, WindowOptions,
     WireRequest, MIN_BUFFER_SLOTS, PROTOCOL_VERSION,
 };
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Identity assigned by the runtime to one protocol connection or client.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -41,6 +47,25 @@ impl ClientId {
     }
 }
 
+impl Serialize for ClientId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u64::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| serde::de::Error::custom("client ID must be non-zero"))
+    }
+}
+
 /// Desktop-controlled surface and scrolling policy.
 ///
 /// The defaults use fractional 3/2 scaling, fixed `Xrgb8888` surfaces, two
@@ -52,6 +77,7 @@ pub struct DesktopPolicy {
     pub buffer_count: u8,
     pub default_width: Proportion,
     pub decorations: Insets,
+    pub window_margins: Insets,
 }
 
 impl Default for DesktopPolicy {
@@ -62,6 +88,7 @@ impl Default for DesktopPolicy {
             buffer_count: MIN_BUFFER_SLOTS,
             default_width: Proportion::new(600).expect("600 per-mille is non-zero"),
             decorations: Insets::new(4, 24, 4, 4),
+            window_margins: Insets::ZERO,
         }
     }
 }
@@ -116,7 +143,8 @@ pub enum DesktopAction {
     },
     DestroyWindow {
         client_id: ClientId,
-        request_id: RequestId,
+        /// Present for an explicit client request and absent for disconnect cleanup.
+        request_id: Option<RequestId>,
         window_id: WindowId,
     },
     RequestFailed {
@@ -165,6 +193,49 @@ impl From<LayoutError> for DesktopError {
     fn from(error: LayoutError) -> Self {
         Self::Layout(error)
     }
+}
+
+/// Privileged policy operations accepted only from the desktop runtime.
+///
+/// Keeping these commands separate from [`WireRequest`] makes it explicit that
+/// clients cannot focus, move, resize policy columns, inject input, or retire
+/// another client's state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TrustedCommand {
+    DisconnectClient {
+        client_id: ClientId,
+    },
+    FocusWindow {
+        window_id: WindowId,
+    },
+    FocusLeft,
+    FocusRight,
+    MoveFocusedLeft,
+    MoveFocusedRight,
+    SetWindowWidth {
+        window_id: WindowId,
+        width: Proportion,
+    },
+    AdjustFocusedWidth {
+        delta_per_mille: i32,
+    },
+    AlignFocused {
+        alignment: HorizontalAlignment,
+    },
+    OutputChanged {
+        output: Size,
+        scale: ScaleFactor,
+    },
+    SetDecorations {
+        decorations: Insets,
+    },
+    PointerInput {
+        position: Point,
+        kind: PointerEventKind,
+    },
+    KeyboardInput {
+        event: KeyboardEvent,
+    },
 }
 
 /// Stateful desktop request translator and scrolling policy core.
@@ -283,6 +354,65 @@ impl Desktop {
         }
     }
 
+    /// Executes one command from the trusted desktop runtime.
+    pub fn handle_trusted_command(
+        &mut self,
+        command: TrustedCommand,
+    ) -> Result<Vec<DesktopAction>, DesktopError> {
+        match command {
+            TrustedCommand::DisconnectClient { client_id } => self.disconnect_client(client_id),
+            TrustedCommand::FocusWindow { window_id } => self.focus_window(window_id),
+            TrustedCommand::FocusLeft => self.focus_left(),
+            TrustedCommand::FocusRight => self.focus_right(),
+            TrustedCommand::MoveFocusedLeft => self.move_focused_left(),
+            TrustedCommand::MoveFocusedRight => self.move_focused_right(),
+            TrustedCommand::SetWindowWidth { window_id, width } => {
+                self.set_window_width(window_id, width)
+            }
+            TrustedCommand::AdjustFocusedWidth { delta_per_mille } => {
+                self.adjust_focused_width(delta_per_mille)
+            }
+            TrustedCommand::AlignFocused { alignment } => self.align_focused(alignment),
+            TrustedCommand::OutputChanged { output, scale } => self.output_changed(output, scale),
+            TrustedCommand::SetDecorations { decorations } => self.set_decorations(decorations),
+            TrustedCommand::PointerInput { position, kind } => self.pointer_input(position, kind),
+            TrustedCommand::KeyboardInput { event } => Ok(self.keyboard_input(event)),
+        }
+    }
+
+    /// Removes every window owned by a disconnected client and reconciles the
+    /// remaining focus, configurations, and compositor placements.
+    ///
+    /// An unknown or already-disconnected client is an idempotent no-op.
+    pub fn disconnect_client(
+        &mut self,
+        client_id: ClientId,
+    ) -> Result<Vec<DesktopAction>, DesktopError> {
+        let removed: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter(|window| window.owner == client_id)
+            .map(|window| window.id)
+            .collect();
+        if removed.is_empty() {
+            return Ok(Vec::new());
+        }
+        for window_id in &removed {
+            self.layout.remove(to_layout_window_id(*window_id))?;
+        }
+        self.windows.retain(|window| window.owner != client_id);
+        let mut actions = removed
+            .into_iter()
+            .map(|window_id| DesktopAction::DestroyWindow {
+                client_id,
+                request_id: None,
+                window_id,
+            })
+            .collect();
+        self.append_reconcile(&mut actions, None)?;
+        Ok(actions)
+    }
+
     pub fn focus_window(
         &mut self,
         window_id: WindowId,
@@ -315,6 +445,28 @@ impl Desktop {
         self.layout
             .set_width(to_layout_window_id(window_id), width)?;
         self.reconcile(Some(window_id))
+    }
+
+    pub fn adjust_focused_width(
+        &mut self,
+        delta_per_mille: i32,
+    ) -> Result<Vec<DesktopAction>, DesktopError> {
+        let Some(window_id) = self.focused_window() else {
+            return Ok(Vec::new());
+        };
+        self.layout
+            .adjust_width(to_layout_window_id(window_id), delta_per_mille)?;
+        self.reconcile(Some(window_id))
+    }
+
+    pub fn align_focused(
+        &mut self,
+        alignment: HorizontalAlignment,
+    ) -> Result<Vec<DesktopAction>, DesktopError> {
+        if !self.layout.align_focused(alignment) {
+            return Ok(Vec::new());
+        }
+        self.reconcile(None)
     }
 
     /// Applies a hotplug/mode/scale change and configures affected clients.
@@ -475,7 +627,7 @@ impl Desktop {
         self.windows.remove(index);
         let mut actions = alloc::vec![DesktopAction::DestroyWindow {
             client_id,
-            request_id,
+            request_id: Some(request_id),
             window_id,
         }];
         if self.append_reconcile(&mut actions, None).is_err() {
@@ -709,6 +861,8 @@ impl Desktop {
     }
 
     fn effective_placements(&self) -> Vec<WindowPlacement> {
+        let output = self.layout.output_size();
+        let output_rect = LayoutRect::new(0, 0, output.width, output.height);
         self.layout
             .placements()
             .into_iter()
@@ -717,10 +871,15 @@ impl Desktop {
                 let window = self.window(window_id)?;
                 let fullscreen = self.fullscreen_window() == Some(window_id);
                 let decorated = window.options.decorations && !fullscreen;
-                let base_client = if decorated {
-                    placement.client
-                } else {
+                let outer = if fullscreen {
                     placement.outer
+                } else {
+                    placement.outer.inset(self.policy.window_margins)
+                };
+                let base_client = if decorated {
+                    outer.inset(self.policy.decorations)
+                } else {
+                    outer
                 };
                 let client_size = constrain_client_size(
                     LayoutSize::new(base_client.width, base_client.height),
@@ -735,9 +894,9 @@ impl Desktop {
                 );
                 Some(WindowPlacement {
                     window_id,
-                    outer: placement.outer,
+                    outer,
                     client,
-                    visible: placement.visible,
+                    visible: outer.intersection(output_rect),
                     focused: placement.focused,
                     decorated,
                 })
@@ -1133,6 +1292,32 @@ mod tests {
     }
 
     #[test]
+    fn normal_windows_apply_policy_margins_but_fullscreen_remains_edge_to_edge() {
+        let mut policy = DesktopPolicy::default();
+        policy.window_margins = Insets::new(12, 12, 12, 12);
+        let mut desktop = Desktop::with_policy(Size::new(1000, 600), policy).unwrap();
+        let (window, _) = create(&mut desktop, client(1), 1, options("margined"));
+
+        let placement = desktop.placements()[0];
+        assert_eq!(placement.outer, LayoutRect::new(12, 12, 576, 576));
+        assert_eq!(placement.client, LayoutRect::new(16, 36, 568, 548));
+        assert_eq!(placement.visible, Some(placement.outer));
+
+        desktop.handle_request(
+            client(1),
+            WireRequest::SetFullscreen {
+                request_id: request(2),
+                window_id: window,
+                fullscreen: true,
+            },
+        );
+        let fullscreen = desktop.placements()[0];
+        assert_eq!(fullscreen.outer, LayoutRect::new(0, 0, 1000, 600));
+        assert_eq!(fullscreen.client, fullscreen.outer);
+        assert!(!fullscreen.decorated);
+    }
+
+    #[test]
     fn ownership_is_enforced_without_leaking_other_clients_windows() {
         let mut desktop = Desktop::new(Size::new(1000, 600)).unwrap();
         let (window, initial) = create(&mut desktop, client(1), 1, options("owned"));
@@ -1319,11 +1504,108 @@ mod tests {
         );
         assert!(matches!(
             destroyed.first(),
-            Some(DesktopAction::DestroyWindow { client_id, window_id, .. })
-                if *client_id == client(11) && *window_id == first
+            Some(DesktopAction::DestroyWindow {
+                client_id,
+                request_id: Some(request_id),
+                window_id,
+            }) if *client_id == client(11) && *request_id == request(2) && *window_id == first
         ));
         assert!(desktop.window(first).is_none());
         assert!(desktop.window(second).is_some());
+    }
+
+    #[test]
+    fn disconnect_client_removes_all_owned_windows_and_reconciles_remaining_state() {
+        let mut desktop = Desktop::new(Size::new(1000, 600)).unwrap();
+        let (first, _) = create(&mut desktop, client(1), 1, options("first"));
+        let (remaining, _) = create(&mut desktop, client(2), 2, options("remaining"));
+        let (third, _) = create(&mut desktop, client(1), 3, options("third"));
+        desktop.focus_window(third).unwrap();
+
+        let actions = desktop.disconnect_client(client(1)).unwrap();
+
+        assert!(desktop.window(first).is_none());
+        assert!(desktop.window(third).is_none());
+        assert_eq!(desktop.windows().len(), 1);
+        assert_eq!(desktop.window(remaining).unwrap().owner, client(2));
+        assert_eq!(desktop.focused_window(), Some(remaining));
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    DesktopAction::DestroyWindow {
+                        client_id,
+                        request_id: None,
+                        ..
+                    } if *client_id == client(1)
+                ))
+                .count(),
+            2
+        );
+        assert!(actions.iter().all(|action| !matches!(
+            action,
+            DesktopAction::Configure { client_id, .. }
+                | DesktopAction::FocusChanged { client_id, .. }
+                | DesktopAction::ForwardPointer { client_id, .. }
+                | DesktopAction::ForwardKeyboard { client_id, .. }
+                if *client_id == client(1)
+        )));
+        assert!(matches!(
+            actions.last(),
+            Some(DesktopAction::SetPlacements { placements })
+                if placements.len() == 1 && placements[0].window_id == remaining
+        ));
+        assert!(desktop.disconnect_client(client(1)).unwrap().is_empty());
+        assert!(desktop.disconnect_client(client(99)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn trusted_command_wrapper_routes_policy_operations_without_client_requests() {
+        let mut desktop = Desktop::new(Size::new(1000, 600)).unwrap();
+        let (first, _) = create(&mut desktop, client(1), 1, options("first"));
+        let (second, _) = create(&mut desktop, client(2), 2, options("second"));
+
+        desktop
+            .handle_trusted_command(TrustedCommand::FocusWindow { window_id: first })
+            .unwrap();
+        assert_eq!(desktop.focused_window(), Some(first));
+        desktop
+            .handle_trusted_command(TrustedCommand::MoveFocusedRight)
+            .unwrap();
+        assert_eq!(desktop.placements()[1].window_id, first);
+        desktop
+            .handle_trusted_command(TrustedCommand::SetWindowWidth {
+                window_id: first,
+                width: Proportion::new(500).unwrap(),
+            })
+            .unwrap();
+        assert_eq!(
+            desktop
+                .placements()
+                .into_iter()
+                .find(|placement| placement.window_id == first)
+                .unwrap()
+                .outer
+                .width,
+            500
+        );
+
+        desktop
+            .handle_trusted_command(TrustedCommand::DisconnectClient {
+                client_id: client(1),
+            })
+            .unwrap();
+        assert!(desktop.window(first).is_none());
+        assert!(desktop.window(second).is_some());
+    }
+
+    #[test]
+    fn client_id_postcard_decode_rejects_zero() {
+        let zero = postcard::to_allocvec(&0_u64).unwrap();
+        assert!(postcard::from_bytes::<ClientId>(&zero).is_err());
+        let encoded = postcard::to_allocvec(&client(7)).unwrap();
+        assert_eq!(postcard::from_bytes::<ClientId>(&encoded), Ok(client(7)));
     }
 
     #[test]

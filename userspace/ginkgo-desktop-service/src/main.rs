@@ -7,8 +7,9 @@ use alloc::{collections::VecDeque, vec::Vec};
 use core::mem::MaybeUninit;
 
 use ginkgo_desktop::{
-    ClientId, Desktop, DesktopAction, PresentationResult, RuntimeMessage, RuntimePacket,
-    RuntimePlacement, RuntimeSender, TrustedCommand, MAX_RUNTIME_PLACEMENTS,
+    ClientId, Desktop, DesktopAction, DesktopPolicy, HorizontalAlignment, Insets,
+    PresentationResult, RuntimeMessage, RuntimePacket, RuntimePlacement, RuntimeSender,
+    TrustedCommand, MAX_RUNTIME_PLACEMENTS,
 };
 use ginkgo_userspace::{
     channel_read, channel_write, debug_write, handle_close, process_yield, Handle,
@@ -16,7 +17,7 @@ use ginkgo_userspace::{
     CHANNEL_MAX_HANDLES,
 };
 use ginkgo_window::{
-    decode_request, encode_event, Configured, ServerErrorCode, WireEvent, WireRequest,
+    decode_request, encode_event, Configured, ScaleFactor, ServerErrorCode, WireEvent, WireRequest,
     PROTOCOL_VERSION,
 };
 
@@ -55,10 +56,49 @@ extern "C" fn process_main(bootstrap_raw: u64, width: u64, height: u64) -> ! {
         Err(_) => fail(b"desktop-service: initialization failed\n", 1),
     };
     let _ = debug_write(b"desktop-service: runtime online\n");
-    if service.run().is_err() {
-        fail(b"desktop-service: fatal runtime error\n", 2);
+    if let Err(error) = service.run() {
+        let message = match error {
+            ServiceError::InvalidBootstrap => b"desktop-service: invalid bootstrap\n".as_slice(),
+            ServiceError::InvalidMessage => b"desktop-service: invalid message\n".as_slice(),
+            ServiceError::Capacity => b"desktop-service: capacity exhausted\n".as_slice(),
+            ServiceError::Codec => b"desktop-service: codec failure\n".as_slice(),
+            ServiceError::Desktop => b"desktop-service: policy failure\n".as_slice(),
+            ServiceError::Syscall(Status::ShouldWait) => {
+                b"desktop-service: leaked should-wait\n".as_slice()
+            }
+            ServiceError::Syscall(_) => b"desktop-service: syscall failure\n".as_slice(),
+        };
+        fail(message, 2);
     }
     ginkgo_runtime::exit(0)
+}
+
+fn desktop_hotkey(event: ginkgo_window::KeyboardEvent) -> Option<TrustedCommand> {
+    if !event.modifiers.logo || event.state != ginkgo_window::ButtonState::Pressed || event.repeat {
+        return None;
+    }
+    Some(match event.usage {
+        0x50 => TrustedCommand::FocusLeft,
+        0x4f => TrustedCommand::FocusRight,
+        0x04 => TrustedCommand::MoveFocusedLeft,
+        0x16 => TrustedCommand::MoveFocusedRight,
+        0x2e => TrustedCommand::AdjustFocusedWidth {
+            delta_per_mille: 50,
+        },
+        0x2d => TrustedCommand::AdjustFocusedWidth {
+            delta_per_mille: -50,
+        },
+        0x0f => TrustedCommand::AlignFocused {
+            alignment: HorizontalAlignment::Left,
+        },
+        0x06 => TrustedCommand::AlignFocused {
+            alignment: HorizontalAlignment::Center,
+        },
+        0x15 => TrustedCommand::AlignFocused {
+            alignment: HorizontalAlignment::Right,
+        },
+        _ => return None,
+    })
 }
 
 fn fail(message: &[u8], code: i32) -> ! {
@@ -175,8 +215,11 @@ impl Service {
         if output.is_empty() {
             return Err(ServiceError::InvalidBootstrap);
         }
+        let mut policy = DesktopPolicy::default();
+        policy.scale = ScaleFactor::new(1, 1).map_err(|_| ServiceError::Desktop)?;
+        policy.window_margins = Insets::new(12, 12, 12, 12);
         Ok(Self {
-            desktop: Desktop::new(output).map_err(|_| ServiceError::Desktop)?,
+            desktop: Desktop::with_policy(output, policy).map_err(|_| ServiceError::Desktop)?,
             broker: OwnedHandle::new(bootstrap)?,
             clients: Vec::new(),
             broker_outbound: VecDeque::new(),
@@ -228,7 +271,8 @@ impl Service {
                 if self.clients.len() >= MAX_CLIENTS || self.client_index(client_id).is_some() {
                     return Err(ServiceError::Capacity);
                 }
-                let attachment = take_attachment(&mut incoming.attachments, channel_attachment.get())?;
+                let attachment =
+                    take_attachment(&mut incoming.attachments, channel_attachment.get())?;
                 attachment.validate(ObjectType::Channel, CLIENT_CHANNEL_RIGHTS)?;
                 self.clients
                     .push(ClientConnection::new(client_id, attachment.handle));
@@ -257,13 +301,13 @@ impl Service {
             RuntimeMessage::PresentResult {
                 client_id,
                 request_id,
-                window_id,
-                generation,
+                window_id: _,
+                generation: _,
                 buffer_id: _,
                 result,
             } => {
-                if !self.matches_window(client_id, window_id, generation) {
-                    return Err(ServiceError::InvalidMessage);
+                if self.client_index(client_id).is_none() {
+                    return Ok(());
                 }
                 if let PresentationResult::Rejected(code) = result {
                     self.queue_client_event(
@@ -279,8 +323,8 @@ impl Service {
                 buffer_id,
                 present_request_id,
             } => {
-                if !self.matches_window(client_id, window_id, generation) {
-                    return Err(ServiceError::InvalidMessage);
+                if self.client_index(client_id).is_none() {
+                    return Ok(());
                 }
                 self.queue_client_event(
                     client_id,
@@ -293,18 +337,24 @@ impl Service {
                 )?;
             }
             RuntimeMessage::PointerInput { position, kind } => {
-                let actions = self
-                    .desktop
-                    .handle_trusted_command(TrustedCommand::PointerInput { position, kind })
-                    .map_err(|_| ServiceError::Desktop)?;
-                self.execute_actions(actions)?;
+                if !self.launcher_visible {
+                    let actions = self
+                        .desktop
+                        .handle_trusted_command(TrustedCommand::PointerInput { position, kind })
+                        .map_err(|_| ServiceError::Desktop)?;
+                    self.execute_actions(actions)?;
+                }
             }
             RuntimeMessage::KeyboardInput { event } => {
-                let actions = self
-                    .desktop
-                    .handle_trusted_command(TrustedCommand::KeyboardInput { event })
-                    .map_err(|_| ServiceError::Desktop)?;
-                self.execute_actions(actions)?;
+                if !self.launcher_visible {
+                    let command =
+                        desktop_hotkey(event).unwrap_or(TrustedCommand::KeyboardInput { event });
+                    let actions = self
+                        .desktop
+                        .handle_trusted_command(command)
+                        .map_err(|_| ServiceError::Desktop)?;
+                    self.execute_actions(actions)?;
+                }
             }
             RuntimeMessage::ServiceReady { .. }
             | RuntimeMessage::LauncherVisibility { .. }
@@ -438,15 +488,10 @@ impl Service {
                     client_id,
                     request_id,
                     code,
-                } => self.queue_client_event(
-                    client_id,
-                    WireEvent::RequestFailed { request_id, code },
-                )?,
+                } => self
+                    .queue_client_event(client_id, WireEvent::RequestFailed { request_id, code })?,
                 DesktopAction::SetPlacements { placements } => {
-                    let placements = placements
-                        .into_iter()
-                        .map(RuntimePlacement::from)
-                        .collect();
+                    let placements = placements.into_iter().map(RuntimePlacement::from).collect();
                     self.queue_broker(RuntimeMessage::SetPlacements { placements })?;
                 }
                 DesktopAction::FocusChanged {
@@ -455,10 +500,7 @@ impl Service {
                     focused,
                 } => self.queue_client_event(
                     client_id,
-                    WireEvent::FocusChanged {
-                        window_id,
-                        focused,
-                    },
+                    WireEvent::FocusChanged { window_id, focused },
                 )?,
                 DesktopAction::Present {
                     client_id,
@@ -484,7 +526,9 @@ impl Service {
                     client_id,
                     window_id,
                     event,
-                } => self.queue_client_event(client_id, WireEvent::Keyboard { window_id, event })?,
+                } => {
+                    self.queue_client_event(client_id, WireEvent::Keyboard { window_id, event })?
+                }
             }
         }
         Ok(())
@@ -564,10 +608,8 @@ impl Service {
             let result = match outbound {
                 ClientOutbound::Event(bytes) => channel_write(channel, bytes, &[]),
                 ClientOutbound::Configured { bytes, surface } => {
-                    let disposition = HandleDisposition::move_handle(
-                        surface.get(),
-                        SURFACE_CLIENT_RIGHTS,
-                    );
+                    let disposition =
+                        HandleDisposition::move_handle(surface.get(), SURFACE_CLIENT_RIGHTS);
                     let result = channel_write(channel, bytes, &[disposition]);
                     if result.is_ok() {
                         surface.disarm();
@@ -586,22 +628,10 @@ impl Service {
         Ok(())
     }
 
-    fn matches_window(
-        &self,
-        client_id: ClientId,
-        window_id: ginkgo_window::WindowId,
-        generation: ginkgo_window::Generation,
-    ) -> bool {
-        self.desktop.window(window_id).is_some_and(|window| {
-            window.owner == client_id
-                && window
-                    .configuration
-                    .is_some_and(|configuration| configuration.generation == generation)
-        })
-    }
-
     fn client_index(&self, client_id: ClientId) -> Option<usize> {
-        self.clients.iter().position(|client| client.id == client_id)
+        self.clients
+            .iter()
+            .position(|client| client.id == client_id)
     }
 
     fn client_mut(&mut self, client_id: ClientId) -> Result<&mut ClientConnection, ServiceError> {

@@ -975,6 +975,7 @@ struct ProcessSlot<T> {
 
 struct GenerationalSlots<T> {
     slots: Vec<ProcessSlot<T>>,
+    next_slot: usize,
     len: usize,
 }
 
@@ -982,6 +983,7 @@ impl<T> GenerationalSlots<T> {
     const fn new() -> Self {
         Self {
             slots: Vec::new(),
+            next_slot: 0,
             len: 0,
         }
     }
@@ -1038,6 +1040,32 @@ impl<T> GenerationalSlots<T> {
         slot.generation = slot.generation.checked_add(1).unwrap_or(0);
         Some(value)
     }
+
+    fn next_id(&mut self) -> Option<ProcessId> {
+        if self.len == 0 {
+            return None;
+        }
+
+        let slot_count = self.slots.len();
+        debug_assert_ne!(slot_count, 0);
+        self.next_slot %= slot_count;
+        for _ in 0..slot_count {
+            let index = self.next_slot;
+            self.next_slot = if index + 1 == slot_count {
+                0
+            } else {
+                index + 1
+            };
+            let slot = &self.slots[index];
+            if slot.value.is_some() {
+                debug_assert_ne!(slot.generation, 0);
+                return Some(ProcessId::from_parts(index as u32, slot.generation));
+            }
+        }
+
+        debug_assert!(false, "live process count does not match occupied slots");
+        None
+    }
 }
 
 /// Generation-checked owner of all live processes.
@@ -1070,6 +1098,16 @@ impl ProcessTable {
 
     pub fn get_mut(&mut self, id: ProcessId) -> Option<&mut Process> {
         self.inner.get_mut(id)
+    }
+
+    /// Selects the next live process ID in deterministic round-robin slot order.
+    ///
+    /// Selection includes non-runnable processes so a permanent process-runner
+    /// task can observe and retire exited or faulted entries. Empty and retired
+    /// slots are skipped. Reused slots are returned with their current generation,
+    /// so an ID returned before removal never aliases its replacement.
+    pub fn next_id(&mut self) -> Option<ProcessId> {
+        self.inner.next_id()
     }
 
     /// Takes a process out of the table so the scheduler can restore the kernel
@@ -1111,6 +1149,18 @@ mod tests {
         }
     }
 
+    fn test_process(state: ProcessState) -> Process {
+        Process {
+            address_space: None,
+            context: UserContext::new(0x1000, USER_STACK_TOP),
+            handles: None,
+            state,
+            shared_mappings: None,
+            retained_failed_mapping_leases: None,
+            next_mapping_cursor: SHARED_MAPPING_BASE,
+        }
+    }
+
     #[test]
     fn unretired_resource_retention_suppresses_destructors() {
         let drops = AtomicUsize::new(0);
@@ -1146,6 +1196,7 @@ mod tests {
                 generation: u32::MAX,
                 value: Some(7),
             }],
+            next_slot: 0,
             len: 1,
         };
         let final_id = ProcessId::from_parts(0, u32::MAX);
@@ -1156,6 +1207,8 @@ mod tests {
         assert_eq!(replacement.slot(), 1);
         assert_eq!(table.get(final_id), None);
         assert_eq!(table.get(replacement), Some(&8));
+        assert_eq!(table.next_id(), Some(replacement));
+        assert_eq!(table.next_id(), Some(replacement));
     }
 
     #[test]
@@ -1165,6 +1218,112 @@ mod tests {
         assert_eq!(table.get(ProcessId::INVALID), None);
         assert_eq!(table.get(ProcessId::from_raw(id.slot() as u64)), None);
         assert_eq!(table.get(ProcessId::from_raw(u64::MAX)), None);
+    }
+
+    #[test]
+    fn process_table_selects_live_ids_in_round_robin_order() {
+        let mut table = ProcessTable::new();
+        assert_eq!(table.next_id(), None);
+
+        let first = table.insert(test_process(ProcessState::Ready)).unwrap();
+        let second = table.insert(test_process(ProcessState::Ready)).unwrap();
+        let third = table.insert(test_process(ProcessState::Ready)).unwrap();
+
+        assert_eq!(table.next_id(), Some(first));
+        assert_eq!(table.next_id(), Some(second));
+        assert_eq!(table.next_id(), Some(third));
+        assert_eq!(table.next_id(), Some(first));
+        assert_eq!(table.next_id(), Some(second));
+        assert_eq!(table.next_id(), Some(third));
+    }
+
+    #[test]
+    fn process_table_new_slot_joins_at_its_deterministic_slot_position() {
+        let mut table = ProcessTable::new();
+        let first = table.insert(test_process(ProcessState::Ready)).unwrap();
+        let second = table.insert(test_process(ProcessState::Ready)).unwrap();
+
+        assert_eq!(table.next_id(), Some(first));
+        let third = table.insert(test_process(ProcessState::Ready)).unwrap();
+        assert_eq!(table.next_id(), Some(second));
+        assert_eq!(table.next_id(), Some(third));
+        assert_eq!(table.next_id(), Some(first));
+    }
+
+    #[test]
+    fn process_table_selection_skips_holes_and_becomes_idle_when_empty() {
+        let mut table = ProcessTable::new();
+        let first = table.insert(test_process(ProcessState::Ready)).unwrap();
+        let second = table.insert(test_process(ProcessState::Ready)).unwrap();
+        let third = table.insert(test_process(ProcessState::Ready)).unwrap();
+        let fourth = table.insert(test_process(ProcessState::Ready)).unwrap();
+
+        assert_eq!(table.next_id(), Some(first));
+        drop(table.take_for_retirement(second).unwrap());
+        drop(table.take_for_retirement(fourth).unwrap());
+        assert_eq!(table.next_id(), Some(third));
+        assert_eq!(table.next_id(), Some(first));
+
+        drop(table.take_for_retirement(first).unwrap());
+        drop(table.take_for_retirement(third).unwrap());
+        assert!(table.is_empty());
+        assert_eq!(table.next_id(), None);
+        assert_eq!(table.next_id(), None);
+    }
+
+    #[test]
+    fn process_table_reused_slot_is_selected_with_its_new_generation() {
+        let mut table = ProcessTable::new();
+        let first = table.insert(test_process(ProcessState::Ready)).unwrap();
+        let stale = table.insert(test_process(ProcessState::Ready)).unwrap();
+        let third = table.insert(test_process(ProcessState::Ready)).unwrap();
+
+        assert_eq!(table.next_id(), Some(first));
+        drop(table.take_for_retirement(stale).unwrap());
+        let replacement = table.insert(test_process(ProcessState::Ready)).unwrap();
+        assert_eq!(replacement.slot(), stale.slot());
+        assert_ne!(replacement.generation(), stale.generation());
+        assert!(table.get(stale).is_none());
+        assert!(table.take_for_retirement(stale).is_none());
+
+        assert_eq!(table.next_id(), Some(replacement));
+        assert_eq!(table.next_id(), Some(third));
+        assert_eq!(table.next_id(), Some(first));
+    }
+
+    #[test]
+    fn process_table_slot_reuse_does_not_reset_the_cursor() {
+        let mut table = ProcessTable::new();
+        let first = table.insert(test_process(ProcessState::Ready)).unwrap();
+        let second = table.insert(test_process(ProcessState::Ready)).unwrap();
+
+        assert_eq!(table.next_id(), Some(first));
+        drop(table.take_for_retirement(first).unwrap());
+        let replacement = table.insert(test_process(ProcessState::Ready)).unwrap();
+        assert_eq!(replacement.slot(), first.slot());
+
+        assert_eq!(table.next_id(), Some(second));
+        assert_eq!(table.next_id(), Some(replacement));
+    }
+
+    #[test]
+    fn process_table_selection_includes_non_runnable_live_processes() {
+        let mut table = ProcessTable::new();
+        let exited = table
+            .insert(test_process(ProcessState::Exited(23)))
+            .unwrap();
+        let fault = ProcessFault::new(ProcessFaultReason::InvalidOpcode, 6);
+        let faulted = table
+            .insert(test_process(ProcessState::Faulted(fault)))
+            .unwrap();
+
+        assert_eq!(table.next_id(), Some(exited));
+        assert_eq!(table.next_id(), Some(faulted));
+        assert_eq!(table.get(exited).unwrap().state(), ProcessState::Exited(23));
+        assert_eq!(
+            table.get(faulted).unwrap().state(),
+            ProcessState::Faulted(fault)
+        );
     }
 
     #[test]
@@ -1199,15 +1358,7 @@ mod tests {
 
     #[test]
     fn start_arguments_set_abi_registers_without_changing_other_context() {
-        let mut process = Process {
-            address_space: None,
-            context: UserContext::new(0x1000, USER_STACK_TOP),
-            handles: None,
-            state: ProcessState::Ready,
-            shared_mappings: None,
-            retained_failed_mapping_leases: None,
-            next_mapping_cursor: SHARED_MAPPING_BASE,
-        };
+        let mut process = test_process(ProcessState::Ready);
         process.context.rax = 4;
         process.context.rbx = 5;
         let mut expected = process.context;

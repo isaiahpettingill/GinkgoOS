@@ -2,13 +2,17 @@
 
 use alloc::vec::Vec;
 
-use ginkgo_graphics::{
-    FramebufferWriter, PixelFormat, Rgb, SurfaceError, SurfaceLayout, SurfacePixel,
-};
+use ginkgo_graphics::{FramebufferWriter, PixelFormat, SurfaceError, SurfaceLayout, SurfacePixel};
 use ginkgo_ipc::{Handle, HandleTable, IpcError, WindowPresentation};
 
 /// Stable identity assigned to a compositor window.
 pub type WindowId = u64;
+
+const DESKTOP_BACKGROUND: SurfacePixel = SurfacePixel::xrgb(14, 20, 32);
+const FOCUSED_TITLE_COLOR: SurfacePixel = SurfacePixel::xrgb(46, 106, 176);
+const FOCUSED_BORDER_COLOR: SurfacePixel = SurfacePixel::xrgb(24, 58, 96);
+const UNFOCUSED_TITLE_COLOR: SurfacePixel = SurfacePixel::xrgb(96, 101, 112);
+const UNFOCUSED_BORDER_COLOR: SurfacePixel = SurfacePixel::xrgb(58, 61, 68);
 
 /// A signed screen or surface coordinate.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -49,18 +53,56 @@ impl Rect {
     }
 }
 
-/// Registration data for one window.
+/// Complete output placement for one window.
 ///
-/// `placement` locates surface coordinate `(0, 0)` on the screen. `client_area`
-/// and `visible_area` are both expressed in surface-local coordinates.
+/// All rectangles use output coordinates. Applications provide only the pixels
+/// for `client`; the compositor owns any space between `outer` and `client`.
+/// `visible: None` hides both the client and its server-side frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WindowPlacement {
+    pub outer: Rect,
+    pub client: Rect,
+    pub visible: Option<Rect>,
+    pub focused: bool,
+    pub decorated: bool,
+}
+
+impl WindowPlacement {
+    pub const fn new(
+        outer: Rect,
+        client: Rect,
+        visible: Option<Rect>,
+        focused: bool,
+        decorated: bool,
+    ) -> Self {
+        Self {
+            outer,
+            client,
+            visible,
+            focused,
+            decorated,
+        }
+    }
+
+    /// Creates a placement whose client occupies the complete outer area.
+    pub const fn undecorated(client: Rect, visible: Option<Rect>, focused: bool) -> Self {
+        Self::new(client, client, visible, focused, false)
+    }
+
+    /// Creates a visible fullscreen placement without a server-side frame.
+    pub const fn fullscreen(area: Rect, focused: bool) -> Self {
+        Self::undecorated(area, Some(area), focused)
+    }
+}
+
+/// Registration data for one window.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WindowConfig {
     pub id: WindowId,
     pub manager: Handle,
+    /// Layout of the application-provided client-pixel buffer.
     pub source_layout: SurfaceLayout,
-    pub placement: Point,
-    pub client_area: Rect,
-    pub visible_area: Rect,
+    pub placement: WindowPlacement,
 }
 
 impl WindowConfig {
@@ -68,17 +110,13 @@ impl WindowConfig {
         id: WindowId,
         manager: Handle,
         source_layout: SurfaceLayout,
-        placement: Point,
-        client_area: Rect,
-        visible_area: Rect,
+        placement: WindowPlacement,
     ) -> Self {
         Self {
             id,
             manager,
             source_layout,
             placement,
-            client_area,
-            visible_area,
         }
     }
 
@@ -246,19 +284,26 @@ impl Compositor {
         Ok(())
     }
 
-    pub fn update_geometry(
+    /// Replaces output placement and appearance without changing buffer config
+    /// or z-order. This accepts the same shape as a desktop runtime placement.
+    pub fn update_placement(
         &mut self,
         id: WindowId,
-        placement: Point,
-        client_area: Rect,
-        visible_area: Rect,
+        placement: WindowPlacement,
     ) -> Result<(), CompositorError> {
         let index = self
             .window_index(id)
             .ok_or(CompositorError::UnknownWindow(id))?;
         self.windows[index].placement = placement;
-        self.windows[index].client_area = client_area;
-        self.windows[index].visible_area = visible_area;
+        Ok(())
+    }
+
+    /// Updates only focus appearance for placement brokers handling a focus delta.
+    pub fn set_focused(&mut self, id: WindowId, focused: bool) -> Result<(), CompositorError> {
+        let index = self
+            .window_index(id)
+            .ok_or(CompositorError::UnknownWindow(id))?;
+        self.windows[index].placement.focused = focused;
         Ok(())
     }
 
@@ -285,20 +330,23 @@ impl Compositor {
             .map(|index| self.windows.remove(index))
     }
 
-    /// Returns the topmost visible window whose client area contains `point`.
+    /// Returns the topmost visible window whose client pixels contain `point`.
+    /// Server-side decoration is deliberately excluded.
     pub fn hit_test_client(&self, point: Point) -> Option<WindowId> {
         let screen_x = i128::from(point.x);
         let screen_y = i128::from(point.y);
         self.windows.iter().rev().find_map(|window| {
-            let local_x = screen_x - i128::from(window.placement.x);
-            let local_y = screen_y - i128::from(window.placement.y);
-            let inside_surface = local_x >= 0
-                && local_y >= 0
-                && local_x < window.source_layout.width as i128
-                && local_y < window.source_layout.height as i128;
-            (inside_surface
-                && window.visible_area.contains(local_x, local_y)
-                && window.client_area.contains(local_x, local_y))
+            let placement = window.placement;
+            let visible = placement.visible?;
+            let source_x = screen_x - i128::from(placement.client.x);
+            let source_y = screen_y - i128::from(placement.client.y);
+            let inside_source = source_x >= 0
+                && source_y >= 0
+                && source_x < window.source_layout.width as i128
+                && source_y < window.source_layout.height as i128;
+            (inside_source
+                && visible.contains(screen_x, screen_y)
+                && placement.client.contains(screen_x, screen_y))
             .then_some(window.id)
         })
     }
@@ -406,11 +454,14 @@ impl Compositor {
             .checked_mul(PixelFormat::Xrgb8888.bytes_per_pixel())
             .ok_or(CompositorError::ArithmeticOverflow)?;
 
-        let mut scene_row = Vec::new();
-        scene_row
-            .try_reserve_exact(width)
+        let scene_len = width
+            .checked_mul(height)
+            .ok_or(CompositorError::ArithmeticOverflow)?;
+        let mut scene = Vec::new();
+        scene
+            .try_reserve_exact(scene_len)
             .map_err(|_| CompositorError::OutOfMemory)?;
-        scene_row.resize(width, SurfacePixel::xrgb(0, 0, 0));
+        scene.resize(scene_len, DESKTOP_BACKGROUND);
 
         let mut source_row = Vec::new();
         source_row
@@ -419,32 +470,46 @@ impl Compositor {
         source_row.resize(source_bytes, 0);
 
         for destination_y in 0..height {
-            scene_row.fill(SurfacePixel::xrgb(0, 0, 0));
+            let row_start = destination_y
+                .checked_mul(width)
+                .ok_or(CompositorError::ArithmeticOverflow)?;
+            let scene_row = scene
+                .get_mut(row_start..row_start + width)
+                .ok_or(CompositorError::ArithmeticOverflow)?;
 
             for (window, selection) in self.windows.iter().zip(selected) {
                 let Some(selection) = selection else {
                     continue;
                 };
-                let Some((source_top, source_bottom)) = clipped_axis(
-                    window.placement.y,
-                    window.visible_area.y,
-                    window.visible_area.height,
+                let placement = window.placement;
+                let Some(visible) = placement.visible else {
+                    continue;
+                };
+
+                draw_frame_row(scene_row, destination_y, placement, visible);
+
+                let Some((source_top, source_bottom)) = clipped_client_axis(
+                    placement.client.y,
+                    placement.client.height,
+                    visible.y,
+                    visible.height,
                     window.source_layout.height,
                     height,
                 ) else {
                     continue;
                 };
-                let source_y = i128::from(destination_y as u64) - i128::from(window.placement.y);
+                let source_y = i128::from(destination_y as u64) - i128::from(placement.client.y);
                 if source_y < source_top as i128 || source_y >= source_bottom as i128 {
                     continue;
                 }
                 let source_y =
                     usize::try_from(source_y).map_err(|_| CompositorError::ArithmeticOverflow)?;
 
-                let Some((source_left, source_right)) = clipped_axis(
-                    window.placement.x,
-                    window.visible_area.x,
-                    window.visible_area.width,
+                let Some((source_left, source_right)) = clipped_client_axis(
+                    placement.client.x,
+                    placement.client.width,
+                    visible.x,
+                    visible.width,
                     window.source_layout.width,
                     width,
                 ) else {
@@ -471,31 +536,36 @@ impl Compositor {
                     handles.copy_displayed(window.manager, selection.presentation, offset, row)?;
                 }
 
-                let destination_left = i128::from(window.placement.x) + source_left as i128;
+                let destination_left = i128::from(placement.client.x) + source_left as i128;
                 let destination_left = usize::try_from(destination_left)
                     .map_err(|_| CompositorError::ArithmeticOverflow)?;
-                for (column, bytes) in row.chunks_exact(4).enumerate() {
-                    let source = SurfacePixel::new(bytes[2], bytes[1], bytes[0], bytes[3]);
-                    blend_source_over(
-                        &mut scene_row[destination_left + column],
-                        source,
-                        window.source_layout.format,
-                    );
+                if window.source_layout.format == PixelFormat::Xrgb8888 {
+                    let destination = scene_row
+                        .get_mut(destination_left..destination_left + copy_width)
+                        .ok_or(CompositorError::ArithmeticOverflow)?;
+                    // SurfacePixel and XRGB8888 share the documented B,G,R,X byte order.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            row.as_ptr(),
+                            destination.as_mut_ptr().cast::<u8>(),
+                            copy_bytes,
+                        );
+                    }
+                } else {
+                    for (column, bytes) in row.chunks_exact(4).enumerate() {
+                        let source = SurfacePixel::new(bytes[2], bytes[1], bytes[0], bytes[3]);
+                        blend_source_over(
+                            &mut scene_row[destination_left + column],
+                            source,
+                            window.source_layout.format,
+                        );
+                    }
                 }
             }
+        }
 
-            for (x, pixel) in scene_row.iter().enumerate() {
-                if !framebuffer.write_rgb_pixel(
-                    x,
-                    destination_y,
-                    Rgb::new(pixel.red, pixel.green, pixel.blue),
-                ) {
-                    return Err(CompositorError::DestinationWrite {
-                        x,
-                        y: destination_y,
-                    });
-                }
-            }
+        if !framebuffer.write_xrgb8888_scene(&scene) {
+            return Err(CompositorError::DestinationWrite { x: 0, y: 0 });
         }
         Ok(())
     }
@@ -507,19 +577,90 @@ impl Default for Compositor {
     }
 }
 
-/// Clips one source axis against its visible range and the destination axis.
-fn clipped_axis(
-    placement: i64,
+fn draw_frame_row(
+    destination: &mut [SurfacePixel],
+    destination_y: usize,
+    placement: WindowPlacement,
+    visible: Rect,
+) {
+    if !placement.decorated {
+        return;
+    }
+
+    let y = destination_y as i128;
+    let outer_top = i128::from(placement.outer.y);
+    let visible_top = i128::from(visible.y);
+    if y < outer_top.max(visible_top)
+        || y >= (outer_top + placement.outer.height as i128)
+            .min(visible_top + visible.height as i128)
+    {
+        return;
+    }
+
+    let Some((left, right)) = clipped_output_axis(
+        placement.outer.x,
+        placement.outer.width,
+        visible.x,
+        visible.width,
+        destination.len(),
+    ) else {
+        return;
+    };
+    let (title, border) = if placement.focused {
+        (FOCUSED_TITLE_COLOR, FOCUSED_BORDER_COLOR)
+    } else {
+        (UNFOCUSED_TITLE_COLOR, UNFOCUSED_BORDER_COLOR)
+    };
+    let frame_color = if y < i128::from(placement.client.y) {
+        title
+    } else {
+        border
+    };
+
+    for (x, pixel) in destination.iter_mut().enumerate().take(right).skip(left) {
+        if !placement.client.contains(x as i128, y) {
+            *pixel = frame_color;
+        }
+    }
+}
+
+/// Clips an application-provided client-buffer axis against the client area,
+/// its visible output range, and the framebuffer destination.
+fn clipped_client_axis(
+    client_start: i64,
+    client_length: usize,
     visible_start: i64,
     visible_length: usize,
     source_length: usize,
     destination_length: usize,
 ) -> Option<(usize, usize)> {
-    let placement = i128::from(placement);
-    let left = 0_i128.max(i128::from(visible_start)).max(-placement);
+    let client_start = i128::from(client_start);
+    let visible_start = i128::from(visible_start);
+    let left = 0_i128.max(visible_start - client_start).max(-client_start);
     let right = (source_length as i128)
-        .min(i128::from(visible_start) + visible_length as i128)
-        .min(destination_length as i128 - placement);
+        .min(client_length as i128)
+        .min(visible_start + visible_length as i128 - client_start)
+        .min(destination_length as i128 - client_start);
+    if left >= right {
+        return None;
+    }
+    Some((usize::try_from(left).ok()?, usize::try_from(right).ok()?))
+}
+
+/// Clips one output-space axis against a visible range and the framebuffer.
+fn clipped_output_axis(
+    area_start: i64,
+    area_length: usize,
+    visible_start: i64,
+    visible_length: usize,
+    destination_length: usize,
+) -> Option<(usize, usize)> {
+    let area_start = i128::from(area_start);
+    let visible_start = i128::from(visible_start);
+    let left = 0_i128.max(area_start).max(visible_start);
+    let right = (area_start + area_length as i128)
+        .min(visible_start + visible_length as i128)
+        .min(destination_length as i128);
     if left >= right {
         return None;
     }
@@ -562,14 +703,17 @@ mod tests {
     }
 
     fn full_window(id: WindowId, manager: Handle, source_layout: SurfaceLayout) -> WindowConfig {
+        let area = Rect::new(0, 0, source_layout.width, source_layout.height);
         WindowConfig::new(
             id,
             manager,
             source_layout,
-            Point::new(0, 0),
-            Rect::new(0, 0, source_layout.width, source_layout.height),
-            Rect::new(0, 0, source_layout.width, source_layout.height),
+            WindowPlacement::undecorated(area, Some(area), false),
         )
+    }
+
+    fn raw_color(pixel: SurfacePixel) -> u32 {
+        u32::from(pixel.red) << 16 | u32::from(pixel.green) << 8 | u32::from(pixel.blue)
     }
 
     fn create_window(
@@ -692,7 +836,8 @@ mod tests {
 
         let mut compositor = Compositor::new();
         let mut window = full_window(1, manager, layout(3, 2, PixelFormat::Xrgb8888));
-        window.placement = Point::new(-1, 1);
+        let client = Rect::new(-1, 1, 3, 2);
+        window.placement = WindowPlacement::undecorated(client, Some(client), false);
         compositor.register_window(window).unwrap();
 
         let mut bytes = [0_u8; 16];
@@ -701,8 +846,8 @@ mod tests {
             .compose_pending(&handles, &mut framebuffer, 1)
             .unwrap();
 
-        assert_eq!(framebuffer.read_raw_pixel(0, 0), Some(0));
-        assert_eq!(framebuffer.read_raw_pixel(1, 0), Some(0));
+        assert_eq!(framebuffer.read_raw_pixel(0, 0), Some(0x0020_140E));
+        assert_eq!(framebuffer.read_raw_pixel(1, 0), Some(0x0020_140E));
         assert_eq!(framebuffer.read_raw_pixel(0, 1), Some(0x0000_FF00));
         assert_eq!(framebuffer.read_raw_pixel(1, 1), Some(0x00FF_0000));
     }
@@ -741,6 +886,175 @@ mod tests {
         assert_eq!(framebuffer.read_raw_pixel(0, 0), Some(0x00FF_0000));
         assert_eq!(framebuffer.read_raw_pixel(1, 0), Some(0x0000_FF00));
         assert_eq!(framebuffer.read_raw_pixel(2, 0), Some(0x007F_0080));
+    }
+
+    #[test]
+    fn decorations_are_drawn_only_outside_the_client_area() {
+        let mut handles = HandleTable::new();
+        let source = pixels(&[0x00FF_0000; 4]);
+        let (_, client, manager) = create_window(&mut handles, &source, &source);
+        handles.window_present(client, 0, 1).unwrap();
+
+        let outer = Rect::new(0, 0, 6, 4);
+        let placement = WindowPlacement::new(outer, Rect::new(1, 2, 4, 1), Some(outer), true, true);
+        let mut compositor = Compositor::new();
+        compositor
+            .register_window(WindowConfig::new(
+                1,
+                manager,
+                layout(4, 1, PixelFormat::Xrgb8888),
+                placement,
+            ))
+            .unwrap();
+
+        let mut bytes = [0_u8; 6 * 4 * 4];
+        let mut framebuffer = standard_framebuffer(&mut bytes, 6, 4);
+        compositor
+            .compose_pending(&handles, &mut framebuffer, 1)
+            .unwrap();
+
+        let title = raw_color(FOCUSED_TITLE_COLOR);
+        let border = raw_color(FOCUSED_BORDER_COLOR);
+        for x in 0..6 {
+            assert_eq!(framebuffer.read_raw_pixel(x, 0), Some(title));
+            assert_eq!(framebuffer.read_raw_pixel(x, 1), Some(title));
+            assert_eq!(framebuffer.read_raw_pixel(x, 3), Some(border));
+        }
+        assert_eq!(framebuffer.read_raw_pixel(0, 2), Some(border));
+        for x in 1..5 {
+            assert_eq!(framebuffer.read_raw_pixel(x, 2), Some(0x00FF_0000));
+        }
+        assert_eq!(framebuffer.read_raw_pixel(5, 2), Some(border));
+    }
+
+    #[test]
+    fn decoration_clipping_and_focus_change_appearance() {
+        let mut handles = HandleTable::new();
+        let source = pixels(&[0x0000_FF00; 4]);
+        let (_, client, manager) = create_window(&mut handles, &source, &source);
+        handles.window_present(client, 0, 1).unwrap();
+
+        let placement = WindowPlacement::new(
+            Rect::new(-2, -1, 7, 5),
+            Rect::new(-1, 1, 4, 1),
+            Some(Rect::new(0, 0, 3, 3)),
+            true,
+            true,
+        );
+        let mut compositor = Compositor::new();
+        compositor
+            .register_window(WindowConfig::new(
+                1,
+                manager,
+                layout(4, 1, PixelFormat::Xrgb8888),
+                placement,
+            ))
+            .unwrap();
+
+        let mut bytes = [0_u8; 4 * 4 * 4];
+        let mut framebuffer = standard_framebuffer(&mut bytes, 4, 4);
+        compositor
+            .compose_pending(&handles, &mut framebuffer, 1)
+            .unwrap();
+        assert_eq!(
+            framebuffer.read_raw_pixel(0, 0),
+            Some(raw_color(FOCUSED_TITLE_COLOR))
+        );
+        assert_eq!(framebuffer.read_raw_pixel(0, 1), Some(0x0000_FF00));
+        assert_eq!(
+            framebuffer.read_raw_pixel(0, 2),
+            Some(raw_color(FOCUSED_BORDER_COLOR))
+        );
+        let background = Some(raw_color(DESKTOP_BACKGROUND));
+        assert_eq!(framebuffer.read_raw_pixel(3, 0), background);
+        assert_eq!(framebuffer.read_raw_pixel(0, 3), background);
+
+        compositor.set_focused(1, false).unwrap();
+        compositor.redraw(&handles, &mut framebuffer).unwrap();
+        assert_eq!(
+            framebuffer.read_raw_pixel(0, 0),
+            Some(raw_color(UNFOCUSED_TITLE_COLOR))
+        );
+        assert_eq!(
+            framebuffer.read_raw_pixel(0, 2),
+            Some(raw_color(UNFOCUSED_BORDER_COLOR))
+        );
+        assert_ne!(
+            raw_color(FOCUSED_TITLE_COLOR),
+            raw_color(UNFOCUSED_TITLE_COLOR)
+        );
+    }
+
+    #[test]
+    fn client_copy_never_reaches_into_frame_sized_storage() {
+        let mut handles = HandleTable::new();
+        let source = pixels(&[0x0000_00FF; 2]);
+        let (_, client, manager) = create_window(&mut handles, &source, &source);
+        handles.window_present(client, 0, 1).unwrap();
+
+        let outer = Rect::new(0, 0, 7, 3);
+        let mut compositor = Compositor::new();
+        compositor
+            .register_window(WindowConfig::new(
+                1,
+                manager,
+                layout(2, 1, PixelFormat::Xrgb8888),
+                WindowPlacement::new(outer, Rect::new(2, 1, 4, 1), Some(outer), true, true),
+            ))
+            .unwrap();
+
+        let mut bytes = [0_u8; 7 * 3 * 4];
+        let mut framebuffer = standard_framebuffer(&mut bytes, 7, 3);
+        compositor
+            .compose_pending(&handles, &mut framebuffer, 1)
+            .unwrap();
+
+        assert_eq!(framebuffer.read_raw_pixel(2, 1), Some(0x0000_00FF));
+        assert_eq!(framebuffer.read_raw_pixel(3, 1), Some(0x0000_00FF));
+        let background = Some(raw_color(DESKTOP_BACKGROUND));
+        assert_eq!(framebuffer.read_raw_pixel(4, 1), background);
+        assert_eq!(framebuffer.read_raw_pixel(5, 1), background);
+        assert_eq!(
+            framebuffer.read_raw_pixel(6, 1),
+            Some(raw_color(FOCUSED_BORDER_COLOR))
+        );
+    }
+
+    #[test]
+    fn undecorated_and_fullscreen_placements_draw_no_frame() {
+        let mut handles = HandleTable::new();
+        let transparent = pixels(&[0x0000_0000]);
+        let (_, client, manager) = create_window(&mut handles, &transparent, &transparent);
+        handles.window_present(client, 0, 1).unwrap();
+
+        let outer = Rect::new(0, 0, 3, 3);
+        let mut compositor = Compositor::new();
+        compositor
+            .register_window(WindowConfig::new(
+                1,
+                manager,
+                layout(1, 1, PixelFormat::Argb8888),
+                WindowPlacement::new(outer, Rect::new(1, 1, 1, 1), Some(outer), true, false),
+            ))
+            .unwrap();
+
+        let mut bytes = [0_u8; 3 * 3 * 4];
+        let mut framebuffer = standard_framebuffer(&mut bytes, 3, 3);
+        compositor
+            .compose_pending(&handles, &mut framebuffer, 1)
+            .unwrap();
+        let background = Some(raw_color(DESKTOP_BACKGROUND));
+        for y in 0..3 {
+            for x in 0..3 {
+                assert_eq!(framebuffer.read_raw_pixel(x, y), background);
+            }
+        }
+
+        compositor
+            .update_placement(1, WindowPlacement::fullscreen(Rect::new(0, 0, 1, 1), true))
+            .unwrap();
+        compositor.redraw(&handles, &mut framebuffer).unwrap();
+        assert_eq!(framebuffer.read_raw_pixel(0, 0), background);
     }
 
     #[test]
@@ -785,11 +1099,15 @@ mod tests {
         assert_eq!(compositor.hit_test_client(Point::new(0, 0)), Some(10));
 
         compositor
-            .update_geometry(
+            .update_placement(
                 10,
-                Point::new(0, 0),
-                Rect::new(1, 0, 1, 1),
-                Rect::new(0, 0, 1, 1),
+                WindowPlacement::new(
+                    Rect::new(0, 0, 2, 1),
+                    Rect::new(1, 0, 1, 1),
+                    Some(Rect::new(0, 0, 1, 1)),
+                    false,
+                    false,
+                ),
             )
             .unwrap();
         assert_eq!(compositor.hit_test_client(Point::new(0, 0)), Some(20));

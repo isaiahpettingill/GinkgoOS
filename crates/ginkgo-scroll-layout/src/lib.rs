@@ -187,6 +187,14 @@ pub enum Direction {
     Next,
 }
 
+/// Horizontal position of a focused column within the output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HorizontalAlignment {
+    Left,
+    Center,
+    Right,
+}
+
 /// Errors from layout operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LayoutError {
@@ -264,10 +272,16 @@ impl Layout {
         self.output
     }
 
-    /// Changes output dimensions while keeping focused columns visible.
+    /// Changes output dimensions while keeping focused columns visible and
+    /// preserving their output-relative scroll positions.
     pub fn set_output_size(&mut self, output: Size) {
+        let previous_width = self.output.width;
         self.output = output;
         for workspace in &mut self.workspaces {
+            workspace.viewport = scale_position(workspace.viewport, previous_width, output.width);
+            if let Some(restore) = &mut workspace.fullscreen {
+                restore.viewport = scale_position(restore.viewport, previous_width, output.width);
+            }
             ensure_focused_visible(workspace, output.width);
         }
     }
@@ -429,6 +443,14 @@ impl Layout {
     /// Focuses a window and activates its workspace.
     pub fn focus(&mut self, window: WindowId) -> Result<(), LayoutError> {
         let (workspace_index, _) = self.find_window(window).ok_or(LayoutError::UnknownWindow)?;
+        if self.workspaces[workspace_index]
+            .fullscreen
+            .is_some_and(|restore| restore.window == window)
+        {
+            self.active = workspace_index;
+            return Ok(());
+        }
+
         self.finish_fullscreen(workspace_index);
         let (_, column_index) = self.find_window(window).ok_or(LayoutError::UnknownWindow)?;
 
@@ -439,9 +461,11 @@ impl Layout {
     }
 
     pub fn focus_relative(&mut self, direction: Direction) -> bool {
-        self.finish_fullscreen(self.active);
-        let workspace = &mut self.workspaces[self.active];
-        let Some(focused) = workspace.focused else {
+        let workspace = &self.workspaces[self.active];
+        let focused = workspace
+            .fullscreen
+            .map_or(workspace.focused, |restore| Some(restore.column_index));
+        let Some(focused) = focused else {
             return false;
         };
         let next = match direction {
@@ -449,6 +473,9 @@ impl Layout {
             Direction::Next if focused + 1 < workspace.columns.len() => focused + 1,
             _ => return false,
         };
+
+        self.finish_fullscreen(self.active);
+        let workspace = &mut self.workspaces[self.active];
         workspace.focused = Some(next);
         ensure_focused_visible(workspace, self.output.width);
         true
@@ -480,18 +507,66 @@ impl Layout {
     /// Moves the focused column one position. Returns `false` at an edge or
     /// when the active workspace is empty.
     pub fn move_focused(&mut self, direction: Direction) -> bool {
-        self.finish_fullscreen(self.active);
         let workspace = &self.workspaces[self.active];
-        let Some(index) = workspace.focused else {
-            return false;
+        let fullscreen = workspace.fullscreen.is_some();
+        let (index, window) = if let Some(restore) = workspace.fullscreen {
+            (restore.column_index, restore.window)
+        } else {
+            let Some(index) = workspace.focused else {
+                return false;
+            };
+            (index, workspace.columns[index].window)
         };
         let new_index = match direction {
             Direction::Previous if index > 0 => index - 1,
             Direction::Next if index + 1 < workspace.columns.len() => index + 1,
             _ => return false,
         };
-        let window = workspace.columns[index].window;
+
+        if fullscreen {
+            self.finish_fullscreen(self.active);
+            self.workspaces[self.active].focused = Some(index);
+        }
         self.move_window(window, new_index).is_ok()
+    }
+
+    /// Aligns the focused column to an output edge or center.
+    ///
+    /// Endpoint columns may scroll past the ordinary content bounds so every
+    /// alignment is available for narrow, full-width, and oversized columns.
+    /// Returns `false` when the active workspace has no focused column.
+    pub fn align_focused(&mut self, alignment: HorizontalAlignment) -> bool {
+        let fullscreen_window = self.workspaces[self.active]
+            .fullscreen
+            .map(|restore| restore.window);
+        self.finish_fullscreen(self.active);
+        let workspace = &mut self.workspaces[self.active];
+        if let Some(window) = fullscreen_window {
+            workspace.focused = workspace
+                .columns
+                .iter()
+                .position(|column| column.window == window);
+        }
+        let Some(index) = workspace.focused else {
+            return false;
+        };
+        let Some(column) = workspace.columns.get(index) else {
+            workspace.focused = None;
+            return false;
+        };
+
+        let left = column_left(workspace, self.output.width, index);
+        let width = i64::from(pixel_width(self.output.width, column.width));
+        let output_width = i64::from(self.output.width);
+        workspace.viewport = match alignment {
+            HorizontalAlignment::Left => left,
+            HorizontalAlignment::Center => {
+                left.saturating_add(width.saturating_sub(output_width) / 2)
+            }
+            HorizontalAlignment::Right => left.saturating_add(width).saturating_sub(output_width),
+        };
+        clamp_viewport(workspace, self.output.width);
+        true
     }
 
     pub fn set_width(&mut self, window: WindowId, width: Proportion) -> Result<(), LayoutError> {
@@ -500,6 +575,26 @@ impl Layout {
         let (_, column_index) = self.find_window(window).ok_or(LayoutError::UnknownWindow)?;
         let workspace = &mut self.workspaces[workspace_index];
         workspace.columns[column_index].width = width;
+        ensure_focused_visible(workspace, self.output.width);
+        Ok(())
+    }
+
+    /// Adds a signed per-mille delta to a window's width, saturating at the
+    /// valid [`Proportion`] limits.
+    pub fn adjust_width(
+        &mut self,
+        window: WindowId,
+        delta_per_mille: i32,
+    ) -> Result<(), LayoutError> {
+        let (workspace_index, _) = self.find_window(window).ok_or(LayoutError::UnknownWindow)?;
+        self.finish_fullscreen(workspace_index);
+        let (_, column_index) = self.find_window(window).ok_or(LayoutError::UnknownWindow)?;
+        let workspace = &mut self.workspaces[workspace_index];
+        let current = i64::from(workspace.columns[column_index].width.per_mille());
+        let adjusted = current
+            .saturating_add(i64::from(delta_per_mille))
+            .clamp(1, i64::from(u16::MAX)) as u16;
+        workspace.columns[column_index].width = Proportion(adjusted);
         ensure_focused_visible(workspace, self.output.width);
         Ok(())
     }
@@ -662,10 +757,39 @@ fn column_left(workspace: &Workspace, output_width: u32, index: usize) -> i64 {
 }
 
 fn clamp_viewport(workspace: &mut Workspace, output_width: u32) {
-    let maximum = total_width(workspace, output_width)
-        .saturating_sub(i64::from(output_width))
-        .max(0);
-    workspace.viewport = workspace.viewport.clamp(0, maximum);
+    let Some(first) = workspace.columns.first() else {
+        workspace.viewport = 0;
+        return;
+    };
+    let Some(last) = workspace.columns.last() else {
+        workspace.viewport = 0;
+        return;
+    };
+
+    let output_width = i64::from(output_width);
+    let first_width = i64::from(pixel_width(output_width as u32, first.width));
+    let last_width = i64::from(pixel_width(output_width as u32, last.width));
+    let total = total_width(workspace, output_width as u32);
+    let last_left = total.saturating_sub(last_width);
+    let minimum = first_width.saturating_sub(output_width).min(0);
+    let maximum = last_left.max(total.saturating_sub(output_width)).max(0);
+    workspace.viewport = workspace.viewport.clamp(minimum, maximum);
+}
+
+fn scale_position(position: i64, old_width: u32, new_width: u32) -> i64 {
+    if old_width == 0 || position == 0 {
+        return 0;
+    }
+
+    let numerator = i128::from(position).saturating_mul(i128::from(new_width));
+    let divisor = i128::from(old_width);
+    let half = divisor / 2;
+    let rounded = if numerator >= 0 {
+        numerator.saturating_add(half) / divisor
+    } else {
+        numerator.saturating_sub(half) / divisor
+    };
+    rounded.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
 fn ensure_focused_visible(workspace: &mut Workspace, output_width: u32) {
@@ -802,6 +926,113 @@ mod tests {
     }
 
     #[test]
+    fn incremental_width_adjustment_crosses_full_width_and_saturates() {
+        let mut layout = Layout::new(Size::new(1000, 600));
+        layout.insert(A, proportion(400)).unwrap();
+
+        layout.adjust_width(A, 600).unwrap();
+        assert_eq!(layout.columns(MAIN).unwrap()[0].width, Proportion::FULL);
+        assert_eq!(layout.placements()[0].outer.width, 1000);
+
+        layout.adjust_width(A, 250).unwrap();
+        assert_eq!(layout.columns(MAIN).unwrap()[0].width, proportion(1250));
+        assert_eq!(layout.placements()[0].outer.width, 1250);
+
+        layout.adjust_width(A, i32::MAX).unwrap();
+        assert_eq!(layout.columns(MAIN).unwrap()[0].width.per_mille(), u16::MAX);
+        layout.adjust_width(A, i32::MIN).unwrap();
+        assert_eq!(layout.columns(MAIN).unwrap()[0].width.per_mille(), 1);
+        assert_eq!(layout.adjust_width(B, 100), Err(LayoutError::UnknownWindow));
+    }
+
+    #[test]
+    fn aligns_a_lone_narrow_column_left_center_and_right() {
+        let mut layout = Layout::new(Size::new(1000, 600));
+        layout.insert(A, proportion(400)).unwrap();
+
+        assert!(layout.align_focused(HorizontalAlignment::Left));
+        assert_eq!(layout.viewport(), 0);
+        assert_eq!(layout.placements()[0].outer.x, 0);
+
+        assert!(layout.align_focused(HorizontalAlignment::Center));
+        assert_eq!(layout.viewport(), -300);
+        assert_eq!(layout.placements()[0].outer.x, 300);
+
+        assert!(layout.align_focused(HorizontalAlignment::Right));
+        assert_eq!(layout.viewport(), -600);
+        assert_eq!(layout.placements()[0].outer.x, 600);
+    }
+
+    #[test]
+    fn aligns_full_width_and_oversized_columns() {
+        let mut full = Layout::new(Size::new(1000, 600));
+        full.insert(A, Proportion::FULL).unwrap();
+        for alignment in [
+            HorizontalAlignment::Left,
+            HorizontalAlignment::Center,
+            HorizontalAlignment::Right,
+        ] {
+            assert!(full.align_focused(alignment));
+            assert_eq!(full.viewport(), 0);
+            assert_eq!(full.placements()[0].outer, Rect::new(0, 0, 1000, 600));
+        }
+
+        let mut oversized = Layout::new(Size::new(1000, 600));
+        oversized.insert(A, proportion(1500)).unwrap();
+        assert!(oversized.align_focused(HorizontalAlignment::Left));
+        assert_eq!(oversized.viewport(), 0);
+        assert_eq!(oversized.placements()[0].outer.x, 0);
+        assert!(oversized.align_focused(HorizontalAlignment::Center));
+        assert_eq!(oversized.viewport(), 250);
+        assert_eq!(oversized.placements()[0].outer.x, -250);
+        assert!(oversized.align_focused(HorizontalAlignment::Right));
+        assert_eq!(oversized.viewport(), 500);
+        assert_eq!(oversized.placements()[0].outer.x, -500);
+    }
+
+    #[test]
+    fn endpoint_overscroll_aligns_first_and_final_columns() {
+        let mut layout = Layout::new(Size::new(1000, 600));
+        for window in [A, B, C] {
+            layout.insert(window, proportion(400)).unwrap();
+        }
+
+        layout.focus(A).unwrap();
+        assert!(layout.align_focused(HorizontalAlignment::Right));
+        assert_eq!(layout.viewport(), -600);
+        assert_eq!(layout.placements()[0].outer.x, 600);
+
+        layout.focus(C).unwrap();
+        assert!(layout.align_focused(HorizontalAlignment::Left));
+        assert_eq!(layout.viewport(), 800);
+        assert_eq!(layout.placements()[2].outer.x, 0);
+        assert!(layout.align_focused(HorizontalAlignment::Center));
+        assert_eq!(layout.viewport(), 500);
+        assert_eq!(layout.placements()[2].outer.x, 300);
+        assert!(layout.align_focused(HorizontalAlignment::Right));
+        assert_eq!(layout.viewport(), 200);
+        assert_eq!(layout.placements()[2].outer.x, 600);
+
+        let mut oversized = Layout::new(Size::new(1000, 600));
+        oversized.insert(A, proportion(1500)).unwrap();
+        oversized.insert(B, proportion(1500)).unwrap();
+        oversized.focus(A).unwrap();
+        assert!(oversized.align_focused(HorizontalAlignment::Right));
+        assert_eq!(oversized.viewport(), 500);
+        assert_eq!(oversized.placements()[0].outer.x, -500);
+        oversized.focus(B).unwrap();
+        assert!(oversized.align_focused(HorizontalAlignment::Left));
+        assert_eq!(oversized.viewport(), 1500);
+        assert_eq!(oversized.placements()[1].outer.x, 0);
+        assert!(oversized.align_focused(HorizontalAlignment::Right));
+        assert_eq!(oversized.viewport(), 2000);
+        assert_eq!(oversized.placements()[1].outer.x, -500);
+
+        let mut empty = Layout::new(Size::new(1000, 600));
+        assert!(!empty.align_focused(HorizontalAlignment::Center));
+    }
+
+    #[test]
     fn removal_selects_a_neighbour_and_rejects_duplicates() {
         let mut layout = Layout::new(Size::new(1000, 600));
         for window in [A, B, C] {
@@ -904,6 +1135,82 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_relative_focus_uses_the_fullscreen_column_and_stays_at_edges() {
+        let mut layout = Layout::new(Size::new(1000, 600));
+        for window in [A, B, C] {
+            layout.insert(window, proportion(400)).unwrap();
+        }
+        layout.focus(A).unwrap();
+        layout.enter_fullscreen(C).unwrap();
+
+        assert!(!layout.focus_relative(Direction::Next));
+        assert_eq!(layout.fullscreen_window(), Some(C));
+        layout.focus(C).unwrap();
+        assert_eq!(layout.fullscreen_window(), Some(C));
+
+        assert!(layout.focus_relative(Direction::Previous));
+        assert!(!layout.is_fullscreen());
+        assert_eq!(layout.focused_window(), Some(B));
+
+        layout.focus(A).unwrap();
+        layout.enter_fullscreen(C).unwrap();
+        assert!(layout.move_focused(Direction::Previous));
+        assert!(!layout.is_fullscreen());
+        assert_eq!(windows(&layout, MAIN), alloc::vec![A, C, B]);
+        assert_eq!(layout.focused_window(), Some(C));
+
+        layout.move_window(C, 2).unwrap();
+        layout.enter_fullscreen(A).unwrap();
+        assert!(!layout.focus_relative(Direction::Previous));
+        assert!(!layout.move_focused(Direction::Previous));
+        assert_eq!(layout.fullscreen_window(), Some(A));
+    }
+
+    #[test]
+    fn alignment_exits_fullscreen_and_targets_the_fullscreen_column() {
+        let mut layout = Layout::new(Size::new(1000, 600));
+        layout.insert(A, proportion(400)).unwrap();
+        layout.insert(B, proportion(400)).unwrap();
+        layout.focus(A).unwrap();
+        layout.enter_fullscreen(B).unwrap();
+
+        assert!(layout.align_focused(HorizontalAlignment::Left));
+        assert!(!layout.is_fullscreen());
+        assert_eq!(layout.focused_window(), Some(B));
+        assert_eq!(layout.placements()[1].outer.x, 0);
+    }
+
+    #[test]
+    fn fullscreen_restore_scales_focus_viewport_and_endpoint_overscroll() {
+        let mut layout = Layout::new(Size::new(1000, 600));
+        layout.insert(A, proportion(400)).unwrap();
+        layout.insert(B, proportion(700)).unwrap();
+        layout.insert(C, proportion(600)).unwrap();
+        layout.focus(B).unwrap();
+        assert_eq!(layout.viewport(), 400);
+        layout.enter_fullscreen(B).unwrap();
+
+        layout.set_output_size(Size::new(500, 300));
+        assert!(layout.exit_fullscreen());
+        assert_eq!(layout.focused_window(), Some(B));
+        assert_eq!(layout.viewport(), 200);
+        let placements = layout.placements();
+        assert_eq!(placements[0].outer, Rect::new(-200, 0, 200, 300));
+        assert_eq!(placements[1].outer, Rect::new(0, 0, 350, 300));
+        assert_eq!(placements[2].outer, Rect::new(350, 0, 300, 300));
+
+        layout.focus(A).unwrap();
+        assert!(layout.align_focused(HorizontalAlignment::Right));
+        assert_eq!(layout.viewport(), -300);
+        layout.enter_fullscreen(C).unwrap();
+        layout.set_output_size(Size::new(1000, 600));
+        assert!(layout.exit_fullscreen());
+        assert_eq!(layout.focused_window(), Some(A));
+        assert_eq!(layout.viewport(), -600);
+        assert_eq!(layout.placements()[0].outer.x, 600);
+    }
+
+    #[test]
     fn workspaces_keep_independent_columns_focus_and_viewports() {
         let mut layout = Layout::with_workspace(Size::new(1000, 600), MAIN);
         layout.insert(A, proportion(700)).unwrap();
@@ -958,5 +1265,26 @@ mod tests {
         let placements = layout.placements();
         assert_eq!(placements[0].outer, Rect::new(-100, 0, 300, 300));
         assert_eq!(placements[1].outer, Rect::new(200, 0, 300, 300));
+    }
+
+    #[test]
+    fn output_resize_preserves_center_and_endpoint_alignment() {
+        let mut layout = Layout::new(Size::new(1000, 600));
+        for window in [A, B, C] {
+            layout.insert(window, proportion(400)).unwrap();
+        }
+
+        layout.focus(A).unwrap();
+        assert!(layout.align_focused(HorizontalAlignment::Center));
+        layout.set_output_size(Size::new(500, 300));
+        assert_eq!(layout.viewport(), -150);
+        assert_eq!(layout.placements()[0].outer, Rect::new(150, 0, 200, 300));
+
+        layout.focus(C).unwrap();
+        assert!(layout.align_focused(HorizontalAlignment::Left));
+        assert_eq!(layout.viewport(), 400);
+        layout.set_output_size(Size::new(1000, 600));
+        assert_eq!(layout.viewport(), 800);
+        assert_eq!(layout.placements()[2].outer, Rect::new(0, 0, 400, 600));
     }
 }
