@@ -1,0 +1,1966 @@
+//! x86-64 privilege separation and `SYSCALL` entry foundation.
+//!
+//! This module allocates no stacks and chooses no process-specific syscall ABI.
+//! Integration must create one [`CpuPrivilegeState`] per CPU, provide five
+//! distinct mapped kernel stacks,
+//! call [`initialize_cpu`] on that CPU, and later call [`enter_user`] with a
+//! scheduler-owned [`UserContext`]. [`capture_syscall_and_yield`] is a stateless
+//! dispatcher for the model where every syscall returns to the scheduler.
+//!
+//! # Current interrupt assumptions
+//!
+//! Interrupts must be disabled before initialization and remain disabled while
+//! user code is running. `IA32_FMASK` clears IF, TF, DF, NT, and AC on every
+//! syscall, and context validation rejects IF (as well as the other
+//! privileged/debug flags) on return to user mode. Synchronous user exceptions
+//! are contained on TSS RSP0. #DF, NMI, and #MC use dedicated IST1/IST2/IST3
+//! stacks and always fail-stop without accessing GS. No external interrupts or
+//! nested entries are supported.
+//!
+//! # Fault-handling limitation
+//!
+//! User-triggerable synchronous exceptions are returned as
+//! [`KernelExit::Fault`]. Double faults, NMI, machine check, kernel-mode faults,
+//! faults without an active user context, and unsupported vectors halt the CPU.
+//! There is no resume-from-fault path, IRQ handling, recoverable NMI/MCE policy,
+//! stack-overflow detection, or nested-entry accounting. Context validation
+//! prevents the known non-canonical `SYSRETQ` hazard, but cannot prove mappings
+//! are present or correctly executable/writable. Successful [`initialize_cpu`]
+//! guarantees CPU NX support and enables EFER.NXE; address-space code can use
+//! [`validate_no_execute_requirement`] before accepting `NO_EXECUTE` mappings.
+//!
+//! [`UserContext`] owns an aligned legacy x87/SSE FXSAVE image, so XMM state is
+//! eagerly isolated across syscall, fault, and process switches. CR4.OSXSAVE is
+//! cleared: AVX/XSAVE instructions are intentionally unavailable and fault as
+//! #UD; the supported userspace target baseline is x86-64 plus x87/SSE/SSE2.
+//! Debug-register, FS-base, and user GS-base state remain unsupported. User GS
+//! is reset to zero on every scheduler entry; GS is per-CPU state in the kernel.
+
+use core::{
+    arch::{asm, global_asm},
+    mem::{offset_of, size_of},
+    ptr,
+};
+
+pub const KERNEL_CODE_SELECTOR: u16 = 1 << 3;
+pub const KERNEL_DATA_SELECTOR: u16 = 2 << 3;
+pub const USER_DATA_SELECTOR: u16 = (3 << 3) | 3;
+pub const USER_CODE_SELECTOR: u16 = (4 << 3) | 3;
+pub const TSS_SELECTOR: u16 = 5 << 3;
+
+pub const USER_RFLAGS_DEFAULT: u64 = 1 << 1;
+const USER_RFLAGS_ALLOWED: u64 =
+    (1 << 0) | (1 << 1) | (1 << 2) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 11);
+
+const IA32_EFER: u32 = 0xc000_0080;
+const IA32_STAR: u32 = 0xc000_0081;
+const IA32_LSTAR: u32 = 0xc000_0082;
+const IA32_FMASK: u32 = 0xc000_0084;
+const IA32_GS_BASE: u32 = 0xc000_0101;
+const IA32_KERNEL_GS_BASE: u32 = 0xc000_0102;
+
+const EFER_SYSTEM_CALL_EXTENSIONS: u64 = 1;
+const EFER_NO_EXECUTE_ENABLE: u64 = 1 << 11;
+const EXTENDED_FEATURES_LEAF: u32 = 0x8000_0001;
+const CPUID_SYSCALL_SYSRET: u32 = 1 << 11;
+const CPUID_NO_EXECUTE: u32 = 1 << 20;
+const CPUID_FPU: u32 = 1 << 0;
+const CPUID_FXSR: u32 = 1 << 24;
+const CPUID_SSE: u32 = 1 << 25;
+const CPUID_SSE2: u32 = 1 << 26;
+const CR0_MONITOR_COPROCESSOR: u64 = 1 << 1;
+const CR0_EMULATION: u64 = 1 << 2;
+const CR0_TASK_SWITCHED: u64 = 1 << 3;
+const CR0_NUMERIC_ERROR: u64 = 1 << 5;
+const CR4_OSFXSR: u64 = 1 << 9;
+const CR4_OSXMMEXCPT: u64 = 1 << 10;
+const CR4_OSXSAVE: u64 = 1 << 18;
+const FXSAVE_SIZE: usize = 512;
+const FXSAVE_FCW_OFFSET: usize = 0;
+const FXSAVE_MXCSR_OFFSET: usize = 24;
+const INITIAL_FCW: u16 = 0x037f;
+const INITIAL_MXCSR: u32 = 0x1f80;
+const SUPPORTED_MXCSR_BITS: u32 = 0x0000_ffbf;
+const FMASK_VALUE: u64 = (1 << 8) | (1 << 9) | (1 << 10) | (1 << 14) | (1 << 18); // TF, IF, DF, NT, AC
+const STAR_VALUE: u64 =
+    ((((USER_DATA_SELECTOR & !3) - 8) as u64) << 48) | ((KERNEL_CODE_SELECTOR as u64) << 32);
+
+const _: () = assert!(star_selector_layout_is_valid(STAR_VALUE));
+
+const GDT_ENTRY_COUNT: usize = 7;
+const IDT_ENTRY_COUNT: usize = 256;
+const DIVIDE_ERROR_VECTOR: usize = 0;
+const DEBUG_VECTOR: usize = 1;
+const NMI_VECTOR: usize = 2;
+const BREAKPOINT_VECTOR: usize = 3;
+const OVERFLOW_VECTOR: usize = 4;
+const BOUND_RANGE_VECTOR: usize = 5;
+const INVALID_OPCODE_VECTOR: usize = 6;
+const DEVICE_NOT_AVAILABLE_VECTOR: usize = 7;
+const DOUBLE_FAULT_VECTOR: usize = 8;
+const INVALID_TSS_VECTOR: usize = 10;
+const SEGMENT_NOT_PRESENT_VECTOR: usize = 11;
+const STACK_SEGMENT_VECTOR: usize = 12;
+const GENERAL_PROTECTION_VECTOR: usize = 13;
+const PAGE_FAULT_VECTOR: usize = 14;
+const X87_FLOATING_POINT_VECTOR: usize = 16;
+const ALIGNMENT_CHECK_VECTOR: usize = 17;
+const MACHINE_CHECK_VECTOR: usize = 18;
+const SIMD_FLOATING_POINT_VECTOR: usize = 19;
+const VIRTUALIZATION_VECTOR: usize = 20;
+const CONTROL_PROTECTION_VECTOR: usize = 21;
+const HYPERVISOR_INJECTION_VECTOR: usize = 28;
+const VMM_COMMUNICATION_VECTOR: usize = 29;
+const SECURITY_EXCEPTION_VECTOR: usize = 30;
+const INTERRUPT_GATE_PRESENT_RING0: u8 = 0x8e;
+const INTERRUPT_GATE_PRESENT_RING3: u8 = 0xee;
+const DOUBLE_FAULT_IST_INDEX: u8 = 1;
+const NMI_IST_INDEX: u8 = 2;
+const MACHINE_CHECK_IST_INDEX: u8 = 3;
+const KERNEL_EXIT_FAULT: u64 = 3;
+const USER_CONTEXT_GPR_QWORDS: usize = offset_of!(UserContext, rip) / size_of::<u64>();
+const USER_CONTEXT_QWORDS: usize = size_of::<UserContext>() / size_of::<u64>();
+
+/// Aligned x87/SSE state in the architectural 64-bit FXSAVE format.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FxState {
+    bytes: [u8; FXSAVE_SIZE],
+}
+
+impl FxState {
+    pub const fn initial() -> Self {
+        let mut bytes = [0; FXSAVE_SIZE];
+        bytes[FXSAVE_FCW_OFFSET] = INITIAL_FCW as u8;
+        bytes[FXSAVE_FCW_OFFSET + 1] = (INITIAL_FCW >> 8) as u8;
+        bytes[FXSAVE_MXCSR_OFFSET] = INITIAL_MXCSR as u8;
+        bytes[FXSAVE_MXCSR_OFFSET + 1] = (INITIAL_MXCSR >> 8) as u8;
+        bytes[FXSAVE_MXCSR_OFFSET + 2] = (INITIAL_MXCSR >> 16) as u8;
+        bytes[FXSAVE_MXCSR_OFFSET + 3] = (INITIAL_MXCSR >> 24) as u8;
+        Self { bytes }
+    }
+
+    pub const fn control_word(&self) -> u16 {
+        u16::from_le_bytes([
+            self.bytes[FXSAVE_FCW_OFFSET],
+            self.bytes[FXSAVE_FCW_OFFSET + 1],
+        ])
+    }
+
+    pub const fn mxcsr(&self) -> u32 {
+        u32::from_le_bytes([
+            self.bytes[FXSAVE_MXCSR_OFFSET],
+            self.bytes[FXSAVE_MXCSR_OFFSET + 1],
+            self.bytes[FXSAVE_MXCSR_OFFSET + 2],
+            self.bytes[FXSAVE_MXCSR_OFFSET + 3],
+        ])
+    }
+
+    const fn is_valid(&self) -> bool {
+        self.mxcsr() & !SUPPORTED_MXCSR_BITS == 0
+    }
+}
+
+impl Default for FxState {
+    fn default() -> Self {
+        Self::initial()
+    }
+}
+
+/// General-purpose, SYSRET-visible, and x87/SSE state for one user thread.
+///
+/// `rcx` and `r11` are snapshots of the architectural values produced by
+/// `SYSCALL` (the return RIP and RFLAGS). They are provided for diagnostics;
+/// `rip` and `rflags` are authoritative when resuming because `SYSRETQ` itself
+/// consumes RCX and R11. `fx_state` is eagerly switched with FXSAVE64/FXRSTOR64;
+/// AVX and other XSAVE-only state are intentionally unsupported.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UserContext {
+    pub rax: u64,
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rbp: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rip: u64,
+    pub rsp: u64,
+    pub rflags: u64,
+    pub fx_state: FxState,
+}
+
+impl UserContext {
+    pub const fn new(rip: u64, rsp: u64) -> Self {
+        Self {
+            rax: 0,
+            rbx: 0,
+            rcx: 0,
+            rdx: 0,
+            rsi: 0,
+            rdi: 0,
+            rbp: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rip,
+            rsp,
+            rflags: USER_RFLAGS_DEFAULT,
+            fx_state: FxState::initial(),
+        }
+    }
+
+    /// Sets the conventional RAX syscall result consumed by the next entry.
+    ///
+    /// With [`capture_syscall_and_yield`], the scheduler inspects the captured
+    /// frame, computes the result, calls this method, and passes the same context
+    /// to [`enter_user`] again. The first user instruction then observes `value`
+    /// in RAX.
+    pub fn set_syscall_return(&mut self, value: u64) {
+        self.rax = value;
+    }
+
+    pub const fn validate(&self) -> Result<(), ContextValidationError> {
+        if !is_user_canonical_address(self.rip) || self.rip == 0 {
+            return Err(ContextValidationError::InvalidInstructionPointer);
+        }
+        if !is_user_canonical_address(self.rsp) || self.rsp == 0 {
+            return Err(ContextValidationError::InvalidStackPointer);
+        }
+        if self.rflags & USER_RFLAGS_DEFAULT == 0 || self.rflags & !USER_RFLAGS_ALLOWED != 0 {
+            return Err(ContextValidationError::InvalidFlags);
+        }
+        if !self.fx_state.is_valid() {
+            return Err(ContextValidationError::InvalidFloatingPointState);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextValidationError {
+    InvalidInstructionPointer,
+    InvalidStackPointer,
+    InvalidFlags,
+    InvalidFloatingPointState,
+}
+
+/// Action selected by the syscall dispatcher.
+///
+/// `ResumeUser` is honored only if the possibly modified context passes a fresh
+/// validation immediately before `SYSRETQ`. Invalid state is converted to
+/// `ExitToKernel` and returned to [`enter_user`] instead.
+#[repr(u64)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DispatchAction {
+    ResumeUser = 0,
+    YieldToKernel = 1,
+    ExitToKernel = 2,
+}
+
+/// A contained ring-3 exception captured before returning to the scheduler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UserFaultFrame {
+    pub vector: u64,
+    pub error_code: u64,
+    /// CR2 for a page fault; other contained exceptions have no fault address.
+    pub fault_address: Option<u64>,
+}
+
+/// Kernel-side result of a completed [`enter_user`] call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelExit {
+    YieldToKernel,
+    ExitToKernel,
+    Fault(UserFaultFrame),
+}
+
+/// Dispatcher invoked on the protected per-CPU syscall stack.
+///
+/// The callback may inspect and modify all fields, then choose whether to
+/// resume this frame or return control to the kernel scheduler.
+pub type SyscallDispatcher = extern "C" fn(&mut UserContext) -> DispatchAction;
+
+/// Stateless dispatcher for scheduler-mediated syscalls.
+///
+/// The entry assembly copies the syscall frame back into the `UserContext`
+/// supplied to [`enter_user`] after this callback returns `YieldToKernel`. No
+/// global process pointer is needed. The scheduler may then decode arguments,
+/// update the frame (including with [`UserContext::set_syscall_return`]), and
+/// call [`enter_user`] again.
+pub extern "C" fn capture_syscall_and_yield(_context: &mut UserContext) -> DispatchAction {
+    DispatchAction::YieldToKernel
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuCapabilities {
+    pub syscall_sysret: bool,
+    pub no_execute: bool,
+    pub fxsave_sse: bool,
+}
+
+impl CpuCapabilities {
+    const fn from_cpuid(maximum_extended_leaf: u32, extended_edx: u32, standard_edx: u32) -> Self {
+        let has_extended_features = maximum_extended_leaf >= EXTENDED_FEATURES_LEAF;
+        Self {
+            syscall_sysret: has_extended_features && extended_edx & CPUID_SYSCALL_SYSRET != 0,
+            no_execute: has_extended_features && extended_edx & CPUID_NO_EXECUTE != 0,
+            fxsave_sse: standard_edx & (CPUID_FPU | CPUID_FXSR | CPUID_SSE | CPUID_SSE2)
+                == (CPUID_FPU | CPUID_FXSR | CPUID_SSE | CPUID_SSE2),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoExecuteError {
+    Unsupported,
+}
+
+/// Validates an address-space request to use a `NO_EXECUTE` page-table bit.
+///
+/// This is pure so page-table policy can be tested independently. Runtime code
+/// should pass [`cpu_capabilities`] from the CPU that will activate the mapping.
+pub const fn validate_no_execute_requirement(
+    no_execute_requested: bool,
+    capabilities: CpuCapabilities,
+) -> Result<(), NoExecuteError> {
+    if no_execute_requested && !capabilities.no_execute {
+        Err(NoExecuteError::Unsupported)
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitializeError {
+    InterruptsEnabled,
+    SyscallUnsupported,
+    NoExecuteUnsupported,
+    FloatingPointUnsupported,
+    InvalidStackTop,
+    SharedStackTop,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnterUserError {
+    InvalidContext(ContextValidationError),
+}
+
+/// Top addresses of five caller-owned, downward-growing kernel stacks.
+///
+/// RSP0 receives contained CPL3 exceptions. Dedicated IST1, IST2, and IST3
+/// stacks fail-stop double fault, NMI, and machine check even during a
+/// SWAPGS/SYSRET window. `syscall` is used by LSTAR. All five extents must be
+/// disjoint, not merely have distinct top addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrivilegeStackTops {
+    pub rsp0: u64,
+    pub double_fault: u64,
+    pub nmi: u64,
+    pub machine_check: u64,
+    pub syscall: u64,
+}
+
+impl PrivilegeStackTops {
+    const fn validate(self) -> Result<(), InitializeError> {
+        let tops = [
+            self.rsp0,
+            self.double_fault,
+            self.nmi,
+            self.machine_check,
+            self.syscall,
+        ];
+        let mut index = 0;
+        while index < tops.len() {
+            if !valid_kernel_stack_top(tops[index]) {
+                return Err(InitializeError::InvalidStackTop);
+            }
+            let mut other = index + 1;
+            while other < tops.len() {
+                if tops[index] == tops[other] {
+                    return Err(InitializeError::SharedStackTop);
+                }
+                other += 1;
+            }
+            index += 1;
+        }
+        Ok(())
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IdtEntry {
+    offset_low: u16,
+    selector: u16,
+    ist: u8,
+    type_attributes: u8,
+    offset_middle: u16,
+    offset_high: u32,
+    reserved: u32,
+}
+
+impl IdtEntry {
+    const fn missing() -> Self {
+        Self {
+            offset_low: 0,
+            selector: 0,
+            ist: 0,
+            type_attributes: 0,
+            offset_middle: 0,
+            offset_high: 0,
+            reserved: 0,
+        }
+    }
+
+    const fn interrupt_gate(handler: u64, ist: u8, type_attributes: u8) -> Self {
+        Self {
+            offset_low: handler as u16,
+            selector: KERNEL_CODE_SELECTOR,
+            ist: ist & 0x7,
+            type_attributes,
+            offset_middle: (handler >> 16) as u16,
+            offset_high: (handler >> 32) as u32,
+            reserved: 0,
+        }
+    }
+
+    #[cfg(all(test, not(target_os = "none")))]
+    const fn handler(self) -> u64 {
+        (self.offset_low as u64)
+            | ((self.offset_middle as u64) << 16)
+            | ((self.offset_high as u64) << 32)
+    }
+}
+
+#[repr(C, align(16))]
+struct InterruptDescriptorTable {
+    entries: [IdtEntry; IDT_ENTRY_COUNT],
+}
+
+impl InterruptDescriptorTable {
+    const fn new() -> Self {
+        Self {
+            entries: [IdtEntry::missing(); IDT_ENTRY_COUNT],
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ExceptionGate {
+    vector: usize,
+    handler: u64,
+    ist: u8,
+    type_attributes: u8,
+}
+
+impl ExceptionGate {
+    const fn ring0(vector: usize, handler: u64) -> Self {
+        Self {
+            vector,
+            handler,
+            ist: 0,
+            type_attributes: INTERRUPT_GATE_PRESENT_RING0,
+        }
+    }
+
+    const fn ring3(vector: usize, handler: u64) -> Self {
+        Self {
+            vector,
+            handler,
+            ist: 0,
+            type_attributes: INTERRUPT_GATE_PRESENT_RING3,
+        }
+    }
+
+    const fn fail_stop(vector: usize, handler: u64, ist: u8) -> Self {
+        Self {
+            vector,
+            handler,
+            ist,
+            type_attributes: INTERRUPT_GATE_PRESENT_RING0,
+        }
+    }
+}
+
+fn exception_idt(fail_stop: u64, gates: &[ExceptionGate]) -> InterruptDescriptorTable {
+    let mut idt = InterruptDescriptorTable::new();
+    for entry in &mut idt.entries {
+        *entry = IdtEntry::interrupt_gate(fail_stop, 0, INTERRUPT_GATE_PRESENT_RING0);
+    }
+    for gate in gates {
+        idt.entries[gate.vector] =
+            IdtEntry::interrupt_gate(gate.handler, gate.ist, gate.type_attributes);
+    }
+    idt
+}
+
+/// CPU-local descriptor tables, IDT, and entry bookkeeping.
+///
+/// Construct this in static storage with [`CpuPrivilegeState::new`]. Passing it
+/// to [`initialize_cpu`] permanently lends its address to the processor through
+/// GDTR, IDTR, TR, and `IA32_GS_BASE`; it must never be moved or aliased mutably
+/// after initialization.
+#[repr(C, align(16))]
+pub struct CpuPrivilegeState {
+    syscall: SyscallCpuState,
+    kernel_fx_state: FxState,
+    gdt: [u64; GDT_ENTRY_COUNT],
+    tss: TaskStateSegment,
+    idt: InterruptDescriptorTable,
+}
+
+impl CpuPrivilegeState {
+    pub const fn new() -> Self {
+        Self {
+            syscall: SyscallCpuState::new(),
+            kernel_fx_state: FxState::initial(),
+            gdt: [0; GDT_ENTRY_COUNT],
+            tss: TaskStateSegment::new(),
+            idt: InterruptDescriptorTable::new(),
+        }
+    }
+}
+
+impl Default for CpuPrivilegeState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[repr(C)]
+struct SyscallCpuState {
+    syscall_stack_top: u64,
+    kernel_rsp: u64,
+    user_rsp: u64,
+    dispatcher: u64,
+    active_context: u64,
+    fault_valid: u64,
+    fault_vector: u64,
+    fault_error_code: u64,
+    fault_address: u64,
+}
+
+impl SyscallCpuState {
+    const fn new() -> Self {
+        Self {
+            syscall_stack_top: 0,
+            kernel_rsp: 0,
+            user_rsp: 0,
+            dispatcher: 0,
+            active_context: 0,
+            fault_valid: 0,
+            fault_vector: 0,
+            fault_error_code: 0,
+            fault_address: 0,
+        }
+    }
+}
+
+#[repr(C, packed)]
+struct TaskStateSegment {
+    reserved_1: u32,
+    rsp: [u64; 3],
+    reserved_2: u64,
+    ist: [u64; 7],
+    reserved_3: u64,
+    reserved_4: u16,
+    io_map_base: u16,
+}
+
+impl TaskStateSegment {
+    const fn new() -> Self {
+        Self {
+            reserved_1: 0,
+            rsp: [0; 3],
+            reserved_2: 0,
+            ist: [0; 7],
+            reserved_3: 0,
+            reserved_4: 0,
+            io_map_base: size_of::<Self>() as u16,
+        }
+    }
+
+    unsafe fn set_stack_tops(&mut self, stacks: PrivilegeStackTops) {
+        let this = self as *mut Self;
+        unsafe {
+            ptr::addr_of_mut!((*this).rsp[0]).write_unaligned(stacks.rsp0);
+            ptr::addr_of_mut!((*this).ist[0]).write_unaligned(stacks.double_fault);
+            ptr::addr_of_mut!((*this).ist[1]).write_unaligned(stacks.nmi);
+            ptr::addr_of_mut!((*this).ist[2]).write_unaligned(stacks.machine_check);
+        }
+    }
+}
+
+#[repr(C, packed)]
+struct DescriptorTablePointer {
+    limit: u16,
+    base: u64,
+}
+
+/// Stack words normalized by each exception stub after the saved GPR block.
+/// RSP/SS are present because containment proceeds only when saved CS has RPL3.
+#[repr(C)]
+struct NormalizedExceptionFrame {
+    vector: u64,
+    error_code: u64,
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+    rsp: u64,
+    ss: u64,
+}
+
+const fn exception_pushes_error_code(vector: usize) -> bool {
+    vector == 8
+        || vector == 10
+        || vector == 11
+        || vector == 12
+        || vector == 13
+        || vector == 14
+        || vector == 17
+        || vector == 21
+        || vector == 29
+        || vector == 30
+}
+
+const _: () = {
+    assert!(!exception_pushes_error_code(DIVIDE_ERROR_VECTOR));
+    assert!(!exception_pushes_error_code(DEBUG_VECTOR));
+    assert!(!exception_pushes_error_code(BREAKPOINT_VECTOR));
+    assert!(!exception_pushes_error_code(OVERFLOW_VECTOR));
+    assert!(!exception_pushes_error_code(BOUND_RANGE_VECTOR));
+    assert!(!exception_pushes_error_code(INVALID_OPCODE_VECTOR));
+    assert!(!exception_pushes_error_code(DEVICE_NOT_AVAILABLE_VECTOR));
+    assert!(!exception_pushes_error_code(X87_FLOATING_POINT_VECTOR));
+    assert!(!exception_pushes_error_code(SIMD_FLOATING_POINT_VECTOR));
+    assert!(!exception_pushes_error_code(VIRTUALIZATION_VECTOR));
+    assert!(!exception_pushes_error_code(HYPERVISOR_INJECTION_VECTOR));
+    assert!(exception_pushes_error_code(DOUBLE_FAULT_VECTOR));
+    assert!(exception_pushes_error_code(INVALID_TSS_VECTOR));
+    assert!(exception_pushes_error_code(SEGMENT_NOT_PRESENT_VECTOR));
+    assert!(exception_pushes_error_code(STACK_SEGMENT_VECTOR));
+    assert!(exception_pushes_error_code(GENERAL_PROTECTION_VECTOR));
+    assert!(exception_pushes_error_code(PAGE_FAULT_VECTOR));
+    assert!(exception_pushes_error_code(ALIGNMENT_CHECK_VECTOR));
+    assert!(exception_pushes_error_code(CONTROL_PROTECTION_VECTOR));
+    assert!(exception_pushes_error_code(VMM_COMMUNICATION_VECTOR));
+    assert!(exception_pushes_error_code(SECURITY_EXCEPTION_VECTOR));
+};
+
+const fn star_selector_layout_is_valid(star: u64) -> bool {
+    let syscall_cs = ((star >> 32) as u16) & !3;
+    let sysret_base = ((star >> 48) as u16) & !3;
+    syscall_cs == KERNEL_CODE_SELECTOR
+        && syscall_cs + 8 == KERNEL_DATA_SELECTOR
+        && ((sysret_base + 8) | 3) == USER_DATA_SELECTOR
+        && ((sysret_base + 16) | 3) == USER_CODE_SELECTOR
+}
+
+/// Returns whether `address` is canonical under the kernel's current four-level
+/// (48-bit virtual-address) contract.
+pub const fn is_canonical_address(address: u64) -> bool {
+    let sign = (address >> 47) & 1;
+    let upper = address >> 48;
+    (sign == 0 && upper == 0) || (sign == 1 && upper == 0xffff)
+}
+
+/// Returns whether `address` is in the lower canonical user half.
+pub const fn is_user_canonical_address(address: u64) -> bool {
+    is_canonical_address(address) && address < (1_u64 << 47)
+}
+
+const fn valid_kernel_stack_top(address: u64) -> bool {
+    address != 0 && address & 0xf == 0 && is_canonical_address(address)
+}
+
+/// Installs GDT/TSS/IDT, enables EFER.SCE/NXE, configures eager FXSAVE, and
+/// configures `SYSCALL`.
+///
+/// Success is also the capability boundary for address-space setup: both
+/// `SYSCALL/SYSRET`, execute-disable, FXSAVE, SSE, and SSE2 have been verified
+/// by CPUID. EFER.NXE and CR4.OSFXSR/OSXMMEXCPT are active before return;
+/// CR4.OSXSAVE is deliberately clear.
+///
+/// # Safety
+///
+/// - This function must execute once on the CPU represented by `state`, at CPL0,
+///   with interrupts disabled and long mode/four-level paging already active.
+/// - `state` must be unique to this CPU and remain mapped, writable, and at the
+///   same virtual address forever.
+/// - Each supplied top must belong to a distinct, writable, supervisor-only,
+///   downward-growing stack with enough committed space for its entry class.
+///   The top addresses alone cannot prove stack extent or non-overlap.
+/// - The dispatcher must obey the C ABI, must not unwind, and must not enable
+///   interrupts under the current single-entry assumptions.
+/// - No pre-existing code may depend on the old GDT, IDT, TR, GS base, kernel
+///   GS base, or syscall MSRs after this call.
+pub unsafe fn initialize_cpu(
+    state: &'static mut CpuPrivilegeState,
+    stacks: PrivilegeStackTops,
+    dispatcher: SyscallDispatcher,
+) -> Result<(), InitializeError> {
+    if interrupts_enabled() {
+        return Err(InitializeError::InterruptsEnabled);
+    }
+    let capabilities = cpu_capabilities();
+    if !capabilities.syscall_sysret {
+        return Err(InitializeError::SyscallUnsupported);
+    }
+    if validate_no_execute_requirement(true, capabilities).is_err() {
+        return Err(InitializeError::NoExecuteUnsupported);
+    }
+    if !capabilities.fxsave_sse {
+        return Err(InitializeError::FloatingPointUnsupported);
+    }
+    stacks.validate()?;
+    unsafe { configure_fxsave() };
+
+    state.syscall.syscall_stack_top = stacks.syscall;
+    state.syscall.dispatcher = dispatcher as usize as u64;
+    unsafe { state.tss.set_stack_tops(stacks) };
+
+    let tss_base = ptr::addr_of!(state.tss) as u64;
+    let (tss_low, tss_high) = tss_descriptor(tss_base, (size_of::<TaskStateSegment>() - 1) as u32);
+    state.gdt = gdt(tss_low, tss_high);
+    let fail_stop = ginkgo_x86_exception_fail_stop as *const () as usize as u64;
+    state.idt = exception_idt(
+        fail_stop,
+        &[
+            ExceptionGate::ring0(
+                DIVIDE_ERROR_VECTOR,
+                ginkgo_x86_exception_divide_error as *const () as usize as u64,
+            ),
+            ExceptionGate::ring0(
+                DEBUG_VECTOR,
+                ginkgo_x86_exception_debug as *const () as usize as u64,
+            ),
+            ExceptionGate::fail_stop(NMI_VECTOR, fail_stop, NMI_IST_INDEX),
+            ExceptionGate::ring3(
+                BREAKPOINT_VECTOR,
+                ginkgo_x86_exception_breakpoint as *const () as usize as u64,
+            ),
+            ExceptionGate::ring3(
+                OVERFLOW_VECTOR,
+                ginkgo_x86_exception_overflow as *const () as usize as u64,
+            ),
+            ExceptionGate::ring0(
+                BOUND_RANGE_VECTOR,
+                ginkgo_x86_exception_bound_range as *const () as usize as u64,
+            ),
+            ExceptionGate::ring0(
+                INVALID_OPCODE_VECTOR,
+                ginkgo_x86_exception_invalid_opcode as *const () as usize as u64,
+            ),
+            ExceptionGate::ring0(
+                DEVICE_NOT_AVAILABLE_VECTOR,
+                ginkgo_x86_exception_device_not_available as *const () as usize as u64,
+            ),
+            ExceptionGate::fail_stop(DOUBLE_FAULT_VECTOR, fail_stop, DOUBLE_FAULT_IST_INDEX),
+            ExceptionGate::ring0(
+                INVALID_TSS_VECTOR,
+                ginkgo_x86_exception_invalid_tss as *const () as usize as u64,
+            ),
+            ExceptionGate::ring0(
+                SEGMENT_NOT_PRESENT_VECTOR,
+                ginkgo_x86_exception_segment_not_present as *const () as usize as u64,
+            ),
+            ExceptionGate::ring0(
+                STACK_SEGMENT_VECTOR,
+                ginkgo_x86_exception_stack_segment as *const () as usize as u64,
+            ),
+            ExceptionGate::ring0(
+                GENERAL_PROTECTION_VECTOR,
+                ginkgo_x86_exception_general_protection as *const () as usize as u64,
+            ),
+            ExceptionGate::ring0(
+                PAGE_FAULT_VECTOR,
+                ginkgo_x86_exception_page_fault as *const () as usize as u64,
+            ),
+            ExceptionGate::ring0(
+                X87_FLOATING_POINT_VECTOR,
+                ginkgo_x86_exception_x87_floating_point as *const () as usize as u64,
+            ),
+            ExceptionGate::ring0(
+                ALIGNMENT_CHECK_VECTOR,
+                ginkgo_x86_exception_alignment_check as *const () as usize as u64,
+            ),
+            ExceptionGate::fail_stop(MACHINE_CHECK_VECTOR, fail_stop, MACHINE_CHECK_IST_INDEX),
+            ExceptionGate::ring0(
+                SIMD_FLOATING_POINT_VECTOR,
+                ginkgo_x86_exception_simd_floating_point as *const () as usize as u64,
+            ),
+            ExceptionGate::ring0(
+                VIRTUALIZATION_VECTOR,
+                ginkgo_x86_exception_virtualization as *const () as usize as u64,
+            ),
+            ExceptionGate::ring0(
+                CONTROL_PROTECTION_VECTOR,
+                ginkgo_x86_exception_control_protection as *const () as usize as u64,
+            ),
+            ExceptionGate::ring0(
+                HYPERVISOR_INJECTION_VECTOR,
+                ginkgo_x86_exception_hypervisor_injection as *const () as usize as u64,
+            ),
+            ExceptionGate::ring0(
+                VMM_COMMUNICATION_VECTOR,
+                ginkgo_x86_exception_vmm_communication as *const () as usize as u64,
+            ),
+            ExceptionGate::ring0(
+                SECURITY_EXCEPTION_VECTOR,
+                ginkgo_x86_exception_security as *const () as usize as u64,
+            ),
+        ],
+    );
+
+    let gdtr = DescriptorTablePointer {
+        limit: (size_of::<[u64; GDT_ENTRY_COUNT]>() - 1) as u16,
+        base: ptr::addr_of!(state.gdt) as u64,
+    };
+    let idtr = DescriptorTablePointer {
+        limit: (size_of::<InterruptDescriptorTable>() - 1) as u16,
+        base: ptr::addr_of!(state.idt) as u64,
+    };
+    unsafe {
+        load_gdt_and_tss(&gdtr);
+        load_idt(&idtr);
+    };
+
+    let state_address = state as *mut CpuPrivilegeState as u64;
+    unsafe {
+        write_msr(IA32_GS_BASE, state_address);
+        write_msr(IA32_KERNEL_GS_BASE, 0);
+        write_msr(IA32_STAR, STAR_VALUE);
+        write_msr(
+            IA32_LSTAR,
+            ginkgo_x86_syscall_entry as *const () as usize as u64,
+        );
+        write_msr(IA32_FMASK, FMASK_VALUE);
+        write_msr(
+            IA32_EFER,
+            read_msr(IA32_EFER) | EFER_SYSTEM_CALL_EXTENSIONS | EFER_NO_EXECUTE_ENABLE,
+        );
+    }
+    Ok(())
+}
+
+/// Enters a validated user context and returns only when its dispatcher yields
+/// or exits to the scheduler.
+///
+/// # Safety
+///
+/// The current CPU must have been initialized by [`initialize_cpu`], interrupts
+/// must remain disabled, `context` must stay exclusively borrowed for the whole
+/// user run, and its user mappings (including the stack and instruction pages)
+/// must remain valid. If the caller has switched CR3, that address space must
+/// also retain supervisor-only mappings for this entry text, the per-CPU state,
+/// the syscall stack, and `context`; SYSCALL does not switch page tables. The
+/// assembly preserves the kernel ABI's callee-saved GPRs, eagerly switches the
+/// complete FXSAVE x87/SSE image, and restores the exact kernel stack before
+/// this function returns. XSAVE-only state is deliberately unavailable.
+pub unsafe fn enter_user(context: &mut UserContext) -> Result<KernelExit, EnterUserError> {
+    context.validate().map_err(EnterUserError::InvalidContext)?;
+
+    // Do not leak a previous thread's user GS base across scheduler entries.
+    // During kernel execution GS_BASE is per-CPU and KERNEL_GS_BASE is the value
+    // that SWAPGS will install immediately before SYSRETQ.
+    unsafe { write_msr(IA32_KERNEL_GS_BASE, 0) };
+    let action = unsafe { ginkgo_x86_enter_user(context) };
+    Ok(match action {
+        action if action == DispatchAction::YieldToKernel as u64 => KernelExit::YieldToKernel,
+        action if action == DispatchAction::ExitToKernel as u64 => KernelExit::ExitToKernel,
+        KERNEL_EXIT_FAULT => {
+            let Some(fault) = (unsafe { take_user_fault() }) else {
+                fail_stop();
+            };
+            KernelExit::Fault(fault)
+        }
+        _ => fail_stop(),
+    })
+}
+
+/// Takes the contained user-fault record from the current CPU's GS state.
+///
+/// This is consumed internally by [`enter_user`] and returned as
+/// [`KernelExit::Fault`], keeping process ownership in the scheduler rather than
+/// in a global exception handler.
+unsafe fn take_user_fault() -> Option<UserFaultFrame> {
+    let valid: u64;
+    let vector: u64;
+    let error_code: u64;
+    let address: u64;
+    unsafe {
+        asm!(
+            "mov {valid}, qword ptr gs:[{fault_valid}]",
+            "mov {vector}, qword ptr gs:[{fault_vector}]",
+            "mov {error_code}, qword ptr gs:[{fault_error_code}]",
+            "mov {address}, qword ptr gs:[{fault_address}]",
+            "mov qword ptr gs:[{fault_valid}], 0",
+            valid = out(reg) valid,
+            vector = out(reg) vector,
+            error_code = out(reg) error_code,
+            address = out(reg) address,
+            fault_valid = const STATE_FAULT_VALID,
+            fault_vector = const STATE_FAULT_VECTOR,
+            fault_error_code = const STATE_FAULT_ERROR_CODE,
+            fault_address = const STATE_FAULT_ADDRESS,
+            options(nostack, preserves_flags),
+        );
+    }
+    if valid == 0 {
+        None
+    } else {
+        Some(user_fault_frame(vector, error_code, address))
+    }
+}
+
+const fn user_fault_frame(vector: u64, error_code: u64, fault_address: u64) -> UserFaultFrame {
+    UserFaultFrame {
+        vector,
+        error_code,
+        fault_address: if vector == PAGE_FAULT_VECTOR as u64 {
+            Some(fault_address)
+        } else {
+            None
+        },
+    }
+}
+
+fn fail_stop() -> ! {
+    unsafe {
+        asm!("cli", "2:", "hlt", "jmp 2b", options(noreturn));
+    }
+}
+
+fn interrupts_enabled() -> bool {
+    let rflags: u64;
+    unsafe {
+        asm!("pushfq", "pop {}", out(reg) rflags, options(preserves_flags));
+    }
+    rflags & (1 << 9) != 0
+}
+
+/// Reports the CPU features required by this privilege foundation.
+pub fn cpu_capabilities() -> CpuCapabilities {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let maximum = core::arch::x86_64::__cpuid(0x8000_0000).eax;
+        let extended_edx = if maximum >= EXTENDED_FEATURES_LEAF {
+            core::arch::x86_64::__cpuid(EXTENDED_FEATURES_LEAF).edx
+        } else {
+            0
+        };
+        let standard_edx = core::arch::x86_64::__cpuid(1).edx;
+        CpuCapabilities::from_cpuid(maximum, extended_edx, standard_edx)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        CpuCapabilities::from_cpuid(0, 0, 0)
+    }
+}
+
+const fn fxsave_cr0(current: u64) -> u64 {
+    (current | CR0_MONITOR_COPROCESSOR | CR0_NUMERIC_ERROR) & !(CR0_EMULATION | CR0_TASK_SWITCHED)
+}
+
+const fn fxsave_cr4(current: u64) -> u64 {
+    (current | CR4_OSFXSR | CR4_OSXMMEXCPT) & !CR4_OSXSAVE
+}
+
+unsafe fn configure_fxsave() {
+    let mut cr0: u64;
+    let mut cr4: u64;
+    unsafe {
+        asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
+        asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+    }
+    cr0 = fxsave_cr0(cr0);
+    cr4 = fxsave_cr4(cr4);
+    unsafe {
+        asm!("mov cr0, {}", in(reg) cr0, options(nomem, nostack, preserves_flags));
+        asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags));
+    }
+
+    let mxcsr = INITIAL_MXCSR;
+    unsafe {
+        asm!(
+            "fninit",
+            "ldmxcsr [{}]",
+            in(reg) &mxcsr,
+            options(readonly, preserves_flags),
+        );
+    }
+}
+
+unsafe fn load_gdt_and_tss(gdtr: &DescriptorTablePointer) {
+    unsafe {
+        asm!(
+            "lgdt [{gdtr}]",
+            "push {kernel_code}",
+            "lea rax, [rip + 2f]",
+            "push rax",
+            "retfq",
+            "2:",
+            "mov ax, {kernel_data}",
+            "mov ds, ax",
+            "mov es, ax",
+            "mov ss, ax",
+            "mov eax, 0",
+            "mov fs, ax",
+            "mov gs, ax",
+            "mov ax, {tss}",
+            "ltr ax",
+            gdtr = in(reg) gdtr,
+            kernel_code = const KERNEL_CODE_SELECTOR,
+            kernel_data = const KERNEL_DATA_SELECTOR,
+            tss = const TSS_SELECTOR,
+            lateout("rax") _,
+            options(preserves_flags),
+        );
+    }
+}
+
+unsafe fn load_idt(idtr: &DescriptorTablePointer) {
+    unsafe {
+        asm!("lidt [{idtr}]", idtr = in(reg) idtr, options(readonly, nostack, preserves_flags));
+    }
+}
+
+unsafe fn read_msr(msr: u32) -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    u64::from(low) | (u64::from(high) << 32)
+}
+
+unsafe fn write_msr(msr: u32, value: u64) {
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") value as u32,
+            in("edx") (value >> 32) as u32,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
+const fn gdt(tss_low: u64, tss_high: u64) -> [u64; GDT_ENTRY_COUNT] {
+    [
+        0,
+        0x00af_9a00_0000_ffff, // Ring 0, executable, readable, long mode.
+        0x00cf_9200_0000_ffff, // Ring 0 data.
+        0x00cf_f200_0000_ffff, // Ring 3 data; must precede user code for SYSRET.
+        0x00af_fa00_0000_ffff, // Ring 3, executable, readable, long mode.
+        tss_low,
+        tss_high,
+    ]
+}
+
+const fn tss_descriptor(base: u64, limit: u32) -> (u64, u64) {
+    let low = ((limit & 0xffff) as u64)
+        | ((base & 0x00ff_ffff) << 16)
+        | (0x9_u64 << 40) // Available 64-bit TSS.
+        | (1_u64 << 47) // Present.
+        | ((((limit >> 16) & 0xf) as u64) << 48)
+        | (((base >> 24) & 0xff) << 56);
+    (low, base >> 32)
+}
+
+const STATE_KERNEL_FX: usize = offset_of!(CpuPrivilegeState, kernel_fx_state);
+const STATE_SYSCALL_STACK_TOP: usize =
+    offset_of!(CpuPrivilegeState, syscall) + offset_of!(SyscallCpuState, syscall_stack_top);
+const STATE_KERNEL_RSP: usize =
+    offset_of!(CpuPrivilegeState, syscall) + offset_of!(SyscallCpuState, kernel_rsp);
+const STATE_USER_RSP: usize =
+    offset_of!(CpuPrivilegeState, syscall) + offset_of!(SyscallCpuState, user_rsp);
+const STATE_DISPATCHER: usize =
+    offset_of!(CpuPrivilegeState, syscall) + offset_of!(SyscallCpuState, dispatcher);
+const STATE_ACTIVE_CONTEXT: usize =
+    offset_of!(CpuPrivilegeState, syscall) + offset_of!(SyscallCpuState, active_context);
+const STATE_FAULT_VALID: usize =
+    offset_of!(CpuPrivilegeState, syscall) + offset_of!(SyscallCpuState, fault_valid);
+const STATE_FAULT_VECTOR: usize =
+    offset_of!(CpuPrivilegeState, syscall) + offset_of!(SyscallCpuState, fault_vector);
+const STATE_FAULT_ERROR_CODE: usize =
+    offset_of!(CpuPrivilegeState, syscall) + offset_of!(SyscallCpuState, fault_error_code);
+const STATE_FAULT_ADDRESS: usize =
+    offset_of!(CpuPrivilegeState, syscall) + offset_of!(SyscallCpuState, fault_address);
+
+const EXCEPTION_SAVED_GPRS_SIZE: usize = USER_CONTEXT_GPR_QWORDS * size_of::<u64>();
+const EXCEPTION_VECTOR_OFFSET: usize =
+    EXCEPTION_SAVED_GPRS_SIZE + offset_of!(NormalizedExceptionFrame, vector);
+const EXCEPTION_ERROR_CODE_OFFSET: usize =
+    EXCEPTION_SAVED_GPRS_SIZE + offset_of!(NormalizedExceptionFrame, error_code);
+const EXCEPTION_RIP_OFFSET: usize =
+    EXCEPTION_SAVED_GPRS_SIZE + offset_of!(NormalizedExceptionFrame, rip);
+const EXCEPTION_RFLAGS_OFFSET: usize =
+    EXCEPTION_SAVED_GPRS_SIZE + offset_of!(NormalizedExceptionFrame, rflags);
+const EXCEPTION_RSP_OFFSET: usize =
+    EXCEPTION_SAVED_GPRS_SIZE + offset_of!(NormalizedExceptionFrame, rsp);
+const NORMALIZED_EXCEPTION_CS_OFFSET: usize = offset_of!(NormalizedExceptionFrame, cs);
+
+extern "C" {
+    fn ginkgo_x86_syscall_entry();
+    fn ginkgo_x86_enter_user(context: *mut UserContext) -> u64;
+    fn ginkgo_x86_exception_fail_stop();
+    fn ginkgo_x86_exception_divide_error();
+    fn ginkgo_x86_exception_debug();
+    fn ginkgo_x86_exception_breakpoint();
+    fn ginkgo_x86_exception_overflow();
+    fn ginkgo_x86_exception_bound_range();
+    fn ginkgo_x86_exception_invalid_opcode();
+    fn ginkgo_x86_exception_device_not_available();
+    fn ginkgo_x86_exception_invalid_tss();
+    fn ginkgo_x86_exception_segment_not_present();
+    fn ginkgo_x86_exception_stack_segment();
+    fn ginkgo_x86_exception_general_protection();
+    fn ginkgo_x86_exception_page_fault();
+    fn ginkgo_x86_exception_x87_floating_point();
+    fn ginkgo_x86_exception_alignment_check();
+    fn ginkgo_x86_exception_simd_floating_point();
+    fn ginkgo_x86_exception_virtualization();
+    fn ginkgo_x86_exception_control_protection();
+    fn ginkgo_x86_exception_hypervisor_injection();
+    fn ginkgo_x86_exception_vmm_communication();
+    fn ginkgo_x86_exception_security();
+}
+
+/// Assembly's final guard against a dispatcher attempting an unsafe SYSRET.
+#[no_mangle]
+extern "C" fn ginkgo_x86_validate_user_context(context: *const UserContext) -> u64 {
+    if context.is_null() {
+        return 0;
+    }
+    // SAFETY: The entry assembly passes its live, naturally aligned frame.
+    u64::from(unsafe { &*context }.validate().is_ok())
+}
+
+global_asm!(
+    r#"
+    .text
+    .global ginkgo_x86_enter_user
+    .global ginkgo_x86_syscall_entry
+    .global ginkgo_x86_exception_fail_stop
+    .global ginkgo_x86_exception_divide_error
+    .global ginkgo_x86_exception_debug
+    .global ginkgo_x86_exception_breakpoint
+    .global ginkgo_x86_exception_overflow
+    .global ginkgo_x86_exception_bound_range
+    .global ginkgo_x86_exception_invalid_opcode
+    .global ginkgo_x86_exception_device_not_available
+    .global ginkgo_x86_exception_invalid_tss
+    .global ginkgo_x86_exception_segment_not_present
+    .global ginkgo_x86_exception_stack_segment
+    .global ginkgo_x86_exception_general_protection
+    .global ginkgo_x86_exception_page_fault
+    .global ginkgo_x86_exception_x87_floating_point
+    .global ginkgo_x86_exception_alignment_check
+    .global ginkgo_x86_exception_simd_floating_point
+    .global ginkgo_x86_exception_virtualization
+    .global ginkgo_x86_exception_control_protection
+    .global ginkgo_x86_exception_hypervisor_injection
+    .global ginkgo_x86_exception_vmm_communication
+    .global ginkgo_x86_exception_security
+
+// Unsupported vectors, NMI, #DF, and #MC use this through IDT-selected stacks.
+// This path is safe in every SWAPGS state: it never reads memory or GS.
+ginkgo_x86_exception_fail_stop:
+.Lginkgo_fail_stop:
+    cli
+.Lginkgo_halted:
+    hlt
+    jmp .Lginkgo_halted
+
+// No-error-code exceptions synthesize zero before pushing their vector.
+ginkgo_x86_exception_divide_error:
+    pushq $0
+    pushq ${divide_error_vector}
+    jmp .Lginkgo_exception_common
+
+ginkgo_x86_exception_debug:
+    pushq $0
+    pushq ${debug_vector}
+    jmp .Lginkgo_exception_common
+
+ginkgo_x86_exception_breakpoint:
+    pushq $0
+    pushq ${breakpoint_vector}
+    jmp .Lginkgo_exception_common
+
+ginkgo_x86_exception_overflow:
+    pushq $0
+    pushq ${overflow_vector}
+    jmp .Lginkgo_exception_common
+
+ginkgo_x86_exception_bound_range:
+    pushq $0
+    pushq ${bound_range_vector}
+    jmp .Lginkgo_exception_common
+
+ginkgo_x86_exception_invalid_opcode:
+    pushq $0
+    pushq ${invalid_opcode_vector}
+    jmp .Lginkgo_exception_common
+
+ginkgo_x86_exception_device_not_available:
+    pushq $0
+    pushq ${device_not_available_vector}
+    jmp .Lginkgo_exception_common
+
+ginkgo_x86_exception_x87_floating_point:
+    pushq $0
+    pushq ${x87_floating_point_vector}
+    jmp .Lginkgo_exception_common
+
+ginkgo_x86_exception_simd_floating_point:
+    pushq $0
+    pushq ${simd_floating_point_vector}
+    jmp .Lginkgo_exception_common
+
+ginkgo_x86_exception_virtualization:
+    pushq $0
+    pushq ${virtualization_vector}
+    jmp .Lginkgo_exception_common
+
+ginkgo_x86_exception_hypervisor_injection:
+    pushq $0
+    pushq ${hypervisor_injection_vector}
+    jmp .Lginkgo_exception_common
+
+// Error-code exceptions already have the error word at the hardware stack top.
+ginkgo_x86_exception_invalid_tss:
+    pushq ${invalid_tss_vector}
+    jmp .Lginkgo_exception_common
+
+ginkgo_x86_exception_segment_not_present:
+    pushq ${segment_not_present_vector}
+    jmp .Lginkgo_exception_common
+
+ginkgo_x86_exception_stack_segment:
+    pushq ${stack_segment_vector}
+    jmp .Lginkgo_exception_common
+
+ginkgo_x86_exception_general_protection:
+    pushq ${general_protection_vector}
+    jmp .Lginkgo_exception_common
+
+ginkgo_x86_exception_page_fault:
+    pushq ${page_fault_vector}
+    jmp .Lginkgo_exception_common
+
+ginkgo_x86_exception_alignment_check:
+    pushq ${alignment_check_vector}
+    jmp .Lginkgo_exception_common
+
+ginkgo_x86_exception_control_protection:
+    pushq ${control_protection_vector}
+    jmp .Lginkgo_exception_common
+
+ginkgo_x86_exception_vmm_communication:
+    pushq ${vmm_communication_vector}
+    jmp .Lginkgo_exception_common
+
+ginkgo_x86_exception_security:
+    pushq ${security_exception_vector}
+
+.Lginkgo_exception_common:
+    // This check uses only the protected hardware frame and does not clobber a
+    // GPR. Kernel faults must not SWAPGS or attempt user recovery.
+    testb $3, {normalized_exception_cs}(%rsp)
+    jz .Lginkgo_fail_stop
+    swapgs
+    cmpq $0, %gs:{state_active_context}
+    je .Lginkgo_fail_stop
+
+    // Save GPRs in exact UserContext field order at the new stack top.
+    pushq %r15
+    pushq %r14
+    pushq %r13
+    pushq %r12
+    pushq %r11
+    pushq %r10
+    pushq %r9
+    pushq %r8
+    pushq %rbp
+    pushq %rdi
+    pushq %rsi
+    pushq %rdx
+    pushq %rcx
+    pushq %rbx
+    pushq %rax
+
+    cld
+    movq %gs:{state_active_context}, %rdi
+    movq %rsp, %rsi
+    movq ${context_gpr_qwords}, %rcx
+    rep movsq
+
+    // REP leaves RDI at UserContext.rip. Complete the control-state fields from
+    // the privilege-transition frame; user RSP/SS exist because saved CS was RPL3.
+    movq {exception_rip}(%rsp), %rax
+    movq %rax, 0(%rdi)
+    movq {exception_rsp}(%rsp), %rax
+    movq %rax, 8(%rdi)
+    movq {exception_rflags}(%rsp), %rax
+    movq %rax, 16(%rdi)
+
+    movq {exception_vector}(%rsp), %r8
+    cmpq ${device_not_available_vector}, %r8
+    jne .Lginkgo_fx_fault_ready
+    clts
+.Lginkgo_fx_fault_ready:
+    movq %gs:{state_active_context}, %rax
+    fxsave64 {ctx_fx_state}(%rax)
+    fxrstor64 %gs:{state_kernel_fx}
+
+    movq {exception_error_code}(%rsp), %r9
+    movq %r8, %gs:{state_fault_vector}
+    movq %r9, %gs:{state_fault_error_code}
+    movq $0, %gs:{state_fault_address}
+    cmpq ${page_fault_vector}, %r8
+    jne .Lginkgo_fault_record_ready
+    movq %cr2, %rax
+    movq %rax, %gs:{state_fault_address}
+
+.Lginkgo_fault_record_ready:
+    // Publish valid last, then abandon the TSS stack and return to enter_user's
+    // suspended scheduler continuation with kernel GS still active.
+    movq $1, %gs:{state_fault_valid}
+    movq ${fault_action}, %rax
+    jmp .Lginkgo_restore_kernel
+
+// u64 ginkgo_x86_enter_user(UserContext *context)
+// Save every kernel callee-saved GPR on the scheduler's stack. The saved RSP is
+// the continuation used by a later YieldToKernel/ExitToKernel syscall.
+ginkgo_x86_enter_user:
+    pushq %rbp
+    pushq %rbx
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    movq %rsp, %gs:{state_kernel_rsp}
+    movq %rdi, %gs:{state_active_context}
+    movq $0, %gs:{state_fault_valid}
+
+    // Rust validates before this call, then this final assembly-side check makes
+    // first entry obey the same no-unsafe-SYSRET rule as syscall resumption.
+    subq $8, %rsp
+    callq ginkgo_x86_validate_user_context
+    addq $8, %rsp
+    testq %rax, %rax
+    jz .Lginkgo_first_entry_invalid
+
+    movq %gs:{state_active_context}, %rdx
+    jmp .Lginkgo_restore_user
+
+.Lginkgo_first_entry_invalid:
+    movq ${exit_action}, %rax
+    jmp .Lginkgo_restore_kernel
+
+// LSTAR target. SYSCALL leaves the untrusted user RSP active, so the first
+// instructions swap in kernel GS, save that RSP without dereferencing it, and
+// replace it with the protected per-CPU stack. No push/call occurs beforehand.
+ginkgo_x86_syscall_entry:
+    swapgs
+    movq %rsp, %gs:{state_user_rsp}
+    movq %gs:{state_syscall_stack_top}, %rsp
+    subq ${context_size}, %rsp
+
+    movq %rax, {ctx_rax}(%rsp)
+    movq %rbx, {ctx_rbx}(%rsp)
+    movq %rcx, {ctx_rcx}(%rsp)
+    movq %rdx, {ctx_rdx}(%rsp)
+    movq %rsi, {ctx_rsi}(%rsp)
+    movq %rdi, {ctx_rdi}(%rsp)
+    movq %rbp, {ctx_rbp}(%rsp)
+    movq %r8, {ctx_r8}(%rsp)
+    movq %r9, {ctx_r9}(%rsp)
+    movq %r10, {ctx_r10}(%rsp)
+    movq %r11, {ctx_r11}(%rsp)
+    movq %r12, {ctx_r12}(%rsp)
+    movq %r13, {ctx_r13}(%rsp)
+    movq %r14, {ctx_r14}(%rsp)
+    movq %r15, {ctx_r15}(%rsp)
+    movq %rcx, {ctx_rip}(%rsp)
+    movq %r11, {ctx_rflags}(%rsp)
+    movq %gs:{state_user_rsp}, %rax
+    movq %rax, {ctx_rsp}(%rsp)
+    fxsave64 {ctx_fx_state}(%rsp)
+    fxrstor64 %gs:{state_kernel_fx}
+
+    cld
+    movq %rsp, %rdi
+    callq *%gs:{state_dispatcher}
+    testq %rax, %rax
+    jnz .Lginkgo_return_kernel
+
+    movq %rsp, %rdi
+    callq ginkgo_x86_validate_user_context
+    testq %rax, %rax
+    jnz .Lginkgo_resume_syscall
+
+    movq ${exit_action}, %rax
+    jmp .Lginkgo_return_kernel
+
+.Lginkgo_resume_syscall:
+    movq %rsp, %rdx
+
+// RDX points at the validated frame. RSP is changed only after every memory
+// load; after that point the only instructions are SWAPGS and SYSRETQ.
+.Lginkgo_restore_user:
+    fxsave64 %gs:{state_kernel_fx}
+    fxrstor64 {ctx_fx_state}(%rdx)
+    movq {ctx_rsp}(%rdx), %rax
+    movq %rax, %gs:{state_user_rsp}
+
+    movq {ctx_rax}(%rdx), %rax
+    movq {ctx_rbx}(%rdx), %rbx
+    movq {ctx_rsi}(%rdx), %rsi
+    movq {ctx_rdi}(%rdx), %rdi
+    movq {ctx_rbp}(%rdx), %rbp
+    movq {ctx_r8}(%rdx), %r8
+    movq {ctx_r9}(%rdx), %r9
+    movq {ctx_r10}(%rdx), %r10
+    movq {ctx_r12}(%rdx), %r12
+    movq {ctx_r13}(%rdx), %r13
+    movq {ctx_r14}(%rdx), %r14
+    movq {ctx_r15}(%rdx), %r15
+    movq {ctx_rip}(%rdx), %rcx
+    movq {ctx_rflags}(%rdx), %r11
+    movq {ctx_rdx}(%rdx), %rdx
+    movq %gs:{state_user_rsp}, %rsp
+    swapgs
+    sysretq
+
+// Keep the latest user frame in scheduler-owned storage, then restore the
+// exact kernel continuation and its callee-saved register set. Kernel GS stays
+// active because this path does not return to userspace.
+.Lginkgo_return_kernel:
+    movq %rax, %r8
+    movq %gs:{state_active_context}, %rdi
+    movq %rsp, %rsi
+    movq ${context_qwords}, %rcx
+    cld
+    rep movsq
+    movq %r8, %rax
+
+.Lginkgo_restore_kernel:
+    movq $0, %gs:{state_active_context}
+    movq %gs:{state_kernel_rsp}, %rsp
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %rbx
+    popq %rbp
+    retq
+"#,
+    state_kernel_fx = const STATE_KERNEL_FX,
+    state_syscall_stack_top = const STATE_SYSCALL_STACK_TOP,
+    state_kernel_rsp = const STATE_KERNEL_RSP,
+    state_user_rsp = const STATE_USER_RSP,
+    state_dispatcher = const STATE_DISPATCHER,
+    state_active_context = const STATE_ACTIVE_CONTEXT,
+    state_fault_valid = const STATE_FAULT_VALID,
+    state_fault_vector = const STATE_FAULT_VECTOR,
+    state_fault_error_code = const STATE_FAULT_ERROR_CODE,
+    state_fault_address = const STATE_FAULT_ADDRESS,
+    divide_error_vector = const DIVIDE_ERROR_VECTOR,
+    debug_vector = const DEBUG_VECTOR,
+    breakpoint_vector = const BREAKPOINT_VECTOR,
+    overflow_vector = const OVERFLOW_VECTOR,
+    bound_range_vector = const BOUND_RANGE_VECTOR,
+    invalid_opcode_vector = const INVALID_OPCODE_VECTOR,
+    device_not_available_vector = const DEVICE_NOT_AVAILABLE_VECTOR,
+    invalid_tss_vector = const INVALID_TSS_VECTOR,
+    segment_not_present_vector = const SEGMENT_NOT_PRESENT_VECTOR,
+    stack_segment_vector = const STACK_SEGMENT_VECTOR,
+    general_protection_vector = const GENERAL_PROTECTION_VECTOR,
+    page_fault_vector = const PAGE_FAULT_VECTOR,
+    x87_floating_point_vector = const X87_FLOATING_POINT_VECTOR,
+    alignment_check_vector = const ALIGNMENT_CHECK_VECTOR,
+    simd_floating_point_vector = const SIMD_FLOATING_POINT_VECTOR,
+    virtualization_vector = const VIRTUALIZATION_VECTOR,
+    control_protection_vector = const CONTROL_PROTECTION_VECTOR,
+    hypervisor_injection_vector = const HYPERVISOR_INJECTION_VECTOR,
+    vmm_communication_vector = const VMM_COMMUNICATION_VECTOR,
+    security_exception_vector = const SECURITY_EXCEPTION_VECTOR,
+    normalized_exception_cs = const NORMALIZED_EXCEPTION_CS_OFFSET,
+    exception_vector = const EXCEPTION_VECTOR_OFFSET,
+    exception_error_code = const EXCEPTION_ERROR_CODE_OFFSET,
+    exception_rip = const EXCEPTION_RIP_OFFSET,
+    exception_rflags = const EXCEPTION_RFLAGS_OFFSET,
+    exception_rsp = const EXCEPTION_RSP_OFFSET,
+    context_gpr_qwords = const USER_CONTEXT_GPR_QWORDS,
+    context_size = const size_of::<UserContext>(),
+    context_qwords = const USER_CONTEXT_QWORDS,
+    exit_action = const DispatchAction::ExitToKernel as u64,
+    fault_action = const KERNEL_EXIT_FAULT,
+    ctx_rax = const offset_of!(UserContext, rax),
+    ctx_rbx = const offset_of!(UserContext, rbx),
+    ctx_rcx = const offset_of!(UserContext, rcx),
+    ctx_rdx = const offset_of!(UserContext, rdx),
+    ctx_rsi = const offset_of!(UserContext, rsi),
+    ctx_rdi = const offset_of!(UserContext, rdi),
+    ctx_rbp = const offset_of!(UserContext, rbp),
+    ctx_r8 = const offset_of!(UserContext, r8),
+    ctx_r9 = const offset_of!(UserContext, r9),
+    ctx_r10 = const offset_of!(UserContext, r10),
+    ctx_r11 = const offset_of!(UserContext, r11),
+    ctx_r12 = const offset_of!(UserContext, r12),
+    ctx_r13 = const offset_of!(UserContext, r13),
+    ctx_r14 = const offset_of!(UserContext, r14),
+    ctx_r15 = const offset_of!(UserContext, r15),
+    ctx_rip = const offset_of!(UserContext, rip),
+    ctx_rsp = const offset_of!(UserContext, rsp),
+    ctx_rflags = const offset_of!(UserContext, rflags),
+    ctx_fx_state = const offset_of!(UserContext, fx_state),
+    options(att_syntax),
+);
+
+#[cfg(all(test, not(target_os = "none")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selectors_match_syscall_and_sysret_rules() {
+        assert!(star_selector_layout_is_valid(STAR_VALUE));
+        assert_eq!(KERNEL_CODE_SELECTOR, 0x08);
+        assert_eq!(KERNEL_DATA_SELECTOR, 0x10);
+        assert_eq!(USER_DATA_SELECTOR, 0x1b);
+        assert_eq!(USER_CODE_SELECTOR, 0x23);
+        assert_eq!(TSS_SELECTOR, 0x28);
+
+        let syscall_cs = ((STAR_VALUE >> 32) as u16) & !3;
+        let sysret_base = ((STAR_VALUE >> 48) as u16) & !3;
+        assert_eq!(syscall_cs, KERNEL_CODE_SELECTOR);
+        assert_eq!(syscall_cs + 8, KERNEL_DATA_SELECTOR);
+        assert_eq!((sysret_base + 8) | 3, USER_DATA_SELECTOR);
+        assert_eq!((sysret_base + 16) | 3, USER_CODE_SELECTOR);
+    }
+
+    #[test]
+    fn first_entry_context_is_sysret_safe() {
+        let context = UserContext::new(0x4000_1000, 0x7fff_ffff_f000);
+        assert_eq!(context.rflags, USER_RFLAGS_DEFAULT);
+        assert_eq!(context.validate(), Ok(()));
+        assert!(star_selector_layout_is_valid(STAR_VALUE));
+    }
+
+    #[test]
+    fn extended_capabilities_gate_no_execute_requests() {
+        let absent = CpuCapabilities::from_cpuid(0x8000_0000, u32::MAX, 0);
+        assert_eq!(
+            absent,
+            CpuCapabilities {
+                syscall_sysret: false,
+                no_execute: false,
+                fxsave_sse: false,
+            }
+        );
+
+        let syscall_only = CpuCapabilities::from_cpuid(
+            EXTENDED_FEATURES_LEAF,
+            CPUID_SYSCALL_SYSRET,
+            CPUID_FPU | CPUID_FXSR | CPUID_SSE | CPUID_SSE2,
+        );
+        assert!(syscall_only.syscall_sysret);
+        assert!(!syscall_only.no_execute);
+        assert_eq!(
+            validate_no_execute_requirement(true, syscall_only),
+            Err(NoExecuteError::Unsupported)
+        );
+        assert_eq!(validate_no_execute_requirement(false, syscall_only), Ok(()));
+
+        let complete = CpuCapabilities::from_cpuid(
+            EXTENDED_FEATURES_LEAF,
+            CPUID_SYSCALL_SYSRET | CPUID_NO_EXECUTE,
+            CPUID_FPU | CPUID_FXSR | CPUID_SSE | CPUID_SSE2,
+        );
+        assert!(complete.syscall_sysret);
+        assert!(complete.no_execute);
+        assert!(complete.fxsave_sse);
+        let missing_sse2 = CpuCapabilities::from_cpuid(
+            EXTENDED_FEATURES_LEAF,
+            CPUID_SYSCALL_SYSRET | CPUID_NO_EXECUTE,
+            CPUID_FPU | CPUID_FXSR | CPUID_SSE,
+        );
+        assert!(!missing_sse2.fxsave_sse);
+        assert_eq!(validate_no_execute_requirement(true, complete), Ok(()));
+        assert_eq!(
+            EFER_SYSTEM_CALL_EXTENSIONS | EFER_NO_EXECUTE_ENABLE,
+            (1 << 0) | (1 << 11)
+        );
+    }
+
+    #[test]
+    fn capture_dispatcher_yields_and_scheduler_sets_rax_result() {
+        let mut context = UserContext::new(0x4000_1000, 0x7fff_ffff_f000);
+        context.rax = 0x1234;
+        assert_eq!(
+            capture_syscall_and_yield(&mut context),
+            DispatchAction::YieldToKernel
+        );
+        assert_eq!(context.rax, 0x1234);
+
+        context.set_syscall_return(0xfeed_face);
+        assert_eq!(context.rax, 0xfeed_face);
+        assert_eq!(context.validate(), Ok(()));
+    }
+
+    #[test]
+    fn context_layout_matches_assembly_contract() {
+        assert_eq!(size_of::<FxState>(), FXSAVE_SIZE);
+        assert_eq!(core::mem::align_of::<FxState>(), 16);
+        assert_eq!(size_of::<UserContext>(), 656);
+        assert_eq!(core::mem::align_of::<UserContext>(), 16);
+        assert_eq!(offset_of!(UserContext, rax), 0);
+        assert_eq!(offset_of!(UserContext, rdx), 3 * 8);
+        assert_eq!(offset_of!(UserContext, r15), 14 * 8);
+        assert_eq!(offset_of!(UserContext, rip), 15 * 8);
+        assert_eq!(offset_of!(UserContext, rsp), 16 * 8);
+        assert_eq!(offset_of!(UserContext, rflags), 17 * 8);
+        assert_eq!(offset_of!(UserContext, fx_state), 18 * 8);
+        assert_eq!(USER_CONTEXT_QWORDS, 82);
+
+        assert_eq!(STATE_SYSCALL_STACK_TOP, 0);
+        assert_eq!(STATE_KERNEL_RSP, 8);
+        assert_eq!(STATE_USER_RSP, 16);
+        assert_eq!(STATE_DISPATCHER, 24);
+        assert_eq!(STATE_ACTIVE_CONTEXT, 32);
+        assert_eq!(STATE_FAULT_VALID, 40);
+        assert_eq!(STATE_FAULT_VECTOR, 48);
+        assert_eq!(STATE_FAULT_ERROR_CODE, 56);
+        assert_eq!(STATE_FAULT_ADDRESS, 64);
+        assert_eq!(STATE_KERNEL_FX, 80);
+        assert_eq!(STATE_KERNEL_FX % 16, 0);
+    }
+
+    #[test]
+    fn initial_fxsave_image_is_valid_and_rejects_reserved_mxcsr_bits() {
+        assert_eq!(
+            fxsave_cr0(CR0_EMULATION | CR0_TASK_SWITCHED),
+            CR0_MONITOR_COPROCESSOR | CR0_NUMERIC_ERROR
+        );
+        let cr4 = fxsave_cr4(CR4_OSXSAVE);
+        assert_eq!(cr4 & CR4_OSXSAVE, 0);
+        assert_eq!(
+            cr4 & (CR4_OSFXSR | CR4_OSXMMEXCPT),
+            CR4_OSFXSR | CR4_OSXMMEXCPT
+        );
+
+        let state = FxState::initial();
+        assert_eq!(state.control_word(), INITIAL_FCW);
+        assert_eq!(state.mxcsr(), INITIAL_MXCSR);
+        assert!(state.is_valid());
+
+        let mut context = UserContext::new(0x4000_1000, 0x7fff_ffff_f000);
+        context.fx_state.bytes[FXSAVE_MXCSR_OFFSET + 3] = 0x80;
+        assert_eq!(
+            context.validate(),
+            Err(ContextValidationError::InvalidFloatingPointState)
+        );
+    }
+
+    #[test]
+    fn idt_gate_layout_and_required_vectors_are_correct() {
+        assert_eq!(size_of::<IdtEntry>(), 16);
+        assert_eq!(offset_of!(IdtEntry, offset_low), 0);
+        assert_eq!(offset_of!(IdtEntry, selector), 2);
+        assert_eq!(offset_of!(IdtEntry, ist), 4);
+        assert_eq!(offset_of!(IdtEntry, type_attributes), 5);
+        assert_eq!(offset_of!(IdtEntry, offset_middle), 6);
+        assert_eq!(offset_of!(IdtEntry, offset_high), 8);
+        assert_eq!(offset_of!(IdtEntry, reserved), 12);
+        assert_eq!(size_of::<DescriptorTablePointer>(), 10);
+        assert_eq!(size_of::<InterruptDescriptorTable>(), 16 * IDT_ENTRY_COUNT);
+
+        let fail_stop = 0xffff_8000_0000_1000;
+        let contained = 0xffff_8000_0000_2000;
+        let gates = [
+            ExceptionGate::ring0(DIVIDE_ERROR_VECTOR, contained),
+            ExceptionGate::ring0(DEBUG_VECTOR, contained),
+            ExceptionGate::fail_stop(NMI_VECTOR, fail_stop, NMI_IST_INDEX),
+            ExceptionGate::ring3(BREAKPOINT_VECTOR, contained),
+            ExceptionGate::ring3(OVERFLOW_VECTOR, contained),
+            ExceptionGate::ring0(BOUND_RANGE_VECTOR, contained),
+            ExceptionGate::ring0(INVALID_OPCODE_VECTOR, contained),
+            ExceptionGate::ring0(DEVICE_NOT_AVAILABLE_VECTOR, contained),
+            ExceptionGate::fail_stop(DOUBLE_FAULT_VECTOR, fail_stop, DOUBLE_FAULT_IST_INDEX),
+            ExceptionGate::ring0(INVALID_TSS_VECTOR, contained),
+            ExceptionGate::ring0(SEGMENT_NOT_PRESENT_VECTOR, contained),
+            ExceptionGate::ring0(STACK_SEGMENT_VECTOR, contained),
+            ExceptionGate::ring0(GENERAL_PROTECTION_VECTOR, contained),
+            ExceptionGate::ring0(PAGE_FAULT_VECTOR, contained),
+            ExceptionGate::ring0(X87_FLOATING_POINT_VECTOR, contained),
+            ExceptionGate::ring0(ALIGNMENT_CHECK_VECTOR, contained),
+            ExceptionGate::fail_stop(MACHINE_CHECK_VECTOR, fail_stop, MACHINE_CHECK_IST_INDEX),
+            ExceptionGate::ring0(SIMD_FLOATING_POINT_VECTOR, contained),
+            ExceptionGate::ring0(VIRTUALIZATION_VECTOR, contained),
+            ExceptionGate::ring0(CONTROL_PROTECTION_VECTOR, contained),
+            ExceptionGate::ring0(HYPERVISOR_INJECTION_VECTOR, contained),
+            ExceptionGate::ring0(VMM_COMMUNICATION_VECTOR, contained),
+            ExceptionGate::ring0(SECURITY_EXCEPTION_VECTOR, contained),
+        ];
+        let idt = exception_idt(fail_stop, &gates);
+
+        for vector in [
+            DIVIDE_ERROR_VECTOR,
+            DEBUG_VECTOR,
+            BOUND_RANGE_VECTOR,
+            INVALID_OPCODE_VECTOR,
+            DEVICE_NOT_AVAILABLE_VECTOR,
+            INVALID_TSS_VECTOR,
+            SEGMENT_NOT_PRESENT_VECTOR,
+            STACK_SEGMENT_VECTOR,
+            GENERAL_PROTECTION_VECTOR,
+            PAGE_FAULT_VECTOR,
+            X87_FLOATING_POINT_VECTOR,
+            ALIGNMENT_CHECK_VECTOR,
+            SIMD_FLOATING_POINT_VECTOR,
+            VIRTUALIZATION_VECTOR,
+            CONTROL_PROTECTION_VECTOR,
+            HYPERVISOR_INJECTION_VECTOR,
+            VMM_COMMUNICATION_VECTOR,
+            SECURITY_EXCEPTION_VECTOR,
+        ] {
+            let gate = idt.entries[vector];
+            assert_eq!(gate.handler(), contained);
+            assert_eq!(gate.ist, 0);
+            assert_eq!(gate.type_attributes, INTERRUPT_GATE_PRESENT_RING0);
+        }
+        for vector in [BREAKPOINT_VECTOR, OVERFLOW_VECTOR] {
+            assert_eq!(idt.entries[vector].handler(), contained);
+            assert_eq!(
+                idt.entries[vector].type_attributes,
+                INTERRUPT_GATE_PRESENT_RING3
+            );
+        }
+        for (vector, ist) in [
+            (DOUBLE_FAULT_VECTOR, DOUBLE_FAULT_IST_INDEX),
+            (NMI_VECTOR, NMI_IST_INDEX),
+            (MACHINE_CHECK_VECTOR, MACHINE_CHECK_IST_INDEX),
+        ] {
+            let gate = idt.entries[vector];
+            assert_eq!(gate.handler(), fail_stop);
+            assert_eq!(gate.ist, ist);
+            assert_eq!(gate.type_attributes, INTERRUPT_GATE_PRESENT_RING0);
+        }
+        for gate in &idt.entries {
+            assert_eq!(gate.selector, KERNEL_CODE_SELECTOR);
+            assert_eq!(gate.reserved, 0);
+        }
+        assert_eq!(idt.entries[9].handler(), fail_stop);
+        assert_eq!(idt.entries[255].handler(), fail_stop);
+    }
+
+    #[test]
+    fn normalized_exception_frame_offsets_match_hardware_order() {
+        for vector in [
+            DIVIDE_ERROR_VECTOR,
+            DEBUG_VECTOR,
+            BREAKPOINT_VECTOR,
+            OVERFLOW_VECTOR,
+            BOUND_RANGE_VECTOR,
+            INVALID_OPCODE_VECTOR,
+            DEVICE_NOT_AVAILABLE_VECTOR,
+            X87_FLOATING_POINT_VECTOR,
+            SIMD_FLOATING_POINT_VECTOR,
+            VIRTUALIZATION_VECTOR,
+            HYPERVISOR_INJECTION_VECTOR,
+        ] {
+            assert!(!exception_pushes_error_code(vector));
+        }
+        for vector in [
+            DOUBLE_FAULT_VECTOR,
+            INVALID_TSS_VECTOR,
+            SEGMENT_NOT_PRESENT_VECTOR,
+            STACK_SEGMENT_VECTOR,
+            GENERAL_PROTECTION_VECTOR,
+            PAGE_FAULT_VECTOR,
+            ALIGNMENT_CHECK_VECTOR,
+            CONTROL_PROTECTION_VECTOR,
+            VMM_COMMUNICATION_VECTOR,
+            SECURITY_EXCEPTION_VECTOR,
+        ] {
+            assert!(exception_pushes_error_code(vector));
+        }
+
+        assert_eq!(USER_CONTEXT_GPR_QWORDS, 15);
+        assert_eq!(EXCEPTION_SAVED_GPRS_SIZE, 120);
+        assert_eq!(size_of::<NormalizedExceptionFrame>(), 56);
+        assert_eq!(offset_of!(NormalizedExceptionFrame, vector), 0);
+        assert_eq!(offset_of!(NormalizedExceptionFrame, error_code), 8);
+        assert_eq!(offset_of!(NormalizedExceptionFrame, rip), 16);
+        assert_eq!(offset_of!(NormalizedExceptionFrame, cs), 24);
+        assert_eq!(offset_of!(NormalizedExceptionFrame, rflags), 32);
+        assert_eq!(offset_of!(NormalizedExceptionFrame, rsp), 40);
+        assert_eq!(offset_of!(NormalizedExceptionFrame, ss), 48);
+
+        assert_eq!(NORMALIZED_EXCEPTION_CS_OFFSET, 24);
+        assert_eq!(EXCEPTION_VECTOR_OFFSET, 120);
+        assert_eq!(EXCEPTION_ERROR_CODE_OFFSET, 128);
+        assert_eq!(EXCEPTION_RIP_OFFSET, 136);
+        assert_eq!(EXCEPTION_RFLAGS_OFFSET, 152);
+        assert_eq!(EXCEPTION_RSP_OFFSET, 160);
+    }
+
+    #[test]
+    fn user_fault_frame_exposes_cr2_only_for_page_faults() {
+        let page_fault = user_fault_frame(PAGE_FAULT_VECTOR as u64, 0b101, 0x1234_5000);
+        assert_eq!(
+            KernelExit::Fault(page_fault),
+            KernelExit::Fault(UserFaultFrame {
+                vector: 14,
+                error_code: 0b101,
+                fault_address: Some(0x1234_5000),
+            })
+        );
+
+        let invalid_opcode = user_fault_frame(INVALID_OPCODE_VECTOR as u64, 0, 0xdead_beef);
+        assert_eq!(invalid_opcode.fault_address, None);
+    }
+
+    #[test]
+    fn tss_layout_and_descriptor_are_architectural() {
+        assert_eq!(size_of::<TaskStateSegment>(), 104);
+        assert_eq!(offset_of!(TaskStateSegment, rsp), 4);
+        assert_eq!(offset_of!(TaskStateSegment, ist), 36);
+        assert_eq!(offset_of!(TaskStateSegment, io_map_base), 102);
+
+        let stacks = PrivilegeStackTops {
+            rsp0: 0xffff_8000_0001_0000,
+            double_fault: 0xffff_8000_0002_0000,
+            nmi: 0xffff_8000_0003_0000,
+            machine_check: 0xffff_8000_0004_0000,
+            syscall: 0xffff_8000_0005_0000,
+        };
+        let mut tss = TaskStateSegment::new();
+        unsafe { tss.set_stack_tops(stacks) };
+        let tss_ptr = &raw const tss;
+        assert_eq!(
+            unsafe { ptr::addr_of!((*tss_ptr).rsp[0]).read_unaligned() },
+            stacks.rsp0
+        );
+        assert_eq!(
+            unsafe { ptr::addr_of!((*tss_ptr).ist[0]).read_unaligned() },
+            stacks.double_fault
+        );
+        assert_eq!(
+            unsafe { ptr::addr_of!((*tss_ptr).ist[1]).read_unaligned() },
+            stacks.nmi
+        );
+        assert_eq!(
+            unsafe { ptr::addr_of!((*tss_ptr).ist[2]).read_unaligned() },
+            stacks.machine_check
+        );
+
+        let base = 0xffff_8000_1234_5000;
+        let (low, high) = tss_descriptor(base, 103);
+        assert_eq!(low & 0xffff, 103);
+        assert_eq!((low >> 40) & 0xf, 0x9);
+        assert_eq!((low >> 47) & 1, 1);
+        assert_eq!(high, base >> 32);
+    }
+
+    #[test]
+    fn canonical_address_checks_cover_both_halves_and_hole() {
+        assert!(is_canonical_address(0));
+        assert!(is_canonical_address(0x0000_7fff_ffff_ffff));
+        assert!(is_canonical_address(0xffff_8000_0000_0000));
+        assert!(is_canonical_address(u64::MAX));
+        assert!(!is_canonical_address(0x0000_8000_0000_0000));
+        assert!(!is_canonical_address(0xffff_7fff_ffff_ffff));
+
+        assert!(is_user_canonical_address(0x0000_7fff_ffff_ffff));
+        assert!(!is_user_canonical_address(0xffff_8000_0000_0000));
+    }
+
+    #[test]
+    fn context_validation_rejects_sysret_hazards() {
+        let valid = UserContext::new(0x4000_1000, 0x7fff_ffff_f000);
+        assert_eq!(valid.validate(), Ok(()));
+
+        let mut context = valid;
+        context.rip = 0xffff_8000_0000_0000;
+        assert_eq!(
+            context.validate(),
+            Err(ContextValidationError::InvalidInstructionPointer)
+        );
+
+        context = valid;
+        context.rsp = 0x0000_8000_0000_0000;
+        assert_eq!(
+            context.validate(),
+            Err(ContextValidationError::InvalidStackPointer)
+        );
+
+        for forbidden in [1 << 8, 1 << 9, 1 << 10, 3 << 12, 1 << 14, 1 << 17, 1 << 18] {
+            context = valid;
+            context.rflags |= forbidden;
+            assert_eq!(
+                context.validate(),
+                Err(ContextValidationError::InvalidFlags)
+            );
+        }
+
+        context = valid;
+        context.rflags = 0;
+        assert_eq!(
+            context.validate(),
+            Err(ContextValidationError::InvalidFlags)
+        );
+    }
+
+    #[test]
+    fn stack_tops_must_be_canonical_aligned_and_distinct() {
+        let valid = PrivilegeStackTops {
+            rsp0: 0xffff_8000_0001_0000,
+            double_fault: 0xffff_8000_0002_0000,
+            nmi: 0xffff_8000_0003_0000,
+            machine_check: 0xffff_8000_0004_0000,
+            syscall: 0xffff_8000_0005_0000,
+        };
+        assert_eq!(valid.validate(), Ok(()));
+
+        assert_eq!(
+            PrivilegeStackTops {
+                syscall: valid.rsp0,
+                ..valid
+            }
+            .validate(),
+            Err(InitializeError::SharedStackTop)
+        );
+        assert_eq!(
+            PrivilegeStackTops {
+                syscall: valid.syscall + 1,
+                ..valid
+            }
+            .validate(),
+            Err(InitializeError::InvalidStackTop)
+        );
+    }
+}

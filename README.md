@@ -1,13 +1,17 @@
 # GinkgoOS
 
-A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. The current groundwork includes framebuffer output, physical frame allocation, active page-table management, checked device-I/O capabilities, polling xHCI USB HID input, a kernel-adapted RedoxFS filesystem, and cooperative task scheduling.
+A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. GinkgoOS currently includes framebuffer output, physical frame allocation, isolated userspace address spaces, ring-3 execution and syscalls, capability-backed shared-memory mappings, checked device-I/O capabilities, polling xHCI USB HID input, a kernel-adapted RedoxFS filesystem, and cooperative task/process scheduling.
 
 ## What is included
 
-- Stable Rust and the built-in `x86_64-unknown-none` target
+- Nightly Rust and the built-in `x86_64-unknown-none` target
 - Limine framebuffer, memory-map, and higher-half direct-map requests
 - Allocate-only 4 KiB physical frame allocation from usable memory
 - `x86_64`-backed address types, active page-table translation, mapping, and unmapping
+- Generation-tagged processes with isolated lower-half page tables and supervisor-only shared kernel mappings
+- Strict ELF64 `ET_EXEC` loading, guarded user stacks, x86-64 ring-3 entry, and contained user faults
+- `SYSCALL`/`SYSRET` dispatch plus `no_std` userspace stubs for processes, handles, channels, waits, shared memory, and debug output
+- Rights-checked shared-memory map/unmap with mapping leases that survive source-handle closure
 - `x86_64` port I/O plus `volatile`-backed checked MMIO capabilities
 - A nonblocking serial device built on `uart_16550`
 - PCI discovery and a polling xHCI USB host controller
@@ -25,7 +29,7 @@ A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. Th
 - Embedded-graphics draw targets for volatile hardware framebuffers and ordinary XRGB/ARGB window RAM
 - UEFI ISO and no-ISO QEMU boot targets
 
-The scheduler is deliberately stackless and cooperative: each task performs one bounded step, stores its continuation in `TaskState`, and returns to yield. USB input follows the same model and polls xHCI without interrupts. The kernel does not yet provide independent task stacks, timer preemption, userspace, interrupts, SMP, or blocking waits.
+The scheduler is deliberately stackless and cooperative: each kernel task performs one bounded step, stores its continuation in `TaskState`, and returns to yield. A process task enters ring 3 until the application makes one syscall or faults, dispatches that syscall while the process CR3 remains active, restores the kernel CR3, and then yields to the next scheduler turn. USB input follows the same model and polls xHCI without interrupts. The kernel does not yet provide independent kernel-task stacks, timer preemption, external interrupt delivery, SMP, or blocking waits.
 
 ### IPC groundwork
 
@@ -33,9 +37,38 @@ The scheduler is deliberately stackless and cooperative: each task performs one 
 
 The same capability table now models zero-filled shared-memory objects and protected window client/manager endpoints. Each surface generation uses at least two equal buffer slots. A submitted slot remains unavailable until the compositor successfully copies it, a later successful presentation or pool retirement produces its single bounded `WindowRelease`, and the client reads that release to reclaim ownership. Failed composition does not change ownership or emit a release. Endpoint closure reports `PEER_CLOSED`, and old generations can be retired after pending work completes.
 
-The current shared memory is deliberately heap-backed and accessed through checked copies—it is not yet a userspace mapping API. Window capabilities protect lifecycle and management authority, not pixel immutability: a holder of a writable shared-memory alias can violate the presentation contract by modifying an in-flight buffer. Future mapped clients have the same obligation not to write a submitted slot before its release.
+Shared-memory objects are page-aligned, page-rounded, zero-filled heap allocations with a distinct logical length. Processes may map them read-only or read-write only when the capability has the corresponding `MAP`, `READ`, and optional `WRITE` rights. Each mapping retains an owning lease, so closing or transferring the source handle cannot invalidate a live alias; unmapping or retiring the process releases that lease only after its PTEs are unreachable. Window capabilities protect lifecycle and management authority, not pixel immutability: a holder of a writable alias can still violate the presentation contract by modifying an in-flight buffer before its `BufferReleased` event.
 
-`ginkgo-sysapi` defines the fixed-layout handle, rights, object type, signal, status, wait, and RPC-header contract shared with future userspace. Structured messages use a 24-byte `zerocopy` RPC header followed by a `postcard` payload; the kernel channel remains unaware of application protocols. `ginkgo-userspace` exposes this ABI, codec, and the transport-independent window facade without pulling in the kernel handle backend. Actual syscall entry, process mappings, and blocking waits remain future work because GinkgoOS does not yet have userspace, process isolation, or stackful threads.
+`ginkgo-sysapi` defines fixed-layout syscall numbers and argument blocks alongside the handle, rights, object type, signal, status, wait, mapping, and RPC-header contracts. Structured messages use a 24-byte `zerocopy` RPC header followed by a `postcard` payload; the kernel channel remains unaware of application protocols. `ginkgo-userspace` exposes inline x86-64 syscall stubs, ergonomic wrappers, the codec, and the transport-independent window facade without pulling in the kernel handle backend. Wait-many currently performs one nonblocking signal poll; scheduler wait queues and deadline-aware blocking remain future work.
+
+### Protected userspace execution
+
+At boot, after device initialization has installed its kernel mappings, GinkgoOS creates an isolated page-table root for a generated smoke-test process. The process root starts with an empty lower half and clones only the kernel higher-half topology, clearing `USER_ACCESSIBLE` on every cloned P4 entry even when Limine supplied permissive flags. User mappings reject the zero page, noncanonical or higher-half addresses, writable-executable pages, overlaps, and permission-invalid copies.
+
+The dependency-free ELF loader accepts only little-endian x86-64 `ET_EXEC` images in the Ginkgo executable profile. It validates every program header, mapped range, page overlap, permission, entry point, and stack/guard collision before installing image pages. Each process owns its address space, generation-tagged identity, register and x87/SSE state, capability table, shared mappings, and detailed exit/fault state.
+
+The x86-64 entry path installs a GDT, TSS, IDT, `STAR`/`LSTAR`/`FMASK`, and five distinct 64 KiB supervisor stacks for RSP0, syscall entry, double fault, NMI, and machine check. Synchronous user exceptions are contained and returned to the process scheduler; kernel faults and unrecoverable exception classes fail stop. Every syscall immediately switches away from the untrusted user RSP, captures the complete user context, and returns to scheduler-side dispatch. Return through `SYSRETQ` revalidates canonical RIP/RSP, flags, and floating-point state.
+
+`crates/ginkgo-kernel/build.rs` generates a minimal ELF used as the boot smoke test. It proves ring-3 entry, debug output, shared-memory creation, a 4097-byte read-write mapping, access through the mapped alias, cooperative yield/resume, mapping-lease survival after closing the source handle, unmapping, and clean process exit. A successful serial trace includes:
+
+```text
+userspace: loaded pid=...
+ginkgo-userspace-smoke: entered
+ginkgo-userspace-smoke: mapped alias
+ginkgo-userspace-smoke: resumed
+ginkgo-userspace-smoke: mapped alias
+userspace: pid=... exited status=0
+```
+
+Current execution limitations are intentional and explicit:
+
+- Scheduling is single-core and cooperative. A process that never makes a syscall can monopolize the CPU until timer preemption exists.
+- Interrupts remain disabled while userspace runs; there is no external IRQ entry or asynchronous preemption path yet.
+- Wait-many is a single nonblocking poll, not a scheduler-backed blocking operation.
+- SMAP is not enabled because checked user-copy operations do not yet have exception-fixup support.
+- x87/SSE/SSE2 state is isolated with FXSAVE/FXRSTOR; AVX/XSAVE is intentionally unavailable.
+- The physical allocator is monotonic, so retired process frames are accounted for but not recycled.
+- Early shared-memory and capability allocation still depends on the fixed bootstrap kernel heap.
 
 ### Window-system groundwork
 
@@ -45,7 +78,7 @@ The current shared memory is deliberately heap-backed and accessed through check
 
 `ginkgo-fonts` provides sorted packed one-bit bitmap glyphs, kerning, allocation-free rendering through `embedded-graphics`, and strict parsing of a versioned little-endian `.gkf` representation. YAFF and BDF importers remain future host-side tooling; applications can already embed validated `.gkf` bytes or construct normalized fonts from converter output.
 
-These components are host-tested foundations rather than a boot-time desktop. The running kernel still uses its direct framebuffer validation UI until process creation, syscall dispatch, shared-memory mappings, and a userspace desktop runtime exist.
+These components are host-tested foundations rather than a boot-time desktop. The running kernel now executes the protected userspace smoke process alongside its direct framebuffer validation UI. Wiring a persistent userspace desktop service to the existing protocol, layout policy, and compositor remains the next window-system integration step.
 
 ### USB HID input
 
@@ -65,10 +98,10 @@ On CachyOS or Arch Linux:
 
 ```sh
 sudo pacman -S --needed rustup make curl xorriso qemu-system-x86
-rustup default stable
+rustup default nightly
 ```
 
-The Makefile downloads pinned Limine boot files and an OVMF firmware image automatically.
+Nightly is currently required for `allocator_api`, which the kernel IPC backend uses to keep syscall-reachable `Arc` allocation fallible. The Makefile downloads pinned Limine boot files and an OVMF firmware image automatically.
 
 On Debian or Ubuntu, install equivalent packages:
 
@@ -126,8 +159,8 @@ make check
 ## Project structure
 
 ```text
-crates/ginkgo-kernel/         boot binary, hardware, input, scheduler, and software compositor
-crates/ginkgo-userspace/      no_std userspace ABI, IPC codec, and window facade
+crates/ginkgo-kernel/         boot binary, process/ELF/syscall runtime, hardware, scheduler, and compositor
+crates/ginkgo-userspace/      no_std syscall wrappers, IPC codec, and window facade
 crates/ginkgo-ipc/            channels, capabilities, shared memory, and protected window buffers
 crates/ginkgo-window/         desktop protocol and transport-independent window client state machine
 crates/ginkgo-scroll-layout/  pure scrolling workspace, placement, and fullscreen policy
@@ -160,4 +193,4 @@ The visible output is in `crates/ginkgo-kernel/src/main.rs`:
 screen.draw_text(margin + 40, margin + 38, 4, "Hello, framebuffer!", primary);
 ```
 
-The next sensible milestones are exception/syscall entry, process address spaces and shared-memory mappings, a userspace desktop runtime, xHCI interrupt delivery and USB hotplug/hubs, a timer-driven stackful scheduler, frame deallocation, and a panic screen with serial diagnostics.
+The next sensible milestones are a userspace desktop runtime, scheduler-backed blocking waits, xHCI interrupt delivery and USB hotplug/hubs, timer preemption, SMP, frame deallocation, and a panic screen with serial diagnostics.

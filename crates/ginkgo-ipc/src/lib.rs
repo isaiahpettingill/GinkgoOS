@@ -1,4 +1,5 @@
 #![no_std]
+#![cfg_attr(feature = "kernel", feature(allocator_api))]
 
 //! Zircon-style channels and the shared structured-message wire codec.
 
@@ -26,6 +27,7 @@ pub enum StructuredMessageError {
     HeaderTooShort,
     PayloadTooLarge,
     PayloadLengthMismatch,
+    OutOfMemory,
     Postcard(postcard::Error),
 }
 
@@ -40,17 +42,31 @@ pub fn encode_structured<T: Serialize + ?Sized>(
     mut header: RpcHeader,
     value: &T,
 ) -> Result<Vec<u8>, StructuredMessageError> {
-    let payload = postcard::to_allocvec(value)?;
-    let total = RPC_HEADER_SIZE
-        .checked_add(payload.len())
-        .ok_or(StructuredMessageError::PayloadTooLarge)?;
-    if total > CHANNEL_MAX_BYTES {
-        return Err(StructuredMessageError::PayloadTooLarge);
-    }
-    header.payload_length =
-        u32::try_from(payload.len()).map_err(|_| StructuredMessageError::PayloadTooLarge)?;
+    let maximum_payload = CHANNEL_MAX_BYTES - RPC_HEADER_SIZE;
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(maximum_payload)
+        .map_err(|_| StructuredMessageError::OutOfMemory)?;
+    payload.resize(maximum_payload, 0);
+    let payload_len = match postcard::to_slice(value, &mut payload) {
+        Ok(payload) => payload.len(),
+        Err(postcard::Error::SerializeBufferFull) => {
+            return Err(StructuredMessageError::PayloadTooLarge);
+        }
+        Err(error) => return Err(StructuredMessageError::Postcard(error)),
+    };
+    payload.truncate(payload_len);
 
-    let mut message = Vec::with_capacity(total);
+    let total = RPC_HEADER_SIZE
+        .checked_add(payload_len)
+        .ok_or(StructuredMessageError::PayloadTooLarge)?;
+    header.payload_length =
+        u32::try_from(payload_len).map_err(|_| StructuredMessageError::PayloadTooLarge)?;
+
+    let mut message = Vec::new();
+    message
+        .try_reserve_exact(total)
+        .map_err(|_| StructuredMessageError::OutOfMemory)?;
     message.extend_from_slice(header.as_bytes());
     message.extend_from_slice(&payload);
     Ok(message)

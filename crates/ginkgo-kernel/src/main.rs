@@ -6,11 +6,16 @@ mod crt;
 mod framebuffer;
 mod heap;
 
-use core::{panic::PanicInfo, ptr::NonNull};
+use core::{
+    fmt::{self, Write as _},
+    panic::PanicInfo,
+    ptr::{self, NonNull},
+};
 use framebuffer::{FramebufferWriter, Rgb};
 use ginkgo_filesystem::RedoxFs;
 use ginkgo_hid::{ApplicationKind, Axis, InputEvent, AXIS_MAX, AXIS_MIN};
 use ginkgo_kernel::{
+    arch::{self, CpuPrivilegeState, KernelExit, PrivilegeStackTops},
     input::{DeviceInputEvent, InputManager},
     io::SerialPort,
     limine::{
@@ -19,6 +24,8 @@ use ginkgo_kernel::{
     },
     memory::{UsableFrameAllocator, VirtAddr, VirtPage},
     paging::{ActivePageTable, PageTableFlags},
+    process::{Process, ProcessFault, ProcessFaultReason, ProcessId, ProcessState, ProcessTable},
+    syscall::{self, DebugSink, SyscallOutcome},
     task::{Scheduler, TaskPoll, TaskState},
     usb::{self, UsbError},
 };
@@ -56,6 +63,21 @@ static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 #[used]
 #[link_section = ".limine_requests_end"]
 static REQUESTS_END: [u64; 2] = limine::REQUESTS_END_MARKER;
+
+static USERSPACE_SMOKE_ELF: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-userspace-smoke.elf"));
+
+const PRIVILEGE_STACK_SIZE: usize = 64 * 1024;
+
+#[repr(C, align(16))]
+struct PrivilegeStack([u8; PRIVILEGE_STACK_SIZE]);
+
+static mut RSP0_STACK: PrivilegeStack = PrivilegeStack([0; PRIVILEGE_STACK_SIZE]);
+static mut DOUBLE_FAULT_STACK: PrivilegeStack = PrivilegeStack([0; PRIVILEGE_STACK_SIZE]);
+static mut NMI_STACK: PrivilegeStack = PrivilegeStack([0; PRIVILEGE_STACK_SIZE]);
+static mut MACHINE_CHECK_STACK: PrivilegeStack = PrivilegeStack([0; PRIVILEGE_STACK_SIZE]);
+static mut SYSCALL_STACK: PrivilegeStack = PrivilegeStack([0; PRIVILEGE_STACK_SIZE]);
+static mut CPU_PRIVILEGE_STATE: CpuPrivilegeState = CpuPrivilegeState::new();
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -109,6 +131,7 @@ pub extern "C" fn _start() -> ! {
         screen,
         ui,
         paging_verified: false,
+        processes: ProcessTable::new(),
         pending_console: [0; CONSOLE_BATCH_CAPACITY],
         pending_console_len: 0,
         pending_input: [0; INPUT_BATCH_CAPACITY],
@@ -154,12 +177,59 @@ pub extern "C" fn _start() -> ! {
     }
     context.ui.render(&mut context.screen);
 
-    let mut scheduler = Scheduler::<KernelContext, 5>::new();
+    let cpu_state: &'static mut CpuPrivilegeState =
+        unsafe { &mut *ptr::addr_of_mut!(CPU_PRIVILEGE_STATE) };
+    if let Err(error) = unsafe {
+        arch::initialize_cpu(
+            cpu_state,
+            privilege_stack_tops(),
+            arch::capture_syscall_and_yield,
+        )
+    } {
+        let mut sink = SerialDebugSink::new(&mut context.serial);
+        let _ = writeln!(sink, "userspace: CPU initialization failed: {error:?}\r");
+        halt_forever();
+    }
+
+    let process = match Process::from_elf(
+        USERSPACE_SMOKE_ELF,
+        &context.page_table,
+        &mut context.frames,
+    ) {
+        Ok(process) => process,
+        Err(error) => {
+            let mut sink = SerialDebugSink::new(&mut context.serial);
+            let _ = writeln!(sink, "userspace: ELF load failed: {error:?}\r");
+            halt_forever();
+        }
+    };
+    let process_id = match context.processes.insert(process) {
+        Ok(process_id) => process_id,
+        Err(error) => {
+            let mut sink = SerialDebugSink::new(&mut context.serial);
+            let _ = writeln!(sink, "userspace: process insertion failed: {error:?}\r");
+            halt_forever();
+        }
+    };
+    {
+        let mut sink = SerialDebugSink::new(&mut context.serial);
+        let _ = writeln!(sink, "userspace: loaded pid={}\r", process_id.raw());
+    }
+
+    let mut scheduler = Scheduler::<KernelContext, 6>::new();
     if scheduler.spawn(filesystem_task).is_err()
         || scheduler.spawn(console_task).is_err()
         || scheduler.spawn(accounting_task).is_err()
         || scheduler.spawn(log_flush_task).is_err()
         || scheduler.spawn(input_task).is_err()
+    {
+        halt_forever();
+    }
+    let mut process_state = TaskState::new();
+    process_state.set(0, process_id.raw() as usize);
+    if scheduler
+        .spawn_with_state(process_task, process_state)
+        .is_err()
     {
         halt_forever();
     }
@@ -180,6 +250,7 @@ struct KernelContext {
     screen: FramebufferWriter<'static>,
     ui: ValidationUi,
     paging_verified: bool,
+    processes: ProcessTable,
     pending_console: [u8; CONSOLE_BATCH_CAPACITY],
     pending_console_len: usize,
     pending_input: [u8; INPUT_BATCH_CAPACITY],
@@ -196,6 +267,53 @@ const INPUT_FLUSH_THRESHOLD: usize = INPUT_RECORD_SIZE * (INPUT_BATCH_RECORDS - 
 const LOG_FLUSH_DELAY_SECONDS: u64 = 2;
 const TEXT_BUFFER_CAPACITY: usize = 512;
 const CURSOR_SIZE: usize = 19;
+
+fn privilege_stack_tops() -> PrivilegeStackTops {
+    unsafe fn top(stack: *mut PrivilegeStack) -> u64 {
+        unsafe { stack.cast::<u8>().add(PRIVILEGE_STACK_SIZE) as usize as u64 }
+    }
+
+    unsafe {
+        PrivilegeStackTops {
+            rsp0: top(ptr::addr_of_mut!(RSP0_STACK)),
+            double_fault: top(ptr::addr_of_mut!(DOUBLE_FAULT_STACK)),
+            nmi: top(ptr::addr_of_mut!(NMI_STACK)),
+            machine_check: top(ptr::addr_of_mut!(MACHINE_CHECK_STACK)),
+            syscall: top(ptr::addr_of_mut!(SYSCALL_STACK)),
+        }
+    }
+}
+
+struct SerialDebugSink<'a> {
+    serial: &'a mut Option<SerialPort>,
+}
+
+impl<'a> SerialDebugSink<'a> {
+    fn new(serial: &'a mut Option<SerialPort>) -> Self {
+        Self { serial }
+    }
+}
+
+impl DebugSink for SerialDebugSink<'_> {
+    fn write(&mut self, mut bytes: &[u8]) {
+        let Some(serial) = self.serial.as_mut() else {
+            return;
+        };
+        while !bytes.is_empty() {
+            match serial.write_available(bytes) {
+                Ok(0) | Err(_) => return,
+                Ok(written) => bytes = &bytes[written..],
+            }
+        }
+    }
+}
+
+impl fmt::Write for SerialDebugSink<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        DebugSink::write(self, text.as_bytes());
+        Ok(())
+    }
+}
 const UI_MARGIN: usize = 40;
 const TEXT_TOP: usize = 148;
 const TEXT_ORIGIN_X: usize = UI_MARGIN + 20;
@@ -610,6 +728,90 @@ fn verify_paging(context: &mut KernelContext) -> bool {
         .map(|unmapped_frame| unmapped_frame == frame)
         .unwrap_or(false);
     verified && unmapped && context.page_table.translate_addr(address).is_none()
+}
+
+fn process_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
+    let process_id = ProcessId::from_raw(state.get(0).unwrap_or(0) as u64);
+    let Some(process) = context.processes.get_mut(process_id) else {
+        return TaskPoll::Complete;
+    };
+
+    if process.is_runnable() {
+        unsafe { process.address_space().activate() };
+        let mut user_context = *process.context();
+        match unsafe { arch::enter_user(&mut user_context) } {
+            Ok(KernelExit::YieldToKernel) => {
+                let mut sink = SerialDebugSink::new(&mut context.serial);
+                let outcome = syscall::dispatch(
+                    process,
+                    &mut user_context,
+                    &context.page_table,
+                    &mut context.frames,
+                    &mut sink,
+                );
+                debug_assert!(
+                    outcome == SyscallOutcome::Yield || !process.is_runnable(),
+                    "exit syscall must update process state"
+                );
+            }
+            Ok(KernelExit::Fault(fault)) => {
+                let reason = match fault.vector {
+                    14 => ProcessFaultReason::PageFault,
+                    13 => ProcessFaultReason::GeneralProtection,
+                    6 => ProcessFaultReason::InvalidOpcode,
+                    vector => ProcessFaultReason::Other(u16::try_from(vector).unwrap_or(u16::MAX)),
+                };
+                process.mark_faulted(ProcessFault {
+                    reason,
+                    code: fault.error_code,
+                    address: fault.fault_address,
+                });
+            }
+            Ok(KernelExit::ExitToKernel) | Err(_) => {
+                process.mark_faulted(ProcessFault::new(ProcessFaultReason::InvalidUserContext, 0));
+            }
+        }
+        *process.context_mut() = user_context;
+    }
+
+    unsafe { context.page_table.activate() };
+    let Some(final_state) = context.processes.get(process_id).map(Process::state) else {
+        return TaskPoll::Complete;
+    };
+    if final_state.is_runnable() {
+        return TaskPoll::Pending;
+    }
+
+    let Some(process) = context.processes.take_for_retirement(process_id) else {
+        return TaskPoll::Complete;
+    };
+    let retired = match process.retire() {
+        Ok(retired) => retired,
+        Err(_) => halt_forever(),
+    };
+    let mut sink = SerialDebugSink::new(&mut context.serial);
+    match retired.final_state() {
+        ProcessState::Exited(status) => {
+            let _ = writeln!(
+                sink,
+                "userspace: pid={} exited status={}\r",
+                process_id.raw(),
+                status
+            );
+        }
+        ProcessState::Faulted(fault) => {
+            let _ = writeln!(
+                sink,
+                "userspace: pid={} faulted reason={:?} code={} address={:?}\r",
+                process_id.raw(),
+                fault.reason,
+                fault.code,
+                fault.address
+            );
+        }
+        ProcessState::Ready => unreachable!("runnable process reached retirement"),
+    }
+    TaskPoll::Complete
 }
 
 fn filesystem_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {

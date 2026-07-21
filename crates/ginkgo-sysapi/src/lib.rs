@@ -1,6 +1,12 @@
 #![no_std]
 
-//! Fixed-layout types shared by the GinkgoOS kernel and userspace.
+//! Stable, fixed-layout syscall and IPC types shared by the GinkgoOS kernel and userspace.
+//!
+//! The syscall ABI is currently x86-64 only. System calls use the Linux x86-64
+//! register convention: `rax` contains a [`SyscallNumber`], arguments are passed
+//! in `rdi`, `rsi`, `rdx`, `r10`, `r8`, and `r9`, and `rax` returns a signed
+//! [`Status`] value. Structures passed across the boundary contain integer user
+//! addresses rather than Rust pointers.
 
 use bitflags::bitflags;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -11,6 +17,27 @@ pub const CHANNEL_MAX_BYTES: usize = 16 * 1024;
 pub const CHANNEL_MAX_HANDLES: usize = 16;
 /// Serialized size of [`RpcHeader`].
 pub const RPC_HEADER_SIZE: usize = core::mem::size_of::<RpcHeader>();
+/// A wait deadline which never expires.
+pub const DEADLINE_INFINITE: i64 = i64::MAX;
+
+/// Stable syscall numbers. Existing discriminants must never be changed or reused.
+#[repr(u64)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum SyscallNumber {
+    ProcessYield = 0,
+    ProcessExit = 1,
+    HandleClose = 2,
+    HandleDuplicate = 3,
+    WaitMany = 4,
+    ChannelCreate = 5,
+    ChannelWrite = 6,
+    ChannelRead = 7,
+    SharedMemoryCreate = 8,
+    SharedMemoryGetSize = 9,
+    SharedMemoryMap = 10,
+    SharedMemoryUnmap = 11,
+    DebugWrite = 12,
+}
 
 /// An opaque process-local reference to a kernel object.
 #[repr(transparent)]
@@ -85,7 +112,28 @@ bitflags! {
     }
 }
 
-/// Stable object-kind identifier returned by handle inspection.
+bitflags! {
+    /// Access permitted through a shared-memory mapping.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    pub struct MapProtection: u32 {
+        const READ    = 1 << 0;
+        const WRITE   = 1 << 1;
+        const EXECUTE = 1 << 2;
+    }
+}
+
+bitflags! {
+    /// Placement behavior for a shared-memory mapping.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    pub struct MapFlags: u32 {
+        /// Map exactly at `SharedMemoryMapArgs::address` and fail if occupied.
+        const FIXED = 1 << 0;
+    }
+}
+
+/// Stable object-kind identifier returned with received handles.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObjectType {
@@ -112,6 +160,43 @@ pub enum Status {
     InvalidMessage = -11,
     CyclicTransfer = -12,
     OutOfMemory = -13,
+    InvalidArgument = -14,
+    InvalidAddress = -15,
+    OutOfRange = -16,
+    AlreadyMapped = -17,
+    UnknownSyscall = -18,
+}
+
+impl Status {
+    /// Converts a raw, sign-extended syscall return value to a known status.
+    pub const fn from_raw(raw: i64) -> Option<Self> {
+        Some(match raw {
+            0 => Self::Ok,
+            -1 => Self::InvalidHandle,
+            -2 => Self::WrongObjectType,
+            -3 => Self::AccessDenied,
+            -4 => Self::InvalidRights,
+            -5 => Self::DuplicateHandle,
+            -6 => Self::MessageTooLarge,
+            -7 => Self::HandleTableFull,
+            -8 => Self::ShouldWait,
+            -9 => Self::PeerClosed,
+            -10 => Self::BufferTooSmall,
+            -11 => Self::InvalidMessage,
+            -12 => Self::CyclicTransfer,
+            -13 => Self::OutOfMemory,
+            -14 => Self::InvalidArgument,
+            -15 => Self::InvalidAddress,
+            -16 => Self::OutOfRange,
+            -17 => Self::AlreadyMapped,
+            -18 => Self::UnknownSyscall,
+            _ => return None,
+        })
+    }
+
+    pub const fn raw(self) -> i32 {
+        self as i32
+    }
 }
 
 /// Fixed-layout sizes of one complete channel message.
@@ -135,7 +220,7 @@ impl MessageInfo {
     }
 }
 
-/// One object in a wait-many request.
+/// One object in a wait-many request. The kernel writes `pending` before returning.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WaitItem {
@@ -152,6 +237,176 @@ impl WaitItem {
             pending: Signals::empty(),
         }
     }
+}
+
+/// Argument block for [`SyscallNumber::WaitMany`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WaitManyArgs {
+    /// Address of a writable array of [`WaitItem`] values, or zero when empty.
+    pub items_address: u64,
+    pub item_count: u64,
+    /// Absolute monotonic deadline in nanoseconds, or [`DEADLINE_INFINITE`].
+    pub deadline_ns: i64,
+}
+
+/// Output block for [`SyscallNumber::WaitMany`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WaitManyOutput {
+    pub ready_index: u64,
+}
+
+/// Output block for syscalls that create one handle.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HandleOutput {
+    pub handle: Handle,
+    pub reserved: u32,
+}
+
+impl Default for HandleOutput {
+    fn default() -> Self {
+        Self {
+            handle: Handle::INVALID,
+            reserved: 0,
+        }
+    }
+}
+
+/// How a handle is transferred in a channel write.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DispositionOperation {
+    /// Remove the handle from the sender if the entire write succeeds.
+    Move = 0,
+    /// Create a duplicate for the receiver and retain the sender's handle.
+    Duplicate = 1,
+}
+
+/// One rights-attenuating handle operation in a channel write.
+///
+/// `rights` must be a subset of the source handle's rights. A move requires
+/// `Rights::TRANSFER`; a duplicate requires `Rights::DUPLICATE`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HandleDisposition {
+    pub handle: Handle,
+    pub operation: DispositionOperation,
+    pub rights: Rights,
+    pub reserved: u32,
+}
+
+impl HandleDisposition {
+    pub const fn move_handle(handle: Handle, rights: Rights) -> Self {
+        Self {
+            handle,
+            operation: DispositionOperation::Move,
+            rights,
+            reserved: 0,
+        }
+    }
+
+    pub const fn duplicate(handle: Handle, rights: Rights) -> Self {
+        Self {
+            handle,
+            operation: DispositionOperation::Duplicate,
+            rights,
+            reserved: 0,
+        }
+    }
+}
+
+/// Metadata for one handle received from a channel.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReceivedHandle {
+    pub handle: Handle,
+    pub rights: Rights,
+    pub object_type: ObjectType,
+    pub reserved: u32,
+}
+
+/// Output block for [`SyscallNumber::ChannelCreate`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChannelCreateOutput {
+    pub first: Handle,
+    pub second: Handle,
+}
+
+impl Default for ChannelCreateOutput {
+    fn default() -> Self {
+        Self {
+            first: Handle::INVALID,
+            second: Handle::INVALID,
+        }
+    }
+}
+
+/// Argument block for [`SyscallNumber::ChannelWrite`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChannelWriteArgs {
+    /// Address of `byte_count` readable bytes, or zero when the count is zero.
+    pub bytes_address: u64,
+    pub byte_count: u64,
+    /// Address of `disposition_count` readable [`HandleDisposition`] values.
+    pub dispositions_address: u64,
+    pub disposition_count: u64,
+    /// Reserved for future channel-write options; must currently be zero.
+    pub flags: u32,
+    pub reserved: u32,
+}
+
+/// Argument block for [`SyscallNumber::ChannelRead`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChannelReadArgs {
+    /// Address of `byte_capacity` writable bytes, or zero when the capacity is zero.
+    pub bytes_address: u64,
+    pub byte_capacity: u64,
+    /// Address of `handle_capacity` writable [`ReceivedHandle`] values.
+    pub handles_address: u64,
+    pub handle_capacity: u64,
+    /// Address of a writable [`ChannelReadOutput`].
+    pub output_address: u64,
+    /// Reserved for future channel-read options; must currently be zero.
+    pub flags: u32,
+    pub reserved: u32,
+}
+
+/// Output block for [`SyscallNumber::ChannelRead`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChannelReadOutput {
+    pub message: MessageInfo,
+}
+
+/// Output block for [`SyscallNumber::SharedMemoryGetSize`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SharedMemorySizeOutput {
+    pub size: u64,
+}
+
+/// Argument block for [`SyscallNumber::SharedMemoryMap`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SharedMemoryMapArgs {
+    /// Requested address, or zero to let the kernel choose when not `FIXED`.
+    pub address: u64,
+    pub offset: u64,
+    pub length: u64,
+    pub protection: MapProtection,
+    pub flags: MapFlags,
+}
+
+/// Output block for [`SyscallNumber::SharedMemoryMap`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SharedMemoryMapOutput {
+    pub address: u64,
 }
 
 /// Zerocopy RPC envelope followed immediately by a postcard payload.
@@ -192,4 +447,128 @@ impl RpcHeader {
     }
 }
 
-const _: () = assert!(RPC_HEADER_SIZE == 24);
+const _: () = {
+    assert!(core::mem::size_of::<Handle>() == 4);
+    assert!(core::mem::size_of::<Rights>() == 4);
+    assert!(core::mem::size_of::<Signals>() == 4);
+    assert!(core::mem::size_of::<MessageInfo>() == 8);
+    assert!(core::mem::size_of::<WaitItem>() == 12);
+    assert!(core::mem::size_of::<WaitManyArgs>() == 24);
+    assert!(core::mem::size_of::<WaitManyOutput>() == 8);
+    assert!(core::mem::size_of::<HandleOutput>() == 8);
+    assert!(core::mem::size_of::<HandleDisposition>() == 16);
+    assert!(core::mem::size_of::<ReceivedHandle>() == 16);
+    assert!(core::mem::size_of::<ChannelCreateOutput>() == 8);
+    assert!(core::mem::size_of::<ChannelWriteArgs>() == 40);
+    assert!(core::mem::size_of::<ChannelReadArgs>() == 48);
+    assert!(core::mem::size_of::<ChannelReadOutput>() == 8);
+    assert!(core::mem::size_of::<SharedMemorySizeOutput>() == 8);
+    assert!(core::mem::size_of::<SharedMemoryMapArgs>() == 32);
+    assert!(core::mem::size_of::<SharedMemoryMapOutput>() == 8);
+    assert!(RPC_HEADER_SIZE == 24);
+};
+
+#[cfg(test)]
+mod tests {
+    use core::mem::{align_of, offset_of, size_of};
+
+    use super::*;
+
+    #[test]
+    fn syscall_discriminants_are_stable() {
+        assert_eq!(SyscallNumber::ProcessYield as u64, 0);
+        assert_eq!(SyscallNumber::ProcessExit as u64, 1);
+        assert_eq!(SyscallNumber::HandleClose as u64, 2);
+        assert_eq!(SyscallNumber::HandleDuplicate as u64, 3);
+        assert_eq!(SyscallNumber::WaitMany as u64, 4);
+        assert_eq!(SyscallNumber::ChannelCreate as u64, 5);
+        assert_eq!(SyscallNumber::ChannelWrite as u64, 6);
+        assert_eq!(SyscallNumber::ChannelRead as u64, 7);
+        assert_eq!(SyscallNumber::SharedMemoryCreate as u64, 8);
+        assert_eq!(SyscallNumber::SharedMemoryGetSize as u64, 9);
+        assert_eq!(SyscallNumber::SharedMemoryMap as u64, 10);
+        assert_eq!(SyscallNumber::SharedMemoryUnmap as u64, 11);
+        assert_eq!(SyscallNumber::DebugWrite as u64, 12);
+    }
+
+    #[test]
+    fn status_discriminants_are_stable_and_round_trip() {
+        let statuses = [
+            Status::Ok,
+            Status::InvalidHandle,
+            Status::WrongObjectType,
+            Status::AccessDenied,
+            Status::InvalidRights,
+            Status::DuplicateHandle,
+            Status::MessageTooLarge,
+            Status::HandleTableFull,
+            Status::ShouldWait,
+            Status::PeerClosed,
+            Status::BufferTooSmall,
+            Status::InvalidMessage,
+            Status::CyclicTransfer,
+            Status::OutOfMemory,
+            Status::InvalidArgument,
+            Status::InvalidAddress,
+            Status::OutOfRange,
+            Status::AlreadyMapped,
+            Status::UnknownSyscall,
+        ];
+
+        for (index, status) in statuses.into_iter().enumerate() {
+            let expected = -(index as i32);
+            assert_eq!(status.raw(), expected);
+            assert_eq!(Status::from_raw(i64::from(expected)), Some(status));
+        }
+        assert_eq!(Status::from_raw(1), None);
+        assert_eq!(Status::from_raw(i64::from(i32::MIN)), None);
+    }
+
+    #[test]
+    fn operation_and_object_discriminants_are_stable() {
+        assert_eq!(DispositionOperation::Move as u32, 0);
+        assert_eq!(DispositionOperation::Duplicate as u32, 1);
+        assert_eq!(ObjectType::Channel as u32, 1);
+        assert_eq!(ObjectType::SharedMemory as u32, 2);
+        assert_eq!(ObjectType::Window as u32, 3);
+    }
+
+    #[test]
+    fn argument_blocks_have_stable_layouts() {
+        assert_eq!(size_of::<WaitManyArgs>(), 24);
+        assert_eq!(offset_of!(WaitManyArgs, deadline_ns), 16);
+
+        assert_eq!(size_of::<ChannelWriteArgs>(), 40);
+        assert_eq!(align_of::<ChannelWriteArgs>(), 8);
+        assert_eq!(offset_of!(ChannelWriteArgs, bytes_address), 0);
+        assert_eq!(offset_of!(ChannelWriteArgs, dispositions_address), 16);
+        assert_eq!(offset_of!(ChannelWriteArgs, flags), 32);
+
+        assert_eq!(size_of::<ChannelReadArgs>(), 48);
+        assert_eq!(align_of::<ChannelReadArgs>(), 8);
+        assert_eq!(offset_of!(ChannelReadArgs, handles_address), 16);
+        assert_eq!(offset_of!(ChannelReadArgs, output_address), 32);
+        assert_eq!(offset_of!(ChannelReadArgs, flags), 40);
+
+        assert_eq!(size_of::<SharedMemoryMapArgs>(), 32);
+        assert_eq!(offset_of!(SharedMemoryMapArgs, protection), 24);
+        assert_eq!(offset_of!(SharedMemoryMapArgs, flags), 28);
+    }
+
+    #[test]
+    fn channel_handle_records_have_stable_layouts() {
+        assert_eq!(size_of::<HandleDisposition>(), 16);
+        assert_eq!(offset_of!(HandleDisposition, operation), 4);
+        assert_eq!(offset_of!(HandleDisposition, rights), 8);
+        assert_eq!(size_of::<ReceivedHandle>(), 16);
+        assert_eq!(offset_of!(ReceivedHandle, object_type), 8);
+    }
+
+    #[test]
+    fn mapping_bits_are_stable() {
+        assert_eq!(MapProtection::READ.bits(), 1);
+        assert_eq!(MapProtection::WRITE.bits(), 2);
+        assert_eq!(MapProtection::EXECUTE.bits(), 4);
+        assert_eq!(MapFlags::FIXED.bits(), 1);
+    }
+}

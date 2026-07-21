@@ -1,5 +1,8 @@
 //! Active x86_64 page-table access built on the `x86_64` crate.
 
+#[path = "address_space.rs"]
+pub mod address_space;
+
 use x86_64::{
     registers::control::Cr3,
     structures::paging::{
@@ -33,6 +36,7 @@ pub enum UnmapError {
 
 pub struct ActivePageTable {
     root: PhysFrame<Size4KiB>,
+    hhdm_offset: VirtAddr,
     mapper: OffsetPageTable<'static>,
 }
 
@@ -58,11 +62,36 @@ impl ActivePageTable {
         let root_table = unsafe { &mut *root_virtual.as_mut_ptr::<PageTable>() };
         let mapper = unsafe { OffsetPageTable::new(root_table, hhdm_offset) };
 
-        Ok(Self { root, mapper })
+        Ok(Self {
+            root,
+            hhdm_offset,
+            mapper,
+        })
     }
 
     pub fn root_frame(&self) -> PhysFrame<Size4KiB> {
         self.root
+    }
+
+    /// Returns the HHDM offset validated when this active-root capability was built.
+    ///
+    /// Safe paging consumers must derive HHDM access from this value rather than
+    /// accepting an independent raw offset which could disagree with the mapper.
+    pub const fn hhdm_offset(&self) -> VirtAddr {
+        self.hhdm_offset
+    }
+
+    /// Switches to this page-table root while preserving the current CR3 flags.
+    ///
+    /// The caller must ensure that this root maps the current instruction, stack,
+    /// and all other memory needed immediately after the switch.
+    pub unsafe fn activate(&self) {
+        let (_, flags) = Cr3::read();
+        unsafe { Cr3::write(self.root, flags) };
+    }
+
+    pub fn is_active(&self) -> bool {
+        Cr3::read().0 == self.root
     }
 
     /// Reserves every page-table frame reachable from the active root so the

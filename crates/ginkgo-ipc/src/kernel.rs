@@ -7,8 +7,13 @@
 //! cooperative scheduler; a future syscall layer can block around exposed object
 //! signals without changing these semantics.
 
-use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
-use core::mem;
+use alloc::{
+    alloc::{alloc_zeroed, dealloc, Layout},
+    collections::VecDeque,
+    sync::Arc,
+    vec::Vec,
+};
+use core::{mem, ptr::NonNull, slice};
 
 use ginkgo_sysapi::{
     Handle, MessageInfo, ObjectType, Rights, Signals, Status, WaitItem, CHANNEL_MAX_BYTES,
@@ -20,6 +25,8 @@ use spinning_top::Spinlock;
 pub const CHANNEL_QUEUE_CAPACITY: usize = 64;
 /// Maximum number of live or vacant slots retained by one handle table.
 pub const HANDLE_TABLE_CAPACITY: usize = 4096;
+/// Required allocation and mapping alignment for shared-memory backing.
+pub const SHARED_MEMORY_PAGE_SIZE: usize = 4096;
 /// Default number of equal shared-memory slots owned by [`HandleTable::window_create`].
 pub const WINDOW_BUFFER_COUNT: usize = 2;
 
@@ -43,6 +50,7 @@ const SHARED_MEMORY_DEFAULT_RIGHTS: Rights = Rights::from_bits_retain(
         | Rights::WRITE.bits()
         | Rights::DUPLICATE.bits()
         | Rights::TRANSFER.bits()
+        | Rights::MAP.bits()
         | Rights::MANAGE.bits(),
 );
 const WINDOW_CLIENT_RIGHTS: Rights = Rights::from_bits_retain(
@@ -151,7 +159,47 @@ enum KernelObject {
 }
 
 struct SharedMemoryObject {
-    bytes: Spinlock<Box<[u8]>>,
+    backing: SharedMemoryBacking,
+    access: Spinlock<()>,
+}
+
+struct SharedMemoryBacking {
+    base: NonNull<u8>,
+    logical_len: usize,
+    layout: Layout,
+}
+
+impl SharedMemoryBacking {
+    fn new(logical_len: usize) -> Result<Self, IpcError> {
+        let mapped_len = logical_len
+            .checked_add(SHARED_MEMORY_PAGE_SIZE - 1)
+            .ok_or(IpcError::InvalidMessage)?
+            & !(SHARED_MEMORY_PAGE_SIZE - 1);
+        let layout = Layout::from_size_align(mapped_len, SHARED_MEMORY_PAGE_SIZE)
+            .map_err(|_| IpcError::InvalidMessage)?;
+        let base = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(IpcError::OutOfMemory)?;
+        Ok(Self {
+            base,
+            logical_len,
+            layout,
+        })
+    }
+
+    fn mapped_len(&self) -> usize {
+        self.layout.size()
+    }
+}
+
+// SAFETY: the allocation address and lengths are immutable. All safe byte access
+// is serialized by SharedMemoryObject::access; raw mapping users must provide the
+// external synchronization documented by SharedMemoryMappingLease.
+unsafe impl Send for SharedMemoryBacking {}
+unsafe impl Sync for SharedMemoryBacking {}
+
+impl Drop for SharedMemoryBacking {
+    fn drop(&mut self) {
+        unsafe { dealloc(self.base.as_ptr(), self.layout) };
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -208,7 +256,7 @@ struct WindowState {
     shared_memory: Arc<KernelObject>,
     buffer_len: usize,
     generation: u64,
-    buffers: Box<[WindowBufferState]>,
+    buffers: Vec<WindowBufferState>,
     pending: Option<WindowPresentation>,
     displayed: Option<WindowPresentation>,
     release: Option<WindowRelease>,
@@ -278,8 +326,8 @@ struct ChannelState {
 }
 
 struct KernelMessage {
-    bytes: Box<[u8]>,
-    handles: Box<[HandleEntry]>,
+    bytes: Vec<u8>,
+    handles: Vec<HandleEntry>,
 }
 
 /// A handle moved by a channel write and the rights installed at the receiver.
@@ -292,6 +340,94 @@ pub struct HandleDisposition {
 impl HandleDisposition {
     pub const fn new(handle: Handle, rights: Rights) -> Self {
         Self { handle, rights }
+    }
+}
+
+/// Kernel-internal channel handle operation, independent of the syscall ABI layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HandleOperation {
+    Move,
+    Duplicate,
+}
+
+/// One atomic move or duplicate operation attached to a channel write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HandleOperationDisposition {
+    pub handle: Handle,
+    pub operation: HandleOperation,
+    pub rights: Rights,
+}
+
+impl HandleOperationDisposition {
+    pub const fn move_handle(handle: Handle, rights: Rights) -> Self {
+        Self {
+            handle,
+            operation: HandleOperation::Move,
+            rights,
+        }
+    }
+
+    pub const fn duplicate(handle: Handle, rights: Rights) -> Self {
+        Self {
+            handle,
+            operation: HandleOperation::Duplicate,
+            rights,
+        }
+    }
+}
+
+/// Page-aligned kernel backing metadata retained by a mapping lease.
+///
+/// Direct mapped access aliases kernel read/write APIs and all writable aliases;
+/// mapping code must provide external synchronization and enforce the requested
+/// userspace protections.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SharedMemoryMappingInfo {
+    /// Immutable base address of the page-aligned kernel allocation.
+    pub base: *const u8,
+    /// API-visible byte length used by read/write and window subdivision.
+    pub logical_len: usize,
+    /// Page-rounded allocation length available to a real mapping implementation.
+    pub mapped_len: usize,
+}
+
+/// Access requested by an owning shared-memory mapping lease.
+///
+/// Executable mappings are intentionally unsupported and cannot be represented.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SharedMemoryMappingAccess {
+    ReadOnly,
+    ReadWrite,
+}
+
+impl SharedMemoryMappingAccess {
+    const fn required_rights(self) -> Rights {
+        match self {
+            Self::ReadOnly => Rights::MAP.union(Rights::READ),
+            Self::ReadWrite => Rights::MAP.union(Rights::READ).union(Rights::WRITE),
+        }
+    }
+}
+
+/// Owns a reference to shared-memory backing prepared for a future process mapping.
+///
+/// The lease keeps the allocation alive across source handle close or transfer. It
+/// does not itself install a userspace mapping; process code must enforce address
+/// placement, effective rights, and coherency with every writable alias.
+#[derive(Clone)]
+pub struct SharedMemoryMappingLease {
+    _object: Arc<KernelObject>,
+    info: SharedMemoryMappingInfo,
+    effective_rights: Rights,
+}
+
+impl SharedMemoryMappingLease {
+    pub const fn info(&self) -> SharedMemoryMappingInfo {
+        self.info
+    }
+
+    pub const fn effective_rights(&self) -> Rights {
+        self.effective_rights
     }
 }
 
@@ -344,14 +480,12 @@ impl HandleTable {
             return Err(IpcError::InvalidMessage);
         }
 
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(size)
-            .map_err(|_| IpcError::OutOfMemory)?;
-        bytes.resize(size, 0);
-        let object = Arc::new(KernelObject::SharedMemory(SharedMemoryObject {
-            bytes: Spinlock::new(bytes.into_boxed_slice()),
-        }));
+        let backing = SharedMemoryBacking::new(size)?;
+        let object = Arc::try_new(KernelObject::SharedMemory(SharedMemoryObject {
+            backing,
+            access: Spinlock::new(()),
+        }))
+        .map_err(|_| IpcError::OutOfMemory)?;
         let slot = self.reserve_slots(1)?[0];
         Ok(self.insert_reserved(slot, object, SHARED_MEMORY_DEFAULT_RIGHTS))
     }
@@ -359,8 +493,7 @@ impl HandleTable {
     /// Returns the immutable allocation length of a shared-memory object.
     pub fn shared_memory_len(&self, handle: Handle) -> Result<usize, IpcError> {
         let object = self.object_with_rights(handle, Rights::READ)?;
-        let len = shared_memory_object(&object)?.bytes.lock().len();
-        Ok(len)
+        Ok(shared_memory_object(&object)?.backing.logical_len)
     }
 
     /// Copies a checked range out of shared memory.
@@ -372,8 +505,11 @@ impl HandleTable {
     ) -> Result<(), IpcError> {
         let object = self.object_with_rights(handle, Rights::READ)?;
         let memory = shared_memory_object(&object)?;
-        let bytes = memory.bytes.lock();
-        let range = checked_range(offset, output.len(), bytes.len())?;
+        let _access = memory.access.lock();
+        let range = checked_range(offset, output.len(), memory.backing.logical_len)?;
+        let bytes = unsafe {
+            slice::from_raw_parts(memory.backing.base.as_ptr(), memory.backing.logical_len)
+        };
         output.copy_from_slice(&bytes[range]);
         Ok(())
     }
@@ -392,10 +528,39 @@ impl HandleTable {
     ) -> Result<(), IpcError> {
         let object = self.object_with_rights(handle, Rights::WRITE)?;
         let memory = shared_memory_object(&object)?;
-        let mut bytes = memory.bytes.lock();
-        let range = checked_range(offset, input.len(), bytes.len())?;
+        let _access = memory.access.lock();
+        let range = checked_range(offset, input.len(), memory.backing.logical_len)?;
+        let bytes = unsafe {
+            slice::from_raw_parts_mut(memory.backing.base.as_ptr(), memory.backing.logical_len)
+        };
         bytes[range].copy_from_slice(input);
         Ok(())
+    }
+
+    /// Acquires an owning lease for a future process mapping.
+    ///
+    /// Read-only access requires `MAP | READ`; writable access requires
+    /// `MAP | READ | WRITE`. Executable leases are unsupported. This does not
+    /// install a userspace mapping; the returned lease only retains the object and
+    /// records the maximum effective rights authorized by this request.
+    pub fn shared_memory_mapping_lease(
+        &self,
+        handle: Handle,
+        access: SharedMemoryMappingAccess,
+    ) -> Result<SharedMemoryMappingLease, IpcError> {
+        let effective_rights = access.required_rights();
+        let object = self.object_with_rights(handle, effective_rights)?;
+        let backing = &shared_memory_object(&object)?.backing;
+        let info = SharedMemoryMappingInfo {
+            base: backing.base.as_ptr().cast_const(),
+            logical_len: backing.logical_len,
+            mapped_len: backing.mapped_len(),
+        };
+        Ok(SharedMemoryMappingLease {
+            _object: object,
+            info,
+            effective_rights,
+        })
     }
 
     /// Creates a generation-1 window over two equal shared-memory buffers.
@@ -425,23 +590,20 @@ impl HandleTable {
         if generation == 0 || buffer_count < 2 {
             return Err(IpcError::InvalidMessage);
         }
-        let memory_len = shared_memory_object(&memory)?.bytes.lock().len();
+        let memory_len = shared_memory_object(&memory)?.backing.logical_len;
         if memory_len < buffer_count || memory_len % buffer_count != 0 {
             return Err(IpcError::InvalidMessage);
         }
         let buffer_len = memory_len / buffer_count;
 
-        let mut buffers = Vec::new();
-        buffers
-            .try_reserve_exact(buffer_count)
-            .map_err(|_| IpcError::OutOfMemory)?;
+        let mut buffers = try_vec_with_capacity(buffer_count)?;
         buffers.resize(buffer_count, WindowBufferState::ClientOwned);
         let slots = self.reserve_slots(2)?;
-        let state = Arc::new(Spinlock::new(WindowState {
+        let state = Arc::try_new(Spinlock::new(WindowState {
             shared_memory: memory,
             buffer_len,
             generation,
-            buffers: buffers.into_boxed_slice(),
+            buffers,
             pending: None,
             displayed: None,
             release: None,
@@ -449,15 +611,18 @@ impl HandleTable {
             retired: false,
             client_open: true,
             manager_open: true,
-        }));
-        let client = Arc::new(KernelObject::Window(WindowEndpoint {
+        }))
+        .map_err(|_| IpcError::OutOfMemory)?;
+        let client = Arc::try_new(KernelObject::Window(WindowEndpoint {
             state: Arc::clone(&state),
             role: WindowRole::Client,
-        }));
-        let manager = Arc::new(KernelObject::Window(WindowEndpoint {
+        }))
+        .map_err(|_| IpcError::OutOfMemory)?;
+        let manager = Arc::try_new(KernelObject::Window(WindowEndpoint {
             state,
             role: WindowRole::Manager,
-        }));
+        }))
+        .map_err(|_| IpcError::OutOfMemory)?;
         let client = self.insert_reserved(slots[0], client, WINDOW_CLIENT_RIGHTS);
         let manager = self.insert_reserved(slots[1], manager, WINDOW_MANAGER_RIGHTS);
         Ok((client, manager))
@@ -721,7 +886,7 @@ impl HandleTable {
     /// Creates both ends of a channel in this table.
     pub fn channel_create(&mut self) -> Result<(Handle, Handle), IpcError> {
         let slots = self.reserve_slots(2)?;
-        let [left, right] = new_channel_objects();
+        let [left, right] = new_channel_objects()?;
         let left = self.insert_reserved(slots[0], left, CHANNEL_DEFAULT_RIGHTS);
         let right = self.insert_reserved(slots[1], right, CHANNEL_DEFAULT_RIGHTS);
         Ok((left, right))
@@ -742,14 +907,10 @@ impl HandleTable {
             return Err(IpcError::MessageTooLarge);
         }
 
-        let dispositions = handles
-            .iter()
-            .copied()
-            .map(|handle| {
-                self.handle_rights(handle)
-                    .map(|rights| HandleDisposition::new(handle, rights))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut dispositions = try_vec_with_capacity(handles.len())?;
+        for handle in handles.iter().copied() {
+            dispositions.push(HandleDisposition::new(handle, self.handle_rights(handle)?));
+        }
         self.channel_write_with_dispositions(channel, bytes, &dispositions)
     }
 
@@ -768,11 +929,54 @@ impl HandleTable {
         if bytes.len() > CHANNEL_MAX_BYTES || dispositions.len() > CHANNEL_MAX_HANDLES {
             return Err(IpcError::MessageTooLarge);
         }
+        let mut operations = try_vec_with_capacity(dispositions.len())?;
+        for disposition in dispositions {
+            operations.push(HandleOperationDisposition::move_handle(
+                disposition.handle,
+                disposition.rights,
+            ));
+        }
+        self.channel_write_with_handle_operations(channel, bytes, &operations)
+    }
+
+    /// Writes one message with an atomic ordered mix of moves and duplicates.
+    ///
+    /// A move requires [`Rights::TRANSFER`] and consumes its source only after every
+    /// validation succeeds. A duplicate requires [`Rights::DUPLICATE`] and retains
+    /// its source. Destination rights must be subsets, source handles must be unique,
+    /// and every failure leaves all originals valid with no message queued.
+    pub fn channel_write_with_handle_operations(
+        &mut self,
+        channel: Handle,
+        bytes: &[u8],
+        dispositions: &[HandleOperationDisposition],
+    ) -> Result<(), IpcError> {
+        self.channel_write_with_handle_operations_impl(channel, bytes, dispositions, &mut || Ok(()))
+    }
+
+    fn channel_write_with_handle_operations_impl<F>(
+        &mut self,
+        channel: Handle,
+        bytes: &[u8],
+        dispositions: &[HandleOperationDisposition],
+        graph_allocation_hook: &mut F,
+    ) -> Result<(), IpcError>
+    where
+        F: FnMut() -> Result<(), IpcError>,
+    {
+        enum PreparedHandle {
+            Move { index: usize, rights: Rights },
+            Duplicate(HandleEntry),
+        }
+
+        if bytes.len() > CHANNEL_MAX_BYTES || dispositions.len() > CHANNEL_MAX_HANDLES {
+            return Err(IpcError::MessageTooLarge);
+        }
 
         let channel_object = self.object_with_rights(channel, Rights::WRITE)?;
         let endpoint = channel_endpoint(&channel_object)?;
 
-        let mut transfers = Vec::with_capacity(dispositions.len());
+        let mut prepared = try_vec_with_capacity(dispositions.len())?;
         for (position, disposition) in dispositions.iter().copied().enumerate() {
             if dispositions[..position]
                 .iter()
@@ -785,20 +989,35 @@ impl HandleTable {
                 .entry
                 .as_ref()
                 .ok_or(IpcError::InvalidHandle)?;
-            if !entry.rights.contains(Rights::TRANSFER) {
+            let required = match disposition.operation {
+                HandleOperation::Move => Rights::TRANSFER,
+                HandleOperation::Duplicate => Rights::DUPLICATE,
+            };
+            if !entry.rights.contains(required) {
                 return Err(IpcError::AccessDenied);
             }
             if !entry.rights.contains(disposition.rights) {
                 return Err(IpcError::InvalidRights);
             }
-            transfers.push((index, disposition.rights));
+            match disposition.operation {
+                HandleOperation::Move => prepared.push(PreparedHandle::Move {
+                    index,
+                    rights: disposition.rights,
+                }),
+                HandleOperation::Duplicate => {
+                    prepared.push(PreparedHandle::Duplicate(HandleEntry {
+                        object: Arc::clone(&entry.object),
+                        rights: disposition.rights,
+                    }))
+                }
+            }
         }
 
-        // Allocate all message storage before the commit point. The kernel's
-        // allocator is currently infallible, so no operation below can fail
-        // after handles start moving out of the sender.
-        let message_bytes = bytes.to_vec().into_boxed_slice();
-        let mut message_handles = Vec::with_capacity(dispositions.len());
+        // Allocate all message storage before the commit point, so no operation
+        // below can fail after move handles start leaving the sender.
+        let mut message_bytes = try_vec_with_capacity(bytes.len())?;
+        message_bytes.extend_from_slice(bytes);
+        let mut message_handles = try_vec_with_capacity(dispositions.len())?;
 
         let _graph = CHANNEL_GRAPH_LOCK.lock();
         let mut state = endpoint.state.lock();
@@ -811,28 +1030,41 @@ impl HandleTable {
         }
 
         let mut visited = Vec::new();
-        for &(index, _) in &transfers {
-            let entry = self.slots[index]
-                .entry
-                .as_ref()
-                .expect("validated transfer slot became vacant");
-            if object_reaches_channel(&entry.object, &endpoint.state, &mut visited) {
+        for handle in &prepared {
+            let object = match handle {
+                PreparedHandle::Move { index, .. } => {
+                    &self.slots[*index]
+                        .entry
+                        .as_ref()
+                        .expect("validated move slot became vacant")
+                        .object
+                }
+                PreparedHandle::Duplicate(entry) => &entry.object,
+            };
+            if object_reaches_channel(object, &endpoint.state, &mut visited, graph_allocation_hook)?
+            {
                 return Err(IpcError::CyclicTransfer);
             }
         }
 
-        for (index, destination_rights) in transfers {
-            let mut entry = self.slots[index]
-                .entry
-                .take()
-                .expect("validated transfer slot became vacant");
-            self.slots[index].advance_generation();
-            entry.rights = destination_rights;
+        for handle in prepared {
+            let entry = match handle {
+                PreparedHandle::Move { index, rights } => {
+                    let mut entry = self.slots[index]
+                        .entry
+                        .take()
+                        .expect("validated move slot became vacant");
+                    self.slots[index].advance_generation();
+                    entry.rights = rights;
+                    entry
+                }
+                PreparedHandle::Duplicate(entry) => entry,
+            };
             message_handles.push(entry);
         }
         state.queues[peer].push_back(KernelMessage {
             bytes: message_bytes,
-            handles: message_handles.into_boxed_slice(),
+            handles: message_handles,
         });
         Ok(())
     }
@@ -873,7 +1105,6 @@ impl HandleTable {
         bytes_out[..byte_count].copy_from_slice(&message.bytes);
         for ((entry, slot), output) in message
             .handles
-            .into_vec()
             .into_iter()
             .zip(destination_slots)
             .zip(handles_out.iter_mut())
@@ -991,7 +1222,7 @@ impl HandleTable {
             return Err(IpcError::HandleTableFull);
         }
 
-        let mut reserved = Vec::with_capacity(count);
+        let mut reserved = try_vec_with_capacity(count)?;
         for (index, slot) in self.slots.iter().enumerate() {
             if slot.entry.is_none() && slot.generation != 0 {
                 reserved.push(index);
@@ -1000,6 +1231,10 @@ impl HandleTable {
                 }
             }
         }
+        let new_slot_count = count - reserved.len();
+        self.slots
+            .try_reserve_exact(new_slot_count)
+            .map_err(|_| IpcError::OutOfMemory)?;
         while reserved.len() < count {
             let index = self.slots.len();
             self.slots.push(HandleSlot::vacant());
@@ -1034,24 +1269,34 @@ pub fn channel_create_between(
 ) -> Result<(Handle, Handle), IpcError> {
     let left_slot = left_table.reserve_slots(1)?[0];
     let right_slot = right_table.reserve_slots(1)?[0];
-    let [left, right] = new_channel_objects();
+    let [left, right] = new_channel_objects()?;
     let left = left_table.insert_reserved(left_slot, left, CHANNEL_DEFAULT_RIGHTS);
     let right = right_table.insert_reserved(right_slot, right, CHANNEL_DEFAULT_RIGHTS);
     Ok((left, right))
 }
 
-fn new_channel_objects() -> [Arc<KernelObject>; 2] {
-    let state = Arc::new(Spinlock::new(ChannelState {
+fn new_channel_objects() -> Result<[Arc<KernelObject>; 2], IpcError> {
+    let mut left_queue = VecDeque::new();
+    left_queue
+        .try_reserve_exact(CHANNEL_QUEUE_CAPACITY)
+        .map_err(|_| IpcError::OutOfMemory)?;
+    let mut right_queue = VecDeque::new();
+    right_queue
+        .try_reserve_exact(CHANNEL_QUEUE_CAPACITY)
+        .map_err(|_| IpcError::OutOfMemory)?;
+    let state = Arc::try_new(Spinlock::new(ChannelState {
         open: [true, true],
-        queues: [VecDeque::new(), VecDeque::new()],
-    }));
-    [
-        Arc::new(KernelObject::Channel(ChannelEndpoint {
-            state: Arc::clone(&state),
-            side: 0,
-        })),
-        Arc::new(KernelObject::Channel(ChannelEndpoint { state, side: 1 })),
-    ]
+        queues: [left_queue, right_queue],
+    }))
+    .map_err(|_| IpcError::OutOfMemory)?;
+    let left = Arc::try_new(KernelObject::Channel(ChannelEndpoint {
+        state: Arc::clone(&state),
+        side: 0,
+    }))
+    .map_err(|_| IpcError::OutOfMemory)?;
+    let right = Arc::try_new(KernelObject::Channel(ChannelEndpoint { state, side: 1 }))
+        .map_err(|_| IpcError::OutOfMemory)?;
+    Ok([left, right])
 }
 
 fn channel_endpoint(object: &Arc<KernelObject>) -> Result<&ChannelEndpoint, IpcError> {
@@ -1084,6 +1329,14 @@ fn window_endpoint_for_role(
         return Err(IpcError::AccessDenied);
     }
     Ok(endpoint)
+}
+
+fn try_vec_with_capacity<T>(capacity: usize) -> Result<Vec<T>, IpcError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(capacity)
+        .map_err(|_| IpcError::OutOfMemory)?;
+    Ok(values)
 }
 
 fn checked_range(
@@ -1123,30 +1376,40 @@ fn copy_window_buffer(
         .ok_or(IpcError::InvalidMessage)?;
     let memory = shared_memory_object(&state.shared_memory)
         .expect("window referenced a non-shared-memory object");
-    let bytes = memory.bytes.lock();
+    let _access = memory.access.lock();
+    let bytes =
+        unsafe { slice::from_raw_parts(memory.backing.base.as_ptr(), memory.backing.logical_len) };
     output.copy_from_slice(&bytes[start..end]);
     Ok(())
 }
 
-fn object_reaches_channel(
+fn object_reaches_channel<F>(
     object: &Arc<KernelObject>,
     destination: &Arc<Spinlock<ChannelState>>,
     visited: &mut Vec<usize>,
-) -> bool {
+    allocation_hook: &mut F,
+) -> Result<bool, IpcError>
+where
+    F: FnMut() -> Result<(), IpcError>,
+{
     let KernelObject::Channel(endpoint) = object.as_ref() else {
-        return false;
+        return Ok(false);
     };
-    let mut pending = Vec::from([Arc::clone(&endpoint.state)]);
+    allocation_hook()?;
+    let mut pending = try_vec_with_capacity(1)?;
+    pending.push(Arc::clone(&endpoint.state));
 
     while let Some(candidate) = pending.pop() {
         if Arc::ptr_eq(&candidate, destination) {
-            return true;
+            return Ok(true);
         }
 
         let identity = Arc::as_ptr(&candidate) as usize;
         if visited.contains(&identity) {
             continue;
         }
+        allocation_hook()?;
+        visited.try_reserve(1).map_err(|_| IpcError::OutOfMemory)?;
         visited.push(identity);
 
         // Clone outgoing state references while holding exactly one channel
@@ -1159,6 +1422,8 @@ fn object_reaches_channel(
                 for message in queue {
                     for entry in &message.handles {
                         if let KernelObject::Channel(endpoint) = entry.object.as_ref() {
+                            allocation_hook()?;
+                            outgoing.try_reserve(1).map_err(|_| IpcError::OutOfMemory)?;
                             outgoing.push(Arc::clone(&endpoint.state));
                         }
                     }
@@ -1166,15 +1431,110 @@ fn object_reaches_channel(
             }
             outgoing
         };
-        pending.extend(outgoing);
+        if !outgoing.is_empty() {
+            allocation_hook()?;
+            pending
+                .try_reserve(outgoing.len())
+                .map_err(|_| IpcError::OutOfMemory)?;
+            pending.extend(outgoing);
+        }
     }
 
-    false
+    Ok(false)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_memory_backing_is_page_aligned_rounded_zeroed_and_map_gated() {
+        let mut table = HandleTable::new();
+        let one_byte = table.shared_memory_create(1).unwrap();
+        let exact_page = table.shared_memory_create(SHARED_MEMORY_PAGE_SIZE).unwrap();
+        let over_page = table
+            .shared_memory_create(SHARED_MEMORY_PAGE_SIZE + 1)
+            .unwrap();
+
+        for (handle, logical_len, mapped_len) in [
+            (one_byte, 1, SHARED_MEMORY_PAGE_SIZE),
+            (exact_page, SHARED_MEMORY_PAGE_SIZE, SHARED_MEMORY_PAGE_SIZE),
+            (
+                over_page,
+                SHARED_MEMORY_PAGE_SIZE + 1,
+                SHARED_MEMORY_PAGE_SIZE * 2,
+            ),
+        ] {
+            let lease = table
+                .shared_memory_mapping_lease(handle, SharedMemoryMappingAccess::ReadOnly)
+                .unwrap();
+            assert_eq!(lease.effective_rights(), Rights::MAP | Rights::READ);
+            let info = lease.info();
+            assert_eq!(info.base as usize % SHARED_MEMORY_PAGE_SIZE, 0);
+            assert_eq!(info.logical_len, logical_len);
+            assert_eq!(info.mapped_len, mapped_len);
+            assert_eq!(info.mapped_len % SHARED_MEMORY_PAGE_SIZE, 0);
+            assert_eq!(table.shared_memory_len(handle), Ok(logical_len));
+
+            let storage = unsafe { slice::from_raw_parts(info.base, info.mapped_len) };
+            assert!(storage.iter().all(|byte| *byte == 0));
+            assert!(storage[info.logical_len..].iter().all(|byte| *byte == 0));
+        }
+
+        let writable = table
+            .shared_memory_mapping_lease(one_byte, SharedMemoryMappingAccess::ReadWrite)
+            .unwrap();
+        assert_eq!(
+            writable.effective_rights(),
+            Rights::MAP | Rights::READ | Rights::WRITE
+        );
+
+        let map_only = table.handle_duplicate(one_byte, Rights::MAP).unwrap();
+        assert!(matches!(
+            table.shared_memory_mapping_lease(map_only, SharedMemoryMappingAccess::ReadOnly),
+            Err(IpcError::AccessDenied)
+        ));
+        let read_only = table.handle_duplicate(one_byte, Rights::READ).unwrap();
+        assert!(matches!(
+            table.shared_memory_mapping_lease(read_only, SharedMemoryMappingAccess::ReadOnly),
+            Err(IpcError::AccessDenied)
+        ));
+        let mapped_read = table
+            .handle_duplicate(one_byte, Rights::MAP | Rights::READ)
+            .unwrap();
+        let read_lease = table
+            .shared_memory_mapping_lease(mapped_read, SharedMemoryMappingAccess::ReadOnly)
+            .unwrap();
+        assert_eq!(read_lease.effective_rights(), Rights::MAP | Rights::READ);
+        assert!(matches!(
+            table.shared_memory_mapping_lease(mapped_read, SharedMemoryMappingAccess::ReadWrite),
+            Err(IpcError::AccessDenied)
+        ));
+    }
+
+    #[test]
+    fn shared_memory_mapping_lease_keeps_backing_alive_after_handle_close() {
+        let mut table = HandleTable::new();
+        let memory = table.shared_memory_create(8).unwrap();
+        table.shared_memory_write(memory, 0, b"retained").unwrap();
+        let lease = table
+            .shared_memory_mapping_lease(memory, SharedMemoryMappingAccess::ReadWrite)
+            .unwrap();
+        let stored_lease = lease.clone();
+        let info = lease.info();
+
+        table.handle_close(memory).unwrap();
+        assert_eq!(table.object_type(memory), Err(IpcError::InvalidHandle));
+        assert_eq!(stored_lease.info(), info);
+        assert_eq!(
+            stored_lease.effective_rights(),
+            Rights::MAP | Rights::READ | Rights::WRITE
+        );
+        let bytes = unsafe { slice::from_raw_parts(info.base, info.logical_len) };
+        assert_eq!(bytes, b"retained");
+        drop(lease);
+        assert_eq!(stored_lease.info(), info);
+    }
 
     #[test]
     fn shared_memory_checks_ranges_and_shares_bytes_across_aliases_and_transfer() {
@@ -1189,8 +1549,7 @@ mod tests {
         assert_eq!(sender.object_type(memory), Ok(ObjectType::SharedMemory));
         assert_eq!(sender.shared_memory_len(memory), Ok(8));
         let memory_rights = sender.handle_rights(memory).unwrap();
-        assert!(memory_rights.contains(Rights::READ | Rights::WRITE | Rights::MANAGE));
-        assert!(!memory_rights.contains(Rights::MAP));
+        assert!(memory_rights.contains(Rights::READ | Rights::WRITE | Rights::MAP | Rights::MANAGE));
 
         let mut bytes = [0xff; 8];
         sender.shared_memory_read(memory, 0, &mut bytes).unwrap();
@@ -1201,6 +1560,10 @@ mod tests {
 
         let alias_rights = Rights::READ | Rights::WRITE | Rights::TRANSFER;
         let alias = sender.handle_duplicate(memory, alias_rights).unwrap();
+        assert!(matches!(
+            sender.shared_memory_mapping_lease(alias, SharedMemoryMappingAccess::ReadOnly),
+            Err(IpcError::AccessDenied)
+        ));
         sender.shared_memory_write(alias, 4, &[9, 8]).unwrap();
         sender.shared_memory_read(memory, 0, &mut bytes).unwrap();
         assert_eq!(bytes, [0, 0, 1, 2, 9, 8, 0, 0]);
@@ -1235,6 +1598,10 @@ mod tests {
             Ok(ObjectType::SharedMemory)
         );
         assert_eq!(receiver.handle_rights(transferred), Ok(Rights::READ));
+        assert!(matches!(
+            receiver.shared_memory_mapping_lease(transferred, SharedMemoryMappingAccess::ReadOnly),
+            Err(IpcError::AccessDenied)
+        ));
 
         sender.shared_memory_write(memory, 0, &[7, 6]).unwrap();
         receiver
@@ -1853,6 +2220,232 @@ mod tests {
             required
         );
         assert_eq!(&bytes, b"payload");
+    }
+
+    #[test]
+    fn injected_graph_allocation_failure_is_atomic() {
+        assert!(matches!(
+            try_vec_with_capacity::<u8>(usize::MAX),
+            Err(IpcError::OutOfMemory)
+        ));
+
+        let mut table = HandleTable::new();
+        let (send, receive) = table.channel_create().unwrap();
+        let (candidate, _) = table.channel_create().unwrap();
+        let candidate_rights = table.handle_rights(candidate).unwrap();
+        let disposition = [HandleOperationDisposition::move_handle(
+            candidate,
+            Rights::READ,
+        )];
+        let mut fail_graph_allocation = || Err(IpcError::OutOfMemory);
+
+        assert_eq!(
+            table.channel_write_with_handle_operations_impl(
+                send,
+                b"oom",
+                &disposition,
+                &mut fail_graph_allocation,
+            ),
+            Err(IpcError::OutOfMemory)
+        );
+        assert_eq!(table.handle_rights(candidate), Ok(candidate_rights));
+        assert_eq!(
+            table.channel_read(receive, &mut [], &mut []),
+            Err(IpcError::ShouldWait)
+        );
+    }
+
+    #[test]
+    fn mixed_channel_operations_move_duplicate_and_preserve_exact_rights() {
+        let mut sender = HandleTable::new();
+        let mut receiver = HandleTable::new();
+        let (send, receive) = channel_create_between(&mut sender, &mut receiver).unwrap();
+        let memory = sender.shared_memory_create(8).unwrap();
+        sender.shared_memory_write(memory, 0, b"shared!!").unwrap();
+        let lease = sender
+            .shared_memory_mapping_lease(memory, SharedMemoryMappingAccess::ReadWrite)
+            .unwrap();
+        let duplicate_source = sender
+            .handle_duplicate(memory, Rights::READ | Rights::DUPLICATE)
+            .unwrap();
+        let duplicate_source_rights = sender.handle_rights(duplicate_source).unwrap();
+
+        sender
+            .channel_write_with_handle_operations(
+                send,
+                b"mixed",
+                &[
+                    HandleOperationDisposition::duplicate(duplicate_source, Rights::READ),
+                    HandleOperationDisposition::move_handle(memory, Rights::READ | Rights::MAP),
+                ],
+            )
+            .unwrap();
+        assert_eq!(sender.object_type(memory), Err(IpcError::InvalidHandle));
+        assert_eq!(
+            sender.handle_rights(duplicate_source),
+            Ok(duplicate_source_rights)
+        );
+        let lease_bytes =
+            unsafe { slice::from_raw_parts(lease.info().base, lease.info().logical_len) };
+        assert_eq!(lease_bytes, b"shared!!");
+
+        let mut bytes = [0; 5];
+        let mut handles = [Handle::INVALID; 2];
+        assert_eq!(
+            receiver
+                .channel_read(receive, &mut bytes, &mut handles)
+                .unwrap(),
+            MessageInfo::new(5, 2)
+        );
+        assert_eq!(&bytes, b"mixed");
+        assert_eq!(receiver.handle_rights(handles[0]), Ok(Rights::READ));
+        assert_eq!(
+            receiver.handle_rights(handles[1]),
+            Ok(Rights::READ | Rights::MAP)
+        );
+        assert_eq!(
+            receiver.object_type(handles[0]),
+            Ok(ObjectType::SharedMemory)
+        );
+        assert_eq!(
+            receiver.object_type(handles[1]),
+            Ok(ObjectType::SharedMemory)
+        );
+        let received_lease = receiver
+            .shared_memory_mapping_lease(handles[1], SharedMemoryMappingAccess::ReadOnly)
+            .unwrap();
+        assert_eq!(received_lease.info(), lease.info());
+    }
+
+    #[test]
+    fn mixed_channel_operation_validation_is_atomic() {
+        let mut table = HandleTable::new();
+        let (send, receive) = table.channel_create().unwrap();
+        let move_candidate = table.shared_memory_create(8).unwrap();
+        let source = table.shared_memory_create(8).unwrap();
+        let no_duplicate = table
+            .handle_duplicate(source, Rights::READ | Rights::TRANSFER)
+            .unwrap();
+        let no_transfer = table
+            .handle_duplicate(source, Rights::READ | Rights::DUPLICATE)
+            .unwrap();
+        let move_rights = table.handle_rights(move_candidate).unwrap();
+
+        assert_eq!(
+            table.channel_write_with_handle_operations(
+                send,
+                b"denied",
+                &[
+                    HandleOperationDisposition::move_handle(move_candidate, Rights::READ),
+                    HandleOperationDisposition::duplicate(no_duplicate, Rights::READ),
+                ],
+            ),
+            Err(IpcError::AccessDenied)
+        );
+        assert_eq!(table.handle_rights(move_candidate), Ok(move_rights));
+        assert_eq!(
+            table.channel_read(receive, &mut [], &mut []),
+            Err(IpcError::ShouldWait)
+        );
+
+        assert_eq!(
+            table.channel_write_with_handle_operations(
+                send,
+                b"no transfer",
+                &[HandleOperationDisposition::move_handle(
+                    no_transfer,
+                    Rights::READ,
+                )],
+            ),
+            Err(IpcError::AccessDenied)
+        );
+        assert_eq!(
+            table.channel_write_with_handle_operations(
+                send,
+                b"escalated",
+                &[HandleOperationDisposition::duplicate(
+                    no_transfer,
+                    Rights::READ | Rights::WRITE,
+                )],
+            ),
+            Err(IpcError::InvalidRights)
+        );
+        assert_eq!(
+            table.channel_write_with_handle_operations(
+                send,
+                b"duplicate source",
+                &[
+                    HandleOperationDisposition::duplicate(no_transfer, Rights::READ),
+                    HandleOperationDisposition::move_handle(no_transfer, Rights::READ),
+                ],
+            ),
+            Err(IpcError::DuplicateHandle)
+        );
+        assert_eq!(
+            table.handle_rights(no_transfer),
+            Ok(Rights::READ | Rights::DUPLICATE)
+        );
+        assert_eq!(
+            table.channel_write_with_handle_operations(
+                send,
+                b"cycle",
+                &[HandleOperationDisposition::duplicate(receive, Rights::READ)],
+            ),
+            Err(IpcError::CyclicTransfer)
+        );
+        assert_eq!(table.object_type(receive), Ok(ObjectType::Channel));
+        assert_eq!(
+            table.channel_read(receive, &mut [], &mut []),
+            Err(IpcError::ShouldWait)
+        );
+    }
+
+    #[test]
+    fn mixed_channel_operations_are_atomic_for_full_and_closed_queues() {
+        let mut table = HandleTable::new();
+        let (send, receive) = table.channel_create().unwrap();
+        let move_source = table.shared_memory_create(8).unwrap();
+        let duplicate_base = table.shared_memory_create(8).unwrap();
+        let duplicate_source = table
+            .handle_duplicate(duplicate_base, Rights::READ | Rights::DUPLICATE)
+            .unwrap();
+        let move_rights = table.handle_rights(move_source).unwrap();
+        let duplicate_rights = table.handle_rights(duplicate_source).unwrap();
+        for sequence in 0..CHANNEL_QUEUE_CAPACITY {
+            table.channel_write(send, &[sequence as u8], &[]).unwrap();
+        }
+
+        let operations = [
+            HandleOperationDisposition::move_handle(move_source, Rights::READ),
+            HandleOperationDisposition::duplicate(duplicate_source, Rights::READ),
+        ];
+        assert_eq!(
+            table.channel_write_with_handle_operations(send, b"full", &operations),
+            Err(IpcError::ShouldWait)
+        );
+        assert_eq!(table.handle_rights(move_source), Ok(move_rights));
+        assert_eq!(table.handle_rights(duplicate_source), Ok(duplicate_rights));
+        let mut byte = [0; 1];
+        for sequence in 0..CHANNEL_QUEUE_CAPACITY {
+            assert_eq!(
+                table.channel_read(receive, &mut byte, &mut []).unwrap(),
+                MessageInfo::new(1, 0)
+            );
+            assert_eq!(byte[0], sequence as u8);
+        }
+        assert_eq!(
+            table.channel_read(receive, &mut byte, &mut []),
+            Err(IpcError::ShouldWait)
+        );
+
+        let (closed_send, closed_receive) = table.channel_create().unwrap();
+        table.handle_close(closed_receive).unwrap();
+        assert_eq!(
+            table.channel_write_with_handle_operations(closed_send, b"closed", &operations),
+            Err(IpcError::PeerClosed)
+        );
+        assert_eq!(table.handle_rights(move_source), Ok(move_rights));
+        assert_eq!(table.handle_rights(duplicate_source), Ok(duplicate_rights));
     }
 
     #[test]
