@@ -7,6 +7,10 @@ members = [
     "crates/ginkgo-filesystem",
     "crates/ginkgo-graphics",
     "crates/ginkgo-sysapi",
+    "crates/ginkgo-window",
+    "crates/ginkgo-fonts",
+    "crates/ginkgo-scroll-layout",
+    "crates/ginkgo-desktop",
 ]
 default-members = ["crates/ginkgo-kernel"]
 exclude = ["vendor/redoxfs"]
@@ -31,11 +35,15 @@ volatile = { version = "0.6.1", default-features = false }
 x86_64 = { version = "0.15.5", default-features = false, features = ["instructions"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 
+ginkgo-desktop = { path = "crates/ginkgo-desktop" }
 ginkgo-filesystem = { path = "crates/ginkgo-filesystem" }
+ginkgo-fonts = { path = "crates/ginkgo-fonts" }
 ginkgo-graphics = { path = "crates/ginkgo-graphics" }
 ginkgo-hid = { path = "crates/ginkgo-hid" }
 ginkgo-ipc = { path = "crates/ginkgo-ipc", default-features = false }
+ginkgo-scroll-layout = { path = "crates/ginkgo-scroll-layout" }
 ginkgo-sysapi = { path = "crates/ginkgo-sysapi" }
+ginkgo-window = { path = "crates/ginkgo-window" }
 
 [profile.dev]
 panic = "abort"

@@ -1,5 +1,5 @@
 [package]
-name = "ginkgo-userspace"
+name = "ginkgo-scroll-layout"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -9,6 +9,3 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
-ginkgo-ipc = { workspace = true, default-features = false }
-ginkgo-sysapi.workspace = true
-ginkgo-window.workspace = true

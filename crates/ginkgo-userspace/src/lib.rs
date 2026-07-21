@@ -8,3 +8,4 @@
 
 pub use ginkgo_ipc::{decode_structured, encode_structured, StructuredMessageError};
 pub use ginkgo_sysapi::*;
+pub use ginkgo_window as window;

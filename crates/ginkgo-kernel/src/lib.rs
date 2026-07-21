@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub mod compositor;
 pub mod input;
 pub mod io;
 pub mod limine;

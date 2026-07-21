@@ -90,6 +90,8 @@ bitflags! {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObjectType {
     Channel = 1,
+    SharedMemory = 2,
+    Window = 3,
 }
 
 /// Stable syscall status values. Additional detail is returned in output structs.
@@ -109,6 +111,7 @@ pub enum Status {
     BufferTooSmall = -10,
     InvalidMessage = -11,
     CyclicTransfer = -12,
+    OutOfMemory = -13,
 }
 
 /// Fixed-layout sizes of one complete channel message.
