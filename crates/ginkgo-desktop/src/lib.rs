@@ -159,6 +159,10 @@ pub enum DesktopAction {
         window_id: WindowId,
         focused: bool,
     },
+    CloseRequested {
+        client_id: ClientId,
+        window_id: WindowId,
+    },
     Present {
         client_id: ClientId,
         request_id: RequestId,
@@ -210,6 +214,7 @@ pub enum TrustedCommand {
     },
     FocusLeft,
     FocusRight,
+    CloseFocused,
     MoveFocusedLeft,
     MoveFocusedRight,
     SetWindowWidth {
@@ -364,6 +369,7 @@ impl Desktop {
             TrustedCommand::FocusWindow { window_id } => self.focus_window(window_id),
             TrustedCommand::FocusLeft => self.focus_left(),
             TrustedCommand::FocusRight => self.focus_right(),
+            TrustedCommand::CloseFocused => Ok(self.close_focused()),
             TrustedCommand::MoveFocusedLeft => self.move_focused_left(),
             TrustedCommand::MoveFocusedRight => self.move_focused_right(),
             TrustedCommand::SetWindowWidth { window_id, width } => {
@@ -427,6 +433,19 @@ impl Desktop {
 
     pub fn focus_right(&mut self) -> Result<Vec<DesktopAction>, DesktopError> {
         self.focus_relative(Direction::Next)
+    }
+
+    pub fn close_focused(&self) -> Vec<DesktopAction> {
+        let Some(window_id) = self.focused_window() else {
+            return Vec::new();
+        };
+        let Some(window) = self.window(window_id) else {
+            return Vec::new();
+        };
+        alloc::vec![DesktopAction::CloseRequested {
+            client_id: window.owner,
+            window_id,
+        }]
     }
 
     pub fn move_focused_left(&mut self) -> Result<Vec<DesktopAction>, DesktopError> {
@@ -1570,6 +1589,15 @@ mod tests {
             .handle_trusted_command(TrustedCommand::FocusWindow { window_id: first })
             .unwrap();
         assert_eq!(desktop.focused_window(), Some(first));
+        assert_eq!(
+            desktop
+                .handle_trusted_command(TrustedCommand::CloseFocused)
+                .unwrap(),
+            vec![DesktopAction::CloseRequested {
+                client_id: client(1),
+                window_id: first,
+            }]
+        );
         desktop
             .handle_trusted_command(TrustedCommand::MoveFocusedRight)
             .unwrap();
@@ -1598,6 +1626,15 @@ mod tests {
             .unwrap();
         assert!(desktop.window(first).is_none());
         assert!(desktop.window(second).is_some());
+    }
+
+    #[test]
+    fn closing_with_no_focused_window_is_a_noop() {
+        let mut desktop = Desktop::new(Size::new(1000, 600)).unwrap();
+        assert!(desktop
+            .handle_trusted_command(TrustedCommand::CloseFocused)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

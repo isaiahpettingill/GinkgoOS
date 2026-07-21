@@ -81,7 +81,7 @@ The production `ginkgo-desktop-service` runs `ginkgo-desktop` policy in ring 3 a
 
 The registry contains the hidden `Ginkgo Desktop` service and visible `Ginkgo Demo` at `/minimal-client.elf`. Boot stops at an empty desktop until the user launches an app. The demo draws a steady centered “Hello World” surface, and `F11` toggles fullscreen. Normal panes have desktop margins while fullscreen remains edge-to-edge. `META+N` toggles the registry-backed launcher, whose search and app rows use the embedded-icon `Magnify` and `CubeOutline` drawables and bounded background save/restore.
 
-Currently integrated pane bindings are `META+Left/Right` for focus, `META+A/S` to move the focused pane left/right, `META+=/-` to adjust its width in 5% steps, and `META+L/C/R` to align it left/center/right. The broader hotkey design is tracked in #5. A general userspace filesystem ABI and filesystem-backed search are tracked in #4.
+Currently integrated pane bindings are `META+Left/Right` for focus, `META+Q` to close the focused application, `META+A/S` to move the focused pane left/right, `META+=/-` to adjust its width in 5% steps, and `META+L/C/R` to align it left/center/right. Columns form a horizontally scrolling workspace, so additional running applications can be off-screen; use the focus bindings to navigate them. The remaining hotkey work is tracked in #5. A general userspace filesystem ABI and filesystem-backed search are tracked in #4.
 
 ### USB HID input
 

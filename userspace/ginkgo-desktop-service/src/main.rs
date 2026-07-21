@@ -80,6 +80,7 @@ fn desktop_hotkey(event: ginkgo_window::KeyboardEvent) -> Option<TrustedCommand>
     Some(match event.usage {
         0x50 => TrustedCommand::FocusLeft,
         0x4f => TrustedCommand::FocusRight,
+        0x14 => TrustedCommand::CloseFocused,
         0x04 => TrustedCommand::MoveFocusedLeft,
         0x16 => TrustedCommand::MoveFocusedRight,
         0x2e => TrustedCommand::AdjustFocusedWidth {
@@ -502,6 +503,10 @@ impl Service {
                     client_id,
                     WireEvent::FocusChanged { window_id, focused },
                 )?,
+                DesktopAction::CloseRequested {
+                    client_id,
+                    window_id,
+                } => self.queue_client_event(client_id, WireEvent::CloseRequested { window_id })?,
                 DesktopAction::Present {
                     client_id,
                     request_id,

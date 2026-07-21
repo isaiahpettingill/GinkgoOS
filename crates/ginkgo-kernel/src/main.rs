@@ -1092,8 +1092,13 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
         .position(|(known_process, _)| *known_process == process_id)
     {
         let (_, client_id) = context.process_clients.swap_remove(index);
-        if let Some(desktop) = context.desktop.as_mut() {
-            let _ = desktop.cleanup_client(client_id);
+        let removed_windows = context
+            .desktop
+            .as_mut()
+            .and_then(|desktop| desktop.cleanup_client(client_id).ok())
+            .unwrap_or(0);
+        if removed_windows != 0 {
+            redraw_desktop(context);
         }
     }
 
