@@ -1,0 +1,4 @@
+/target/
+/validator/target/
+!Cargo.lock
+!validator/Cargo.lock

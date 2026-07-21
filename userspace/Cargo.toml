@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "ginkgo-runtime",
+    "ginkgo-desktop-service",
+    "ginkgo-minimal-client",
+]
+exclude = ["validator"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[workspace.dependencies]
+ginkgo-desktop = { path = "../crates/ginkgo-desktop" }
+ginkgo-runtime = { path = "ginkgo-runtime" }
+ginkgo-userspace = { path = "../crates/ginkgo-userspace" }
+ginkgo-window = { path = "../crates/ginkgo-window" }
+spinning_top = "0.3"
+talc = "5.0.4"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = 2
+strip = false
