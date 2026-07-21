@@ -21,9 +21,13 @@ ginkgo-filesystem.workspace = true
 ginkgo-graphics.workspace = true
 ginkgo-hid.workspace = true
 ginkgo-ipc = { workspace = true, features = ["kernel"] }
+ginkgo-program-registry.workspace = true
 ginkgo-sysapi.workspace = true
 spinning_top.workspace = true
 talc.workspace = true
 uart_16550.workspace = true
 volatile.workspace = true
 x86_64.workspace = true
+
+[build-dependencies]
+ginkgo-program-registry = { workspace = true, features = ["host"] }

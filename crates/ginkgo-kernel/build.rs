@@ -1,5 +1,7 @@
 use std::{collections::BTreeMap, env, fs, path::PathBuf};
 
+use ginkgo_program_registry::{encode, EncodeEntry, EntryFlags, Registry};
+
 const ELF_HEADER_SIZE: usize = 64;
 const PROGRAM_HEADER_SIZE: usize = 56;
 const CODE_OFFSET: usize = ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE;
@@ -9,6 +11,8 @@ const PAGE_SIZE: u64 = 4096;
 const PROCESS_YIELD: u32 = 0;
 const PROCESS_EXIT: u32 = 1;
 const HANDLE_CLOSE: u32 = 2;
+const CHANNEL_WRITE: u32 = 6;
+const CHANNEL_READ: u32 = 7;
 const SHARED_MEMORY_CREATE: u32 = 8;
 const SHARED_MEMORY_MAP: u32 = 10;
 const SHARED_MEMORY_UNMAP: u32 = 11;
@@ -16,6 +20,13 @@ const DEBUG_WRITE: u32 = 12;
 
 const SHARED_MEMORY_SIZE: u32 = 4097;
 const MAP_PROTECTION_READ_WRITE: u32 = 3;
+const STATUS_SHOULD_WAIT: i8 = -8;
+
+// Desktop bootstrap protocol. Every message is exactly eight bytes. LauncherState's
+// final byte is the current boolean launcher visibility (0 = hidden, 1 = visible).
+const READY_MESSAGE: &[u8; 8] = b"GKREADY\0";
+const TOGGLE_LAUNCHER_MESSAGE: &[u8; 8] = b"GKTOGGLE";
+const LAUNCHER_STATE_MESSAGE: &[u8; 8] = b"GKLSTAT\0";
 
 const ENTERED: &[u8] = b"ginkgo-userspace-smoke: entered\n";
 const ALIAS: &[u8] = b"ginkgo-userspace-smoke: mapped alias\n";
@@ -30,9 +41,15 @@ fn main() {
     println!("cargo:rustc-link-arg-bin=ginkgo-os=-T{}", linker.display());
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("build output directory"));
-    let elf = build_userspace_smoke_elf();
-    fs::write(out_dir.join("ginkgo-userspace-smoke.elf"), elf)
-        .expect("write ginkgo userspace smoke ELF");
+    fs::write(
+        out_dir.join("ginkgo-userspace-smoke.elf"),
+        build_userspace_smoke_elf(),
+    )
+    .expect("write ginkgo userspace smoke ELF");
+    fs::write(out_dir.join("ginkgo-desktop.elf"), build_desktop_elf())
+        .expect("write ginkgo desktop ELF");
+    fs::write(out_dir.join("programs.gkr"), build_program_registry())
+        .expect("write Ginkgo program registry");
 }
 
 struct Fixup {
@@ -54,6 +71,14 @@ impl Assembler {
     }
 
     fn u32(&mut self, value: u32) {
+        self.emit(&value.to_le_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.emit(&value.to_le_bytes());
+    }
+
+    fn i8(&mut self, value: i8) {
         self.emit(&value.to_le_bytes());
     }
 
@@ -206,12 +231,123 @@ fn emit_userspace_smoke_code() -> Vec<u8> {
     assembler.finish()
 }
 
+fn emit_desktop_code() -> Vec<u8> {
+    let mut assembler = Assembler::default();
+
+    assembler.label("desktop_entry");
+    assembler.emit(&[0x48, 0x83, 0xe4, 0xf0]); // and rsp, -16
+    assembler.emit(&[0x48, 0x83, 0xec, 0x70]); // sub rsp, 112
+    assembler.emit(&[0x41, 0x89, 0xfc]); // mov r12d, edi (bootstrap channel)
+    assembler.emit(&[0x45, 0x31, 0xed]); // xor r13d, r13d (launcher hidden)
+
+    // ChannelWriteArgs at rsp points at the inline Ready message.
+    assembler.rel32(&[0x48, 0x8d, 0x05], "desktop_ready"); // lea rax, [rip + ready]
+    assembler.emit(&[0x48, 0x89, 0x04, 0x24]); // mov [rsp], rax
+    assembler.emit(&[0x48, 0xc7, 0x44, 0x24, 0x08]); // byte_count = 8
+    assembler.u32(READY_MESSAGE.len() as u32);
+    for offset in [0x10, 0x18, 0x20] {
+        assembler.emit(&[0x48, 0xc7, 0x44, 0x24, offset]);
+        assembler.u32(0);
+    }
+
+    // Retry Ready until it has been sent. This process intentionally never exits.
+    assembler.label("desktop_ready_write");
+    assembler.emit(&[0x44, 0x89, 0xe7]); // mov edi, r12d
+    assembler.emit(&[0x48, 0x89, 0xe6]); // mov rsi, rsp
+    assembler.emit(&[0xb8]); // mov eax, ChannelWrite
+    assembler.u32(CHANNEL_WRITE);
+    assembler.emit(&[0x0f, 0x05]); // syscall
+    assembler.emit(&[0x48, 0x85, 0xc0]); // test rax, rax
+    assembler.rel32(&[0x0f, 0x84], "desktop_setup_read"); // je setup_read
+    assembler.emit(&[0xb8]); // mov eax, ProcessYield
+    assembler.u32(PROCESS_YIELD);
+    assembler.emit(&[0x0f, 0x05]); // syscall
+    assembler.rel32(&[0xe9], "desktop_ready_write"); // jmp ready_write
+
+    assembler.label("desktop_setup_read");
+    // ChannelReadArgs at rsp + 40 use an eight-byte buffer at rsp + 88,
+    // no handle buffer, and ChannelReadOutput at rsp + 96.
+    assembler.emit(&[0x48, 0x8d, 0x44, 0x24, 0x58]); // lea rax, [rsp + 88]
+    assembler.emit(&[0x48, 0x89, 0x44, 0x24, 0x28]); // bytes_address
+    assembler.emit(&[0x48, 0xc7, 0x44, 0x24, 0x30]); // byte_capacity = 8
+    assembler.u32(TOGGLE_LAUNCHER_MESSAGE.len() as u32);
+    for offset in [0x38, 0x40] {
+        assembler.emit(&[0x48, 0xc7, 0x44, 0x24, offset]);
+        assembler.u32(0);
+    }
+    assembler.emit(&[0x48, 0x8d, 0x44, 0x24, 0x60]); // lea rax, [rsp + 96]
+    assembler.emit(&[0x48, 0x89, 0x44, 0x24, 0x48]); // output_address
+    assembler.emit(&[0x48, 0xc7, 0x44, 0x24, 0x50]); // flags and reserved = 0
+    assembler.u32(0);
+
+    // LauncherState is built in a separate eight-byte buffer at rsp + 104.
+    assembler.emit(&[0x48, 0xb8]); // movabs rax, LauncherState template
+    assembler.u64(u64::from_le_bytes(*LAUNCHER_STATE_MESSAGE));
+    assembler.emit(&[0x48, 0x89, 0x44, 0x24, 0x68]); // mov [rsp + 104], rax
+
+    assembler.label("desktop_read");
+    assembler.emit(&[0x44, 0x89, 0xe7]); // mov edi, r12d
+    assembler.emit(&[0x48, 0x8d, 0x74, 0x24, 0x28]); // lea rsi, [rsp + 40]
+    assembler.emit(&[0xb8]); // mov eax, ChannelRead
+    assembler.u32(CHANNEL_READ);
+    assembler.emit(&[0x0f, 0x05]); // syscall
+    assembler.emit(&[0x48, 0x83, 0xf8]); // cmp rax, ShouldWait
+    assembler.i8(STATUS_SHOULD_WAIT);
+    assembler.rel32(&[0x0f, 0x84], "desktop_read_yield"); // je read_yield
+    assembler.emit(&[0x48, 0x85, 0xc0]); // test rax, rax
+    assembler.rel32(&[0x0f, 0x85], "desktop_read_yield"); // unexpected errors also retry
+
+    assembler.emit(&[0x83, 0x7c, 0x24, 0x60, 0x08]); // cmp byte_count, 8
+    assembler.rel32(&[0x0f, 0x85], "desktop_read"); // jne read
+    assembler.emit(&[0x48, 0xb8]); // movabs rax, ToggleLauncher
+    assembler.u64(u64::from_le_bytes(*TOGGLE_LAUNCHER_MESSAGE));
+    assembler.emit(&[0x48, 0x39, 0x44, 0x24, 0x58]); // cmp [rsp + 88], rax
+    assembler.rel32(&[0x0f, 0x85], "desktop_read"); // jne read
+
+    assembler.emit(&[0x41, 0x80, 0xf5, 0x01]); // xor r13b, 1
+    assembler.emit(&[0x44, 0x88, 0x6c, 0x24, 0x6f]); // state[7] = r13b
+    assembler.emit(&[0x48, 0x8d, 0x44, 0x24, 0x68]); // lea rax, [rsp + 104]
+    assembler.emit(&[0x48, 0x89, 0x04, 0x24]); // write args bytes_address = rax
+
+    assembler.label("desktop_state_write");
+    assembler.emit(&[0x44, 0x89, 0xe7]); // mov edi, r12d
+    assembler.emit(&[0x48, 0x89, 0xe6]); // mov rsi, rsp
+    assembler.emit(&[0xb8]); // mov eax, ChannelWrite
+    assembler.u32(CHANNEL_WRITE);
+    assembler.emit(&[0x0f, 0x05]); // syscall
+    assembler.emit(&[0x48, 0x85, 0xc0]); // test rax, rax
+    assembler.rel32(&[0x0f, 0x84], "desktop_read"); // je read
+    assembler.emit(&[0xb8]); // mov eax, ProcessYield
+    assembler.u32(PROCESS_YIELD);
+    assembler.emit(&[0x0f, 0x05]); // syscall
+    assembler.rel32(&[0xe9], "desktop_state_write"); // jmp state_write
+
+    assembler.label("desktop_read_yield");
+    assembler.emit(&[0xb8]); // mov eax, ProcessYield
+    assembler.u32(PROCESS_YIELD);
+    assembler.emit(&[0x0f, 0x05]); // syscall
+    assembler.rel32(&[0xe9], "desktop_read"); // jmp read
+
+    assembler.label("desktop_ready");
+    assembler.emit(READY_MESSAGE);
+
+    assembler.finish()
+}
+
 fn build_userspace_smoke_elf() -> Vec<u8> {
-    let code = emit_userspace_smoke_code();
+    build_userspace_elf(emit_userspace_smoke_code(), "smoke")
+}
+
+fn build_desktop_elf() -> Vec<u8> {
+    build_userspace_elf(emit_desktop_code(), "desktop")
+}
+
+fn build_userspace_elf(code: Vec<u8>, artifact: &str) -> Vec<u8> {
     let file_size = CODE_OFFSET
         .checked_add(code.len())
-        .expect("smoke ELF size does not overflow");
-    let file_size_u64 = u64::try_from(file_size).expect("smoke ELF size fits in u64");
+        .unwrap_or_else(|| panic!("{artifact} ELF size does not overflow"));
+    let file_size_u64 =
+        u64::try_from(file_size).unwrap_or_else(|_| panic!("{artifact} ELF size fits in u64"));
     let entry = LOAD_ADDRESS
         .checked_add(u64::try_from(CODE_OFFSET).expect("code offset fits in u64"))
         .expect("smoke ELF entry does not overflow");
@@ -246,11 +382,11 @@ fn build_userspace_smoke_elf() -> Vec<u8> {
 
     elf.extend_from_slice(&code);
     assert_eq!(elf.len(), file_size);
-    validate_userspace_smoke_elf(&elf);
+    validate_userspace_elf(&elf);
     elf
 }
 
-fn validate_userspace_smoke_elf(elf: &[u8]) {
+fn validate_userspace_elf(elf: &[u8]) {
     assert_eq!(&elf[0..4], b"\x7fELF");
     assert_eq!(&elf[4..8], &[2, 1, 1, 0]);
     assert_eq!(read_u16(elf, 16), 2); // ET_EXEC
@@ -299,6 +435,25 @@ fn validate_userspace_smoke_elf(elf: &[u8]) {
     assert_ne!(flags & 1, 0); // entry is in an executable segment
     assert_eq!(entry, LOAD_ADDRESS + CODE_OFFSET as u64);
     assert!(u64::try_from(elf.len()).expect("ELF length fits in u64") <= PAGE_SIZE);
+}
+
+fn build_program_registry() -> Vec<u8> {
+    let registry = encode(&[EncodeEntry {
+        app_id: "desktop",
+        display_name: "Ginkgo Desktop",
+        executable_path: "/desktop.elf",
+        flags: EntryFlags::HIDDEN,
+    }])
+    .expect("desktop registry metadata is valid");
+    let parsed = Registry::parse(&registry).expect("generated program registry is valid");
+    let desktop = parsed
+        .entries()
+        .next()
+        .expect("desktop registry entry exists");
+    assert_eq!(desktop.app_id, "desktop");
+    assert_eq!(desktop.executable_path, "/desktop.elf");
+    assert!(!desktop.is_visible());
+    registry
 }
 
 fn push_u16(bytes: &mut Vec<u8>, value: u16) {

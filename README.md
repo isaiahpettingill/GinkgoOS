@@ -1,6 +1,6 @@
 # GinkgoOS
 
-A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. GinkgoOS currently includes framebuffer output, physical frame allocation, isolated userspace address spaces, ring-3 execution and syscalls, capability-backed shared-memory mappings, checked device-I/O capabilities, polling xHCI USB HID input, a kernel-adapted RedoxFS filesystem, and cooperative task/process scheduling.
+A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. GinkgoOS boots through an on-screen kernel log and splash into a persistent protected ring-3 desktop service with a program-registry-backed launcher. The kernel also includes framebuffer output, physical frame allocation, isolated userspace address spaces, syscalls and capability IPC, shared-memory mappings, checked device-I/O capabilities, polling xHCI USB HID input, a kernel-adapted RedoxFS filesystem, and cooperative task/process scheduling.
 
 ## What is included
 
@@ -20,6 +20,8 @@ A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. Gi
 - Process-local capability handles and bounded bidirectional datagram channels with atomic, rights-attenuating handle transfer
 - Heap-backed shared-memory capabilities and protected multi-buffered window lifecycles
 - A software compositor with clipping, hardware-format conversion, and ARGB source-over blending
+- A persistent protected userspace desktop bootstrap service and `META+N` launcher
+- A strictly validated, versioned `.gkr` executable registry with hidden system entries
 - A transport-independent scrolling desktop policy and application window protocol
 - Packed bitmap-font rendering and a validated, versioned `.gkf` format
 - RedoxFS transactions and on-disk format over a volatile memory-backed block device
@@ -43,22 +45,20 @@ Shared-memory objects are page-aligned, page-rounded, zero-filled heap allocatio
 
 ### Protected userspace execution
 
-At boot, after device initialization has installed its kernel mappings, GinkgoOS creates an isolated page-table root for a generated smoke-test process. The process root starts with an empty lower half and clones only the kernel higher-half topology, clearing `USER_ACCESSIBLE` on every cloned P4 entry even when Limine supplied permissive flags. User mappings reject the zero page, noncanonical or higher-half addresses, writable-executable pages, overlaps, and permission-invalid copies.
+At boot, after device initialization has installed its kernel mappings, GinkgoOS installs `/desktop.elf` and `/programs.gkr` into RedoxFS, reads both files back through the filesystem adapter, validates the registry and ELF, and creates an isolated page-table root for the desktop process. The process root starts with an empty lower half and clones only the kernel higher-half topology, clearing `USER_ACCESSIBLE` on every cloned P4 entry even when Limine supplied permissive flags. User mappings reject the zero page, noncanonical or higher-half addresses, writable-executable pages, overlaps, and permission-invalid copies.
 
 The dependency-free ELF loader accepts only little-endian x86-64 `ET_EXEC` images in the Ginkgo executable profile. It validates every program header, mapped range, page overlap, permission, entry point, and stack/guard collision before installing image pages. Each process owns its address space, generation-tagged identity, register and x87/SSE state, capability table, shared mappings, and detailed exit/fault state.
 
 The x86-64 entry path installs a GDT, TSS, IDT, `STAR`/`LSTAR`/`FMASK`, and five distinct 64 KiB supervisor stacks for RSP0, syscall entry, double fault, NMI, and machine check. Synchronous user exceptions are contained and returned to the process scheduler; kernel faults and unrecoverable exception classes fail stop. Every syscall immediately switches away from the untrusted user RSP, captures the complete user context, and returns to scheduler-side dispatch. Return through `SYSRETQ` revalidates canonical RIP/RSP, flags, and floating-point state.
 
-`crates/ginkgo-kernel/build.rs` generates a minimal ELF used as the boot smoke test. It proves ring-3 entry, debug output, shared-memory creation, a 4097-byte read-write mapping, access through the mapped alias, cooperative yield/resume, mapping-lease survival after closing the source handle, unmapping, and clean process exit. A successful serial trace includes:
+`crates/ginkgo-kernel/build.rs` generates the initial desktop ELF and the boot registry. The kernel gives the desktop only one bootstrap channel plus the display dimensions in its initial System V register arguments. The desktop remains resident, announces readiness, owns launcher visibility, polls its channel cooperatively, and yields whenever no command is available. A successful serial trace includes:
 
 ```text
-userspace: loaded pid=...
-ginkgo-userspace-smoke: entered
-ginkgo-userspace-smoke: mapped alias
-ginkgo-userspace-smoke: resumed
-ginkgo-userspace-smoke: mapped alias
-userspace: pid=... exited status=0
+desktop: loaded /desktop.elf from RedoxFS pid=...
+desktop: protected userland ready
 ```
+
+The build script retains the original process/syscall smoke ELF for focused execution testing, but it is no longer the initial boot process.
 
 Current execution limitations are intentional and explicit:
 
@@ -78,11 +78,13 @@ Current execution limitations are intentional and explicit:
 
 `ginkgo-fonts` provides sorted packed one-bit bitmap glyphs, kerning, allocation-free rendering through `embedded-graphics`, and strict parsing of a versioned little-endian `.gkf` representation. YAFF and BDF importers remain future host-side tooling; applications can already embed validated `.gkf` bytes or construct normalized fonts from converter output.
 
-These components are host-tested foundations rather than a boot-time desktop. The running kernel now executes the protected userspace smoke process alongside its direct framebuffer validation UI. Wiring a persistent userspace desktop service to the existing protocol, layout policy, and compositor remains the next window-system integration step.
+The running kernel now boots a persistent protected userspace desktop service instead of the former one-shot smoke process. The desktop and kernel communicate over one capability channel; the service owns launcher state, while the kernel retains framebuffer and device authority. `META+N` is consumed by the desktop path and toggles a launcher backed by the validated program registry. The registry currently contains only the hidden desktop executable, so a fresh launcher correctly reports that no applications are installed.
+
+Application window channels, shared surface allocation, compositor placement actions, and the rest of the pane hotkeys remain the next integration layer. General userspace filesystem access is tracked separately from this privileged boot loading path.
 
 ### USB HID input
 
-At boot, GinkgoOS discovers the first PCI xHCI controller, enumerates directly attached root-port devices, configures each HID interrupt-IN endpoint, and parses its report descriptor. `InputManager` normalizes reports into device-tagged `InputEvent` values for keyboard keys, mouse buttons and relative axes, joystick/gamepad buttons, absolute axes, wheels, and hat switches. The embedded-graphics validation UI tracks relative mice and absolute USB tablets, displays mouse-button state through the cursor color, and provides a wrapped ProFont keyboard text buffer with Shift, Caps Lock, Enter, Tab, and Backspace handling. USB keyboard presses also feed the serial and `/console` path, and every normalized event is recorded in `/input`; both filesystem streams are flushed in batches so RedoxFS transactions do not stall USB polling. Report IDs and packed, signed, or non-byte-aligned fields are supported.
+At boot, GinkgoOS discovers the first PCI xHCI controller, enumerates directly attached root-port devices, configures each HID interrupt-IN endpoint, and parses its report descriptor. `InputManager` normalizes reports into device-tagged `InputEvent` values for keyboard keys, mouse buttons and relative axes, joystick/gamepad buttons, absolute axes, wheels, and hat switches. The desktop tracks relative mice and absolute USB tablets, displays mouse-button state through the cursor color, tracks left/right Shift and Logo keys, and routes `META+N` to the protected desktop service. Launcher text input supports Shift, Caps Lock, Enter, Tab, and Backspace. Every normalized event is recorded in `/input`; filesystem streams are flushed in batches so RedoxFS transactions do not stall USB polling. Report IDs and packed, signed, or non-byte-aligned fields are supported.
 
 Input is currently limited to devices attached directly to xHCI root ports at boot. USB hubs and hotplug re-enumeration are not implemented yet. Enumeration failures are isolated per port so one malformed or unsupported device does not disable other input devices.
 
@@ -162,6 +164,7 @@ make check
 crates/ginkgo-kernel/         boot binary, process/ELF/syscall runtime, hardware, scheduler, and compositor
 crates/ginkgo-userspace/      no_std syscall wrappers, IPC codec, and window facade
 crates/ginkgo-ipc/            channels, capabilities, shared memory, and protected window buffers
+crates/ginkgo-program-registry/ validated no_std `.gkr` parser and host encoder
 crates/ginkgo-window/         desktop protocol and transport-independent window client state machine
 crates/ginkgo-scroll-layout/  pure scrolling workspace, placement, and fullscreen policy
 crates/ginkgo-desktop/        transport-independent desktop service policy and runtime actions
@@ -185,12 +188,14 @@ sudo dd if=build/ginkgo-os.iso of=/dev/sdX bs=4M status=progress conv=fsync
 
 Disable Secure Boot unless you sign the Limine EFI executable and configure its integrity policy.
 
-## First code to change
+## Desktop bootstrap
 
-The visible output is in `crates/ginkgo-kernel/src/main.rs`:
+The initial desktop ELF and registry are generated by `crates/ginkgo-kernel/build.rs`. At boot, `crates/ginkgo-kernel/src/main.rs` installs and reopens them through RedoxFS, validates the registry, loads the executable, creates a cross-table capability channel, and starts the process. Startup deliberately progresses through three visual phases:
 
-```rust
-screen.draw_text(margin + 40, margin + 38, 4, "Hello, framebuffer!", primary);
-```
+1. An append-only kernel initialization log.
+2. A splash screen while protected userland starts.
+3. The desktop only after its readiness message arrives.
 
-The next sensible milestones are a userspace desktop runtime, scheduler-backed blocking waits, xHCI interrupt delivery and USB hotplug/hubs, timer preemption, SMP, frame deallocation, and a panic screen with serial diagnostics.
+Runtime status and launcher transitions use bounded dirty-region redraws. Solid 32-bpp framebuffer fills use aligned bulk volatile stores rather than byte-at-a-time pixel writes.
+
+The next sensible milestones are application window-channel integration, the userspace filesystem ABI, the complete pane hotkey set, scheduler-backed blocking waits, xHCI interrupt delivery and USB hotplug/hubs, timer preemption, SMP, frame deallocation, and a panic screen with serial diagnostics.

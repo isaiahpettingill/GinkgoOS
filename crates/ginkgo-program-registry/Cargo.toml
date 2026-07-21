@@ -1,0 +1,13 @@
+[package]
+name = "ginkgo-program-registry"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[features]
+default = []
+host = []
+
+[lib]
+path = "src/lib.rs"

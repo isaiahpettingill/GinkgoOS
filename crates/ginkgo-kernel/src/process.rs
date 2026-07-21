@@ -439,6 +439,16 @@ impl Process {
         &self.context
     }
 
+    /// Sets the first three System V AMD64 arguments for the initial user entry.
+    ///
+    /// Call this after process creation and before the process is first entered.
+    /// The arguments are installed in `rdi`, `rsi`, and `rdx`, respectively.
+    pub fn set_start_arguments(&mut self, [rdi, rsi, rdx]: [u64; 3]) {
+        self.context.rdi = rdi;
+        self.context.rsi = rsi;
+        self.context.rdx = rdx;
+    }
+
     pub fn context_mut(&mut self) -> &mut UserContext {
         &mut self.context
     }
@@ -1185,6 +1195,29 @@ mod tests {
         assert_eq!(layout.stack_bottom % PAGE_SIZE, 0);
         assert_eq!(layout.stack_top % 16, 0);
         assert!(layout.stack_top < USER_ADDRESS_END);
+    }
+
+    #[test]
+    fn start_arguments_set_abi_registers_without_changing_other_context() {
+        let mut process = Process {
+            address_space: None,
+            context: UserContext::new(0x1000, USER_STACK_TOP),
+            handles: None,
+            state: ProcessState::Ready,
+            shared_mappings: None,
+            retained_failed_mapping_leases: None,
+            next_mapping_cursor: SHARED_MAPPING_BASE,
+        };
+        process.context.rax = 4;
+        process.context.rbx = 5;
+        let mut expected = process.context;
+        expected.rdi = 1;
+        expected.rsi = 2;
+        expected.rdx = 3;
+
+        process.set_start_arguments([1, 2, 3]);
+
+        assert_eq!(process.context, expected);
     }
 
     #[test]

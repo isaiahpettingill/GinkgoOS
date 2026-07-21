@@ -14,6 +14,7 @@ use core::{
 use framebuffer::{FramebufferWriter, Rgb};
 use ginkgo_filesystem::RedoxFs;
 use ginkgo_hid::{ApplicationKind, Axis, InputEvent, AXIS_MAX, AXIS_MIN};
+use ginkgo_ipc::{channel_create_between, Handle, HandleTable, IpcError};
 use ginkgo_kernel::{
     arch::{self, CpuPrivilegeState, KernelExit, PrivilegeStackTops},
     input::{DeviceInputEvent, InputManager},
@@ -29,6 +30,7 @@ use ginkgo_kernel::{
     task::{Scheduler, TaskPoll, TaskState},
     usb::{self, UsbError},
 };
+use ginkgo_program_registry::Registry;
 use volatile::VolatilePtr;
 use x86_64::instructions::{hlt, interrupts};
 
@@ -64,8 +66,63 @@ static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 #[link_section = ".limine_requests_end"]
 static REQUESTS_END: [u64; 2] = limine::REQUESTS_END_MARKER;
 
-static USERSPACE_SMOKE_ELF: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-userspace-smoke.elf"));
+static DESKTOP_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-desktop.elf"));
+static PROGRAM_REGISTRY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/programs.gkr"));
+
+const DESKTOP_PATH: &str = "/desktop.elf";
+const PROGRAM_REGISTRY_PATH: &str = "/programs.gkr";
+const DESKTOP_READY_MESSAGE: &[u8; 8] = b"GKREADY\0";
+const TOGGLE_LAUNCHER_MESSAGE: &[u8; 8] = b"GKTOGGLE";
+const LAUNCHER_STATE_PREFIX: &[u8; 7] = b"GKLSTAT";
+
+const BOOT_EXECUTABLE_MAX_BYTES: usize = 4096;
+
+fn install_and_load_system_programs(
+    fs: &mut RedoxFs,
+) -> Option<([u8; BOOT_EXECUTABLE_MAX_BYTES], usize, usize)> {
+    install_system_file(fs, DESKTOP_PATH, DESKTOP_ELF)?;
+    install_system_file(fs, PROGRAM_REGISTRY_PATH, PROGRAM_REGISTRY)?;
+
+    let registry_file = fs.open(PROGRAM_REGISTRY_PATH).ok()?;
+    let registry_info = fs.stat(registry_file).ok()?;
+    let registry_len = usize::try_from(registry_info.len).ok()?;
+    let mut registry_bytes = [0u8; 512];
+    if registry_len > registry_bytes.len()
+        || fs
+            .read(registry_file, 0, &mut registry_bytes[..registry_len])
+            .ok()?
+            != registry_len
+    {
+        return None;
+    }
+    let registry = Registry::parse(&registry_bytes[..registry_len]).ok()?;
+    let desktop = registry.entries().find(|entry| entry.app_id == "desktop")?;
+    if desktop.executable_path != DESKTOP_PATH || desktop.is_visible() {
+        return None;
+    }
+    let visible_programs = registry.visible_entries().count();
+
+    let executable = fs.open(desktop.executable_path).ok()?;
+    let executable_info = fs.stat(executable).ok()?;
+    let executable_len = usize::try_from(executable_info.len).ok()?;
+    if executable_len == 0 || executable_len > BOOT_EXECUTABLE_MAX_BYTES {
+        return None;
+    }
+    let mut executable_bytes = [0u8; BOOT_EXECUTABLE_MAX_BYTES];
+    if fs
+        .read(executable, 0, &mut executable_bytes[..executable_len])
+        .ok()?
+        != executable_len
+    {
+        return None;
+    }
+    Some((executable_bytes, executable_len, visible_programs))
+}
+
+fn install_system_file(fs: &mut RedoxFs, path: &str, bytes: &[u8]) -> Option<()> {
+    let file = fs.create(path).ok()?;
+    (fs.write(file, 0, bytes).ok()? == bytes.len()).then_some(())
+}
 
 const PRIVILEGE_STACK_SIZE: usize = 64 * 1024;
 
@@ -98,7 +155,7 @@ pub extern "C" fn _start() -> ! {
     };
 
     let mut ui = ValidationUi::new(screen.width(), screen.height());
-    ui.render(&mut screen);
+    ui.render_boot_log(&mut screen, "framebuffer: online");
 
     let Some(memory_map) = MEMORY_MAP_REQUEST.response() else {
         halt_forever();
@@ -113,14 +170,22 @@ pub extern "C" fn _start() -> ! {
         halt_forever();
     };
     if page_table.reserve_active_frames(&mut frames).is_err() {
-        ui.input_status = "Boot failure: could not reserve active page tables";
-        ui.render(&mut screen);
+        ui.render_boot_log(&mut screen, "paging: failed to reserve active tables");
         halt_forever();
     }
     let serial = unsafe { SerialPort::new(SerialPort::COM1_BASE) };
-    let Ok(fs) = RedoxFs::new() else {
+    let Ok(mut fs) = RedoxFs::new() else {
         halt_forever();
     };
+    let Some((desktop_image, desktop_image_len, visible_programs)) =
+        install_and_load_system_programs(&mut fs)
+    else {
+        ui.render_boot_log(&mut screen, "redoxfs: system program installation failed");
+        halt_forever();
+    };
+    ui.visible_programs = visible_programs;
+    ui.render_boot_log(&mut screen, "redoxfs: desktop ELF and registry loaded");
+
     let mut context = KernelContext {
         frames,
         page_table,
@@ -132,6 +197,9 @@ pub extern "C" fn _start() -> ! {
         ui,
         paging_verified: false,
         processes: ProcessTable::new(),
+        desktop_handles: HandleTable::new(),
+        desktop_channel: Handle::INVALID,
+        launcher_toggle_pending: false,
         pending_console: [0; CONSOLE_BATCH_CAPACITY],
         pending_console_len: 0,
         pending_input: [0; INPUT_BATCH_CAPACITY],
@@ -140,8 +208,14 @@ pub extern "C" fn _start() -> ! {
     };
     context.paging_verified = verify_paging(&mut context);
     if !context.paging_verified {
+        context
+            .ui
+            .render_boot_log(&mut context.screen, "paging: verification failed");
         halt_forever();
     }
+    context
+        .ui
+        .render_boot_log(&mut context.screen, "paging: mappings verified");
     usb::configure_timestamp_frequency(
         TSC_FREQUENCY_REQUEST
             .response()
@@ -175,7 +249,10 @@ pub extern "C" fn _start() -> ! {
             context.ui.input_status = usb_error_status(error);
         }
     }
-    context.ui.render(&mut context.screen);
+    let input_status = context.ui.input_status;
+    context
+        .ui
+        .render_boot_log(&mut context.screen, input_status);
 
     let cpu_state: &'static mut CpuPrivilegeState =
         unsafe { &mut *ptr::addr_of_mut!(CPU_PRIVILEGE_STATE) };
@@ -188,40 +265,78 @@ pub extern "C" fn _start() -> ! {
     } {
         let mut sink = SerialDebugSink::new(&mut context.serial);
         let _ = writeln!(sink, "userspace: CPU initialization failed: {error:?}\r");
+        context
+            .ui
+            .render_boot_log(&mut context.screen, "userspace: CPU initialization failed");
         halt_forever();
     }
+    context
+        .ui
+        .render_boot_log(&mut context.screen, "userspace: privilege state ready");
+    context.ui.render_splash(&mut context.screen);
 
-    let process = match Process::from_elf(
-        USERSPACE_SMOKE_ELF,
+    let mut process = match Process::from_elf(
+        &desktop_image[..desktop_image_len],
         &context.page_table,
         &mut context.frames,
     ) {
         Ok(process) => process,
         Err(error) => {
             let mut sink = SerialDebugSink::new(&mut context.serial);
-            let _ = writeln!(sink, "userspace: ELF load failed: {error:?}\r");
+            let _ = writeln!(sink, "desktop: ELF load failed: {error:?}\r");
+            context
+                .ui
+                .render_failure(&mut context.screen, "Desktop ELF validation failed");
             halt_forever();
         }
     };
+    let (desktop_channel, process_channel) =
+        match channel_create_between(&mut context.desktop_handles, process.handles_mut()) {
+            Ok(channels) => channels,
+            Err(error) => {
+                let mut sink = SerialDebugSink::new(&mut context.serial);
+                let _ = writeln!(sink, "desktop: bootstrap channel failed: {error:?}\r");
+                context
+                    .ui
+                    .render_failure(&mut context.screen, "Desktop channel creation failed");
+                halt_forever();
+            }
+        };
+    process.set_start_arguments([
+        u64::from(process_channel.raw()),
+        context.screen.width() as u64,
+        context.screen.height() as u64,
+    ]);
+    context.desktop_channel = desktop_channel;
+
     let process_id = match context.processes.insert(process) {
         Ok(process_id) => process_id,
         Err(error) => {
             let mut sink = SerialDebugSink::new(&mut context.serial);
-            let _ = writeln!(sink, "userspace: process insertion failed: {error:?}\r");
+            let _ = writeln!(sink, "desktop: process insertion failed: {error:?}\r");
+            context
+                .ui
+                .render_failure(&mut context.screen, "Desktop process creation failed");
             halt_forever();
         }
     };
     {
         let mut sink = SerialDebugSink::new(&mut context.serial);
-        let _ = writeln!(sink, "userspace: loaded pid={}\r", process_id.raw());
+        let _ = writeln!(
+            sink,
+            "desktop: loaded {} from RedoxFS pid={}\r",
+            DESKTOP_PATH,
+            process_id.raw()
+        );
     }
 
-    let mut scheduler = Scheduler::<KernelContext, 6>::new();
+    let mut scheduler = Scheduler::<KernelContext, 7>::new();
     if scheduler.spawn(filesystem_task).is_err()
         || scheduler.spawn(console_task).is_err()
         || scheduler.spawn(accounting_task).is_err()
         || scheduler.spawn(log_flush_task).is_err()
         || scheduler.spawn(input_task).is_err()
+        || scheduler.spawn(desktop_task).is_err()
     {
         halt_forever();
     }
@@ -251,6 +366,9 @@ struct KernelContext {
     ui: ValidationUi,
     paging_verified: bool,
     processes: ProcessTable,
+    desktop_handles: HandleTable,
+    desktop_channel: Handle,
+    launcher_toggle_pending: bool,
     pending_console: [u8; CONSOLE_BATCH_CAPACITY],
     pending_console_len: usize,
     pending_input: [u8; INPUT_BATCH_CAPACITY],
@@ -333,12 +451,17 @@ struct ValidationUi {
     input_available: bool,
     input_status: &'static str,
     completion_code: Option<u8>,
+    desktop_ready: bool,
+    desktop_failed: bool,
+    launcher_visible: bool,
+    visible_programs: usize,
     cursor_backing: [u32; CURSOR_SIZE * CURSOR_SIZE],
     cursor_origin_x: usize,
     cursor_origin_y: usize,
     cursor_width: usize,
     cursor_height: usize,
     cursor_visible: bool,
+    boot_log_line: usize,
 }
 
 impl ValidationUi {
@@ -354,13 +477,88 @@ impl ValidationUi {
             input_available: false,
             input_status: "USB HID: initializing...",
             completion_code: None,
+            desktop_ready: false,
+            desktop_failed: false,
+            launcher_visible: false,
+            visible_programs: 0,
             cursor_backing: [0; CURSOR_SIZE * CURSOR_SIZE],
             cursor_origin_x: 0,
             cursor_origin_y: 0,
             cursor_width: 0,
             cursor_height: 0,
             cursor_visible: false,
+            boot_log_line: 0,
         }
+    }
+
+    fn render_boot_log(&mut self, screen: &mut FramebufferWriter<'_>, message: &'static str) {
+        let background = Rgb::new(8, 13, 22);
+        let primary = Rgb::new(210, 222, 238);
+        let accent = Rgb::new(110, 231, 183);
+        if self.boot_log_line == 0 {
+            screen.clear(background);
+            screen.draw_text(UI_MARGIN, UI_MARGIN, 3, "GinkgoOS kernel", accent);
+            screen.draw_text(
+                UI_MARGIN,
+                UI_MARGIN + 42,
+                1,
+                "Initializing hardware and protected execution...",
+                primary,
+            );
+        }
+        let y = UI_MARGIN + 82 + self.boot_log_line.saturating_mul(22);
+        if y + 18 < self.height {
+            screen.draw_text(UI_MARGIN, y, 2, message, primary);
+            self.boot_log_line += 1;
+        }
+    }
+
+    fn render_splash(&mut self, screen: &mut FramebufferWriter<'_>) {
+        let background = Rgb::new(14, 20, 32);
+        let panel = Rgb::new(31, 41, 61);
+        let primary = Rgb::new(232, 238, 247);
+        let muted = Rgb::new(148, 163, 184);
+        let accent = Rgb::new(110, 231, 183);
+        screen.clear(background);
+        let panel_width = 520usize.min(self.width.saturating_sub(UI_MARGIN * 2));
+        let panel_height = 190usize.min(self.height.saturating_sub(UI_MARGIN * 2));
+        let x = self.width.saturating_sub(panel_width) / 2;
+        let y = self.height.saturating_sub(panel_height) / 2;
+        screen.fill_rect(x, y, panel_width, panel_height, panel);
+        screen.fill_rect(x, y, 12, panel_height, accent);
+        screen.draw_text(x + 46, y + 38, 4, "GinkgoOS", primary);
+        screen.draw_text(
+            x + 48,
+            y + 105,
+            2,
+            "Starting the protected desktop service...",
+            muted,
+        );
+        self.cursor_visible = false;
+    }
+
+    fn render_failure(&mut self, screen: &mut FramebufferWriter<'_>, message: &'static str) {
+        let background = Rgb::new(28, 14, 20);
+        let panel = Rgb::new(65, 28, 38);
+        let primary = Rgb::new(255, 230, 235);
+        let warning = Rgb::new(251, 113, 133);
+        screen.clear(background);
+        screen.fill_rect(
+            UI_MARGIN,
+            self.height / 3,
+            self.width.saturating_sub(UI_MARGIN * 2),
+            150,
+            panel,
+        );
+        screen.draw_text(
+            UI_MARGIN + 30,
+            self.height / 3 + 28,
+            3,
+            "Boot failed",
+            warning,
+        );
+        screen.draw_text(UI_MARGIN + 30, self.height / 3 + 82, 2, message, primary);
+        self.cursor_visible = false;
     }
 
     fn push_byte(&mut self, byte: u8) -> Option<(usize, usize)> {
@@ -433,36 +631,29 @@ impl ValidationUi {
     }
 
     fn render_status(&mut self, screen: &mut FramebufferWriter<'_>) {
+        if !self.desktop_ready {
+            return;
+        }
         self.hide_cursor(screen);
         let panel = Rgb::new(31, 41, 61);
-        let accent = Rgb::new(110, 231, 183);
-        let warning = Rgb::new(251, 191, 36);
         let muted = Rgb::new(148, 163, 184);
-        screen.fill_rect(UI_MARGIN + 30, UI_MARGIN + 52, 72 * 5, 10, panel);
-        screen.fill_rect(UI_MARGIN + 30, UI_MARGIN + 64, 30 * 5, 10, panel);
+        let warning = Rgb::new(251, 191, 36);
+        let x = UI_MARGIN + 30;
+        let y = UI_MARGIN + 64;
+        screen.fill_rect(
+            x,
+            y,
+            screen.width().saturating_sub(x + UI_MARGIN + 190),
+            10,
+            panel,
+        );
         screen.draw_text(
-            UI_MARGIN + 30,
-            UI_MARGIN + 52,
+            x,
+            y,
             1,
             self.input_status,
-            if self.input_available {
-                accent
-            } else {
-                warning
-            },
+            if self.input_available { muted } else { warning },
         );
-        if let Some(code) = self.completion_code {
-            let digits = [hex_digit(code >> 4), hex_digit(code & 0x0f)];
-            screen.draw_text(
-                UI_MARGIN + 30,
-                UI_MARGIN + 64,
-                1,
-                "xHCI completion code: 0x",
-                muted,
-            );
-            let digits = unsafe { core::str::from_utf8_unchecked(&digits) };
-            screen.draw_text(UI_MARGIN + 30 + 24 * 5, UI_MARGIN + 64, 1, digits, warning);
-        }
         self.show_cursor(screen);
     }
 
@@ -473,22 +664,25 @@ impl ValidationUi {
         dirty_end: usize,
     ) {
         self.hide_cursor(screen);
-        let panel = Rgb::new(31, 41, 61);
+        let elevated = Rgb::new(41, 53, 78);
         let primary = Rgb::new(232, 238, 247);
         let muted = Rgb::new(148, 163, 184);
 
         if dirty_start == 0 {
             screen.fill_rect(
-                TEXT_ORIGIN_X,
-                TEXT_ORIGIN_Y,
-                12 * TEXT_ADVANCE,
-                TEXT_LINE_HEIGHT,
-                panel,
+                TEXT_ORIGIN_X.saturating_sub(10),
+                TEXT_ORIGIN_Y.saturating_sub(10),
+                screen
+                    .width()
+                    .saturating_sub(TEXT_ORIGIN_X * 2)
+                    .saturating_add(20),
+                42,
+                elevated,
             );
         }
         for index in dirty_start..dirty_end {
             let (x, y) = self.text_position(index);
-            screen.fill_rect(x, y, TEXT_ADVANCE, TEXT_LINE_HEIGHT, panel);
+            screen.fill_rect(x, y, TEXT_ADVANCE, TEXT_LINE_HEIGHT, elevated);
         }
         for index in dirty_start..self.text_len {
             let byte = self.text[index];
@@ -505,7 +699,7 @@ impl ValidationUi {
                 TEXT_ORIGIN_X,
                 TEXT_ORIGIN_Y,
                 TEXT_SCALE,
-                "Type here...",
+                "Search programs...",
                 muted,
             );
         }
@@ -591,7 +785,7 @@ impl ValidationUi {
     }
 
     fn render(&mut self, screen: &mut FramebufferWriter<'_>) {
-        let background = Rgb::new(18, 24, 38);
+        let background = Rgb::new(14, 20, 32);
         let panel = Rgb::new(31, 41, 61);
         let primary = Rgb::new(232, 238, 247);
         let muted = Rgb::new(148, 163, 184);
@@ -606,65 +800,168 @@ impl ValidationUi {
             panel,
         );
         screen.fill_rect(UI_MARGIN, UI_MARGIN, 10, 76, accent);
+        screen.draw_text(UI_MARGIN + 30, UI_MARGIN + 16, 3, "GinkgoOS", primary);
         screen.draw_text(
             UI_MARGIN + 30,
-            UI_MARGIN + 18,
-            3,
-            "HID input validation",
-            primary,
-        );
-        screen.draw_text(
-            UI_MARGIN + 30,
-            UI_MARGIN + 52,
+            UI_MARGIN + 50,
             1,
-            self.input_status,
-            if self.input_available {
+            if self.desktop_failed {
+                "Protected desktop service stopped"
+            } else if self.desktop_ready {
+                "Protected userland desktop is running"
+            } else {
+                "Starting protected userland desktop..."
+            },
+            if self.desktop_ready && !self.desktop_failed {
                 accent
             } else {
                 warning
             },
         );
-        if let Some(code) = self.completion_code {
-            let digits = [hex_digit(code >> 4), hex_digit(code & 0x0f)];
-            screen.draw_text(
-                UI_MARGIN + 30,
-                UI_MARGIN + 64,
-                1,
-                "xHCI completion code: 0x",
-                muted,
-            );
-            let digits = unsafe { core::str::from_utf8_unchecked(&digits) };
-            screen.draw_text(UI_MARGIN + 30 + 24 * 5, UI_MARGIN + 64, 1, digits, warning);
-        }
-
-        screen.draw_text(UI_MARGIN, TEXT_TOP, 2, "Keyboard text buffer", muted);
-        screen.fill_rect(
-            UI_MARGIN,
-            TEXT_TOP + 28,
-            screen.width().saturating_sub(UI_MARGIN * 2),
-            screen.height().saturating_sub(TEXT_TOP + 68),
-            panel,
+        screen.draw_text(
+            UI_MARGIN + 30,
+            UI_MARGIN + 64,
+            1,
+            self.input_status,
+            if self.input_available { muted } else { warning },
         );
-        let text = unsafe { core::str::from_utf8_unchecked(&self.text[..self.text_len]) };
-        screen.draw_text_wrapped(
-            TEXT_ORIGIN_X,
-            TEXT_ORIGIN_Y,
-            screen.width().saturating_sub(TEXT_ORIGIN_X * 2),
-            TEXT_SCALE,
-            text,
-            primary,
+        screen.draw_text(
+            screen.width().saturating_sub(UI_MARGIN + 170),
+            UI_MARGIN + 26,
+            1,
+            "META+N  Launcher",
+            muted,
         );
-        if self.text_len == 0 {
-            screen.draw_text(
-                TEXT_ORIGIN_X,
-                TEXT_ORIGIN_Y,
-                TEXT_SCALE,
-                "Type here...",
-                muted,
-            );
-        }
 
         self.cursor_visible = false;
+        self.render_content(screen);
+    }
+
+    fn render_content(&mut self, screen: &mut FramebufferWriter<'_>) {
+        self.hide_cursor(screen);
+        let background = Rgb::new(14, 20, 32);
+        let panel = Rgb::new(31, 41, 61);
+        let elevated = Rgb::new(41, 53, 78);
+        let primary = Rgb::new(232, 238, 247);
+        let muted = Rgb::new(148, 163, 184);
+        let accent = Rgb::new(110, 231, 183);
+        screen.fill_rect(
+            0,
+            TEXT_TOP.saturating_sub(18),
+            self.width,
+            self.height.saturating_sub(TEXT_TOP.saturating_sub(18)),
+            background,
+        );
+
+        if self.desktop_failed {
+            let card_y = TEXT_TOP + 36;
+            screen.fill_rect(
+                UI_MARGIN,
+                card_y,
+                screen.width().saturating_sub(UI_MARGIN * 2),
+                150,
+                panel,
+            );
+            screen.draw_text(
+                UI_MARGIN + 30,
+                card_y + 30,
+                3,
+                "Desktop service unavailable",
+                primary,
+            );
+            screen.draw_text(
+                UI_MARGIN + 30,
+                card_y + 86,
+                2,
+                "Restart GinkgoOS to relaunch protected userland.",
+                muted,
+            );
+        } else if self.launcher_visible {
+            screen.draw_text(UI_MARGIN, TEXT_TOP, 2, "Launcher", primary);
+            screen.draw_text(
+                UI_MARGIN + 110,
+                TEXT_TOP + 4,
+                1,
+                "type to search installed programs",
+                muted,
+            );
+            screen.fill_rect(
+                UI_MARGIN,
+                TEXT_TOP + 28,
+                screen.width().saturating_sub(UI_MARGIN * 2),
+                screen.height().saturating_sub(TEXT_TOP + 68),
+                panel,
+            );
+            screen.fill_rect(
+                TEXT_ORIGIN_X.saturating_sub(10),
+                TEXT_ORIGIN_Y.saturating_sub(10),
+                screen
+                    .width()
+                    .saturating_sub(TEXT_ORIGIN_X * 2)
+                    .saturating_add(20),
+                42,
+                elevated,
+            );
+            let text = unsafe { core::str::from_utf8_unchecked(&self.text[..self.text_len]) };
+            screen.draw_text_wrapped(
+                TEXT_ORIGIN_X,
+                TEXT_ORIGIN_Y,
+                screen.width().saturating_sub(TEXT_ORIGIN_X * 2),
+                TEXT_SCALE,
+                text,
+                primary,
+            );
+            if self.text_len == 0 {
+                screen.draw_text(
+                    TEXT_ORIGIN_X,
+                    TEXT_ORIGIN_Y,
+                    TEXT_SCALE,
+                    "Search programs...",
+                    muted,
+                );
+            }
+            screen.draw_text(
+                TEXT_ORIGIN_X,
+                TEXT_ORIGIN_Y + 70,
+                2,
+                if self.visible_programs == 0 {
+                    "No applications installed"
+                } else {
+                    "Applications are registered"
+                },
+                muted,
+            );
+        } else {
+            let card_y = TEXT_TOP + 36;
+            screen.fill_rect(
+                UI_MARGIN,
+                card_y,
+                screen.width().saturating_sub(UI_MARGIN * 2),
+                180,
+                panel,
+            );
+            screen.draw_text(
+                UI_MARGIN + 30,
+                card_y + 30,
+                3,
+                "Welcome to GinkgoOS",
+                primary,
+            );
+            screen.draw_text(
+                UI_MARGIN + 30,
+                card_y + 82,
+                2,
+                "The window manager and launcher are running in ring 3.",
+                muted,
+            );
+            screen.draw_text(
+                UI_MARGIN + 30,
+                card_y + 120,
+                2,
+                "Press META+N to open the launcher.",
+                accent,
+            );
+        }
         self.show_cursor(screen);
     }
 }
@@ -862,6 +1159,71 @@ fn console_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll 
     TaskPoll::Pending
 }
 
+fn desktop_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll {
+    if context.launcher_toggle_pending {
+        match context.desktop_handles.channel_write(
+            context.desktop_channel,
+            TOGGLE_LAUNCHER_MESSAGE,
+            &[],
+        ) {
+            Ok(()) => context.launcher_toggle_pending = false,
+            Err(IpcError::ShouldWait) => {}
+            Err(_) => context.launcher_toggle_pending = false,
+        }
+    }
+
+    let mut message = [0u8; 8];
+    let result =
+        context
+            .desktop_handles
+            .channel_read(context.desktop_channel, &mut message, &mut []);
+    match result {
+        Ok(info) if info.byte_count == message.len() as u32 && info.handle_count == 0 => {
+            if &message == DESKTOP_READY_MESSAGE {
+                if !context.ui.desktop_ready {
+                    context.ui.desktop_ready = true;
+                    context.ui.desktop_failed = false;
+                    {
+                        let mut sink = SerialDebugSink::new(&mut context.serial);
+                        let _ = writeln!(sink, "desktop: protected userland ready\r");
+                    }
+                    context.ui.render(&mut context.screen);
+                }
+            } else if &message[..7] == LAUNCHER_STATE_PREFIX && message[7] <= 1 {
+                let launcher_visible = message[7] != 0;
+                if context.ui.launcher_visible != launcher_visible {
+                    context.ui.launcher_visible = launcher_visible;
+                    context.ui.render_content(&mut context.screen);
+                }
+            }
+            TaskPoll::Pending
+        }
+        Ok(_) | Err(IpcError::ShouldWait) => TaskPoll::Pending,
+        Err(IpcError::PeerClosed) => {
+            context.ui.desktop_ready = false;
+            context.ui.desktop_failed = true;
+            context.ui.launcher_visible = false;
+            context.ui.render(&mut context.screen);
+            TaskPoll::Complete
+        }
+        Err(_) => TaskPoll::Pending,
+    }
+}
+
+fn request_launcher_toggle(context: &mut KernelContext) {
+    if context.launcher_toggle_pending {
+        context.launcher_toggle_pending = false;
+        return;
+    }
+    if context
+        .desktop_handles
+        .channel_write(context.desktop_channel, TOGGLE_LAUNCHER_MESSAGE, &[])
+        == Err(IpcError::ShouldWait)
+    {
+        context.launcher_toggle_pending = true;
+    }
+}
+
 fn input_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
     let Some(input) = context.input.as_mut() else {
         return TaskPoll::Complete;
@@ -872,7 +1234,7 @@ fn input_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
             context.ui.input_available = false;
             context.ui.completion_code = usb_error_completion_code(error);
             context.ui.input_status = usb_error_status(error);
-            context.ui.render(&mut context.screen);
+            context.ui.render_status(&mut context.screen);
             return TaskPoll::Complete;
         }
     };
@@ -880,7 +1242,7 @@ fn input_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
         context.ui.input_available = false;
         context.ui.completion_code = Some(code);
         context.ui.input_status = "USB HID: interrupt endpoint stopped with a transfer error";
-        context.ui.render(&mut context.screen);
+        context.ui.render_status(&mut context.screen);
         return TaskPoll::Complete;
     }
 
@@ -936,16 +1298,18 @@ fn handle_input_event(
                 let bit = if usage == 0xe1 { 1 } else { 2 };
                 let shifts = state.get(1).unwrap_or(0);
                 state.set(1, if pressed { shifts | bit } else { shifts & !bit });
+            } else if matches!(usage, 0xe3 | 0xe7) {
+                let bit = if usage == 0xe3 { 1 } else { 2 };
+                let logos = state.get(3).unwrap_or(0);
+                state.set(3, if pressed { logos | bit } else { logos & !bit });
             } else if usage == 0x39 && pressed {
                 state.set(2, state.get(2).unwrap_or(0) ^ 1);
-            } else if pressed {
+            } else if pressed && usage == 0x11 && state.get(3).unwrap_or(0) != 0 {
+                request_launcher_toggle(context);
+            } else if pressed && context.ui.launcher_visible {
                 let shift = state.get(1).unwrap_or(0) != 0;
                 let caps_lock = state.get(2).unwrap_or(0) != 0;
                 if let Some(byte) = keyboard_ascii(usage, shift, caps_lock) {
-                    if let Some(serial) = context.serial.as_mut() {
-                        let _ = serial.try_write(byte);
-                    }
-                    queue_console_byte(context, byte);
                     text_dirty = context.ui.push_byte(byte);
                 }
             }
@@ -1148,13 +1512,6 @@ fn encode_input_event(device_event: DeviceInputEvent) -> [u8; INPUT_RECORD_SIZE]
     record[12..16].copy_from_slice(&value.to_le_bytes());
     record[16..24].copy_from_slice(&raw_value.to_le_bytes());
     record
-}
-
-const fn hex_digit(value: u8) -> u8 {
-    match value {
-        0..=9 => b'0' + value,
-        _ => b'A' + (value - 10),
-    }
 }
 
 const fn usb_error_completion_code(error: UsbError) -> Option<u8> {

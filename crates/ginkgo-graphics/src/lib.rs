@@ -2,7 +2,11 @@
 
 //! Framebuffer drawing primitives shared by the kernel and future userspace.
 
-use core::{convert::Infallible, marker::PhantomData, ptr::NonNull};
+use core::{
+    convert::Infallible,
+    marker::PhantomData,
+    ptr::{self, NonNull},
+};
 
 use embedded_graphics::{
     draw_target::DrawTarget,
@@ -586,13 +590,14 @@ impl<'a> FramebufferWriter<'a> {
 
         let bytes_per_pixel = bytes_per_pixel(self.framebuffer.bits_per_pixel);
         let offset = y * self.framebuffer.pitch as usize + x * bytes_per_pixel;
+        let address = unsafe { self.framebuffer.address.add(offset) };
+        if bytes_per_pixel == 4 && (address as usize) % core::mem::align_of::<u32>() == 0 {
+            unsafe { ptr::write_volatile(address.cast::<u32>(), packed) };
+            return;
+        }
         for byte_index in 0..bytes_per_pixel {
-            let Some(pointer) =
-                NonNull::new(unsafe { self.framebuffer.address.add(offset + byte_index) })
-            else {
-                return;
-            };
-            unsafe { VolatilePtr::new(pointer) }.write((packed >> (byte_index * 8)) as u8);
+            let pointer = unsafe { address.add(byte_index) };
+            unsafe { ptr::write_volatile(pointer, (packed >> (byte_index * 8)) as u8) };
         }
     }
 
@@ -607,6 +612,53 @@ impl<'a> FramebufferWriter<'a> {
                 << self.framebuffer.green_mask_shift)
             | (scale_channel(color.b(), self.framebuffer.blue_mask_size)
                 << self.framebuffer.blue_mask_shift)
+    }
+
+    fn fill_packed_rect(
+        &mut self,
+        left: usize,
+        top: usize,
+        right: usize,
+        bottom: usize,
+        packed: u32,
+    ) {
+        let bytes_per_pixel = bytes_per_pixel(self.framebuffer.bits_per_pixel);
+        let pitch = self.framebuffer.pitch as usize;
+        let repeated = u64::from(packed) | (u64::from(packed) << 32);
+        for y in top..bottom {
+            let row_offset = y * pitch + left * bytes_per_pixel;
+            let row = unsafe { self.framebuffer.address.add(row_offset) };
+            let pixel_count = right.saturating_sub(left);
+            if bytes_per_pixel == 4 && (row as usize) % core::mem::align_of::<u32>() == 0 {
+                let mut written = 0usize;
+                if (row as usize) % core::mem::align_of::<u64>() != 0 && pixel_count != 0 {
+                    unsafe { ptr::write_volatile(row.cast::<u32>(), packed) };
+                    written = 1;
+                }
+                while written + 1 < pixel_count {
+                    let pair = unsafe { row.add(written * 4) }.cast::<u64>();
+                    unsafe { ptr::write_volatile(pair, repeated) };
+                    written += 2;
+                }
+                if written < pixel_count {
+                    let final_pixel = unsafe { row.add(written * 4) }.cast::<u32>();
+                    unsafe { ptr::write_volatile(final_pixel, packed) };
+                }
+                continue;
+            }
+
+            for x in 0..pixel_count {
+                let pixel = unsafe { row.add(x * bytes_per_pixel) };
+                for byte_index in 0..bytes_per_pixel {
+                    unsafe {
+                        ptr::write_volatile(
+                            pixel.add(byte_index),
+                            (packed >> (byte_index * 8)) as u8,
+                        )
+                    };
+                }
+            }
+        }
     }
 }
 
@@ -648,22 +700,13 @@ impl DrawTarget for FramebufferWriter<'_> {
             .saturating_add(i64::from(area.size.height))
             .clamp(0, self.height() as i64) as usize;
         let packed = self.pack_color(color);
-
-        for y in top.min(bottom)..bottom {
-            for x in left.min(right)..right {
-                self.write_raw_pixel(x, y, packed);
-            }
-        }
+        self.fill_packed_rect(left.min(right), top.min(bottom), right, bottom, packed);
         Ok(())
     }
 
     fn clear(&mut self, color: Self::Color) -> Result<(), Self::Error> {
         let packed = self.pack_color(color);
-        for y in 0..self.height() {
-            for x in 0..self.width() {
-                self.write_raw_pixel(x, y, packed);
-            }
-        }
+        self.fill_packed_rect(0, 0, self.width(), self.height(), packed);
         Ok(())
     }
 }
