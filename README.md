@@ -10,7 +10,7 @@ A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. Gi
 - `x86_64`-backed address types, active page-table translation, mapping, and unmapping
 - Generation-tagged processes with isolated lower-half page tables and supervisor-only shared kernel mappings
 - Strict ELF64 `ET_EXEC` loading, guarded user stacks, x86-64 ring-3 entry, and contained user faults
-- `SYSCALL`/`SYSRET` dispatch plus `no_std` userspace stubs for processes, handles, channels, waits, shared memory, and debug output
+- `SYSCALL`/`SYSRET` dispatch plus `no_std` userspace stubs for processes, handles, channels, waits, shared memory, files, directories, and debug output
 - Rights-checked shared-memory map/unmap with mapping leases that survive source-handle closure
 - `x86_64` port I/O plus `volatile`-backed checked MMIO capabilities
 - A nonblocking serial device built on `uart_16550`
@@ -20,12 +20,12 @@ A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. Gi
 - Process-local capability handles and bounded bidirectional datagram channels with atomic, rights-attenuating handle transfer
 - Heap-backed shared-memory capabilities and protected two-buffer window pools
 - A software compositor with clipping, hardware-format conversion, ARGB source-over blending, and complete-scene publication
-- Production Rust desktop-service and minimal-client ELFs built in the nested userspace workspace
+- Production Rust desktop-service, file-navigator, and minimal-client ELFs built in the nested userspace workspace
 - A persistent protected userspace desktop service and `META+N` launcher
 - A strictly validated, versioned `.gkr` executable registry with hidden system entries
 - A transport-independent scrolling desktop policy and application window protocol
 - Packed bitmap-font rendering and a validated, versioned `.gkf` format
-- RedoxFS transactions and on-disk format over a volatile memory-backed block device
+- Persistent RedoxFS transactions over a bounded-polling legacy ATA PIO disk backend
 - Talc-backed dynamic allocation for RedoxFS and future kernel services
 - Fixed-capacity round-robin cooperative task scheduling
 - A high-half ELF linker script
@@ -42,17 +42,17 @@ The same capability table holds zero-filled shared-memory objects and protected 
 
 Shared-memory objects are page-aligned, page-rounded, zero-filled heap allocations with a distinct logical length. Processes may map them read-only or read-write only when the capability has the corresponding `MAP`, `READ`, and optional `WRITE` rights. Each mapping retains an owning lease, so closing or transferring the source handle cannot invalidate a live alias; unmapping or retiring the process releases that lease only after its PTEs are unreachable. Window capabilities protect lifecycle and management authority, not pixel immutability: a holder of a writable alias can still violate the presentation contract by modifying an in-flight buffer before its `BufferReleased` event.
 
-`ginkgo-sysapi` defines fixed-layout syscall numbers and argument blocks alongside the handle, rights, object type, signal, status, wait, mapping, and RPC-header contracts. Structured messages use a 24-byte `zerocopy` RPC header followed by a `postcard` payload; the kernel channel remains unaware of application protocols. `ginkgo-userspace` exposes inline x86-64 syscall stubs, ergonomic wrappers, the codec, and the transport-independent window facade without pulling in the kernel handle backend. Wait-many currently performs one nonblocking signal poll; scheduler wait queues and deadline-aware blocking remain future work.
+`ginkgo-sysapi` defines append-only syscall numbers and fixed-layout argument blocks alongside the handle, rights, object type, signal, status, wait, mapping, filesystem, and RPC-header contracts. Filesystem syscalls cover open/create, positional read/write, stat, root-directory enumeration, truncate, and unlink. Files and the filesystem root are generation-protected process-local capabilities; only registry entries carrying `EntryFlags::FILESYSTEM` receive a root capability, and file capabilities cannot be duplicated or transferred. Kernel-owned executables, the registry, and kernel logs remain readable but reject userspace write, truncate, and unlink operations. Structured messages use a 24-byte `zerocopy` RPC header followed by a `postcard` payload; the kernel channel remains unaware of application protocols. `ginkgo-userspace` exposes inline x86-64 syscall stubs, ergonomic wrappers, the codec, and the transport-independent window facade without pulling in the kernel handle backend. Wait-many currently performs one nonblocking signal poll; scheduler wait queues and deadline-aware blocking remain future work.
 
 ### Protected userspace execution
 
-At boot, after device initialization has installed its kernel mappings, GinkgoOS installs `/desktop.elf`, `/minimal-client.elf`, and `/programs.gkr` into RedoxFS and reads them back through the filesystem adapter. It validates the registry and desktop ELF, then creates an isolated page-table root for the desktop process. The process root starts with an empty lower half and clones only the kernel higher-half topology, clearing `USER_ACCESSIBLE` on every cloned P4 entry even when Limine supplied permissive flags. User mappings reject the zero page, noncanonical or higher-half addresses, writable-executable pages, overlaps, and permission-invalid copies.
+At boot, after device initialization has installed its kernel mappings, GinkgoOS installs `/desktop.elf`, `/file-navigator.elf`, `/minimal-client.elf`, and `/programs.gkr` into RedoxFS and reads them back through the filesystem adapter. It validates the registry and desktop ELF, then creates an isolated page-table root for the desktop process. The process root starts with an empty lower half and clones only the kernel higher-half topology, clearing `USER_ACCESSIBLE` on every cloned P4 entry even when Limine supplied permissive flags. User mappings reject the zero page, noncanonical or higher-half addresses, writable-executable pages, overlaps, and permission-invalid copies.
 
 The dependency-free ELF loader accepts only little-endian x86-64 `ET_EXEC` images in the Ginkgo executable profile. It validates every program header, mapped range, page overlap, permission, entry point, and stack/guard collision before installing image pages. Each process owns its address space, generation-tagged identity, register and x87/SSE state, capability table, shared mappings, and detailed exit/fault state.
 
 The x86-64 entry path installs a GDT, TSS, IDT, `STAR`/`LSTAR`/`FMASK`, and five distinct 64 KiB supervisor stacks for RSP0, syscall entry, double fault, NMI, and machine check. Synchronous user exceptions are contained and returned to the process scheduler; kernel faults and unrecoverable exception classes fail stop. Every syscall immediately switches away from the untrusted user RSP, captures the complete user context, and returns to scheduler-side dispatch. Return through `SYSRETQ` revalidates canonical RIP/RSP, flags, and floating-point state.
 
-Normal Makefile builds first compile the production Rust `ginkgo-desktop-service` and `ginkgo-minimal-client` release ELFs from the independent `userspace/` workspace. The kernel build consumes and embeds those artifacts with the generated registry; they become `/desktop.elf`, `/minimal-client.elf`, and `/programs.gkr` in the boot filesystem. The desktop receives only one bootstrap channel plus the display dimensions, and each launched app receives only its per-app desktop channel. The service remains resident, announces readiness, owns launcher and window policy, polls bounded channels cooperatively, and yields when idle. A successful serial trace includes:
+Normal Makefile builds first compile the production Rust `ginkgo-desktop-service`, `ginkgo-file-navigator`, and `ginkgo-minimal-client` release ELFs from the independent `userspace/` workspace. The kernel build consumes and embeds those artifacts with the generated registry; they become `/desktop.elf`, `/file-navigator.elf`, `/minimal-client.elf`, and `/programs.gkr` in the boot filesystem. The desktop receives only one bootstrap channel plus the display dimensions. Every launched app receives its per-app desktop channel, while only registry-authorized apps receive a filesystem-root capability. The service remains resident, announces readiness, owns launcher and window policy, polls bounded channels cooperatively, and yields when idle. A successful serial trace includes:
 
 ```text
 desktop: loaded /desktop.elf from RedoxFS pid=...
@@ -79,9 +79,9 @@ The production `ginkgo-desktop-service` runs `ginkgo-desktop` policy in ring 3 a
 
 `ginkgo-fonts` provides sorted packed one-bit bitmap glyphs, kerning, allocation-free rendering through `embedded-graphics`, and strict parsing of a versioned little-endian `.gkf` representation. YAFF and BDF importers remain future host-side tooling; applications can already embed validated `.gkf` bytes or construct normalized fonts from converter output.
 
-The registry contains the hidden `Ginkgo Desktop` service and visible `Ginkgo Demo` at `/minimal-client.elf`. Boot stops at an empty desktop until the user launches an app. The demo draws a steady centered “Hello World” surface, and `F11` toggles fullscreen. Normal panes have desktop margins while fullscreen remains edge-to-edge. `META+N` toggles the registry-backed launcher, whose search and app rows use the embedded-icon `Magnify` and `CubeOutline` drawables and bounded background save/restore.
+The registry contains the hidden `Ginkgo Desktop` service plus visible `Files` and `Ginkgo Demo` applications. `Files` lists the persistent root directory, moves selection with Up/Down, previews a file with Enter, returns with Backspace, and removes non-system files with Delete. Boot stops at an empty desktop until the user launches an app. The demo draws a steady centered “Hello World” surface, and `F11` toggles fullscreen. Normal panes have desktop margins while fullscreen remains edge-to-edge. `META+N` toggles the registry-backed launcher, whose search and app rows use the embedded-icon `Magnify` and `CubeOutline` drawables and bounded background save/restore.
 
-Currently integrated pane bindings are `META+Left/Right` for focus, `META+Q` to close the focused application, `META+A/S` to move the focused pane left/right, `META+=/-` to adjust its width in 5% steps, and `META+L/C/R` to align it left/center/right. Columns form a horizontally scrolling workspace, so additional running applications can be off-screen; use the focus bindings to navigate them. The remaining hotkey work is tracked in #5. A general userspace filesystem ABI and filesystem-backed search are tracked in #4.
+Currently integrated pane bindings are `META+Left/Right` for focus, `META+Q` to close the focused application, `META+A/S` to move the focused pane left/right, `META+=/-` to adjust its width in 5% steps, and `META+L/C/R` to align it left/center/right. Columns form a horizontally scrolling workspace, so additional running applications can be off-screen; use the focus bindings to navigate them. The remaining desktop hotkey work is tracked in #5.
 
 ### USB HID input
 
@@ -91,25 +91,25 @@ Input is currently limited to devices attached directly to xHCI root ports at bo
 
 ### Filesystem architecture
 
-The kernel uses the RedoxFS 0.9.1 transaction engine and filesystem format, adapted from upstream commit `99bc185bf8ad8bd6f4d2562c424d800c2a3d310b`. A host build script formats a deterministic 2 MiB seed image. At boot, the kernel copies that image into memory, opens it through a GinkgoOS `Disk` implementation, and performs normal RedoxFS node transactions.
+The kernel uses the RedoxFS 0.9.1 transaction engine and filesystem format, adapted from upstream commit `99bc185bf8ad8bd6f4d2562c424d800c2a3d310b`. The filesystem adapter is generic over its `Disk` implementation. Host tests retain an in-memory backend, while the boot kernel claims the legacy primary-master ATA device, validates its LBA28 capacity, and performs bounded polling PIO transfers in 512-byte sectors. A blank disk is formatted once; later boots reopen the existing unencrypted image. Trusted embedded executables and the registry are refreshed on every boot without deleting ordinary files.
 
-The current adapter intentionally supports unencrypted images only. Persistence across reboot requires replacing the memory disk with a block-device driver; the filesystem-facing code does not need to change.
+The default QEMU targets attach `build/ginkgo-redoxfs.img` with writethrough caching. `make clean` preserves this image, `make reset-fs` deletes it, and the deliberately destructive `make distclean` removes the entire build directory. The current hardware driver supports only a legacy primary-master ATA disk; AHCI, NVMe, virtio-blk, partitions, and encrypted RedoxFS images are not yet supported.
 
 ## Dependencies
 
 On CachyOS or Arch Linux:
 
 ```sh
-sudo pacman -S --needed rustup make curl xorriso qemu-system-x86
+sudo pacman -S --needed rustup make curl xorriso qemu-system-x86 sccache
 rustup default nightly
 ```
 
-Nightly is currently required for `allocator_api`, which the kernel IPC backend uses to keep syscall-reachable `Arc` allocation fallible. The Makefile downloads pinned Limine boot files and an OVMF firmware image automatically.
+Nightly is currently required for `allocator_api`, which the kernel IPC backend uses to keep syscall-reachable `Arc` allocation fallible. Both Cargo workspaces use `sccache` as their `rustc-wrapper`; install it before building. The Makefile downloads pinned Limine boot files and an OVMF firmware image automatically.
 
 On Debian or Ubuntu, install equivalent packages:
 
 ```sh
-sudo apt install make curl xorriso qemu-system-x86
+sudo apt install make curl xorriso qemu-system-x86 sccache
 ```
 
 Install Rust through rustup, then ensure `cargo` is in `PATH`.
@@ -120,7 +120,7 @@ Install Rust through rustup, then ensure `cargo` is in `PATH`.
 make run
 ```
 
-The first run downloads Limine and OVMF, builds the kernel, creates `build/ginkgo-os.iso`, and starts QEMU. The default QEMU configuration attaches an xHCI USB keyboard and tablet so the HID path is exercised.
+The first run downloads Limine and OVMF, builds the kernel, creates `build/ginkgo-os.iso`, creates a persistent 16 MiB `build/ginkgo-redoxfs.img` if needed, and starts QEMU. The default `pc` machine attaches that image as the primary ATA disk plus an xHCI USB keyboard and tablet. Subsequent runs reuse the same filesystem image.
 
 To boot directly from a QEMU virtual FAT disk without creating an ISO or requiring `xorriso`:
 
@@ -171,10 +171,10 @@ crates/ginkgo-scroll-layout/  pure scrolling workspace, placement, and fullscree
 crates/ginkgo-desktop/        transport-independent desktop service policy and runtime actions
 crates/ginkgo-fonts/          packed bitmap fonts, rendering, and validated `.gkf` parsing
 crates/ginkgo-hid/            transport-independent HID descriptor parser and report decoder
-crates/ginkgo-filesystem/     RedoxFS memory-disk adapter and deterministic seed-image build
+crates/ginkgo-filesystem/     generic RedoxFS adapter plus host memory-disk backend
 crates/ginkgo-graphics/       hardware framebuffer and ordinary RAM pixel draw targets
 crates/ginkgo-sysapi/         fixed-layout handles, rights, object types, signals, statuses, waits, and RPC header
-userspace/                    nested production workspace for the desktop service, minimal client, runtime, and ELF validator
+userspace/                    nested production workspace for the desktop service, file navigator, minimal client, runtime, and ELF validator
 vendor/redoxfs/               pinned no_std GinkgoOS adaptation of RedoxFS
 limine.conf                 Limine menu entry
 Makefile                    kernel build, ISO, and QEMU automation
@@ -192,7 +192,7 @@ Disable Secure Boot unless you sign the Limine EFI executable and configure its 
 
 ## Desktop bootstrap
 
-The normal Makefile pipeline builds the nested userspace workspace first and passes its production ELFs into the kernel build for embedding. At boot, `crates/ginkgo-kernel/src/main.rs` installs and reopens `/desktop.elf`, `/minimal-client.elf`, and `/programs.gkr` through RedoxFS, validates the registry, loads the desktop, and gives it a minimal cross-table bootstrap channel. Registered apps are loaded on demand with their own attenuated desktop channels. Startup deliberately progresses through three visual phases:
+The normal Makefile pipeline builds the nested userspace workspace first and passes its production ELFs into the kernel build for embedding. At boot, `crates/ginkgo-kernel/src/main.rs` installs and reopens `/desktop.elf`, `/file-navigator.elf`, `/minimal-client.elf`, and `/programs.gkr` through RedoxFS, validates the registry, loads the desktop, and gives it a minimal cross-table bootstrap channel. Registered apps are loaded on demand with their own attenuated desktop channels and explicitly granted capabilities. Startup deliberately progresses through three visual phases:
 
 1. An append-only kernel initialization log.
 2. A splash screen while protected userland starts.
@@ -200,4 +200,4 @@ The normal Makefile pipeline builds the nested userspace workspace first and pas
 
 Runtime status and launcher transitions use bounded dirty-region redraws and bounded background restoration. Solid 32-bpp framebuffer fills and completed compositor scenes use packed volatile writes rather than byte-at-a-time publication.
 
-The next sensible milestones include the filesystem ABI and file search tracked in #4, the broader desktop hotkey work tracked in #5, scheduler-backed blocking waits, xHCI interrupt delivery and USB hotplug/hubs, timer preemption, SMP, frame deallocation, and a panic screen with serial diagnostics.
+The next sensible milestones include nested directories and richer file management, the broader desktop hotkey work tracked in #5, scheduler-backed blocking waits, xHCI interrupt delivery and USB hotplug/hubs, timer preemption, SMP, frame deallocation, and a panic screen with serial diagnostics.

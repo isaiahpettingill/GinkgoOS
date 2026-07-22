@@ -29,6 +29,7 @@ use ginkgo_hid::{ApplicationKind, Axis, InputEvent, AXIS_MAX, AXIS_MIN};
 use ginkgo_ipc::IpcError;
 use ginkgo_kernel::{
     arch::{self, CpuPrivilegeState, KernelExit, PrivilegeStackTops},
+    ata::AtaPioDisk,
     desktop_runtime::{DesktopBroker, DesktopBrokerError, DesktopRuntimeEvent},
     input::{DeviceInputEvent, InputManager},
     io::SerialPort,
@@ -43,10 +44,11 @@ use ginkgo_kernel::{
     task::{Scheduler, TaskPoll, TaskState},
     usb::{self, UsbError},
 };
-use ginkgo_program_registry::Registry;
+use ginkgo_program_registry::{EntryFlags, Registry};
 use ginkgo_window::{
     ButtonState, KeyboardEvent, Modifiers, Point as WindowPoint, PointerButton, PointerEventKind,
 };
+use redoxfs::Disk;
 use volatile::VolatilePtr;
 use x86_64::instructions::{hlt, interrupts};
 
@@ -85,10 +87,13 @@ static REQUESTS_END: [u64; 2] = limine::REQUESTS_END_MARKER;
 static DESKTOP_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-desktop.elf"));
 static MINIMAL_CLIENT_ELF: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-minimal-client.elf"));
+static FILE_NAVIGATOR_ELF: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-file-navigator.elf"));
 static PROGRAM_REGISTRY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/programs.gkr"));
 
 const DESKTOP_PATH: &str = "/desktop.elf";
 const MINIMAL_CLIENT_PATH: &str = "/minimal-client.elf";
+const FILE_NAVIGATOR_PATH: &str = "/file-navigator.elf";
 const PROGRAM_REGISTRY_PATH: &str = "/programs.gkr";
 const MAX_EXECUTABLE_BYTES: usize = 512 * 1024;
 const MAX_LAUNCHER_PROGRAMS: usize = 6;
@@ -99,6 +104,7 @@ struct ProgramSummary {
     name_len: usize,
     path: [u8; 64],
     path_len: usize,
+    filesystem: bool,
 }
 
 impl ProgramSummary {
@@ -107,6 +113,7 @@ impl ProgramSummary {
         name_len: 0,
         path: [0; 64],
         path_len: 0,
+        filesystem: false,
     };
 
     fn name(&self) -> &str {
@@ -138,9 +145,12 @@ impl ProgramCatalog {
     }
 }
 
-fn install_and_load_system_programs(fs: &mut RedoxFs) -> Option<(Vec<u8>, ProgramCatalog)> {
+fn install_and_load_system_programs<D: Disk>(
+    fs: &mut RedoxFs<D>,
+) -> Option<(Vec<u8>, ProgramCatalog)> {
     install_system_file(fs, DESKTOP_PATH, DESKTOP_ELF)?;
     install_system_file(fs, MINIMAL_CLIENT_PATH, MINIMAL_CLIENT_ELF)?;
+    install_system_file(fs, FILE_NAVIGATOR_PATH, FILE_NAVIGATOR_ELF)?;
     install_system_file(fs, PROGRAM_REGISTRY_PATH, PROGRAM_REGISTRY)?;
 
     let registry_bytes = read_system_file(fs, PROGRAM_REGISTRY_PATH, 16 * 1024)?;
@@ -155,6 +165,7 @@ fn install_and_load_system_programs(fs: &mut RedoxFs) -> Option<(Vec<u8>, Progra
         let slot = &mut catalog.programs[catalog.len];
         slot.name_len = copy_program_string(&mut slot.name, entry.display_name)?;
         slot.path_len = copy_program_string(&mut slot.path, entry.executable_path)?;
+        slot.filesystem = entry.flags.contains(EntryFlags::FILESYSTEM);
         catalog.len += 1;
     }
 
@@ -162,7 +173,7 @@ fn install_and_load_system_programs(fs: &mut RedoxFs) -> Option<(Vec<u8>, Progra
     Some((desktop_image, catalog))
 }
 
-fn read_system_file(fs: &mut RedoxFs, path: &str, maximum: usize) -> Option<Vec<u8>> {
+fn read_system_file<D: Disk>(fs: &mut RedoxFs<D>, path: &str, maximum: usize) -> Option<Vec<u8>> {
     let file = fs.open(path).ok()?;
     let length = usize::try_from(fs.stat(file).ok()?.len).ok()?;
     if length == 0 || length > maximum {
@@ -180,8 +191,9 @@ fn copy_program_string<const N: usize>(output: &mut [u8; N], value: &str) -> Opt
     Some(value.len())
 }
 
-fn install_system_file(fs: &mut RedoxFs, path: &str, bytes: &[u8]) -> Option<()> {
-    let file = fs.create(path).ok()?;
+fn install_system_file<D: Disk>(fs: &mut RedoxFs<D>, path: &str, bytes: &[u8]) -> Option<()> {
+    let file = fs.open(path).or_else(|_| fs.create(path)).ok()?;
+    fs.truncate(file, 0).ok()?;
     (fs.write(file, 0, bytes).ok()? == bytes.len()).then_some(())
 }
 
@@ -235,7 +247,21 @@ pub extern "C" fn _start() -> ! {
         halt_forever();
     }
     let serial = unsafe { SerialPort::new(SerialPort::COM1_BASE) };
-    let Ok(mut fs) = RedoxFs::new() else {
+    let Ok(mut disk) = (unsafe { AtaPioDisk::primary_master() }) else {
+        ui.render_boot_log(&mut screen, "ata: persistent disk unavailable");
+        halt_forever();
+    };
+    let Ok(blank_disk) = disk.is_blank() else {
+        ui.render_boot_log(&mut screen, "ata: persistent disk read failed");
+        halt_forever();
+    };
+    let fs_result = if blank_disk {
+        RedoxFs::format_disk(disk)
+    } else {
+        RedoxFs::open_disk(disk)
+    };
+    let Ok(mut fs) = fs_result else {
+        ui.render_boot_log(&mut screen, "redoxfs: persistent disk mount failed");
         halt_forever();
     };
     let Some((desktop_image, catalog)) = install_and_load_system_programs(&mut fs) else {
@@ -411,7 +437,7 @@ struct KernelContext {
     frames: UsableFrameAllocator<'static>,
     page_table: ActivePageTable,
     hhdm_offset: u64,
-    fs: RedoxFs,
+    fs: RedoxFs<AtaPioDisk>,
     serial: Option<SerialPort>,
     input: Option<InputManager>,
     screen: FramebufferWriter<'static>,
@@ -1044,6 +1070,7 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                     &mut user_context,
                     &context.page_table,
                     &mut context.frames,
+                    &mut context.fs,
                     &mut sink,
                 );
                 debug_assert!(
@@ -1131,11 +1158,15 @@ fn filesystem_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPo
     const MESSAGE: &[u8] = b"GinkgoOS: paging, RedoxFS, devices, and scheduler online\r\n";
 
     if state.get(0) == Some(0) {
-        let file = match context.fs.create("/system.log") {
+        let file = match context
+            .fs
+            .open("/system.log")
+            .or_else(|_| context.fs.create("/system.log"))
+        {
             Ok(file) => file,
             Err(_) => return TaskPoll::Complete,
         };
-        if context.fs.write(file, 0, MESSAGE).is_err() {
+        if context.fs.truncate(file, 0).is_err() || context.fs.write(file, 0, MESSAGE).is_err() {
             return TaskPoll::Complete;
         }
         state.set(0, 1);
@@ -1156,7 +1187,12 @@ fn filesystem_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPo
 
 fn console_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
     if state.get(0) == Some(0) {
-        if context.fs.create("/console").is_err() {
+        if context
+            .fs
+            .open("/console")
+            .or_else(|_| context.fs.create("/console"))
+            .is_err()
+        {
             return TaskPoll::Complete;
         }
         state.set(0, 1);
@@ -1189,7 +1225,15 @@ fn launch_registered_program(context: &mut KernelContext, program_index: usize) 
         .ok_or(())?
         .connect_client(client_id, process.handles_mut())
         .map_err(|_| ())?;
-    process.set_start_arguments([u64::from(channel.raw()), 0, 0]);
+    let filesystem = if program.filesystem {
+        process
+            .handles_mut()
+            .filesystem_root_create()
+            .map_err(|_| ())?
+    } else {
+        ginkgo_sysapi::Handle::INVALID
+    };
+    process.set_start_arguments([u64::from(channel.raw()), u64::from(filesystem.raw()), 0]);
     let process_id = context.processes.insert(process).map_err(|_| ())?;
     context.process_clients.push((process_id, client_id));
     let mut sink = SerialDebugSink::new(&mut context.serial);
@@ -1580,7 +1624,7 @@ fn log_flush_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPo
     TaskPoll::Pending
 }
 
-fn append_log(fs: &mut RedoxFs, path: &str, bytes: &[u8]) -> bool {
+fn append_log<D: Disk>(fs: &mut RedoxFs<D>, path: &str, bytes: &[u8]) -> bool {
     const LOG_LIMIT: u64 = 64 * 1024;
     let file = match fs.open(path).or_else(|_| fs.create(path)) {
         Ok(file) => file,

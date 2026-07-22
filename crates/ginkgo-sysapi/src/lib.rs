@@ -37,6 +37,13 @@ pub enum SyscallNumber {
     SharedMemoryMap = 10,
     SharedMemoryUnmap = 11,
     DebugWrite = 12,
+    FilesystemOpen = 13,
+    FilesystemRead = 14,
+    FilesystemWrite = 15,
+    FilesystemStat = 16,
+    FilesystemReadDirectory = 17,
+    FilesystemTruncate = 18,
+    FilesystemUnlink = 19,
 }
 
 /// An opaque process-local reference to a kernel object.
@@ -113,6 +120,18 @@ bitflags! {
 }
 
 bitflags! {
+    /// Access and creation behavior for [`SyscallNumber::FilesystemOpen`].
+    #[repr(transparent)]
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    pub struct FilesystemOpenFlags: u32 {
+        const READ     = 1 << 0;
+        const WRITE    = 1 << 1;
+        const CREATE   = 1 << 2;
+        const TRUNCATE = 1 << 3;
+    }
+}
+
+bitflags! {
     /// Access permitted through a shared-memory mapping.
     #[repr(transparent)]
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -140,6 +159,8 @@ pub enum ObjectType {
     Channel = 1,
     SharedMemory = 2,
     Window = 3,
+    FilesystemRoot = 4,
+    File = 5,
 }
 
 /// Stable syscall status values. Additional detail is returned in output structs.
@@ -165,6 +186,9 @@ pub enum Status {
     OutOfRange = -16,
     AlreadyMapped = -17,
     UnknownSyscall = -18,
+    NotFound = -19,
+    EndOfDirectory = -20,
+    Io = -21,
 }
 
 impl Status {
@@ -190,6 +214,9 @@ impl Status {
             -16 => Self::OutOfRange,
             -17 => Self::AlreadyMapped,
             -18 => Self::UnknownSyscall,
+            -19 => Self::NotFound,
+            -20 => Self::EndOfDirectory,
+            -21 => Self::Io,
             _ => return None,
         })
     }
@@ -409,6 +436,59 @@ pub struct SharedMemoryMapOutput {
     pub address: u64,
 }
 
+/// Maximum UTF-8 bytes in one filesystem path component.
+pub const FILESYSTEM_NAME_MAX: usize = 252;
+/// Maximum bytes transferred by one filesystem read syscall.
+pub const FILESYSTEM_READ_MAX_BYTES: usize = 16 * 1024;
+
+/// Argument block for [`SyscallNumber::FilesystemOpen`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FilesystemOpenArgs {
+    pub name_address: u64,
+    pub name_length: u64,
+    pub flags: FilesystemOpenFlags,
+    pub reserved: u32,
+}
+
+/// Output block for [`SyscallNumber::FilesystemRead`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FilesystemReadOutput {
+    pub count: u64,
+}
+
+/// Stable file metadata returned by [`SyscallNumber::FilesystemStat`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FilesystemStat {
+    pub length: u64,
+    pub reserved: [u64; 2],
+}
+
+/// One root-directory entry returned by [`SyscallNumber::FilesystemReadDirectory`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FilesystemDirectoryEntry {
+    pub next_cookie: u64,
+    pub length: u64,
+    pub name_length: u16,
+    pub reserved: [u8; 6],
+    pub name: [u8; FILESYSTEM_NAME_MAX],
+}
+
+impl Default for FilesystemDirectoryEntry {
+    fn default() -> Self {
+        Self {
+            next_cookie: 0,
+            length: 0,
+            name_length: 0,
+            reserved: [0; 6],
+            name: [0; FILESYSTEM_NAME_MAX],
+        }
+    }
+}
+
 /// Zerocopy RPC envelope followed immediately by a postcard payload.
 ///
 /// All fields are little-endian on GinkgoOS's current x86-64 ABI. Protocols
@@ -465,6 +545,10 @@ const _: () = {
     assert!(core::mem::size_of::<SharedMemorySizeOutput>() == 8);
     assert!(core::mem::size_of::<SharedMemoryMapArgs>() == 32);
     assert!(core::mem::size_of::<SharedMemoryMapOutput>() == 8);
+    assert!(core::mem::size_of::<FilesystemOpenArgs>() == 24);
+    assert!(core::mem::size_of::<FilesystemReadOutput>() == 8);
+    assert!(core::mem::size_of::<FilesystemStat>() == 24);
+    assert!(core::mem::size_of::<FilesystemDirectoryEntry>() == 280);
     assert!(RPC_HEADER_SIZE == 24);
 };
 
@@ -489,6 +573,13 @@ mod tests {
         assert_eq!(SyscallNumber::SharedMemoryMap as u64, 10);
         assert_eq!(SyscallNumber::SharedMemoryUnmap as u64, 11);
         assert_eq!(SyscallNumber::DebugWrite as u64, 12);
+        assert_eq!(SyscallNumber::FilesystemOpen as u64, 13);
+        assert_eq!(SyscallNumber::FilesystemRead as u64, 14);
+        assert_eq!(SyscallNumber::FilesystemWrite as u64, 15);
+        assert_eq!(SyscallNumber::FilesystemStat as u64, 16);
+        assert_eq!(SyscallNumber::FilesystemReadDirectory as u64, 17);
+        assert_eq!(SyscallNumber::FilesystemTruncate as u64, 18);
+        assert_eq!(SyscallNumber::FilesystemUnlink as u64, 19);
     }
 
     #[test]
@@ -513,6 +604,9 @@ mod tests {
             Status::OutOfRange,
             Status::AlreadyMapped,
             Status::UnknownSyscall,
+            Status::NotFound,
+            Status::EndOfDirectory,
+            Status::Io,
         ];
 
         for (index, status) in statuses.into_iter().enumerate() {
@@ -531,6 +625,8 @@ mod tests {
         assert_eq!(ObjectType::Channel as u32, 1);
         assert_eq!(ObjectType::SharedMemory as u32, 2);
         assert_eq!(ObjectType::Window as u32, 3);
+        assert_eq!(ObjectType::FilesystemRoot as u32, 4);
+        assert_eq!(ObjectType::File as u32, 5);
     }
 
     #[test]
@@ -553,6 +649,11 @@ mod tests {
         assert_eq!(size_of::<SharedMemoryMapArgs>(), 32);
         assert_eq!(offset_of!(SharedMemoryMapArgs, protection), 24);
         assert_eq!(offset_of!(SharedMemoryMapArgs, flags), 28);
+
+        assert_eq!(size_of::<FilesystemOpenArgs>(), 24);
+        assert_eq!(offset_of!(FilesystemOpenArgs, flags), 16);
+        assert_eq!(size_of::<FilesystemDirectoryEntry>(), 280);
+        assert_eq!(offset_of!(FilesystemDirectoryEntry, name), 24);
     }
 
     #[test]
@@ -570,5 +671,9 @@ mod tests {
         assert_eq!(MapProtection::WRITE.bits(), 2);
         assert_eq!(MapProtection::EXECUTE.bits(), 4);
         assert_eq!(MapFlags::FIXED.bits(), 1);
+        assert_eq!(FilesystemOpenFlags::READ.bits(), 1);
+        assert_eq!(FilesystemOpenFlags::WRITE.bits(), 2);
+        assert_eq!(FilesystemOpenFlags::CREATE.bits(), 4);
+        assert_eq!(FilesystemOpenFlags::TRUNCATE.bits(), 8);
     }
 }

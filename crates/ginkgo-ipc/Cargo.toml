@@ -7,12 +7,13 @@ license.workspace = true
 
 [features]
 default = ["kernel"]
-kernel = ["dep:spinning_top"]
+kernel = ["dep:ginkgo-filesystem", "dep:spinning_top"]
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
+ginkgo-filesystem = { workspace = true, optional = true }
 ginkgo-sysapi.workspace = true
 postcard.workspace = true
 serde.workspace = true

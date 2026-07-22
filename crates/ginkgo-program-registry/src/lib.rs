@@ -16,7 +16,7 @@
 //! app_id bytes | display_name bytes | executable_path bytes
 //! ```
 //!
-//! Version 1 requires zero header flags, recognizes only [`EntryFlags::HIDDEN`],
+//! Version 1 requires zero header flags and rejects unknown entry flags,
 //! and rejects trailing data. App IDs are lowercase dot-separated identifiers;
 //! executable paths are absolute, normalized paths without `.` or `..` segments.
 
@@ -59,8 +59,10 @@ impl EntryFlags {
     pub const EMPTY: Self = Self(0);
     /// Exclude this application from normal launcher listings.
     pub const HIDDEN: Self = Self(1 << 0);
+    /// Grant a process-local filesystem-root capability at launch.
+    pub const FILESYSTEM: Self = Self(1 << 1);
 
-    const KNOWN_BITS: u16 = Self::HIDDEN.0;
+    const KNOWN_BITS: u16 = Self::HIDDEN.0 | Self::FILESYSTEM.0;
 
     /// Creates flags if every bit is known to this format version.
     pub const fn from_bits(bits: u16) -> Option<Self> {
@@ -101,6 +103,8 @@ impl fmt::Debug for EntryFlags {
             formatter.write_str("EntryFlags(EMPTY)")
         } else if *self == Self::HIDDEN {
             formatter.write_str("EntryFlags(HIDDEN)")
+        } else if *self == Self::FILESYSTEM {
+            formatter.write_str("EntryFlags(FILESYSTEM)")
         } else {
             write!(formatter, "EntryFlags({:#06x})", self.0)
         }

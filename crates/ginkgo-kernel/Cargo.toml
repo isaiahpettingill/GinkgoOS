@@ -27,6 +27,8 @@ ginkgo-ipc = { workspace = true, features = ["kernel"] }
 ginkgo-program-registry.workspace = true
 ginkgo-sysapi.workspace = true
 ginkgo-window.workspace = true
+redoxfs = { path = "../../vendor/redoxfs", default-features = false }
+syscall = { package = "redox_syscall", version = "0.9.0", default-features = false }
 spinning_top.workspace = true
 talc.workspace = true
 uart_16550.workspace = true

@@ -111,6 +111,136 @@ pub fn debug_write(bytes: &[u8]) -> SyscallResult<()> {
     status_result(unsafe { raw_syscall6(SyscallNumber::DebugWrite, address, length, 0, 0, 0, 0) })
 }
 
+/// Opens or creates one file relative to an authorized filesystem-root capability.
+pub fn filesystem_open(
+    root: Handle,
+    name: &str,
+    flags: FilesystemOpenFlags,
+) -> SyscallResult<Handle> {
+    let args = FilesystemOpenArgs {
+        name_address: slice_address(name.as_bytes()),
+        name_length: name.len() as u64,
+        flags,
+        reserved: 0,
+    };
+    let mut output = HandleOutput::default();
+    let raw = unsafe {
+        raw_syscall6(
+            SyscallNumber::FilesystemOpen,
+            u64::from(root.raw()),
+            pointer_address(&args),
+            mut_pointer_address(&mut output),
+            0,
+            0,
+            0,
+        )
+    };
+    status_result(raw)?;
+    Ok(output.handle)
+}
+
+/// Reads at most 16 KiB from a file at an explicit offset.
+pub fn filesystem_read(file: Handle, offset: u64, output: &mut [u8]) -> SyscallResult<usize> {
+    let mut result = FilesystemReadOutput::default();
+    let raw = unsafe {
+        raw_syscall6(
+            SyscallNumber::FilesystemRead,
+            u64::from(file.raw()),
+            offset,
+            mut_slice_address(output),
+            output.len() as u64,
+            mut_pointer_address(&mut result),
+            0,
+        )
+    };
+    status_result(raw)?;
+    usize::try_from(result.count).map_err(|_| Status::OutOfRange)
+}
+
+/// Writes at most 16 KiB to a file at an explicit offset.
+pub fn filesystem_write(file: Handle, offset: u64, input: &[u8]) -> SyscallResult<usize> {
+    let mut result = FilesystemReadOutput::default();
+    let raw = unsafe {
+        raw_syscall6(
+            SyscallNumber::FilesystemWrite,
+            u64::from(file.raw()),
+            offset,
+            slice_address(input),
+            input.len() as u64,
+            mut_pointer_address(&mut result),
+            0,
+        )
+    };
+    status_result(raw)?;
+    usize::try_from(result.count).map_err(|_| Status::OutOfRange)
+}
+
+pub fn filesystem_stat(file: Handle) -> SyscallResult<FilesystemStat> {
+    let mut output = FilesystemStat::default();
+    let raw = unsafe {
+        raw_syscall6(
+            SyscallNumber::FilesystemStat,
+            u64::from(file.raw()),
+            mut_pointer_address(&mut output),
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    status_result(raw)?;
+    Ok(output)
+}
+
+/// Reads one directory entry at `cookie`. `EndOfDirectory` ends iteration.
+pub fn filesystem_read_directory(
+    root: Handle,
+    cookie: u64,
+) -> SyscallResult<FilesystemDirectoryEntry> {
+    let mut output = FilesystemDirectoryEntry::default();
+    let raw = unsafe {
+        raw_syscall6(
+            SyscallNumber::FilesystemReadDirectory,
+            u64::from(root.raw()),
+            cookie,
+            mut_pointer_address(&mut output),
+            0,
+            0,
+            0,
+        )
+    };
+    status_result(raw)?;
+    Ok(output)
+}
+
+pub fn filesystem_truncate(file: Handle, length: u64) -> SyscallResult<()> {
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::FilesystemTruncate,
+            u64::from(file.raw()),
+            length,
+            0,
+            0,
+            0,
+            0,
+        )
+    })
+}
+
+pub fn filesystem_unlink(root: Handle, name: &str) -> SyscallResult<()> {
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::FilesystemUnlink,
+            u64::from(root.raw()),
+            slice_address(name.as_bytes()),
+            name.len() as u64,
+            0,
+            0,
+            0,
+        )
+    })
+}
+
 /// Closes a process-local handle.
 #[inline]
 pub fn handle_close(handle: Handle) -> SyscallResult<()> {
@@ -478,6 +608,9 @@ mod tests {
             Status::OutOfRange,
             Status::AlreadyMapped,
             Status::UnknownSyscall,
+            Status::NotFound,
+            Status::EndOfDirectory,
+            Status::Io,
         ] {
             assert_eq!(status_result(status.raw().into()), Err(status));
         }

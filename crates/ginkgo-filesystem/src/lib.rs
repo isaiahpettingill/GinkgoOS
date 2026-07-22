@@ -8,7 +8,7 @@
 
 extern crate alloc;
 
-use alloc::{collections::BTreeMap, vec::Vec};
+use alloc::{collections::BTreeMap, string::String, vec, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use redoxfs::{Disk, FileSystem, Node, TreePtr, BLOCK_SIZE};
@@ -39,6 +39,12 @@ pub struct FileInfo {
     pub len: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectoryEntry {
+    pub name: String,
+    pub len: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FsError {
     InvalidName,
@@ -59,6 +65,12 @@ impl MemoryDisk {
     fn from_seed() -> Self {
         Self {
             data: SEED_IMAGE.to_vec(),
+        }
+    }
+
+    pub fn zeroed(size: usize) -> Self {
+        Self {
+            data: vec![0; size],
         }
     }
 
@@ -89,23 +101,41 @@ impl Disk for MemoryDisk {
     }
 }
 
-/// A RedoxFS instance backed by kernel memory.
-pub struct RedoxFs {
+/// A RedoxFS instance over an owned block device.
+pub struct RedoxFs<D: Disk = MemoryDisk> {
     filesystem_id: u64,
     generations: BTreeMap<u32, u32>,
-    inner: FileSystem<MemoryDisk>,
+    inner: FileSystem<D>,
 }
 
-impl RedoxFs {
+impl RedoxFs<MemoryDisk> {
     pub fn new() -> Result<Self, FsError> {
-        let disk = MemoryDisk::from_seed();
+        Self::open_disk(MemoryDisk::from_seed())
+    }
+}
+
+impl<D: Disk> RedoxFs<D> {
+    pub fn open_disk(disk: D) -> Result<Self, FsError> {
         let inner = FileSystem::open(disk, None, Some(0), false).map_err(map_error)?;
+        Ok(Self::from_inner(inner))
+    }
+
+    pub fn format_disk(disk: D) -> Result<Self, FsError> {
+        let inner = FileSystem::create(disk, 0, 0).map_err(map_error)?;
+        Ok(Self::from_inner(inner))
+    }
+
+    fn from_inner(inner: FileSystem<D>) -> Self {
         let filesystem_id = NEXT_FILESYSTEM_ID.fetch_add(1, Ordering::Relaxed);
-        Ok(Self {
+        Self {
             filesystem_id,
             generations: BTreeMap::new(),
             inner,
-        })
+        }
+    }
+
+    pub fn into_disk(self) -> D {
+        self.inner.disk
     }
 
     pub fn image_size(&mut self) -> Result<u64, FsError> {
@@ -113,11 +143,34 @@ impl RedoxFs {
     }
 
     pub fn file_count(&mut self) -> Result<usize, FsError> {
-        let mut entries = Vec::new();
+        Ok(self.list_root()?.len())
+    }
+
+    pub fn list_root(&mut self) -> Result<Vec<DirectoryEntry>, FsError> {
+        let mut directory = Vec::new();
         self.inner
-            .tx(|tx| tx.child_nodes(TreePtr::root(), &mut entries))
+            .tx(|tx| tx.child_nodes(TreePtr::root(), &mut directory))
             .map_err(map_error)?;
-        Ok(entries.len())
+
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(directory.len())
+            .map_err(|_| FsError::NoSpace)?;
+        for entry in directory {
+            let name = entry.name().ok_or(FsError::Io)?;
+            let node = self
+                .inner
+                .tx(|tx| tx.read_tree(entry.node_ptr()))
+                .map_err(map_error)?;
+            if !node.data().is_dir() {
+                entries.push(DirectoryEntry {
+                    name: String::from(name),
+                    len: node.data().size(),
+                });
+            }
+        }
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(entries)
     }
 
     pub fn create(&mut self, path: &str) -> Result<FileHandle, FsError> {
@@ -332,6 +385,31 @@ mod tests {
             second.write(file, 0, b"wrong disk"),
             Err(FsError::InvalidHandle)
         );
+    }
+
+    #[test]
+    fn persists_files_when_a_disk_is_reopened() {
+        let disk = MemoryDisk::zeroed(2 * 1024 * 1024);
+        let mut fs = RedoxFs::format_disk(disk).unwrap();
+        let file = fs.create("/persistent").unwrap();
+        fs.write(file, 0, b"survives reboot").unwrap();
+
+        let disk = fs.into_disk();
+        let mut reopened = RedoxFs::open_disk(disk).unwrap();
+        let file = reopened.open("/persistent").unwrap();
+        let mut bytes = [0; 15];
+        assert_eq!(reopened.read(file, 0, &mut bytes).unwrap(), bytes.len());
+        assert_eq!(&bytes, b"survives reboot");
+    }
+
+    #[test]
+    fn lists_root_files_in_lexical_order() {
+        let mut fs = RedoxFs::new().unwrap();
+        fs.create("/zeta").unwrap();
+        fs.create("/alpha").unwrap();
+        let entries = fs.list_root().unwrap();
+        assert_eq!(entries[0].name, "alpha");
+        assert_eq!(entries[1].name, "zeta");
     }
 
     #[test]

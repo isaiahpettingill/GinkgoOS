@@ -15,6 +15,7 @@ use alloc::{
 };
 use core::{mem, ptr::NonNull, slice};
 
+use ginkgo_filesystem::FileHandle;
 use ginkgo_sysapi::{
     Handle, MessageInfo, ObjectType, Rights, Signals, Status, WaitItem, CHANNEL_MAX_BYTES,
     CHANNEL_MAX_HANDLES,
@@ -156,6 +157,8 @@ enum KernelObject {
     Channel(ChannelEndpoint),
     SharedMemory(SharedMemoryObject),
     Window(WindowEndpoint),
+    FilesystemRoot,
+    File(FileHandle),
 }
 
 struct SharedMemoryObject {
@@ -472,6 +475,44 @@ impl HandleTable {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Creates a non-transferable capability for the filesystem root namespace.
+    pub fn filesystem_root_create(&mut self) -> Result<Handle, IpcError> {
+        let object =
+            Arc::try_new(KernelObject::FilesystemRoot).map_err(|_| IpcError::OutOfMemory)?;
+        let slot = self.reserve_slots(1)?[0];
+        Ok(self.insert_reserved(slot, object, Rights::READ | Rights::WRITE))
+    }
+
+    /// Creates a process-local file capability with the requested read/write access.
+    pub fn filesystem_file_create(
+        &mut self,
+        file: FileHandle,
+        rights: Rights,
+    ) -> Result<Handle, IpcError> {
+        if rights.is_empty() || !(Rights::READ | Rights::WRITE).contains(rights) {
+            return Err(IpcError::InvalidRights);
+        }
+        let object = Arc::try_new(KernelObject::File(file)).map_err(|_| IpcError::OutOfMemory)?;
+        let slot = self.reserve_slots(1)?[0];
+        Ok(self.insert_reserved(slot, object, rights))
+    }
+
+    pub fn filesystem_root(&self, handle: Handle, rights: Rights) -> Result<(), IpcError> {
+        let object = self.object_with_rights(handle, rights)?;
+        match object.as_ref() {
+            KernelObject::FilesystemRoot => Ok(()),
+            _ => Err(IpcError::WrongObjectType),
+        }
+    }
+
+    pub fn filesystem_file(&self, handle: Handle, rights: Rights) -> Result<FileHandle, IpcError> {
+        let object = self.object_with_rights(handle, rights)?;
+        match object.as_ref() {
+            KernelObject::File(file) => Ok(*file),
+            _ => Err(IpcError::WrongObjectType),
+        }
     }
 
     /// Creates zero-filled, heap-backed shared memory.
@@ -1149,6 +1190,8 @@ impl HandleTable {
             KernelObject::Channel(_) => Ok(ObjectType::Channel),
             KernelObject::SharedMemory(_) => Ok(ObjectType::SharedMemory),
             KernelObject::Window(_) => Ok(ObjectType::Window),
+            KernelObject::FilesystemRoot => Ok(ObjectType::FilesystemRoot),
+            KernelObject::File(_) => Ok(ObjectType::File),
         }
     }
 
@@ -1159,6 +1202,7 @@ impl HandleTable {
             KernelObject::Channel(endpoint) => Ok(endpoint.signals()),
             KernelObject::SharedMemory(_) => Ok(Signals::empty()),
             KernelObject::Window(endpoint) => Ok(endpoint.signals()),
+            KernelObject::FilesystemRoot | KernelObject::File(_) => Ok(Signals::empty()),
         }
     }
 
@@ -1302,21 +1346,30 @@ fn new_channel_objects() -> Result<[Arc<KernelObject>; 2], IpcError> {
 fn channel_endpoint(object: &Arc<KernelObject>) -> Result<&ChannelEndpoint, IpcError> {
     match object.as_ref() {
         KernelObject::Channel(endpoint) => Ok(endpoint),
-        KernelObject::SharedMemory(_) | KernelObject::Window(_) => Err(IpcError::WrongObjectType),
+        KernelObject::SharedMemory(_)
+        | KernelObject::Window(_)
+        | KernelObject::FilesystemRoot
+        | KernelObject::File(_) => Err(IpcError::WrongObjectType),
     }
 }
 
 fn shared_memory_object(object: &Arc<KernelObject>) -> Result<&SharedMemoryObject, IpcError> {
     match object.as_ref() {
         KernelObject::SharedMemory(memory) => Ok(memory),
-        KernelObject::Channel(_) | KernelObject::Window(_) => Err(IpcError::WrongObjectType),
+        KernelObject::Channel(_)
+        | KernelObject::Window(_)
+        | KernelObject::FilesystemRoot
+        | KernelObject::File(_) => Err(IpcError::WrongObjectType),
     }
 }
 
 fn window_endpoint(object: &Arc<KernelObject>) -> Result<&WindowEndpoint, IpcError> {
     match object.as_ref() {
         KernelObject::Window(endpoint) => Ok(endpoint),
-        KernelObject::Channel(_) | KernelObject::SharedMemory(_) => Err(IpcError::WrongObjectType),
+        KernelObject::Channel(_)
+        | KernelObject::SharedMemory(_)
+        | KernelObject::FilesystemRoot
+        | KernelObject::File(_) => Err(IpcError::WrongObjectType),
     }
 }
 

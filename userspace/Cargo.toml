@@ -3,6 +3,7 @@ members = [
     "ginkgo-runtime",
     "ginkgo-desktop-service",
     "ginkgo-minimal-client",
+    "ginkgo-file-navigator",
 ]
 exclude = ["validator"]
 resolver = "2"

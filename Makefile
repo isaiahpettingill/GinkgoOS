@@ -9,6 +9,9 @@ USERSPACE_MANIFEST := userspace/Cargo.toml
 USERSPACE_TARGET := userspace/target/x86_64-unknown-none/release
 DESKTOP_ELF := $(USERSPACE_TARGET)/ginkgo-desktop-service
 MINIMAL_CLIENT_ELF := $(USERSPACE_TARGET)/ginkgo-minimal-client
+FILE_NAVIGATOR_ELF := $(USERSPACE_TARGET)/ginkgo-file-navigator
+FS_IMAGE := $(BUILD_DIR)/ginkgo-redoxfs.img
+FS_IMAGE_SIZE_MB ?= 16
 ISO := $(BUILD_DIR)/$(IMAGE_NAME).iso
 
 LIMINE_VERSION ?= v12.5.1
@@ -29,17 +32,17 @@ QEMU ?= $(SCOOP_ROOT)/apps/qemu/current/qemu-system-x86_64.exe
 else
 QEMU ?= qemu-system-x86_64
 endif
-QEMU_FLAGS ?= -m 512M -M q35,i8042=off -serial stdio -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 -no-reboot -no-shutdown
+QEMU_FLAGS ?= -m 512M -M pc,i8042=off -serial stdio -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 -no-reboot -no-shutdown
 
-.PHONY: all userspace kernel iso qemu no-iso run check clean distclean
+.PHONY: all userspace kernel iso qemu no-iso run check clean distclean reset-fs
 
 all: iso
 
 userspace:
-	cargo build --manifest-path $(USERSPACE_MANIFEST) --release --target x86_64-unknown-none -p ginkgo-desktop-service -p ginkgo-minimal-client
+	cargo build --manifest-path $(USERSPACE_MANIFEST) --release --target x86_64-unknown-none -p ginkgo-desktop-service -p ginkgo-minimal-client -p ginkgo-file-navigator
 
 kernel: userspace
-	GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" cargo build -p ginkgo-kernel --bin ginkgo-os
+	GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" cargo build -p ginkgo-kernel --bin ginkgo-os
 
 $(LIMINE_DIR)/BOOTX64.EFI:
 	mkdir -p $(BUILD_DIR)
@@ -67,13 +70,19 @@ $(ISO): kernel $(LIMINE_DIR)/BOOTX64.EFI limine.conf
 		-efi-boot-part --efi-boot-image --protective-msdos-label \
 		$(ISO_ROOT) -o $(ISO)
 
-qemu: $(OVMF_CODE)
+$(FS_IMAGE):
+	mkdir -p $(BUILD_DIR)
+	dd if=/dev/zero of=$(FS_IMAGE) bs=1M count=$(FS_IMAGE_SIZE_MB)
+
+qemu: $(OVMF_CODE) $(FS_IMAGE)
 	@test -f $(ISO) || { echo "Missing $(ISO); create it first with 'make iso' (WSL is supported)."; exit 1; }
 	"$(QEMU)" $(QEMU_FLAGS) \
 		-drive if=pflash,unit=0,format=raw,file=$(OVMF_CODE),readonly=on \
+		-drive if=none,id=ginkgo-fs,format=raw,cache=writethrough,file=$(FS_IMAGE) \
+		-device ide-hd,drive=ginkgo-fs,bus=ide.0,unit=0 \
 		-cdrom $(ISO) -boot d
 
-no-iso: kernel $(LIMINE_DIR)/BOOTX64.EFI $(OVMF_CODE) limine.conf
+no-iso: kernel $(LIMINE_DIR)/BOOTX64.EFI $(OVMF_CODE) $(FS_IMAGE) limine.conf
 	rm -rf $(NO_ISO_ROOT)
 	mkdir -p $(NO_ISO_ROOT)/boot/limine $(NO_ISO_ROOT)/EFI/BOOT
 	cp $(KERNEL) $(NO_ISO_ROOT)/boot/kernel
@@ -81,19 +90,28 @@ no-iso: kernel $(LIMINE_DIR)/BOOTX64.EFI $(OVMF_CODE) limine.conf
 	cp $(LIMINE_DIR)/BOOTX64.EFI $(NO_ISO_ROOT)/EFI/BOOT/
 	"$(QEMU)" $(QEMU_FLAGS) \
 		-drive if=pflash,unit=0,format=raw,file=$(OVMF_CODE),readonly=on \
-		-drive file=fat:rw:$(NO_ISO_ROOT),format=raw -boot c
+		-drive if=none,id=ginkgo-fs,format=raw,cache=writethrough,file=$(FS_IMAGE) \
+		-device ide-hd,drive=ginkgo-fs,bus=ide.0,unit=0 \
+		-drive if=none,id=ginkgo-boot,format=raw,file=fat:rw:$(NO_ISO_ROOT) \
+		-device ide-hd,drive=ginkgo-boot,bus=ide.1,unit=0 -boot c
 
-run: $(OVMF_CODE) $(ISO)
+run: $(OVMF_CODE) $(ISO) $(FS_IMAGE)
 	"$(QEMU)" $(QEMU_FLAGS) \
 		-drive if=pflash,unit=0,format=raw,file=$(OVMF_CODE),readonly=on \
+		-drive if=none,id=ginkgo-fs,format=raw,cache=writethrough,file=$(FS_IMAGE) \
+		-device ide-hd,drive=ginkgo-fs,bus=ide.0,unit=0 \
 		-cdrom $(ISO) -boot d
 
 check: userspace
-	GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" cargo check -p ginkgo-kernel --bin ginkgo-os
+	GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" cargo check -p ginkgo-kernel --bin ginkgo-os
 
 clean:
 	cargo clean
 	rm -rf $(ISO_ROOT) $(NO_ISO_ROOT) $(ISO)
 
+reset-fs:
+	rm -f $(FS_IMAGE)
+
+# Deliberately destructive: unlike clean, distclean also removes persistent data.
 distclean: clean
 	rm -rf $(BUILD_DIR)

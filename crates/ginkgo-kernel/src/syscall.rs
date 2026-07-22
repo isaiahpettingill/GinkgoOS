@@ -9,17 +9,20 @@
 //! simulates deadline expiry: no ready item returns [`Status::ShouldWait`], and
 //! the normal syscall outcome gives the cooperative scheduler another turn.
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec, vec::Vec};
 use core::mem::size_of;
 
+use ginkgo_filesystem::{FsError, RedoxFs};
 use ginkgo_ipc::{
     HandleOperation, HandleOperationDisposition, IpcError, MessageInfo, ObjectType, Rights,
     Signals, WaitItem,
 };
 use ginkgo_sysapi::{
-    Handle, MapFlags, MapProtection, SharedMemoryMapArgs, Status, SyscallNumber, CHANNEL_MAX_BYTES,
-    CHANNEL_MAX_HANDLES,
+    FilesystemDirectoryEntry, FilesystemOpenFlags, Handle, MapFlags, MapProtection,
+    SharedMemoryMapArgs, Status, SyscallNumber, CHANNEL_MAX_BYTES, CHANNEL_MAX_HANDLES,
+    FILESYSTEM_NAME_MAX, FILESYSTEM_READ_MAX_BYTES,
 };
+use redoxfs::Disk;
 
 use crate::{
     arch::UserContext,
@@ -53,6 +56,10 @@ const CHANNEL_READ_OUTPUT_SIZE: usize = 8;
 const SHARED_MEMORY_SIZE_OUTPUT_SIZE: usize = 8;
 const SHARED_MEMORY_MAP_ARGS_SIZE: usize = 32;
 const SHARED_MEMORY_MAP_OUTPUT_SIZE: usize = 8;
+const FILESYSTEM_OPEN_ARGS_SIZE: usize = 24;
+const FILESYSTEM_READ_OUTPUT_SIZE: usize = 8;
+const FILESYSTEM_STAT_SIZE: usize = 24;
+const FILESYSTEM_DIRECTORY_ENTRY_SIZE: usize = size_of::<FilesystemDirectoryEntry>();
 
 /// A bounded destination for early userspace diagnostics.
 pub trait DebugSink {
@@ -74,11 +81,12 @@ pub enum SyscallOutcome {
 /// Every outcome except a valid process exit writes a sign-extended [`Status`]
 /// to RAX and yields. Unknown syscall numbers are decoded without converting an
 /// arbitrary integer into a Rust enum.
-pub fn dispatch<D: DebugSink + ?Sized>(
+pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
     process: &mut Process,
     context: &mut UserContext,
     kernel_page_table: &ActivePageTable,
     frame_allocator: &mut UsableFrameAllocator<'_>,
+    filesystem: &mut RedoxFs<B>,
     debug_sink: &mut D,
 ) -> SyscallOutcome {
     let Some(number) = decode_syscall_number(context.rax) else {
@@ -111,6 +119,7 @@ pub fn dispatch<D: DebugSink + ?Sized>(
             context,
             kernel_page_table,
             frame_allocator,
+            filesystem,
             debug_sink,
         )
     };
@@ -118,12 +127,13 @@ pub fn dispatch<D: DebugSink + ?Sized>(
     SyscallOutcome::Yield
 }
 
-fn dispatch_non_exit<D: DebugSink + ?Sized>(
+fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
     number: SyscallNumber,
     process: &mut Process,
     context: &UserContext,
     kernel_page_table: &ActivePageTable,
     frame_allocator: &mut UsableFrameAllocator<'_>,
+    filesystem: &mut RedoxFs<B>,
     debug_sink: &mut D,
 ) -> Status {
     let result = match number {
@@ -153,6 +163,39 @@ fn dispatch_non_exit<D: DebugSink + ?Sized>(
         ),
         SyscallNumber::SharedMemoryUnmap => shared_memory_unmap(process, context.rdi, context.rsi),
         SyscallNumber::DebugWrite => debug_write(process, context.rdi, context.rsi, debug_sink),
+        SyscallNumber::FilesystemOpen => {
+            filesystem_open(process, filesystem, context.rdi, context.rsi, context.rdx)
+        }
+        SyscallNumber::FilesystemRead => filesystem_read(
+            process,
+            filesystem,
+            context.rdi,
+            context.rsi,
+            context.rdx,
+            context.r10,
+            context.r8,
+        ),
+        SyscallNumber::FilesystemWrite => filesystem_write(
+            process,
+            filesystem,
+            context.rdi,
+            context.rsi,
+            context.rdx,
+            context.r10,
+            context.r8,
+        ),
+        SyscallNumber::FilesystemStat => {
+            filesystem_stat(process, filesystem, context.rdi, context.rsi)
+        }
+        SyscallNumber::FilesystemReadDirectory => {
+            filesystem_read_directory(process, filesystem, context.rdi, context.rsi, context.rdx)
+        }
+        SyscallNumber::FilesystemTruncate => {
+            filesystem_truncate(process, filesystem, context.rdi, context.rsi)
+        }
+        SyscallNumber::FilesystemUnlink => {
+            filesystem_unlink(process, filesystem, context.rdi, context.rsi, context.rdx)
+        }
     };
     match result {
         Ok(()) => Status::Ok,
@@ -175,6 +218,13 @@ const fn decode_syscall_number(raw: u64) -> Option<SyscallNumber> {
         10 => SyscallNumber::SharedMemoryMap,
         11 => SyscallNumber::SharedMemoryUnmap,
         12 => SyscallNumber::DebugWrite,
+        13 => SyscallNumber::FilesystemOpen,
+        14 => SyscallNumber::FilesystemRead,
+        15 => SyscallNumber::FilesystemWrite,
+        16 => SyscallNumber::FilesystemStat,
+        17 => SyscallNumber::FilesystemReadDirectory,
+        18 => SyscallNumber::FilesystemTruncate,
+        19 => SyscallNumber::FilesystemUnlink,
         _ => return None,
     })
 }
@@ -481,6 +531,269 @@ fn debug_write<D: DebugSink + ?Sized>(
         .map_err(map_address_space_error)?;
     debug_sink.write(&buffer[..length]);
     Ok(())
+}
+
+fn filesystem_open<B: Disk>(
+    process: &mut Process,
+    filesystem: &mut RedoxFs<B>,
+    raw_root: u64,
+    args_address: u64,
+    output_address: u64,
+) -> Result<(), Status> {
+    let root = decode_handle(raw_root)?;
+    let raw = copy_block_from_user::<FILESYSTEM_OPEN_ARGS_SIZE>(process, args_address)?;
+    let name_address = read_u64(&raw, 0);
+    let name_length = read_u64(&raw, 8);
+    let flags =
+        FilesystemOpenFlags::from_bits(read_u32(&raw, 16)).ok_or(Status::InvalidArgument)?;
+    if read_u32(&raw, 20) != 0
+        || !flags.intersects(FilesystemOpenFlags::READ | FilesystemOpenFlags::WRITE)
+        || (flags.intersects(FilesystemOpenFlags::CREATE | FilesystemOpenFlags::TRUNCATE)
+            && !flags.contains(FilesystemOpenFlags::WRITE))
+    {
+        return Err(Status::InvalidArgument);
+    }
+    validate_user_output(process, output_address, HANDLE_OUTPUT_SIZE)?;
+    let name = copy_filesystem_name(process, name_address, name_length)?;
+    let mut required_root = Rights::READ;
+    if flags.intersects(
+        FilesystemOpenFlags::WRITE | FilesystemOpenFlags::CREATE | FilesystemOpenFlags::TRUNCATE,
+    ) {
+        required_root |= Rights::WRITE;
+        if is_protected_system_file(&name) {
+            return Err(Status::AccessDenied);
+        }
+    }
+    process
+        .handles()
+        .filesystem_root(root, required_root)
+        .map_err(map_ipc_error)?;
+
+    let mut path = String::from("/");
+    path.push_str(&name);
+    let mut created = false;
+    let file = match filesystem.open(&path) {
+        Ok(file) => file,
+        Err(FsError::NotFound) if flags.contains(FilesystemOpenFlags::CREATE) => {
+            created = true;
+            filesystem.create(&path).map_err(map_fs_error)?
+        }
+        Err(error) => return Err(map_fs_error(error)),
+    };
+    let mut rights = Rights::empty();
+    if flags.contains(FilesystemOpenFlags::READ) {
+        rights |= Rights::READ;
+    }
+    if flags.contains(FilesystemOpenFlags::WRITE) {
+        rights |= Rights::WRITE;
+    }
+    let handle = match process.handles_mut().filesystem_file_create(file, rights) {
+        Ok(handle) => handle,
+        Err(error) => {
+            if created {
+                let _ = filesystem.remove(file);
+            }
+            return Err(map_ipc_error(error));
+        }
+    };
+    if flags.contains(FilesystemOpenFlags::TRUNCATE) {
+        if let Err(error) = filesystem.truncate(file, 0) {
+            close_handles(process, core::slice::from_ref(&handle));
+            return Err(map_fs_error(error));
+        }
+    }
+    let output = encode_handle_output(handle);
+    if let Err(status) = copy_to_user(process, output_address, &output) {
+        close_handles(process, core::slice::from_ref(&handle));
+        return Err(status);
+    }
+    Ok(())
+}
+
+fn filesystem_read<B: Disk>(
+    process: &mut Process,
+    filesystem: &mut RedoxFs<B>,
+    raw_file: u64,
+    offset: u64,
+    output_address: u64,
+    raw_length: u64,
+    count_address: u64,
+) -> Result<(), Status> {
+    let file = decode_handle(raw_file)?;
+    let length = checked_array_bytes(
+        raw_length,
+        1,
+        FILESYSTEM_READ_MAX_BYTES as u64,
+        Status::OutOfRange,
+    )?;
+    validate_user_output(process, output_address, length)?;
+    validate_user_output(process, count_address, FILESYSTEM_READ_OUTPUT_SIZE)?;
+    let file = process
+        .handles()
+        .filesystem_file(file, Rights::READ)
+        .map_err(map_ipc_error)?;
+    let mut bytes = zeroed_vec(length)?;
+    let count = filesystem
+        .read(file, offset, &mut bytes)
+        .map_err(map_fs_error)?;
+    copy_to_user(process, output_address, &bytes[..count])?;
+    copy_to_user(process, count_address, &(count as u64).to_le_bytes())
+}
+
+fn filesystem_write<B: Disk>(
+    process: &mut Process,
+    filesystem: &mut RedoxFs<B>,
+    raw_file: u64,
+    offset: u64,
+    input_address: u64,
+    raw_length: u64,
+    count_address: u64,
+) -> Result<(), Status> {
+    let file = decode_handle(raw_file)?;
+    let length = checked_array_bytes(
+        raw_length,
+        1,
+        FILESYSTEM_READ_MAX_BYTES as u64,
+        Status::OutOfRange,
+    )?;
+    validate_user_output(process, count_address, FILESYSTEM_READ_OUTPUT_SIZE)?;
+    let file = process
+        .handles()
+        .filesystem_file(file, Rights::WRITE)
+        .map_err(map_ipc_error)?;
+    let bytes = copy_vec_from_user(process, input_address, length)?;
+    let count = filesystem
+        .write(file, offset, &bytes)
+        .map_err(map_fs_error)?;
+    copy_to_user(process, count_address, &(count as u64).to_le_bytes())
+}
+
+fn filesystem_stat<B: Disk>(
+    process: &Process,
+    filesystem: &mut RedoxFs<B>,
+    raw_file: u64,
+    output_address: u64,
+) -> Result<(), Status> {
+    let file = decode_handle(raw_file)?;
+    validate_user_output(process, output_address, FILESYSTEM_STAT_SIZE)?;
+    let file = process
+        .handles()
+        .filesystem_file(file, Rights::READ)
+        .map_err(map_ipc_error)?;
+    let info = filesystem.stat(file).map_err(map_fs_error)?;
+    let mut output = [0_u8; FILESYSTEM_STAT_SIZE];
+    output[..8].copy_from_slice(&info.len.to_le_bytes());
+    copy_to_user(process, output_address, &output)
+}
+
+fn filesystem_read_directory<B: Disk>(
+    process: &Process,
+    filesystem: &mut RedoxFs<B>,
+    raw_root: u64,
+    cookie: u64,
+    output_address: u64,
+) -> Result<(), Status> {
+    let root = decode_handle(raw_root)?;
+    validate_user_output(process, output_address, FILESYSTEM_DIRECTORY_ENTRY_SIZE)?;
+    process
+        .handles()
+        .filesystem_root(root, Rights::READ)
+        .map_err(map_ipc_error)?;
+    let index = usize::try_from(cookie).map_err(|_| Status::OutOfRange)?;
+    let entries = filesystem.list_root().map_err(map_fs_error)?;
+    let entry = entries.get(index).ok_or(Status::EndOfDirectory)?;
+    let next_cookie = cookie.checked_add(1).ok_or(Status::OutOfRange)?;
+    let mut output = vec![0_u8; FILESYSTEM_DIRECTORY_ENTRY_SIZE];
+    output[0..8].copy_from_slice(&next_cookie.to_le_bytes());
+    output[8..16].copy_from_slice(&entry.len.to_le_bytes());
+    output[16..18].copy_from_slice(&(entry.name.len() as u16).to_le_bytes());
+    output[24..24 + entry.name.len()].copy_from_slice(entry.name.as_bytes());
+    copy_to_user(process, output_address, &output)
+}
+
+fn filesystem_truncate<B: Disk>(
+    process: &Process,
+    filesystem: &mut RedoxFs<B>,
+    raw_file: u64,
+    length: u64,
+) -> Result<(), Status> {
+    let file = decode_handle(raw_file)?;
+    let file = process
+        .handles()
+        .filesystem_file(file, Rights::WRITE)
+        .map_err(map_ipc_error)?;
+    filesystem.truncate(file, length).map_err(map_fs_error)
+}
+
+fn filesystem_unlink<B: Disk>(
+    process: &Process,
+    filesystem: &mut RedoxFs<B>,
+    raw_root: u64,
+    name_address: u64,
+    name_length: u64,
+) -> Result<(), Status> {
+    let root = decode_handle(raw_root)?;
+    process
+        .handles()
+        .filesystem_root(root, Rights::WRITE)
+        .map_err(map_ipc_error)?;
+    let name = copy_filesystem_name(process, name_address, name_length)?;
+    if is_protected_system_file(&name) {
+        return Err(Status::AccessDenied);
+    }
+    let mut path = String::from("/");
+    path.push_str(&name);
+    let file = filesystem.open(&path).map_err(map_fs_error)?;
+    filesystem.remove(file).map_err(map_fs_error)
+}
+
+fn copy_filesystem_name(
+    process: &Process,
+    address: u64,
+    raw_length: u64,
+) -> Result<String, Status> {
+    let length = checked_array_bytes(
+        raw_length,
+        1,
+        FILESYSTEM_NAME_MAX as u64,
+        Status::OutOfRange,
+    )?;
+    if length == 0 {
+        return Err(Status::InvalidArgument);
+    }
+    let bytes = copy_vec_from_user(process, address, length)?;
+    let name = core::str::from_utf8(&bytes).map_err(|_| Status::InvalidArgument)?;
+    if name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains(':')
+        || name.as_bytes().contains(&0)
+    {
+        return Err(Status::InvalidArgument);
+    }
+    Ok(String::from(name))
+}
+
+fn is_protected_system_file(name: &str) -> bool {
+    name == "desktop.elf"
+        || name == "minimal-client.elf"
+        || name == "file-navigator.elf"
+        || name == "programs.gkr"
+        || name == "system.log"
+        || name == "console"
+        || name == "input"
+}
+
+const fn map_fs_error(error: FsError) -> Status {
+    match error {
+        FsError::InvalidName => Status::InvalidArgument,
+        FsError::AlreadyExists => Status::InvalidArgument,
+        FsError::NotFound => Status::NotFound,
+        FsError::NoSpace => Status::OutOfMemory,
+        FsError::InvalidHandle => Status::InvalidHandle,
+        FsError::OffsetOverflow => Status::OutOfRange,
+        FsError::Io => Status::Io,
+    }
 }
 
 fn copy_block_from_user<const N: usize>(
@@ -837,11 +1150,18 @@ mod tests {
             SyscallNumber::SharedMemoryMap,
             SyscallNumber::SharedMemoryUnmap,
             SyscallNumber::DebugWrite,
+            SyscallNumber::FilesystemOpen,
+            SyscallNumber::FilesystemRead,
+            SyscallNumber::FilesystemWrite,
+            SyscallNumber::FilesystemStat,
+            SyscallNumber::FilesystemReadDirectory,
+            SyscallNumber::FilesystemTruncate,
+            SyscallNumber::FilesystemUnlink,
         ];
         for number in expected {
             assert_eq!(decode_syscall_number(number as u64), Some(number));
         }
-        assert_eq!(decode_syscall_number(13), None);
+        assert_eq!(decode_syscall_number(20), None);
         assert_eq!(decode_syscall_number(u64::MAX), None);
     }
 

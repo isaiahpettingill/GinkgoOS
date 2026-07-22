@@ -106,6 +106,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ginkgo-file-navigator"
+version = "0.1.0"
+dependencies = [
+ "ginkgo-graphics",
+ "ginkgo-runtime",
+ "ginkgo-userspace",
+ "ginkgo-window",
+]
+
+[[package]]
 name = "ginkgo-graphics"
 version = "0.1.0"
 dependencies = [
