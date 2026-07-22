@@ -4,9 +4,9 @@
 //! first single-core preemptive scheduler. It discovers the bootstrap local APIC
 //! through `IA32_APIC_BASE`, maps one uncached supervisor page into the shared
 //! kernel half, calibrates the APIC one-shot timer against Limine's TSC frequency,
-//! and exposes the EOI register address required by the ring-3 interrupt entry in
-//! [`crate::arch`]. x2APIC, I/O APIC routing, SMP, and kernel-mode interrupt
-//! dispatch are outside this layer.
+//! and exposes its xAPIC ID plus the EOI register address required by external
+//! interrupt entries in [`crate::arch`]. x2APIC, I/O APIC routing, SMP, and
+//! general kernel-mode interrupt dispatch are outside this layer.
 //!
 //! The mapping must be created before any [`crate::paging::address_space::AddressSpace`]
 //! is created. User address spaces copy the kernel P4 half at construction time,
@@ -36,6 +36,8 @@ const APIC_BASE_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 #[cfg(target_os = "none")]
 const CPUID_APIC: u32 = 1 << 9;
 
+#[cfg(any(target_os = "none", test))]
+const APIC_ID: usize = 0x020;
 #[cfg(any(target_os = "none", test))]
 const APIC_TPR: usize = 0x080;
 const APIC_EOI: usize = 0x0b0;
@@ -151,6 +153,7 @@ pub struct LocalApicTimer {
     mmio_base: NonNull<u8>,
     ticks_per_second: u64,
     clock: MonotonicClock,
+    id: u8,
 }
 
 impl LocalApicTimer {
@@ -219,10 +222,17 @@ impl LocalApicTimer {
                 mmio_base,
                 ticks_per_second: 0,
                 clock,
+                id: 0,
             };
+            timer.id = (unsafe { timer.read(APIC_ID) } >> 24) as u8;
             unsafe { timer.configure_and_calibrate(tsc_frequency)? };
             Ok(timer)
         }
+    }
+
+    /// Returns the eight-bit xAPIC ID used as an MSI destination.
+    pub const fn id(&self) -> u8 {
+        self.id
     }
 
     /// Returns the calibrated post-divider APIC timer frequency in hertz.
@@ -412,6 +422,7 @@ mod tests {
         assert_eq!(SPURIOUS_VECTOR, 0xff);
         assert!(PREEMPTION_VECTOR >= 32);
         assert_ne!(PREEMPTION_VECTOR, SPURIOUS_VECTOR);
+        assert_eq!(APIC_ID, 0x20);
         assert_eq!(APIC_TPR, 0x80);
         assert_eq!(APIC_EOI, 0xb0);
         assert_eq!(APIC_SVR, 0xf0);

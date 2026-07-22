@@ -453,6 +453,8 @@ pub extern "C" fn _start() -> ! {
         pending_console_len: 0,
         pending_input: [0; INPUT_BATCH_CAPACITY],
         pending_input_len: 0,
+        pressed_keys: Vec::new(),
+        pressed_pointer_buttons: Vec::new(),
         log_flush_deadline: 0,
     };
     context.paging_verified = verify_paging(&mut context);
@@ -474,6 +476,22 @@ pub extern "C" fn _start() -> ! {
         )
     } {
         Ok(input) => {
+            {
+                let mut sink = SerialDebugSink::new(&mut context.serial);
+                for device in input.topology_snapshot() {
+                    let _ = writeln!(
+                        sink,
+                        "USB topology: root={} route={:05x} depth={} slot={} hub={} ports={} interfaces={}\r",
+                        device.path.root_port,
+                        device.path.route_string,
+                        device.path.depth,
+                        device.slot_id,
+                        device.is_hub,
+                        device.hub_port_count,
+                        device.interface_count
+                    );
+                }
+            }
             context.ui.input_available = input.usable_interface_count() != 0;
             context.ui.completion_code = None;
             context.ui.input_status = if context.ui.input_available {
@@ -537,6 +555,21 @@ pub extern "C" fn _start() -> ! {
             .ui
             .render_boot_log(&mut context.screen, "userspace: CPU initialization failed");
         halt_forever();
+    }
+    if let Some(input) = context.input.as_mut() {
+        match unsafe { input.enable_msi(context.timer.id()) } {
+            Ok(()) => {
+                let mut sink = SerialDebugSink::new(&mut context.serial);
+                let _ = writeln!(sink, "USB HID: xHCI MSI enabled\r");
+            }
+            Err(error) => {
+                let mut sink = SerialDebugSink::new(&mut context.serial);
+                let _ = writeln!(
+                    sink,
+                    "USB HID: MSI unavailable, retaining polling fallback: {error:?}\r"
+                );
+            }
+        }
     }
     let user_copy_probe = [0x1000_u64, 0x0000_7000_0000_0000]
         .into_iter()
@@ -732,6 +765,8 @@ struct KernelContext {
     pending_console_len: usize,
     pending_input: [u8; INPUT_BATCH_CAPACITY],
     pending_input_len: usize,
+    pressed_keys: Vec<(ginkgo_kernel::usb::HidInterfaceId, u16)>,
+    pressed_pointer_buttons: Vec<(ginkgo_kernel::usb::HidInterfaceId, u16)>,
     log_flush_deadline: u64,
 }
 
@@ -1808,39 +1843,92 @@ fn audio_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll {
 }
 
 fn input_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
-    let Some(input) = context.input.as_mut() else {
-        return TaskPoll::Complete;
+    if context.input.is_none() {
+        return TaskPoll::Pending;
+    }
+    let summary = {
+        let (input, frames) = (&mut context.input, &mut context.frames);
+        let Some(input) = input.as_mut() else {
+            return TaskPoll::Pending;
+        };
+        input.poll_with_resources(frames, context.hhdm_offset)
     };
-    let summary = match input.poll() {
+    let summary = match summary {
         Ok(summary) => summary,
         Err(error) => {
             context.ui.input_available = false;
             context.ui.completion_code = usb_error_completion_code(error);
             context.ui.input_status = usb_error_status(error);
             context.ui.render_status(&mut context.screen);
-            return TaskPoll::Complete;
+            return TaskPoll::Pending;
         }
     };
-    if let Some(code) = input.first_transfer_error() {
-        context.ui.input_available = false;
-        context.ui.completion_code = Some(code);
-        context.ui.input_status = "USB HID: interrupt endpoint stopped with a transfer error";
-        context.ui.render_status(&mut context.screen);
-        return TaskPoll::Complete;
-    }
 
     let old_cursor = (
         context.ui.mouse_x,
         context.ui.mouse_y,
         context.ui.mouse_pressed,
     );
-    let receiving_status = "USB HID: receiving reports - mouse and keyboard active";
-    let status_dirty = summary.reports != 0 && context.ui.input_status != receiving_status;
-    if status_dirty {
-        context.ui.input_status = receiving_status;
-        context.ui.completion_code = None;
+    let mut disconnected = Vec::new();
+    while let Some(interface) = context
+        .input
+        .as_mut()
+        .and_then(InputManager::pop_disconnected)
+    {
+        disconnected.push(interface);
     }
+    for interface in disconnected {
+        release_disconnected_input(context, state, interface);
+    }
+
+    if summary.interfaces_added != 0 || summary.interfaces_removed != 0 {
+        let diagnostics = context
+            .input
+            .as_ref()
+            .map(InputManager::interrupt_diagnostics)
+            .unwrap_or_default();
+        let mut sink = SerialDebugSink::new(&mut context.serial);
+        let _ = writeln!(
+            sink,
+            "USB hotplug: added={} removed={} live={} interrupts={} watchdog={} deferred={} dropped={} recycled={} frames={}\r",
+            summary.interfaces_added,
+            summary.interfaces_removed,
+            context
+                .input
+                .as_ref()
+                .map_or(0, InputManager::usable_interface_count),
+            diagnostics.interrupts_observed,
+            diagnostics.watchdog_polls,
+            diagnostics.deferred_events,
+            diagnostics.dropped_deferred_events,
+            context
+                .input
+                .as_ref()
+                .map_or(0, InputManager::recycled_dma_pages),
+            context.frames.allocated_count()
+        );
+    }
+
+    let usable = context
+        .input
+        .as_ref()
+        .is_some_and(|input| input.usable_interface_count() != 0);
+    context.ui.input_available = usable;
+    let receiving_status = "USB HID: receiving reports - mouse and keyboard active";
+    let waiting_status = "USB HID: waiting for a keyboard or pointing device";
+    let desired_status = if usable && summary.reports != 0 {
+        receiving_status
+    } else if usable {
+        "USB HID: ready - move the mouse and type below"
+    } else {
+        waiting_status
+    };
+    let status_dirty = summary.interfaces_added != 0
+        || summary.interfaces_removed != 0
+        || context.ui.input_status != desired_status;
     if status_dirty {
+        context.ui.input_status = desired_status;
+        context.ui.completion_code = None;
         context.ui.render_status(&mut context.screen);
     }
     for _ in 0..32 {
@@ -1865,17 +1953,90 @@ fn input_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
     TaskPoll::Pending
 }
 
-fn update_modifier_bits(state: &mut TaskState, word: usize, left: bool, pressed: bool) {
-    let bit = if left { 1 } else { 2 };
-    let current = state.get(word).unwrap_or(0);
-    state.set(
-        word,
-        if pressed {
-            current | bit
-        } else {
-            current & !bit
-        },
-    );
+fn update_pressed<T: Eq + Copy>(pressed: &mut Vec<T>, value: T, is_pressed: bool) {
+    if is_pressed {
+        if !pressed.contains(&value) {
+            pressed.push(value);
+        }
+    } else {
+        pressed.retain(|candidate| *candidate != value);
+    }
+}
+
+fn refresh_modifier_state(context: &KernelContext, state: &mut TaskState) {
+    for (word, left, right) in [
+        (1, 0xe1, 0xe5),
+        (4, 0xe0, 0xe4),
+        (5, 0xe2, 0xe6),
+        (3, 0xe3, 0xe7),
+    ] {
+        let mut bits = 0;
+        if context.pressed_keys.iter().any(|(_, usage)| *usage == left) {
+            bits |= 1;
+        }
+        if context
+            .pressed_keys
+            .iter()
+            .any(|(_, usage)| *usage == right)
+        {
+            bits |= 2;
+        }
+        state.set(word, bits);
+    }
+}
+
+fn release_disconnected_input(
+    context: &mut KernelContext,
+    state: &mut TaskState,
+    interface: ginkgo_kernel::usb::HidInterfaceId,
+) {
+    let released_keys: Vec<u16> = context
+        .pressed_keys
+        .iter()
+        .filter_map(|(owner, usage)| (*owner == interface).then_some(*usage))
+        .collect();
+    context
+        .pressed_keys
+        .retain(|(owner, _)| *owner != interface);
+    refresh_modifier_state(context, state);
+    let modifiers = current_modifiers(state);
+    if let Some(desktop) = context.desktop.as_mut() {
+        for usage in released_keys {
+            let _ = desktop.send_keyboard_input(KeyboardEvent {
+                usage,
+                state: ButtonState::Released,
+                repeat: false,
+                modifiers,
+            });
+        }
+    }
+
+    let released_buttons: Vec<u16> = context
+        .pressed_pointer_buttons
+        .iter()
+        .filter_map(|(owner, button)| (*owner == interface).then_some(*button))
+        .collect();
+    context
+        .pressed_pointer_buttons
+        .retain(|(owner, _)| *owner != interface);
+    if released_buttons.contains(&1) {
+        let primary_still_pressed = context
+            .pressed_pointer_buttons
+            .iter()
+            .any(|(_, button)| *button == 1);
+        context.ui.set_mouse_button(primary_still_pressed);
+    }
+    if let Some(desktop) = context.desktop.as_mut() {
+        for button in released_buttons.into_iter().filter_map(pointer_button) {
+            let _ = desktop.send_pointer_input(
+                WindowPoint::new(context.ui.mouse_x as i32, context.ui.mouse_y as i32),
+                PointerEventKind::Button {
+                    button,
+                    state: ButtonState::Released,
+                },
+            );
+        }
+    }
 }
 
 fn current_modifiers(state: &TaskState) -> Modifiers {
@@ -1910,15 +2071,13 @@ fn handle_input_event(
     let mut text_dirty = None;
     match device_event.event {
         InputEvent::Key { usage, pressed, .. } => {
-            if matches!(usage, 0xe1 | 0xe5) {
-                update_modifier_bits(state, 1, usage == 0xe1, pressed);
-            } else if matches!(usage, 0xe0 | 0xe4) {
-                update_modifier_bits(state, 4, usage == 0xe0, pressed);
-            } else if matches!(usage, 0xe2 | 0xe6) {
-                update_modifier_bits(state, 5, usage == 0xe2, pressed);
-            } else if matches!(usage, 0xe3 | 0xe7) {
-                update_modifier_bits(state, 3, usage == 0xe3, pressed);
-            } else if usage == 0x39 && pressed {
+            update_pressed(
+                &mut context.pressed_keys,
+                (device_event.interface, usage),
+                pressed,
+            );
+            refresh_modifier_state(context, state);
+            if usage == 0x39 && pressed {
                 state.set(2, state.get(2).unwrap_or(0) ^ 1);
             } else if usage == 0x53 && pressed {
                 state.set(6, state.get(6).unwrap_or(0) ^ 1);
@@ -1979,6 +2138,11 @@ fn handle_input_event(
         InputEvent::Button {
             button, pressed, ..
         } if application == Some(ApplicationKind::Mouse) => {
+            update_pressed(
+                &mut context.pressed_pointer_buttons,
+                (device_event.interface, button),
+                pressed,
+            );
             if button == 1 {
                 let _ = context.ui.set_mouse_button(pressed);
             }

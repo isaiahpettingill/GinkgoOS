@@ -1,7 +1,9 @@
 //! Legacy PCI configuration-space discovery for x86_64.
 //!
 //! This module uses PCI configuration mechanism #1 (`0xcf8`/`0xcfc`) to find
-//! devices by class and to configure their memory BARs.
+//! devices by class, configure their memory BARs, and safely walk conventional
+//! capability lists. MSI configuration is deliberately limited to one fixed,
+//! edge-triggered vector addressed to one xAPIC ID.
 
 use crate::io::{IoError, PortRegion};
 
@@ -9,6 +11,17 @@ const CONFIG_ADDRESS_PORT: u16 = 0x0cf8;
 const CONFIG_PORT_COUNT: u16 = 8;
 const COMMAND_MEMORY_SPACE: u16 = 1 << 1;
 const COMMAND_BUS_MASTER: u16 = 1 << 2;
+const STATUS_CAPABILITIES_LIST: u16 = 1 << 4;
+const CAPABILITY_POINTER: u8 = 0x34;
+const CARDBUS_CAPABILITY_POINTER: u8 = 0x14;
+const CAPABILITY_MIN_OFFSET: u8 = 0x40;
+const CAPABILITY_MAX_OFFSET: u8 = 0xfc;
+const CAPABILITY_SLOT_COUNT: usize = 48;
+const MSI_CAPABILITY_ID: u8 = 0x05;
+const MSI_ENABLE: u16 = 1;
+const MSI_MULTIPLE_MESSAGE_ENABLE: u16 = 0b111 << 4;
+const MSI_64_BIT_CAPABLE: u16 = 1 << 7;
+const MSI_ADDRESS_BASE: u32 = 0xfee0_0000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PciError {
@@ -18,6 +31,9 @@ pub enum PciError {
     InvalidBar,
     UnsupportedIoBar,
     BarSizeOverflow,
+    MalformedCapabilityList,
+    MsiCapabilityNotPresent,
+    InvalidMsiVector,
 }
 
 impl From<IoError> for PciError {
@@ -140,6 +156,12 @@ impl PciConfig {
             .write_u32(0, address.mechanism_one_address(register & !3)?)?;
         self.ports.write_u16(4 + u16::from(register & 2), value)?;
         Ok(())
+    }
+
+    fn read_u8(&mut self, address: PciAddress, register: u8) -> Result<u8, PciError> {
+        let aligned = register & !3;
+        let shift = u32::from(register & 3) * 8;
+        Ok((self.read_u32(address, aligned)? >> shift) as u8)
     }
 
     pub fn device(&mut self, address: PciAddress) -> Result<Option<PciDevice>, PciError> {
@@ -324,6 +346,141 @@ impl PciConfig {
             command | COMMAND_MEMORY_SPACE | COMMAND_BUS_MASTER,
         )
     }
+
+    /// Finds a conventional PCI capability while bounding and validating the list.
+    ///
+    /// Every pointer must name an aligned dword in `0x40..=0xfc`. Cycles,
+    /// overlong chains, unsupported header layouts, and a set capabilities-status
+    /// bit with a null head are reported as malformed instead of being followed.
+    pub fn find_capability(
+        &mut self,
+        device: PciDevice,
+        capability_id: u8,
+    ) -> Result<Option<u8>, PciError> {
+        let status = self.read_u16(device.address, 0x06)?;
+        if status & STATUS_CAPABILITIES_LIST == 0 {
+            return Ok(None);
+        }
+        let pointer_register = match device.header_type & 0x7f {
+            0 | 1 => CAPABILITY_POINTER,
+            2 => CARDBUS_CAPABILITY_POINTER,
+            _ => return Err(PciError::MalformedCapabilityList),
+        };
+        let first = self.read_u8(device.address, pointer_register)?;
+        find_capability_in_list(first, capability_id, |offset| {
+            self.read_u32(device.address, offset)
+        })
+    }
+
+    /// Programs one fixed, edge-triggered MSI message for `device`.
+    ///
+    /// `destination_apic_id` is the eight-bit xAPIC ID and `vector` must be in
+    /// `0x20..=0xfe`. Multiple-message enable is cleared even if the capability
+    /// advertises more vectors. The capability is disabled before its address and
+    /// data are changed and enabled only after all writes succeed.
+    pub fn configure_msi(
+        &mut self,
+        device: PciDevice,
+        destination_apic_id: u8,
+        vector: u8,
+    ) -> Result<(), PciError> {
+        if !(0x20..=0xfe).contains(&vector) {
+            return Err(PciError::InvalidMsiVector);
+        }
+        let capability = self
+            .find_capability(device, MSI_CAPABILITY_ID)?
+            .ok_or(PciError::MsiCapabilityNotPresent)?;
+        let control_register = capability
+            .checked_add(2)
+            .ok_or(PciError::MalformedCapabilityList)?;
+        let control = self.read_u16(device.address, control_register)?;
+        let registers = msi_registers(capability, control)?;
+        let disabled_control = control & !(MSI_ENABLE | MSI_MULTIPLE_MESSAGE_ENABLE);
+
+        self.write_u16(device.address, control_register, disabled_control)?;
+        self.write_u32(
+            device.address,
+            registers.address_low,
+            MSI_ADDRESS_BASE | (u32::from(destination_apic_id) << 12),
+        )?;
+        if let Some(address_high) = registers.address_high {
+            self.write_u32(device.address, address_high, 0)?;
+        }
+        self.write_u16(device.address, registers.message_data, u16::from(vector))?;
+        self.write_u16(
+            device.address,
+            control_register,
+            disabled_control | MSI_ENABLE,
+        )
+    }
+}
+
+fn find_capability_in_list<F>(
+    first: u8,
+    capability_id: u8,
+    mut read: F,
+) -> Result<Option<u8>, PciError>
+where
+    F: FnMut(u8) -> Result<u32, PciError>,
+{
+    if first == 0 {
+        return Err(PciError::MalformedCapabilityList);
+    }
+
+    let mut visited = 0_u64;
+    let mut pointer = first;
+    for _ in 0..CAPABILITY_SLOT_COUNT {
+        if pointer < CAPABILITY_MIN_OFFSET || pointer > CAPABILITY_MAX_OFFSET || pointer & 3 != 0 {
+            return Err(PciError::MalformedCapabilityList);
+        }
+        let slot = usize::from((pointer - CAPABILITY_MIN_OFFSET) / 4);
+        let bit = 1_u64 << slot;
+        if visited & bit != 0 {
+            return Err(PciError::MalformedCapabilityList);
+        }
+        visited |= bit;
+
+        let header = read(pointer)?;
+        if header as u8 == capability_id {
+            return Ok(Some(pointer));
+        }
+        pointer = (header >> 8) as u8;
+        if pointer == 0 {
+            return Ok(None);
+        }
+    }
+    Err(PciError::MalformedCapabilityList)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MsiRegisters {
+    address_low: u8,
+    address_high: Option<u8>,
+    message_data: u8,
+}
+
+fn msi_registers(capability: u8, control: u16) -> Result<MsiRegisters, PciError> {
+    let address_low = capability
+        .checked_add(4)
+        .filter(|offset| *offset <= CAPABILITY_MAX_OFFSET)
+        .ok_or(PciError::MalformedCapabilityList)?;
+    let is_64_bit = control & MSI_64_BIT_CAPABLE != 0;
+    let address_high = is_64_bit
+        .then(|| capability.checked_add(8))
+        .flatten()
+        .filter(|offset| *offset <= CAPABILITY_MAX_OFFSET);
+    if is_64_bit && address_high.is_none() {
+        return Err(PciError::MalformedCapabilityList);
+    }
+    let message_data = capability
+        .checked_add(if is_64_bit { 12 } else { 8 })
+        .filter(|offset| *offset <= 0xfe)
+        .ok_or(PciError::MalformedCapabilityList)?;
+    Ok(MsiRegisters {
+        address_low,
+        address_high,
+        message_data,
+    })
 }
 
 fn device_matches(
@@ -469,5 +626,81 @@ mod tests {
         );
         assert_eq!(memory_bar_size(0, 0, false), Err(PciError::InvalidBar));
         assert_eq!(memory_bar_size(0, 0, true), Err(PciError::InvalidBar));
+    }
+
+    fn capability_search(
+        first: u8,
+        entries: &[(u8, u8, u8)],
+        id: u8,
+    ) -> Result<Option<u8>, PciError> {
+        find_capability_in_list(first, id, |offset| {
+            entries
+                .iter()
+                .find(|entry| entry.0 == offset)
+                .map(|entry| u32::from(entry.1) | (u32::from(entry.2) << 8))
+                .ok_or(PciError::MalformedCapabilityList)
+        })
+    }
+
+    #[test]
+    fn capability_search_finds_entries_and_terminates_at_a_null_link() {
+        let entries = [(0x40, 0x01, 0x4c), (0x4c, MSI_CAPABILITY_ID, 0)];
+        assert_eq!(
+            capability_search(0x40, &entries, MSI_CAPABILITY_ID),
+            Ok(Some(0x4c))
+        );
+        assert_eq!(capability_search(0x40, &entries, 0x11), Ok(None));
+    }
+
+    #[test]
+    fn capability_search_rejects_null_unaligned_out_of_range_and_cyclic_lists() {
+        assert_eq!(
+            capability_search(0, &[], MSI_CAPABILITY_ID),
+            Err(PciError::MalformedCapabilityList)
+        );
+        for invalid in [0x3c, 0x41, 0xfd] {
+            assert_eq!(
+                capability_search(invalid, &[], MSI_CAPABILITY_ID),
+                Err(PciError::MalformedCapabilityList)
+            );
+        }
+        let cycle = [(0x40, 0x01, 0x48), (0x48, 0x02, 0x40)];
+        assert_eq!(
+            capability_search(0x40, &cycle, MSI_CAPABILITY_ID),
+            Err(PciError::MalformedCapabilityList)
+        );
+        let malformed_link = [(0x40, 0x01, 0x42)];
+        assert_eq!(
+            capability_search(0x40, &malformed_link, MSI_CAPABILITY_ID),
+            Err(PciError::MalformedCapabilityList)
+        );
+    }
+
+    #[test]
+    fn msi_layout_accepts_complete_32_and_64_bit_capabilities_only() {
+        assert_eq!(
+            msi_registers(0x40, 0),
+            Ok(MsiRegisters {
+                address_low: 0x44,
+                address_high: None,
+                message_data: 0x48,
+            })
+        );
+        assert_eq!(
+            msi_registers(0x40, MSI_64_BIT_CAPABLE),
+            Ok(MsiRegisters {
+                address_low: 0x44,
+                address_high: Some(0x48),
+                message_data: 0x4c,
+            })
+        );
+        assert_eq!(
+            msi_registers(0xf8, 0),
+            Err(PciError::MalformedCapabilityList)
+        );
+        assert_eq!(
+            msi_registers(0xf4, MSI_64_BIT_CAPABLE),
+            Err(PciError::MalformedCapabilityList)
+        );
     }
 }

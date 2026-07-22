@@ -1,6 +1,6 @@
 # GinkgoOS
 
-A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. GinkgoOS boots through an on-screen kernel log and Ginkgo splash into a persistent protected ring-3 desktop service with a program-registry-backed launcher. The kernel also includes framebuffer output, physical frame allocation, isolated userspace address spaces, syscalls and capability IPC, shared-memory mappings, checked device-I/O capabilities, polling xHCI USB HID input, polling Intel HDA audio, a kernel-adapted RedoxFS filesystem, timer-preempted userspace, deadline-aware blocking waits, and cooperative bounded kernel tasks.
+A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. GinkgoOS boots through an on-screen kernel log and Ginkgo splash into a persistent protected ring-3 desktop service with a program-registry-backed launcher. The kernel also includes framebuffer output, physical frame allocation, isolated userspace address spaces, syscalls and capability IPC, shared-memory mappings, checked device-I/O capabilities, interrupt-assisted xHCI USB HID input, polling Intel HDA audio, a kernel-adapted RedoxFS filesystem, timer-preempted userspace, deadline-aware blocking waits, and cooperative bounded kernel tasks.
 
 ## What is included
 
@@ -14,7 +14,7 @@ A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. Gi
 - Rights-checked shared-memory map/unmap with mapping leases that survive source-handle closure
 - `x86_64` port I/O plus `volatile`-backed checked MMIO capabilities
 - A nonblocking serial device built on `uart_16550`
-- General PCI class discovery, a polling xHCI USB host controller, and polling Intel HDA output
+- General PCI class discovery, interrupt-assisted xHCI with hubs/hotplug, and polling Intel HDA output
 - USB HID keyboards, mice, joysticks, and gamepads, including DragonRise Generic USB Joystick reports
 - Descriptor-driven keyboard, button, axis, wheel, and hat-switch events in a bounded kernel input queue
 - Process-local capability handles and bounded bidirectional datagram channels with atomic, rights-attenuating handle transfer
@@ -37,7 +37,7 @@ A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. Gi
 - Embedded-graphics draw targets for volatile hardware framebuffers and ordinary XRGB/ARGB window RAM
 - UEFI ISO and no-ISO QEMU boot targets with a 1920×1080 preferred mode and larger default UI font
 
-Kernel tasks remain deliberately stackless and cooperative: each task performs one bounded step, stores its continuation in `TaskState`, and returns to yield. Userspace is preemptive: the process task arms a calibrated local-APIC one-shot timer before entering ring 3, and a 10 ms quantum captures the complete user context before returning to the scheduler. Syscalls and interrupt returns use protected per-CPU stacks, while `IRETQ` preserves asynchronously interrupted `RCX` and `R11`. Blocked waits retain kernel-owned requests and are polled in bounded scheduler steps until a signal or absolute monotonic deadline completes them. When no process is runnable, a short interrupt-backed `HLT` replaces busy spinning. USB input and Intel HDA audio still poll their DMA rings; general device IRQ routing, independent kernel-task stacks, and SMP are not yet provided.
+Kernel tasks remain deliberately stackless and cooperative: each task performs one bounded step, stores its continuation in `TaskState`, and returns to yield. Userspace is preemptive: the process task arms a calibrated local-APIC one-shot timer before entering ring 3, and a 10 ms quantum captures the complete user context before returning to the scheduler. Syscalls and interrupt returns use protected per-CPU stacks, while `IRETQ` preserves asynchronously interrupted `RCX` and `R11`. Blocked waits retain kernel-owned requests and are polled in bounded scheduler steps until a signal or absolute monotonic deadline completes them. When no process is runnable, a short interrupt-backed `HLT` replaces busy spinning. xHCI uses a dedicated MSI vector to signal its bounded task-context event drain, with a polling watchdog fallback. Intel HDA remains polling; general device IRQ routing, independent kernel-task stacks, and SMP are not yet provided.
 
 ### IPC groundwork
 
@@ -93,9 +93,9 @@ Currently integrated pane bindings are `META+Left/Right` for focus, `META+Q` to 
 
 ### USB HID input
 
-At boot, GinkgoOS discovers the first PCI xHCI controller, enumerates directly attached root-port devices, configures each HID interrupt-IN endpoint, and parses its report descriptor. `InputManager` normalizes reports into device-tagged `InputEvent` values for keyboard keys, mouse buttons and relative axes, joystick/gamepad buttons, absolute axes, wheels, and hat switches. The desktop tracks relative mice and absolute USB tablets, displays mouse-button state through the cursor color, tracks left/right Shift and Logo keys, and routes `META+N` to the protected desktop service. Launcher text input supports Shift, Caps Lock, Enter, Tab, and Backspace. Every normalized event is recorded in `/input`; filesystem streams are flushed in batches so RedoxFS transactions do not stall USB polling. Report IDs and packed, signed, or non-byte-aligned fields are supported.
+At boot, GinkgoOS discovers the first PCI xHCI controller, traverses USB 2 and USB 3 hubs, configures HID interrupt-IN endpoints, and parses their report descriptors. `InputManager` normalizes reports into device-tagged `InputEvent` values for keyboard keys, mouse buttons and relative axes, joystick/gamepad buttons, absolute axes, wheels, and hat switches. The desktop tracks relative mice and absolute USB tablets, displays mouse-button state through the cursor color, tracks left/right Shift and Logo keys, and routes `META+N` to the protected desktop service. Launcher text input supports Shift, Caps Lock, Enter, Tab, and Backspace. Every normalized event is recorded in `/input`; filesystem streams are flushed in batches so RedoxFS transactions do not stall USB event handling. Report IDs and packed, signed, or non-byte-aligned fields are supported.
 
-Input is currently limited to devices attached directly to xHCI root ports at boot. USB hubs and hotplug re-enumeration are not implemented yet. Enumeration failures are isolated per port so one malformed or unsupported device does not disable other input devices.
+The xHCI driver tracks five-tier route strings, powers and resets hub ports, handles root and downstream connect/disconnect events, and tears down descendants before disabling their slots. Runtime-added HID interfaces receive fresh decoders without restarting the desktop; disconnect removes queued events and clears stale held state. A bounded deferred-event queue prevents synchronous commands from discarding unrelated HID or port-change completions. MSI wakes the event path, while a watchdog poll preserves operation on hardware without usable MSI. Topology, path-aware failures, interrupt counts, and fallback activity are retained for diagnostics. Failures remain isolated per path so one malformed hub port or endpoint does not disable unrelated devices.
 
 ### Intel HDA audio
 
@@ -138,7 +138,9 @@ Install Rust through rustup, then ensure `cargo` is in `PATH`.
 make run
 ```
 
-The first run downloads Limine and OVMF, builds the kernel, creates `build/ginkgo-os.iso`, creates a persistent 16 MiB GPT `build/ginkgo-redoxfs.img` if needed, and starts QEMU. The default `pc` machine attaches that image through transitional `virtio-blk` plus an xHCI USB keyboard and tablet. Subsequent runs reuse the same filesystem image.
+The first run downloads Limine and OVMF, builds the kernel, creates `build/ginkgo-os.iso`, creates a persistent 16 MiB GPT `build/ginkgo-redoxfs.img` if needed, and starts QEMU. The default `pc` machine attaches that image through transitional `virtio-blk` plus an xHCI USB hub containing a keyboard and tablet. Subsequent runs reuse the same filesystem image.
+
+Run `make usb-smoke` for automated headless QEMU/QMP coverage. The test verifies hub enumeration, MSI delivery, disconnect with an outstanding HID transfer, repeated keyboard reconnects, and restoration of the live-interface baseline while an unrelated tablet remains active.
 
 To boot directly from a QEMU virtual FAT disk without creating an ISO or requiring `xorriso`:
 

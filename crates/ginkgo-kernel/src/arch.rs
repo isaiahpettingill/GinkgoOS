@@ -11,16 +11,20 @@
 //!
 //! Kernel Rust normally runs with interrupts disabled. [`idle_until_interrupt`]
 //! is the sole supported CPL0 site that briefly executes `STI; HLT; CLI` to wait
-//! for an armed timer. Validated user contexts require IF, while `IA32_FMASK`
+//! for an external interrupt, normally an armed timer. Validated user contexts
+//! require IF, while `IA32_FMASK`
 //! clears IF, TF, DF, NT, and AC atomically on every syscall.
 //! Synchronous user exceptions and the local APIC preemption interrupt are
 //! contained on TSS RSP0. The preemption path captures the complete user context,
 //! acknowledges the APIC, and returns [`KernelExit::Preempted`] to the suspended
 //! scheduler continuation. A timer arriving at the CPL0 idle site preserves the
 //! interrupted register state, acknowledges EOI, and returns to the idle `CLI`.
-//! #DF, NMI, and #MC use dedicated IST1/IST2/IST3 stacks and always fail-stop
-//! without accessing GS. Other external interrupts, nested kernel entries, and
-//! enabling IF elsewhere in kernel Rust remain unsupported.
+//! The dedicated xHCI MSI entry similarly preserves interrupted state at CPL0 or
+//! CPL3, records one coalescing pending bit, acknowledges EOI without entering
+//! Rust or relying on GS, and returns directly. #DF, NMI, and #MC use dedicated
+//! IST1/IST2/IST3 stacks and always fail-stop without accessing GS. Other external
+//! interrupts, nested kernel entries, and enabling IF elsewhere in kernel Rust
+//! remain unsupported.
 //!
 //! # Fault-handling limitation
 //!
@@ -45,6 +49,7 @@ use core::{
     arch::{asm, global_asm},
     mem::{offset_of, size_of},
     ptr,
+    sync::atomic::{AtomicU64, AtomicU8, Ordering},
 };
 
 use crate::local_apic::{PREEMPTION_VECTOR, SPURIOUS_VECTOR};
@@ -137,6 +142,8 @@ const CONTROL_PROTECTION_VECTOR: usize = 21;
 const HYPERVISOR_INJECTION_VECTOR: usize = 28;
 const VMM_COMMUNICATION_VECTOR: usize = 29;
 const SECURITY_EXCEPTION_VECTOR: usize = 30;
+/// Dedicated fixed xHCI MSI vector installed by the CPU IDT initialization.
+pub const XHCI_VECTOR: u8 = 0x41;
 const INTERRUPT_GATE_PRESENT_RING0: u8 = 0x8e;
 const INTERRUPT_GATE_PRESENT_RING3: u8 = 0xee;
 const DOUBLE_FAULT_IST_INDEX: u8 = 1;
@@ -146,6 +153,21 @@ const KERNEL_EXIT_FAULT: u64 = 3;
 const KERNEL_EXIT_PREEMPTED: u64 = 4;
 const USER_CONTEXT_GPR_QWORDS: usize = offset_of!(UserContext, rip) / size_of::<u64>();
 const USER_CONTEXT_QWORDS: usize = size_of::<UserContext>() / size_of::<u64>();
+
+// These symbols are accessed directly by the xHCI assembly entry. They are
+// process-global because this interrupt layer currently supports only the BSP.
+#[no_mangle]
+static GINKGO_XHCI_INTERRUPT_PENDING: AtomicU8 = AtomicU8::new(0);
+#[no_mangle]
+static GINKGO_EXTERNAL_INTERRUPT_EOI: AtomicU64 = AtomicU64::new(0);
+
+/// Consumes the coalescing xHCI interrupt-pending flag.
+///
+/// The assembly ISR sets this flag before acknowledging the local APIC. Multiple
+/// interrupts before one call intentionally coalesce into a single `true` result.
+pub fn take_xhci_interrupt_pending() -> bool {
+    GINKGO_XHCI_INTERRUPT_PENDING.swap(0, Ordering::AcqRel) != 0
+}
 
 /// Aligned extended state area. XSAVE-capable CPUs preserve enabled AVX state;
 /// older CPUs use the architectural legacy prefix through FXSAVE.
@@ -391,9 +413,9 @@ pub const fn validate_no_execute_requirement(
 
 /// External-interrupt resources installed into one CPU's entry state.
 ///
-/// A zero EOI address disables the preemption entry and is used by the legacy
-/// [`initialize_cpu`] wrapper. A configured address must be the permanently
-/// mapped, supervisor-only virtual address returned by
+/// A zero EOI address disables maskable external-interrupt entries and is used
+/// by the legacy [`initialize_cpu`] wrapper. A configured address must be the
+/// permanently mapped, supervisor-only virtual address returned by
 /// [`crate::local_apic::LocalApicTimer::eoi_register_address`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExternalInterruptState {
@@ -447,18 +469,20 @@ pub enum IdleError {
     UnsupportedEnvironment,
 }
 
-/// Sleeps until the armed local APIC timer delivers an interrupt.
+/// Sleeps until a supported local-APIC interrupt arrives.
 ///
 /// This is the only supported site at which kernel code temporarily enables
 /// maskable interrupts. The caller must have initialized the current CPU with
-/// [`initialize_cpu_with_external_interrupts`] and armed its local APIC timer.
-/// If no interrupt is capable of arriving, the CPU may remain halted forever.
+/// [`initialize_cpu_with_external_interrupts`] and normally arms its local APIC
+/// timer first. If no interrupt is capable of arriving, the CPU may remain halted
+/// forever.
 ///
 /// The function first verifies that IF is clear. On bare metal, `STI; HLT` is a
 /// lost-wakeup-safe pair because interrupt recognition is inhibited until after
-/// the instruction following `STI` begins. A CPL0 timer interrupt acknowledges
-/// the APIC and IRETs to the following `CLI`, so this function always returns to
-/// its caller with IF clear. Other CPL0 interrupt sites remain unsupported.
+/// the instruction following `STI` begins. A CPL0 timer or xHCI interrupt
+/// acknowledges the APIC and IRETs to the following `CLI`, so this function
+/// always returns to its caller with IF clear. Other CPL0 interrupt sites remain
+/// unsupported.
 pub fn idle_until_interrupt() -> Result<(), IdleError> {
     if interrupts_enabled() {
         return Err(IdleError::InterruptsEnabled);
@@ -852,7 +876,7 @@ pub unsafe fn initialize_cpu(
     }
 }
 
-/// Installs the privilege foundation and a local-APIC preemption EOI target.
+/// Installs the privilege foundation and local-APIC external-interrupt EOI target.
 ///
 /// This is the interrupt-capable form of [`initialize_cpu`]. In addition to that
 /// function's safety contract, `external.local_apic_eoi` must remain mapped,
@@ -888,6 +912,8 @@ pub unsafe fn initialize_cpu_with_external_interrupts(
     state.syscall.syscall_stack_top = stacks.syscall;
     state.syscall.dispatcher = dispatcher as usize as u64;
     state.syscall.interrupt_eoi = external.local_apic_eoi;
+    GINKGO_XHCI_INTERRUPT_PENDING.store(0, Ordering::Relaxed);
+    GINKGO_EXTERNAL_INTERRUPT_EOI.store(external.local_apic_eoi, Ordering::Release);
     unsafe { state.tss.set_stack_tops(stacks) };
 
     let tss_base = ptr::addr_of!(state.tss) as u64;
@@ -983,6 +1009,10 @@ pub unsafe fn initialize_cpu_with_external_interrupts(
             ExceptionGate::ring0(
                 usize::from(PREEMPTION_VECTOR),
                 ginkgo_x86_timer_interrupt as *const () as usize as u64,
+            ),
+            ExceptionGate::ring0(
+                usize::from(XHCI_VECTOR),
+                ginkgo_x86_xhci_interrupt as *const () as usize as u64,
             ),
             ExceptionGate::ring0(
                 usize::from(SPURIOUS_VECTOR),
@@ -1392,6 +1422,7 @@ extern "C" {
     fn ginkgo_x86_exception_vmm_communication();
     fn ginkgo_x86_exception_security();
     fn ginkgo_x86_timer_interrupt();
+    fn ginkgo_x86_xhci_interrupt();
     fn ginkgo_x86_spurious_interrupt();
 }
 
@@ -1433,6 +1464,7 @@ global_asm!(
     .global ginkgo_x86_exception_vmm_communication
     .global ginkgo_x86_exception_security
     .global ginkgo_x86_timer_interrupt
+    .global ginkgo_x86_xhci_interrupt
     .global ginkgo_x86_spurious_interrupt
 
 // Fault-contained copy used after page-table validation. The page-fault handler
@@ -1472,8 +1504,21 @@ ginkgo_x86_exception_fail_stop:
 ginkgo_x86_spurious_interrupt:
     iretq
 
-// The timer is the only supported maskable external interrupt. It either wakes
-// idle_until_interrupt at CPL0 or preempts an active user context at CPL3.
+// The xHCI MSI may interrupt CPL0 idle or CPL3. RIP-relative globals avoid GS,
+// whose active base differs across privilege levels. Preserve the sole scratch
+// register, publish a coalescing byte, acknowledge the APIC, and return directly.
+ginkgo_x86_xhci_interrupt:
+    pushq %rax
+    movb $1, GINKGO_XHCI_INTERRUPT_PENDING(%rip)
+    movq GINKGO_EXTERNAL_INTERRUPT_EOI(%rip), %rax
+    testq %rax, %rax
+    jz .Lginkgo_fail_stop
+    movl $0, (%rax)
+    popq %rax
+    iretq
+
+// The timer is the only external interrupt that drives scheduler preemption. It
+// either wakes idle_until_interrupt at CPL0 or preempts an active user at CPL3.
 ginkgo_x86_timer_interrupt:
     pushq $0
     pushq ${preemption_vector}
@@ -2152,7 +2197,8 @@ mod tests {
         let fail_stop = 0xffff_8000_0000_1000;
         let contained = 0xffff_8000_0000_2000;
         let timer = 0xffff_8000_0000_3000;
-        let spurious = 0xffff_8000_0000_4000;
+        let xhci = 0xffff_8000_0000_4000;
+        let spurious = 0xffff_8000_0000_5000;
         let gates = [
             ExceptionGate::ring0(DIVIDE_ERROR_VECTOR, contained),
             ExceptionGate::ring0(DEBUG_VECTOR, contained),
@@ -2178,6 +2224,7 @@ mod tests {
             ExceptionGate::ring0(VMM_COMMUNICATION_VECTOR, contained),
             ExceptionGate::ring0(SECURITY_EXCEPTION_VECTOR, contained),
             ExceptionGate::ring0(usize::from(PREEMPTION_VECTOR), timer),
+            ExceptionGate::ring0(usize::from(XHCI_VECTOR), xhci),
             ExceptionGate::ring0(usize::from(SPURIOUS_VECTOR), spurious),
         ];
         let idt = exception_idt(fail_stop, &gates);
@@ -2233,6 +2280,10 @@ mod tests {
         assert_eq!(timer_gate.handler(), timer);
         assert_eq!(timer_gate.ist, 0);
         assert_eq!(timer_gate.type_attributes, INTERRUPT_GATE_PRESENT_RING0);
+        let xhci_gate = idt.entries[usize::from(XHCI_VECTOR)];
+        assert_eq!(xhci_gate.handler(), xhci);
+        assert_eq!(xhci_gate.ist, 0);
+        assert_eq!(xhci_gate.type_attributes, INTERRUPT_GATE_PRESENT_RING0);
         let spurious_gate = idt.entries[usize::from(SPURIOUS_VECTOR)];
         assert_eq!(spurious_gate.handler(), spurious);
         assert_eq!(spurious_gate.ist, 0);
@@ -2425,6 +2476,16 @@ mod tests {
             context.validate(),
             Err(ContextValidationError::InvalidFlags)
         );
+    }
+
+    #[test]
+    fn xhci_pending_flag_coalesces_and_is_consumed() {
+        GINKGO_XHCI_INTERRUPT_PENDING.store(0, Ordering::Relaxed);
+        assert!(!take_xhci_interrupt_pending());
+        GINKGO_XHCI_INTERRUPT_PENDING.store(1, Ordering::Release);
+        GINKGO_XHCI_INTERRUPT_PENDING.store(1, Ordering::Release);
+        assert!(take_xhci_interrupt_pending());
+        assert!(!take_xhci_interrupt_pending());
     }
 
     #[test]

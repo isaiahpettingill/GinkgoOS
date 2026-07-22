@@ -13,7 +13,10 @@ use ginkgo_hid::{
 use crate::{
     memory::UsableFrameAllocator,
     paging::ActivePageTable,
-    usb::{HidInterfaceId, HidInterfaceInfo, PortFailure, UsbError, UsbHost},
+    usb::{
+        HidInterfaceId, HidInterfaceInfo, PortFailure, TopologyFailure, UsbError, UsbHost,
+        UsbLifecycleEvent, UsbTopologyEntry, XhciInterruptDiagnostics,
+    },
 };
 
 /// Maximum number of decoded events retained until a kernel consumer reads them.
@@ -41,6 +44,8 @@ pub struct PollSummary {
     pub events: usize,
     pub dropped_events: usize,
     pub malformed_reports: usize,
+    pub interfaces_added: usize,
+    pub interfaces_removed: usize,
 }
 
 struct DecoderEntry {
@@ -56,6 +61,7 @@ pub struct InputManager {
     events: VecDeque<DeviceInputEvent>,
     dropped_events: usize,
     malformed_reports: usize,
+    disconnected: VecDeque<HidInterfaceId>,
 }
 
 impl InputManager {
@@ -110,17 +116,48 @@ impl InputManager {
             events: VecDeque::with_capacity(INPUT_QUEUE_CAPACITY),
             dropped_events: 0,
             malformed_reports: 0,
+            disconnected: VecDeque::new(),
         })
     }
 
     /// Polls xHCI once, decodes all completed reports, and queues state changes.
-    /// This method does not wait for input and is suitable for a cooperative task.
+    /// This compatibility method cannot enumerate newly attached devices because
+    /// runtime slot setup requires access to the physical frame allocator.
     pub fn poll(&mut self) -> Result<PollSummary, UsbError> {
         let reports = self.host.poll()?;
+        self.process_poll(reports)
+    }
+
+    /// Polls xHCI with the resources required for runtime device enumeration.
+    pub fn poll_with_resources(
+        &mut self,
+        frames: &mut UsableFrameAllocator<'_>,
+        hhdm_offset: u64,
+    ) -> Result<PollSummary, UsbError> {
+        let reports = self.host.poll_with_resources(frames, hhdm_offset)?;
+        self.process_poll(reports)
+    }
+
+    fn process_poll(
+        &mut self,
+        reports: Vec<crate::usb::HidReport>,
+    ) -> Result<PollSummary, UsbError> {
         let mut summary = PollSummary {
             reports: reports.len(),
             ..PollSummary::default()
         };
+        while let Some(event) = self.host.pop_lifecycle_event() {
+            match event {
+                UsbLifecycleEvent::InterfaceAdded(info) => {
+                    self.install_decoder(&info);
+                    summary.interfaces_added += 1;
+                }
+                UsbLifecycleEvent::InterfaceRemoved(info) => {
+                    self.remove_interface(info.id);
+                    summary.interfaces_removed += 1;
+                }
+            }
+        }
 
         for report in reports {
             let Some(decoder) = self
@@ -163,9 +200,52 @@ impl InputManager {
         Ok(summary)
     }
 
+    fn install_decoder(&mut self, info: &HidInterfaceInfo) {
+        if self.decoders.iter().any(|entry| entry.interface == info.id)
+            || self
+                .descriptor_failures
+                .iter()
+                .any(|failure| failure.interface == info.id)
+        {
+            return;
+        }
+        let Some(descriptor) = self.host.report_descriptor(info.id) else {
+            return;
+        };
+        match DeviceLayout::parse(descriptor) {
+            Ok(mut layout) => {
+                if info.vendor_id == 0x0079 && info.product_id == 0x0006 {
+                    layout.apply_dragonrise_0079_0006_quirks();
+                }
+                self.decoders.push(DecoderEntry {
+                    interface: info.id,
+                    decoder: ReportDecoder::new(layout),
+                });
+            }
+            Err(error) => self.descriptor_failures.push(DescriptorFailure {
+                interface: info.id,
+                error,
+            }),
+        }
+    }
+
+    fn remove_interface(&mut self, id: HidInterfaceId) {
+        self.decoders.retain(|entry| entry.interface != id);
+        self.descriptor_failures
+            .retain(|failure| failure.interface != id);
+        self.events.retain(|event| event.interface != id);
+        if !self.disconnected.contains(&id) {
+            self.disconnected.push_back(id);
+        }
+    }
+
     /// Removes the oldest queued input event.
     pub fn pop_event(&mut self) -> Option<DeviceInputEvent> {
         self.events.pop_front()
+    }
+
+    pub fn pop_disconnected(&mut self) -> Option<HidInterfaceId> {
+        self.disconnected.pop_front()
     }
 
     pub fn queued_events(&self) -> usize {
@@ -206,6 +286,31 @@ impl InputManager {
 
     pub fn enumeration_failures(&self) -> &[PortFailure] {
         self.host.enumeration_failures()
+    }
+
+    /// Enables interrupt-assisted xHCI event delivery after the IDT is active.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the destination local APIC and xHCI IDT vector are active.
+    pub unsafe fn enable_msi(&mut self, destination_apic_id: u8) -> Result<(), UsbError> {
+        unsafe { self.host.enable_msi(destination_apic_id) }
+    }
+
+    pub fn topology_snapshot(&self) -> Vec<UsbTopologyEntry> {
+        self.host.topology_snapshot()
+    }
+
+    pub fn topology_failures(&self) -> &[TopologyFailure] {
+        self.host.topology_failures()
+    }
+
+    pub fn interrupt_diagnostics(&self) -> XhciInterruptDiagnostics {
+        self.host.interrupt_diagnostics()
+    }
+
+    pub fn recycled_dma_pages(&self) -> usize {
+        self.host.recycled_dma_pages()
     }
 
     pub fn first_transfer_error(&self) -> Option<u8> {

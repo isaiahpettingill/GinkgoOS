@@ -4,6 +4,7 @@ IMAGE_NAME := ginkgo-os
 BUILD_DIR := build
 ISO_ROOT := $(BUILD_DIR)/iso_root
 NO_ISO_ROOT := $(BUILD_DIR)/no_iso_root
+USB_SMOKE_ROOT := $(BUILD_DIR)/usb_smoke_root
 KERNEL := target/x86_64-unknown-none/debug/ginkgo-os
 USERSPACE_MANIFEST := userspace/Cargo.toml
 USERSPACE_TARGET := userspace/target/x86_64-unknown-none/release
@@ -36,9 +37,9 @@ else
 QEMU ?= qemu-system-x86_64
 QEMU_AUDIO_FLAGS ?= -audiodev sdl,id=ginkgo-audio
 endif
-QEMU_FLAGS ?= -cpu max -m 512M -M pc,i8042=off -serial stdio -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 $(QEMU_AUDIO_FLAGS) -device ich9-intel-hda -device hda-output,audiodev=ginkgo-audio -no-reboot -no-shutdown
+QEMU_FLAGS ?= -cpu max -m 512M -M pc,i8042=off -serial stdio -device qemu-xhci,id=xhci,msi=on,msix=off -device usb-hub,id=ginkgo-hub,bus=xhci.0,port=1 -device usb-kbd,bus=xhci.0,port=1.1 -device usb-tablet,bus=xhci.0,port=1.2 $(QEMU_AUDIO_FLAGS) -device ich9-intel-hda -device hda-output,audiodev=ginkgo-audio -no-reboot -no-shutdown
 
-.PHONY: all userspace kernel iso qemu no-iso run check clean distclean reset-fs
+.PHONY: all userspace kernel iso qemu no-iso run usb-smoke check clean distclean reset-fs
 
 all: iso
 
@@ -106,12 +107,20 @@ run: $(OVMF_CODE) $(ISO) $(FS_IMAGE)
 		-device virtio-blk-pci,disable-modern=on,drive=ginkgo-fs \
 		-cdrom $(ISO) -boot d
 
+usb-smoke: kernel $(LIMINE_DIR)/BOOTX64.EFI $(OVMF_CODE) $(FS_IMAGE)
+	rm -rf $(USB_SMOKE_ROOT)
+	mkdir -p $(USB_SMOKE_ROOT)/boot/limine $(USB_SMOKE_ROOT)/EFI/BOOT
+	cp $(KERNEL) $(USB_SMOKE_ROOT)/boot/kernel
+	cp limine.conf $(USB_SMOKE_ROOT)/boot/limine/limine.conf
+	cp $(LIMINE_DIR)/BOOTX64.EFI $(USB_SMOKE_ROOT)/EFI/BOOT/
+	$(PYTHON) tools/qemu_usb_hotplug_test.py --qemu "$(QEMU)" --ovmf $(OVMF_CODE) --disk $(FS_IMAGE) --boot-root $(USB_SMOKE_ROOT)
+
 check: userspace
 	GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" GINKGO_TERMINAL_ELF="$(abspath $(TERMINAL_ELF))" cargo check -p ginkgo-kernel --bin ginkgo-os
 
 clean:
 	cargo clean
-	rm -rf $(ISO_ROOT) $(NO_ISO_ROOT) $(ISO)
+	rm -rf $(ISO_ROOT) $(NO_ISO_ROOT) $(USB_SMOKE_ROOT) $(ISO)
 
 reset-fs:
 	rm -f $(FS_IMAGE)
