@@ -41,6 +41,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GINKGO_DESKTOP_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_MINIMAL_CLIENT_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_FILE_NAVIGATOR_ELF");
+    println!("cargo:rerun-if-env-changed=GINKGO_TERMINAL_ELF");
     println!("cargo:rustc-link-arg-bin=ginkgo-os=-T{}", linker.display());
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("build output directory"));
@@ -54,11 +55,14 @@ fn main() {
         .unwrap_or_else(build_userspace_smoke_elf);
     let file_navigator = read_userspace_artifact("GINKGO_FILE_NAVIGATOR_ELF")
         .unwrap_or_else(build_userspace_smoke_elf);
+    let terminal =
+        read_userspace_artifact("GINKGO_TERMINAL_ELF").unwrap_or_else(build_userspace_smoke_elf);
     fs::write(out_dir.join("ginkgo-desktop.elf"), desktop).expect("write ginkgo desktop ELF");
     fs::write(out_dir.join("ginkgo-minimal-client.elf"), minimal_client)
         .expect("write Ginkgo minimal client ELF");
     fs::write(out_dir.join("ginkgo-file-navigator.elf"), file_navigator)
         .expect("write Ginkgo file navigator ELF");
+    fs::write(out_dir.join("ginkgo-terminal.elf"), terminal).expect("write Ginkgo terminal ELF");
     fs::write(out_dir.join("programs.gkr"), build_program_registry())
         .expect("write Ginkgo program registry");
 }
@@ -473,6 +477,12 @@ fn build_program_registry() -> Vec<u8> {
             display_name: "Files",
             executable_path: "/file-navigator.elf",
             flags: EntryFlags::FILESYSTEM,
+        },
+        EncodeEntry {
+            app_id: "terminal",
+            display_name: "Terminal",
+            executable_path: "/terminal.elf",
+            flags: EntryFlags::FILESYSTEM | EntryFlags::PROCESS_LAUNCH,
         },
         EncodeEntry {
             app_id: "minimal-client",

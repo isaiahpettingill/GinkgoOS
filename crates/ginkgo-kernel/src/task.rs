@@ -110,11 +110,7 @@ impl<C, const TASKS: usize> Scheduler<C, TASKS> {
         self.spawn_with_state(run, TaskState::new())
     }
 
-    pub fn spawn_with_state(
-        &mut self,
-        run: TaskFn<C>,
-        state: TaskState,
-    ) -> Result<(), SpawnError> {
+    pub fn spawn_with_state(&mut self, run: TaskFn<C>, state: TaskState) -> Result<(), SpawnError> {
         let slot = self
             .slots
             .iter_mut()
@@ -236,10 +232,7 @@ mod tests {
             len: 0,
         };
         scheduler
-            .spawn_with_state(
-                task_one,
-                TaskState::from_words([1, 0, 0, 0, 0, 0, 0, 0]),
-            )
+            .spawn_with_state(task_one, TaskState::from_words([1, 0, 0, 0, 0, 0, 0, 0]))
             .unwrap();
         assert_eq!(scheduler.spawn(task_two), Err(SpawnError::Full));
 

@@ -7,10 +7,11 @@ use alloc::{collections::VecDeque, vec::Vec};
 use core::mem::MaybeUninit;
 
 use ginkgo_desktop::{
-    ClientId, Desktop, DesktopAction, DesktopPolicy, HorizontalAlignment, Insets,
+    AttachmentIndex, ClientId, Desktop, DesktopAction, DesktopPolicy, HorizontalAlignment, Insets,
     PresentationResult, RuntimeMessage, RuntimePacket, RuntimePlacement, RuntimeSender,
     TrustedCommand, MAX_RUNTIME_PLACEMENTS,
 };
+use ginkgo_terminal_protocol::{decode_launch_request, is_launch_message};
 use ginkgo_userspace::{
     channel_read, channel_write, debug_write, handle_close, process_yield, Handle,
     HandleDisposition, ObjectType, ReceivedHandle, Rights, Status, CHANNEL_MAX_BYTES,
@@ -36,6 +37,9 @@ const SURFACE_SOURCE_RIGHTS: Rights = Rights::from_bits_retain(
 );
 const SURFACE_CLIENT_RIGHTS: Rights =
     Rights::from_bits_retain(Rights::READ.bits() | Rights::WRITE.bits() | Rights::MAP.bits());
+const STARTUP_FORWARD_RIGHTS: Rights = Rights::from_bits_retain(
+    Rights::READ.bits() | Rights::WRITE.bits() | Rights::WAIT.bits() | Rights::TRANSFER.bits(),
+);
 
 ginkgo_runtime::entry!(process_main);
 
@@ -187,6 +191,15 @@ enum ClientOutbound {
     },
 }
 
+enum BrokerOutbound {
+    Bytes(Vec<u8>),
+    WithHandle {
+        bytes: Vec<u8>,
+        handle: OwnedHandle,
+        rights: Rights,
+    },
+}
+
 struct ClientConnection {
     id: ClientId,
     channel: OwnedHandle,
@@ -207,7 +220,7 @@ struct Service {
     desktop: Desktop,
     broker: OwnedHandle,
     clients: Vec<ClientConnection>,
-    broker_outbound: VecDeque<Vec<u8>>,
+    broker_outbound: VecDeque<BrokerOutbound>,
     launcher_visible: bool,
 }
 
@@ -362,7 +375,8 @@ impl Service {
             | RuntimeMessage::Configure { .. }
             | RuntimeMessage::DestroyWindow { .. }
             | RuntimeMessage::SetPlacements { .. }
-            | RuntimeMessage::Present { .. } => return Err(ServiceError::InvalidMessage),
+            | RuntimeMessage::Present { .. }
+            | RuntimeMessage::LaunchProgram { .. } => return Err(ServiceError::InvalidMessage),
         }
         Ok(())
     }
@@ -386,7 +400,7 @@ impl Service {
             let mut broker_backpressured = false;
             for _ in 0..MAX_READS_PER_TURN {
                 let channel = self.clients[index].channel.get();
-                let incoming = match read_message(channel) {
+                let mut incoming = match read_message(channel) {
                     Ok(Some(incoming)) => incoming,
                     Ok(None) => break,
                     Err(ServiceError::Syscall(Status::PeerClosed)) => {
@@ -398,6 +412,45 @@ impl Service {
                         break;
                     }
                 };
+                let client_id = self.clients[index].id;
+                if is_launch_message(&incoming.bytes) {
+                    let request =
+                        match decode_launch_request(&incoming.bytes, incoming.attachments.len()) {
+                            Ok(request) => request,
+                            Err(_) => {
+                                disconnected = true;
+                                break;
+                            }
+                        };
+                    let attachment = match take_attachment(
+                        &mut incoming.attachments,
+                        request.startup_attachment as u8,
+                    ) {
+                        Ok(attachment) => attachment,
+                        Err(_) => {
+                            disconnected = true;
+                            break;
+                        }
+                    };
+                    if attachment
+                        .validate(ObjectType::Channel, STARTUP_FORWARD_RIGHTS)
+                        .is_err()
+                    {
+                        disconnected = true;
+                        break;
+                    }
+                    self.queue_broker_with_handle(
+                        RuntimeMessage::LaunchProgram {
+                            requester: client_id,
+                            app_id: request.app_id,
+                            startup_attachment: AttachmentIndex::new(0),
+                        },
+                        attachment.handle,
+                        STARTUP_FORWARD_RIGHTS,
+                    )?;
+                    self.flush_broker()?;
+                    continue;
+                }
                 if !incoming.attachments.is_empty() {
                     disconnected = true;
                     break;
@@ -409,7 +462,6 @@ impl Service {
                         break;
                     }
                 };
-                let client_id = self.clients[index].id;
                 if let WireRequest::CreateWindow { request_id, .. } = &request {
                     if self.desktop.windows().len() >= MAX_RUNTIME_PLACEMENTS {
                         self.queue_client_event(
@@ -547,7 +599,28 @@ impl Service {
         let bytes = packet
             .encode_validated(RuntimeSender::DesktopService, 0)
             .map_err(|_| ServiceError::Codec)?;
-        self.broker_outbound.push_back(bytes);
+        self.broker_outbound.push_back(BrokerOutbound::Bytes(bytes));
+        Ok(())
+    }
+
+    fn queue_broker_with_handle(
+        &mut self,
+        message: RuntimeMessage,
+        handle: OwnedHandle,
+        rights: Rights,
+    ) -> Result<(), ServiceError> {
+        if self.broker_outbound.len() >= MAX_BROKER_QUEUE {
+            return Err(ServiceError::Capacity);
+        }
+        let packet = RuntimePacket::new(message);
+        let bytes = packet
+            .encode_validated(RuntimeSender::DesktopService, 1)
+            .map_err(|_| ServiceError::Codec)?;
+        self.broker_outbound.push_back(BrokerOutbound::WithHandle {
+            bytes,
+            handle,
+            rights,
+        });
         Ok(())
     }
 
@@ -590,10 +663,25 @@ impl Service {
 
     fn flush_broker(&mut self) -> Result<(), ServiceError> {
         for _ in 0..MAX_WRITES_PER_TURN {
-            let Some(bytes) = self.broker_outbound.front() else {
+            let Some(outbound) = self.broker_outbound.front_mut() else {
                 break;
             };
-            match channel_write(self.broker.get(), bytes, &[]) {
+            let result = match outbound {
+                BrokerOutbound::Bytes(bytes) => channel_write(self.broker.get(), bytes, &[]),
+                BrokerOutbound::WithHandle {
+                    bytes,
+                    handle,
+                    rights,
+                } => {
+                    let disposition = HandleDisposition::move_handle(handle.get(), *rights);
+                    let result = channel_write(self.broker.get(), bytes, &[disposition]);
+                    if result.is_ok() {
+                        handle.disarm();
+                    }
+                    result
+                }
+            };
+            match result {
                 Ok(()) => {
                     self.broker_outbound.pop_front();
                 }

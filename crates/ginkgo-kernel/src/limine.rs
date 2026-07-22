@@ -17,40 +17,19 @@ pub const REQUESTS_START_MARKER: [u64; 4] = [
     0x181e_920a_7852_b9d9,
 ];
 
-pub const REQUESTS_END_MARKER: [u64; 2] = [
-    0xadc0_e053_1bb1_0d03,
-    0x9572_709f_3176_4c62,
-];
+pub const REQUESTS_END_MARKER: [u64; 2] = [0xadc0_e053_1bb1_0d03, 0x9572_709f_3176_4c62];
 
-const COMMON_MAGIC: [u64; 2] = [
-    0xc7b1_dd30_df4c_8b88,
-    0x0a82_e883_a194_f07b,
-];
+const COMMON_MAGIC: [u64; 2] = [0xc7b1_dd30_df4c_8b88, 0x0a82_e883_a194_f07b];
 
-const STACK_SIZE_REQUEST_MAGIC: [u64; 2] = [
-    0x224e_f046_0a8e_8926,
-    0xe1cb_0fc2_5f46_ea3d,
-];
+const STACK_SIZE_REQUEST_MAGIC: [u64; 2] = [0x224e_f046_0a8e_8926, 0xe1cb_0fc2_5f46_ea3d];
 
-const TSC_FREQUENCY_REQUEST_MAGIC: [u64; 2] = [
-    0x10f2_ee1d_87d1_95e4,
-    0xf747_a2b7_8f6d_db31,
-];
+const TSC_FREQUENCY_REQUEST_MAGIC: [u64; 2] = [0x10f2_ee1d_87d1_95e4, 0xf747_a2b7_8f6d_db31];
 
-const FRAMEBUFFER_REQUEST_MAGIC: [u64; 2] = [
-    0x9d58_27dc_d881_dd75,
-    0xa314_8604_f6fa_b11b,
-];
+const FRAMEBUFFER_REQUEST_MAGIC: [u64; 2] = [0x9d58_27dc_d881_dd75, 0xa314_8604_f6fa_b11b];
 
-const MEMORY_MAP_REQUEST_MAGIC: [u64; 2] = [
-    0x67cf_3d9d_378a_806f,
-    0xe304_acdf_c50c_3c62,
-];
+const MEMORY_MAP_REQUEST_MAGIC: [u64; 2] = [0x67cf_3d9d_378a_806f, 0xe304_acdf_c50c_3c62];
 
-const HHDM_REQUEST_MAGIC: [u64; 2] = [
-    0x48dc_f1cb_8ad2_b852,
-    0x6398_4e95_9a98_244b,
-];
+const HHDM_REQUEST_MAGIC: [u64; 2] = [0x48dc_f1cb_8ad2_b852, 0x6398_4e95_9a98_244b];
 
 pub const MEMORY_MAP_USABLE: u64 = 0;
 pub const MEMORY_MAP_RESERVED: u64 = 1;
@@ -72,11 +51,7 @@ unsafe impl Sync for BaseRevision {}
 impl BaseRevision {
     pub const fn new(revision: u64) -> Self {
         Self {
-            words: UnsafeCell::new([
-                0xf956_2b2d_5c95_a6c8,
-                0x6a7b_3849_4453_6bdc,
-                revision,
-            ]),
+            words: UnsafeCell::new([0xf956_2b2d_5c95_a6c8, 0x6a7b_3849_4453_6bdc, revision]),
         }
     }
 
@@ -189,8 +164,8 @@ pub struct MemoryMapResponse {
 
 impl MemoryMapResponse {
     pub fn entries(&self) -> Result<MemoryMapEntries<'_>, MemoryMapError> {
-        let count = usize::try_from(self.entry_count)
-            .map_err(|_| MemoryMapError::EntryCountTooLarge)?;
+        let count =
+            usize::try_from(self.entry_count).map_err(|_| MemoryMapError::EntryCountTooLarge)?;
 
         if count == 0 {
             return Ok(MemoryMapEntries {

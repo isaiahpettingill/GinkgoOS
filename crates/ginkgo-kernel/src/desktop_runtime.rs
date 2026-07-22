@@ -15,8 +15,8 @@ use ginkgo_desktop::{
 use ginkgo_graphics::{FramebufferWriter, SurfaceLayout};
 use ginkgo_ipc::ginkgo_sysapi::{CHANNEL_MAX_BYTES, CHANNEL_MAX_HANDLES};
 use ginkgo_ipc::{
-    channel_create_between, Handle, HandleDisposition, HandleOperationDisposition, HandleTable,
-    IpcError, ObjectType, Rights, WindowRelease,
+    channel_create_between, handle_move_between, Handle, HandleDisposition,
+    HandleOperationDisposition, HandleTable, IpcError, ObjectType, Rights, WindowRelease,
 };
 use ginkgo_window::{
     BufferId, ConfigurationError, Generation, KeyboardEvent, Point as InputPoint, PointerEventKind,
@@ -119,10 +119,15 @@ impl From<CompositorError> for DesktopBrokerError {
 }
 
 /// Observable result of processing one desktop-service packet.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DesktopRuntimeEvent {
     ServiceReady,
     LauncherVisibility(bool),
+    LaunchRequested {
+        requester: ClientId,
+        app_id: alloc::string::String,
+        startup: Handle,
+    },
     SurfaceConfigured {
         client_id: ClientId,
         window_id: WindowId,
@@ -349,11 +354,32 @@ impl DesktopBroker {
             self.close_attachments(attachments);
             return Err(DesktopBrokerError::Validation(error));
         }
-        // This remains explicit even though protocol version 1 has no valid
-        // desktop-to-kernel attachments, so future variants cannot accidentally
-        // leave unconsumed capabilities in the broker table.
-        self.close_attachments(attachments);
+        if let RuntimeMessage::LaunchProgram {
+            requester,
+            app_id,
+            startup_attachment,
+        } = packet.message
+        {
+            let startup = attachments[usize::from(startup_attachment.get())];
+            let object_type = self.handles.object_type(startup)?;
+            if object_type != ObjectType::Channel {
+                self.close_attachments(attachments);
+                return Err(DesktopBrokerError::RuntimeChannelType(object_type));
+            }
+            let required = Rights::READ | Rights::WRITE | Rights::WAIT | Rights::TRANSFER;
+            let actual = self.handles.handle_rights(startup)?;
+            if !actual.contains(required) {
+                self.close_attachments(attachments);
+                return Err(DesktopBrokerError::RuntimeChannelRights { required, actual });
+            }
+            return Ok(DesktopRuntimeEvent::LaunchRequested {
+                requester,
+                app_id,
+                startup,
+            });
+        }
 
+        self.close_attachments(attachments);
         match packet.message {
             RuntimeMessage::ServiceReady { .. } => {
                 self.service_ready = true;
@@ -383,6 +409,9 @@ impl DesktopBroker {
             } => self.present(
                 client_id, request_id, window_id, generation, buffer_id, &damage,
             ),
+            RuntimeMessage::LaunchProgram { .. } => {
+                unreachable!("launch packets return before attachment cleanup")
+            }
             _ => unreachable!("validated desktop packet had a kernel-only message"),
         }
     }
@@ -468,6 +497,21 @@ impl DesktopBroker {
             return Err(error);
         }
         Ok(client)
+    }
+
+    /// Closes a broker-owned startup channel after a rejected launch.
+    pub fn close_startup_channel(&mut self, startup: Handle) {
+        let _ = self.handles.handle_close(startup);
+    }
+
+    /// Moves a broker-owned startup channel into a newly created process.
+    pub fn move_startup_channel(
+        &mut self,
+        startup: Handle,
+        destination: &mut HandleTable,
+    ) -> Result<Handle, DesktopBrokerError> {
+        let rights = Rights::READ | Rights::WRITE | Rights::WAIT;
+        handle_move_between(&mut self.handles, destination, startup, rights).map_err(Into::into)
     }
 
     /// Removes all broker resources owned by a disconnected client.

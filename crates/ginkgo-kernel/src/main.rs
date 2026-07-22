@@ -90,32 +90,44 @@ static MINIMAL_CLIENT_ELF: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-minimal-client.elf"));
 static FILE_NAVIGATOR_ELF: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-file-navigator.elf"));
+static TERMINAL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-terminal.elf"));
 static PROGRAM_REGISTRY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/programs.gkr"));
 
 const DESKTOP_PATH: &str = "/desktop.elf";
 const MINIMAL_CLIENT_PATH: &str = "/minimal-client.elf";
 const FILE_NAVIGATOR_PATH: &str = "/file-navigator.elf";
+const TERMINAL_PATH: &str = "/terminal.elf";
 const PROGRAM_REGISTRY_PATH: &str = "/programs.gkr";
-const MAX_EXECUTABLE_BYTES: usize = 512 * 1024;
+const MAX_EXECUTABLE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LAUNCHER_PROGRAMS: usize = 6;
 
 #[derive(Clone, Copy)]
 struct ProgramSummary {
+    app_id: [u8; 64],
+    app_id_len: usize,
     name: [u8; 48],
     name_len: usize,
     path: [u8; 64],
     path_len: usize,
     filesystem: bool,
+    process_launch: bool,
 }
 
 impl ProgramSummary {
     const EMPTY: Self = Self {
+        app_id: [0; 64],
+        app_id_len: 0,
         name: [0; 48],
         name_len: 0,
         path: [0; 64],
         path_len: 0,
         filesystem: false,
+        process_launch: false,
     };
+
+    fn app_id(&self) -> &str {
+        unsafe { core::str::from_utf8_unchecked(&self.app_id[..self.app_id_len]) }
+    }
 
     fn name(&self) -> &str {
         unsafe { core::str::from_utf8_unchecked(&self.name[..self.name_len]) }
@@ -144,6 +156,13 @@ impl ProgramCatalog {
             .copied()
             .filter(|_| index < self.len)
     }
+
+    fn find(&self, app_id: &str) -> Option<ProgramSummary> {
+        self.programs[..self.len]
+            .iter()
+            .copied()
+            .find(|program| program.app_id() == app_id)
+    }
 }
 
 fn install_and_load_system_programs<D: Disk>(
@@ -152,6 +171,7 @@ fn install_and_load_system_programs<D: Disk>(
     install_system_file(fs, DESKTOP_PATH, DESKTOP_ELF)?;
     install_system_file(fs, MINIMAL_CLIENT_PATH, MINIMAL_CLIENT_ELF)?;
     install_system_file(fs, FILE_NAVIGATOR_PATH, FILE_NAVIGATOR_ELF)?;
+    install_system_file(fs, TERMINAL_PATH, TERMINAL_ELF)?;
     install_system_file(fs, PROGRAM_REGISTRY_PATH, PROGRAM_REGISTRY)?;
 
     let registry_bytes = read_system_file(fs, PROGRAM_REGISTRY_PATH, 16 * 1024)?;
@@ -164,9 +184,11 @@ fn install_and_load_system_programs<D: Disk>(
     let mut catalog = ProgramCatalog::EMPTY;
     for entry in registry.visible_entries().take(MAX_LAUNCHER_PROGRAMS) {
         let slot = &mut catalog.programs[catalog.len];
+        slot.app_id_len = copy_program_string(&mut slot.app_id, entry.app_id)?;
         slot.name_len = copy_program_string(&mut slot.name, entry.display_name)?;
         slot.path_len = copy_program_string(&mut slot.path, entry.executable_path)?;
         slot.filesystem = entry.flags.contains(EntryFlags::FILESYSTEM);
+        slot.process_launch = entry.flags.contains(EntryFlags::PROCESS_LAUNCH);
         catalog.len += 1;
     }
 
@@ -466,6 +488,13 @@ pub extern "C" fn _start() -> ! {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ProcessClient {
+    process_id: ProcessId,
+    client_id: ClientId,
+    may_launch: bool,
+}
+
 struct KernelContext {
     frames: UsableFrameAllocator<'static>,
     page_table: ActivePageTable,
@@ -479,7 +508,7 @@ struct KernelContext {
     paging_verified: bool,
     processes: ProcessTable,
     desktop: Option<DesktopBroker>,
-    process_clients: Vec<(ProcessId, ClientId)>,
+    process_clients: Vec<ProcessClient>,
     next_client_id: u64,
     launch_requested: Option<usize>,
     launcher_toggle_pending: bool,
@@ -1151,9 +1180,9 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
     if let Some(index) = context
         .process_clients
         .iter()
-        .position(|(known_process, _)| *known_process == process_id)
+        .position(|known| known.process_id == process_id)
     {
-        let (_, client_id) = context.process_clients.swap_remove(index);
+        let client_id = context.process_clients.swap_remove(index).client_id;
         let removed_windows = context
             .desktop
             .as_mut()
@@ -1246,8 +1275,11 @@ fn console_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll 
     TaskPoll::Pending
 }
 
-fn launch_registered_program(context: &mut KernelContext, program_index: usize) -> Result<(), ()> {
-    let program = context.ui.catalog.get(program_index).ok_or(())?;
+fn launch_program(
+    context: &mut KernelContext,
+    program: ProgramSummary,
+    startup: Option<ginkgo_sysapi::Handle>,
+) -> Result<(), ()> {
     let image = read_system_file(&mut context.fs, program.path(), MAX_EXECUTABLE_BYTES).ok_or(())?;
     let mut process =
         Process::from_elf(&image, &context.page_table, &mut context.frames).map_err(|_| ())?;
@@ -1260,17 +1292,45 @@ fn launch_registered_program(context: &mut KernelContext, program_index: usize) 
         .ok_or(())?
         .connect_client(client_id, process.handles_mut())
         .map_err(|_| ())?;
-    let filesystem = if program.filesystem {
-        process
-            .handles_mut()
-            .filesystem_root_create()
-            .map_err(|_| ())?
-    } else {
-        ginkgo_sysapi::Handle::INVALID
+    let setup = (|| {
+        let filesystem = if program.filesystem {
+            process
+                .handles_mut()
+                .filesystem_root_create()
+                .map_err(|_| ())?
+        } else {
+            ginkgo_sysapi::Handle::INVALID
+        };
+        let startup = match startup {
+            Some(startup) => context
+                .desktop
+                .as_mut()
+                .ok_or(())?
+                .move_startup_channel(startup, process.handles_mut())
+                .map_err(|_| ())?,
+            None => ginkgo_sysapi::Handle::INVALID,
+        };
+        process.set_start_arguments([
+            u64::from(channel.raw()),
+            u64::from(filesystem.raw()),
+            u64::from(startup.raw()),
+        ]);
+        context.processes.insert(process).map_err(|_| ())
+    })();
+    let process_id = match setup {
+        Ok(process_id) => process_id,
+        Err(()) => {
+            if let Some(desktop) = context.desktop.as_mut() {
+                let _ = desktop.cleanup_client(client_id);
+            }
+            return Err(());
+        }
     };
-    process.set_start_arguments([u64::from(channel.raw()), u64::from(filesystem.raw()), 0]);
-    let process_id = context.processes.insert(process).map_err(|_| ())?;
-    context.process_clients.push((process_id, client_id));
+    context.process_clients.push(ProcessClient {
+        process_id,
+        client_id,
+        may_launch: program.process_launch,
+    });
     let mut sink = SerialDebugSink::new(&mut context.serial);
     let _ = writeln!(
         sink,
@@ -1280,6 +1340,11 @@ fn launch_registered_program(context: &mut KernelContext, program_index: usize) 
         client_id.get()
     );
     Ok(())
+}
+
+fn launch_registered_program(context: &mut KernelContext, program_index: usize) -> Result<(), ()> {
+    let program = context.ui.catalog.get(program_index).ok_or(())?;
+    launch_program(context, program, None)
 }
 
 fn redraw_desktop(context: &mut KernelContext) {
@@ -1339,6 +1404,34 @@ fn desktop_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                     } else {
                         context.ui.hide_launcher(&mut context.screen);
                     }
+                }
+            }
+            DesktopRuntimeEvent::LaunchRequested {
+                requester,
+                app_id,
+                startup,
+            } => {
+                let authorized = context
+                    .process_clients
+                    .iter()
+                    .any(|known| known.client_id == requester && known.may_launch);
+                let program = authorized
+                    .then(|| context.ui.catalog.find(&app_id))
+                    .flatten();
+                if program
+                    .and_then(|program| launch_program(context, program, Some(startup)).ok())
+                    .is_none()
+                {
+                    if let Some(desktop) = context.desktop.as_mut() {
+                        desktop.close_startup_channel(startup);
+                    }
+                    let mut sink = SerialDebugSink::new(&mut context.serial);
+                    let _ = writeln!(
+                        sink,
+                        "launcher: rejected app={} requester={}\r",
+                        app_id,
+                        requester.get()
+                    );
                 }
             }
             DesktopRuntimeEvent::PlacementsChanged { .. }

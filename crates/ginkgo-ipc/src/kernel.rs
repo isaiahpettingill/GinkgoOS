@@ -1306,6 +1306,43 @@ impl Default for HandleTable {
     }
 }
 
+/// Atomically moves one capability between process-local handle tables.
+///
+/// The source must carry `TRANSFER`, and `rights` must be a subset of its current
+/// rights. Destination capacity is reserved before the source is consumed, so any
+/// reported error leaves the source handle unchanged.
+pub fn handle_move_between(
+    source_table: &mut HandleTable,
+    destination_table: &mut HandleTable,
+    source_handle: Handle,
+    rights: Rights,
+) -> Result<Handle, IpcError> {
+    let (source_index, _) = source_table.validated_slot(source_handle)?;
+    let source_entry = source_table.slots[source_index]
+        .entry
+        .as_ref()
+        .ok_or(IpcError::InvalidHandle)?;
+    if !source_entry.rights.contains(Rights::TRANSFER) {
+        return Err(IpcError::AccessDenied);
+    }
+    if !source_entry.rights.contains(rights) {
+        return Err(IpcError::InvalidRights);
+    }
+
+    let destination_index = destination_table.reserve_slots(1)?[0];
+    let mut entry = source_table.slots[source_index]
+        .entry
+        .take()
+        .expect("validated move slot became vacant");
+    source_table.slots[source_index].advance_generation();
+    entry.rights = rights;
+    destination_table.slots[destination_index].entry = Some(entry);
+    Ok(handle_from_parts(
+        destination_index,
+        destination_table.slots[destination_index].generation,
+    ))
+}
+
 /// Creates one channel endpoint in each of two process-local handle tables.
 pub fn channel_create_between(
     left_table: &mut HandleTable,
@@ -2499,6 +2536,48 @@ mod tests {
         );
         assert_eq!(table.handle_rights(move_source), Ok(move_rights));
         assert_eq!(table.handle_rights(duplicate_source), Ok(duplicate_rights));
+    }
+
+    #[test]
+    fn direct_cross_table_move_attenuates_rights_and_invalidates_the_source() {
+        let mut source = HandleTable::new();
+        let mut destination = HandleTable::new();
+        let (endpoint, peer) = source.channel_create().unwrap();
+        let destination_rights = Rights::READ | Rights::WRITE | Rights::WAIT;
+
+        let moved =
+            handle_move_between(&mut source, &mut destination, endpoint, destination_rights)
+                .unwrap();
+        assert_eq!(source.handle_rights(endpoint), Err(IpcError::InvalidHandle));
+        assert_eq!(destination.handle_rights(moved), Ok(destination_rights));
+        source.channel_write(peer, b"hello", &[]).unwrap();
+        let mut bytes = [0; 5];
+        let info = destination
+            .channel_read(moved, &mut bytes, &mut [])
+            .unwrap();
+        assert_eq!(info.byte_count, 5);
+        assert_eq!(&bytes, b"hello");
+
+        let (without_transfer, _) = source.channel_create().unwrap();
+        let without_transfer = source
+            .handle_duplicate(
+                without_transfer,
+                Rights::READ | Rights::WRITE | Rights::WAIT,
+            )
+            .unwrap();
+        assert_eq!(
+            handle_move_between(
+                &mut source,
+                &mut destination,
+                without_transfer,
+                Rights::READ,
+            ),
+            Err(IpcError::AccessDenied)
+        );
+        assert_eq!(
+            source.handle_rights(without_transfer),
+            Ok(Rights::READ | Rights::WRITE | Rights::WAIT)
+        );
     }
 
     #[test]

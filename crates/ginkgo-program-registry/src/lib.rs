@@ -61,8 +61,10 @@ impl EntryFlags {
     pub const HIDDEN: Self = Self(1 << 0);
     /// Grant a process-local filesystem-root capability at launch.
     pub const FILESYSTEM: Self = Self(1 << 1);
+    /// Allow this application to request registry-governed child launches.
+    pub const PROCESS_LAUNCH: Self = Self(1 << 2);
 
-    const KNOWN_BITS: u16 = Self::HIDDEN.0 | Self::FILESYSTEM.0;
+    const KNOWN_BITS: u16 = Self::HIDDEN.0 | Self::FILESYSTEM.0 | Self::PROCESS_LAUNCH.0;
 
     /// Creates flags if every bit is known to this format version.
     pub const fn from_bits(bits: u16) -> Option<Self> {

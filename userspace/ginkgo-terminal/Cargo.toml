@@ -1,5 +1,5 @@
 [package]
-name = "ginkgo-desktop-service"
+name = "ginkgo-terminal"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -7,12 +7,13 @@ license.workspace = true
 build = "build.rs"
 
 [[bin]]
-name = "ginkgo-desktop-service"
+name = "ginkgo-terminal"
 path = "src/main.rs"
 
 [dependencies]
-ginkgo-desktop.workspace = true
-ginkgo-runtime.workspace = true
 ginkgo-terminal-protocol.workspace = true
+ginkgo-graphics.workspace = true
+ginkgo-runtime.workspace = true
 ginkgo-userspace.workspace = true
 ginkgo-window.workspace = true
+rhai.workspace = true

@@ -5,7 +5,7 @@
 //! attachment indices in the payload are valid only after [`RuntimePacket::validate`]
 //! has checked the actual attachment count supplied by the transport.
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 
 use ginkgo_window::{
     BufferId, ConfigurationError, Generation, KeyboardEvent, Point, PointerEventKind, Rect,
@@ -20,7 +20,7 @@ pub const RUNTIME_PROTOCOL_ID: u32 = u32::from_le_bytes(*b"GKDR");
 /// Current version of the desktop runtime protocol.
 ///
 /// Existing variants and fields are append-only within a version.
-pub const RUNTIME_PROTOCOL_VERSION: u16 = 1;
+pub const RUNTIME_PROTOCOL_VERSION: u16 = 2;
 /// Maximum encoded packet size, matching the channel transport limit.
 pub const MAX_RUNTIME_PACKET_BYTES: usize = 16 * 1024;
 /// Maximum number of placements accepted in one replacement set.
@@ -166,6 +166,12 @@ pub enum RuntimeMessage {
         buffer_id: BufferId,
         damage: Vec<Rect>,
     },
+    /// Requests a registry-governed launch and transfers the child's console endpoint.
+    LaunchProgram {
+        requester: ClientId,
+        app_id: String,
+        startup_attachment: AttachmentIndex,
+    },
 
     // Kernel broker -> desktop service.
     ToggleLauncher,
@@ -207,7 +213,9 @@ impl RuntimeMessage {
     /// Returns the exact number of out-of-band attachments this message requires.
     pub const fn required_attachment_count(&self) -> usize {
         match self {
-            Self::ClientConnected { .. } | Self::SurfaceReady { .. } => 1,
+            Self::LaunchProgram { .. }
+            | Self::ClientConnected { .. }
+            | Self::SurfaceReady { .. } => 1,
             _ => 0,
         }
     }
@@ -224,7 +232,8 @@ impl RuntimeMessage {
             | Self::Configure { .. }
             | Self::DestroyWindow { .. }
             | Self::SetPlacements { .. }
-            | Self::Present { .. } => RuntimeSender::DesktopService,
+            | Self::Present { .. }
+            | Self::LaunchProgram { .. } => RuntimeSender::DesktopService,
             Self::ToggleLauncher
             | Self::ClientConnected { .. }
             | Self::SurfaceReady { .. }
@@ -248,6 +257,9 @@ impl RuntimeMessage {
             });
         }
         match self {
+            Self::LaunchProgram {
+                startup_attachment, ..
+            } => validate_attachment(*startup_attachment, attachment_count)?,
             Self::ClientConnected {
                 channel_attachment, ..
             } => validate_attachment(*channel_attachment, attachment_count)?,
@@ -271,6 +283,11 @@ impl RuntimeMessage {
                 .map_err(RuntimeValidationError::InvalidConfiguration),
             Self::SetPlacements { placements } => validate_placements(placements),
             Self::Present { damage, .. } => validate_damage(damage),
+            Self::LaunchProgram { app_id, .. }
+                if app_id.is_empty() || app_id.len() > 255 || !app_id.is_ascii() =>
+            {
+                Err(RuntimeValidationError::InvalidApplicationId)
+            }
             Self::KeyboardInput { event } if !(1..=0x00e7).contains(&event.usage) => {
                 Err(RuntimeValidationError::InvalidKeyboardUsage(event.usage))
             }
@@ -417,6 +434,7 @@ pub enum RuntimeValidationError {
     InvalidDamageRect {
         index: usize,
     },
+    InvalidApplicationId,
     InvalidKeyboardUsage(u16),
 }
 
@@ -615,9 +633,15 @@ mod tests {
                 buffer_id: BufferId::new(0),
                 damage: vec![Rect::new(Point::new(0, 0), Size::new(4, 2))],
             },
+            RuntimeMessage::LaunchProgram {
+                requester: client_id(1),
+                app_id: String::from("minimal-client"),
+                startup_attachment: AttachmentIndex::new(0),
+            },
         ];
         for message in service_messages {
-            round_trip(message, RuntimeSender::DesktopService, 0);
+            let attachments = message.required_attachment_count();
+            round_trip(message, RuntimeSender::DesktopService, attachments);
         }
 
         let broker_messages = vec![

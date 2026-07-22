@@ -10,6 +10,7 @@ USERSPACE_TARGET := userspace/target/x86_64-unknown-none/release
 DESKTOP_ELF := $(USERSPACE_TARGET)/ginkgo-desktop-service
 MINIMAL_CLIENT_ELF := $(USERSPACE_TARGET)/ginkgo-minimal-client
 FILE_NAVIGATOR_ELF := $(USERSPACE_TARGET)/ginkgo-file-navigator
+TERMINAL_ELF := $(USERSPACE_TARGET)/ginkgo-terminal
 FS_IMAGE := $(BUILD_DIR)/ginkgo-redoxfs.img
 FS_IMAGE_SIZE_MB ?= 16
 ISO := $(BUILD_DIR)/$(IMAGE_NAME).iso
@@ -41,10 +42,10 @@ QEMU_FLAGS ?= -m 512M -M pc,i8042=off -serial stdio -device qemu-xhci,id=xhci -d
 all: iso
 
 userspace:
-	cargo build --manifest-path $(USERSPACE_MANIFEST) --release --target x86_64-unknown-none -p ginkgo-desktop-service -p ginkgo-minimal-client -p ginkgo-file-navigator
+	cargo build --manifest-path $(USERSPACE_MANIFEST) --release --target x86_64-unknown-none -p ginkgo-desktop-service -p ginkgo-minimal-client -p ginkgo-file-navigator -p ginkgo-terminal
 
 kernel: userspace
-	GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" cargo build -p ginkgo-kernel --bin ginkgo-os
+	GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" GINKGO_TERMINAL_ELF="$(abspath $(TERMINAL_ELF))" cargo build -p ginkgo-kernel --bin ginkgo-os
 
 $(LIMINE_DIR)/BOOTX64.EFI:
 	mkdir -p $(BUILD_DIR)
@@ -105,7 +106,7 @@ run: $(OVMF_CODE) $(ISO) $(FS_IMAGE)
 		-cdrom $(ISO) -boot d
 
 check: userspace
-	GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" cargo check -p ginkgo-kernel --bin ginkgo-os
+	GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" GINKGO_TERMINAL_ELF="$(abspath $(TERMINAL_ELF))" cargo check -p ginkgo-kernel --bin ginkgo-os
 
 clean:
 	cargo clean

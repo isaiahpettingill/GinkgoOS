@@ -4,6 +4,7 @@ members = [
     "ginkgo-desktop-service",
     "ginkgo-minimal-client",
     "ginkgo-file-navigator",
+    "ginkgo-terminal",
 ]
 exclude = ["validator"]
 resolver = "2"
@@ -18,8 +19,10 @@ license = "MIT"
 ginkgo-desktop = { path = "../crates/ginkgo-desktop" }
 ginkgo-graphics = { path = "../crates/ginkgo-graphics" }
 ginkgo-runtime = { path = "ginkgo-runtime" }
+ginkgo-terminal-protocol = { path = "../crates/ginkgo-terminal-protocol" }
 ginkgo-userspace = { path = "../crates/ginkgo-userspace" }
 ginkgo-window = { path = "../crates/ginkgo-window" }
+rhai = { version = "1.25.1", default-features = false, features = ["no_std"] }
 spinning_top = "0.3"
 talc = "5.0.4"
 

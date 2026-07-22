@@ -1,0 +1,13 @@
+[package]
+name = "ginkgo-terminal-protocol"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ginkgo-ipc = { workspace = true, default-features = false }
+serde.workspace = true
