@@ -777,8 +777,8 @@ impl DrawTarget for FramebufferWriter<'_> {
 
 fn font_for_scale(scale: usize) -> &'static MonoFont<'static> {
     match scale {
-        0 | 1 => &PROFONT_7_POINT,
-        2 => &PROFONT_14_POINT,
+        0 => &PROFONT_7_POINT,
+        1 | 2 => &PROFONT_14_POINT,
         _ => &PROFONT_24_POINT,
     }
 }

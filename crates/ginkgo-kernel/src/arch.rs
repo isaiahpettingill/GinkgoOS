@@ -34,10 +34,10 @@
 //! guarantees CPU NX support and enables EFER.NXE; address-space code can use
 //! [`validate_no_execute_requirement`] before accepting `NO_EXECUTE` mappings.
 //!
-//! [`UserContext`] owns an aligned legacy x87/SSE FXSAVE image, so XMM state is
-//! eagerly isolated across syscall, fault, preemption, and process switches. CR4.OSXSAVE is
-//! cleared: AVX/XSAVE instructions are intentionally unavailable and fault as
-//! #UD; the supported userspace target baseline is x86-64 plus x87/SSE/SSE2.
+//! [`UserContext`] owns a 64-byte-aligned extended-state area. XSAVE-capable CPUs
+//! preserve enabled x87/SSE/AVX state across syscall, fault, preemption, and process
+//! switches; legacy CPUs fall back to FXSAVE. AVX2 uses the preserved AVX state,
+//! while system images retain an x86-64 plus x87/SSE/SSE2 target baseline.
 //! Debug-register, FS-base, and user GS-base state remain unsupported. User GS
 //! is reset to zero on every scheduler entry; GS is per-CPU state in the kernel.
 
@@ -82,6 +82,8 @@ const EXTENDED_FEATURES_LEAF: u32 = 0x8000_0001;
 const CPUID_SYSCALL_SYSRET: u32 = 1 << 11;
 const CPUID_NO_EXECUTE: u32 = 1 << 20;
 const CPUID_FPU: u32 = 1 << 0;
+const CPUID_XSAVE: u32 = 1 << 26;
+const CPUID_AVX: u32 = 1 << 28;
 const CPUID_FXSR: u32 = 1 << 24;
 const CPUID_SSE: u32 = 1 << 25;
 const CPUID_SSE2: u32 = 1 << 26;
@@ -92,7 +94,13 @@ const CR0_NUMERIC_ERROR: u64 = 1 << 5;
 const CR4_OSFXSR: u64 = 1 << 9;
 const CR4_OSXMMEXCPT: u64 = 1 << 10;
 const CR4_OSXSAVE: u64 = 1 << 18;
-const FXSAVE_SIZE: usize = 512;
+const CR4_SMAP: u64 = 1 << 21;
+const CPUID_SMAP: u32 = 1 << 20;
+const FXSAVE_SIZE: usize = 4096;
+
+const XCR0_X87: u64 = 1 << 0;
+const XCR0_SSE: u64 = 1 << 1;
+const XCR0_AVX: u64 = 1 << 2;
 const FXSAVE_FCW_OFFSET: usize = 0;
 const FXSAVE_MXCSR_OFFSET: usize = 24;
 const INITIAL_FCW: u16 = 0x037f;
@@ -139,8 +147,9 @@ const KERNEL_EXIT_PREEMPTED: u64 = 4;
 const USER_CONTEXT_GPR_QWORDS: usize = offset_of!(UserContext, rip) / size_of::<u64>();
 const USER_CONTEXT_QWORDS: usize = size_of::<UserContext>() / size_of::<u64>();
 
-/// Aligned x87/SSE state in the architectural 64-bit FXSAVE format.
-#[repr(C, align(16))]
+/// Aligned extended state area. XSAVE-capable CPUs preserve enabled AVX state;
+/// older CPUs use the architectural legacy prefix through FXSAVE.
+#[repr(C, align(64))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FxState {
     bytes: [u8; FXSAVE_SIZE],
@@ -192,8 +201,7 @@ impl Default for FxState {
 /// values (the return RIP and pre-syscall RFLAGS); after an interrupt they retain
 /// the ordinary user register values from the interrupted instruction. `rip` and
 /// `rflags` are always the authoritative control state. `fx_state` is eagerly
-/// switched with FXSAVE64/FXRSTOR64; AVX and other XSAVE-only state are
-/// intentionally unsupported.
+/// switched with XSAVE64/XRSTOR64 when available and FXSAVE64/FXRSTOR64 otherwise.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UserContext {
@@ -334,16 +342,29 @@ pub struct CpuCapabilities {
     pub syscall_sysret: bool,
     pub no_execute: bool,
     pub fxsave_sse: bool,
+    pub smap: bool,
+    pub xsave: bool,
+    pub avx: bool,
 }
 
 impl CpuCapabilities {
-    const fn from_cpuid(maximum_extended_leaf: u32, extended_edx: u32, standard_edx: u32) -> Self {
+    const fn from_cpuid(
+        maximum_extended_leaf: u32,
+        extended_edx: u32,
+        maximum_standard_leaf: u32,
+        standard_ecx: u32,
+        standard_edx: u32,
+        structured_ebx: u32,
+    ) -> Self {
         let has_extended_features = maximum_extended_leaf >= EXTENDED_FEATURES_LEAF;
         Self {
             syscall_sysret: has_extended_features && extended_edx & CPUID_SYSCALL_SYSRET != 0,
             no_execute: has_extended_features && extended_edx & CPUID_NO_EXECUTE != 0,
             fxsave_sse: standard_edx & (CPUID_FPU | CPUID_FXSR | CPUID_SSE | CPUID_SSE2)
                 == (CPUID_FPU | CPUID_FXSR | CPUID_SSE | CPUID_SSE2),
+            smap: maximum_standard_leaf >= 7 && structured_ebx & CPUID_SMAP != 0,
+            xsave: standard_ecx & CPUID_XSAVE != 0,
+            avx: standard_ecx & (CPUID_XSAVE | CPUID_AVX) == (CPUID_XSAVE | CPUID_AVX),
         }
     }
 }
@@ -406,6 +427,7 @@ pub enum InitializeError {
     SyscallUnsupported,
     NoExecuteUnsupported,
     FloatingPointUnsupported,
+    ExtendedStateTooLarge(u32),
     InvalidStackTop,
     SharedStackTop,
     InvalidInterruptEoiAddress,
@@ -648,6 +670,11 @@ struct SyscallCpuState {
     fault_error_code: u64,
     fault_address: u64,
     interrupt_eoi: u64,
+    user_copy_fixup: u64,
+    smap_enabled: u64,
+    xsave_enabled: u64,
+    xsave_mask_low: u64,
+    xsave_mask_high: u64,
 }
 
 impl SyscallCpuState {
@@ -663,6 +690,11 @@ impl SyscallCpuState {
             fault_error_code: 0,
             fault_address: 0,
             interrupt_eoi: 0,
+            user_copy_fixup: 0,
+            smap_enabled: 0,
+            xsave_enabled: 0,
+            xsave_mask_low: 0,
+            xsave_mask_high: 0,
         }
     }
 }
@@ -790,7 +822,7 @@ const fn valid_kernel_stack_top(address: u64) -> bool {
 /// Success is also the capability boundary for address-space setup: both
 /// `SYSCALL/SYSRET`, execute-disable, FXSAVE, SSE, and SSE2 have been verified
 /// by CPUID. EFER.NXE and CR4.OSFXSR/OSXMMEXCPT are active before return;
-/// CR4.OSXSAVE is deliberately clear.
+/// CR4.OSXSAVE is preserved rather than forcibly disabling hardware features.
 ///
 /// # Safety
 ///
@@ -848,8 +880,11 @@ pub unsafe fn initialize_cpu_with_external_interrupts(
     }
     stacks.validate()?;
     external.validate()?;
-    unsafe { configure_fxsave() };
+    let xsave_mask = unsafe { configure_extended_state(capabilities)? };
 
+    state.syscall.xsave_enabled = u64::from(xsave_mask.is_some());
+    state.syscall.xsave_mask_low = xsave_mask.unwrap_or(0) as u32 as u64;
+    state.syscall.xsave_mask_high = xsave_mask.unwrap_or(0) >> 32;
     state.syscall.syscall_stack_top = stacks.syscall;
     state.syscall.dispatcher = dispatcher as usize as u64;
     state.syscall.interrupt_eoi = external.local_apic_eoi;
@@ -970,6 +1005,7 @@ pub unsafe fn initialize_cpu_with_external_interrupts(
     };
 
     let state_address = state as *mut CpuPrivilegeState as u64;
+    state.syscall.smap_enabled = u64::from(capabilities.smap);
     unsafe {
         write_msr(IA32_GS_BASE, state_address);
         write_msr(IA32_KERNEL_GS_BASE, 0);
@@ -983,6 +1019,12 @@ pub unsafe fn initialize_cpu_with_external_interrupts(
             IA32_EFER,
             read_msr(IA32_EFER) | EFER_SYSTEM_CALL_EXTENSIONS | EFER_NO_EXECUTE_ENABLE,
         );
+        if capabilities.smap {
+            asm!("clac", options(nomem, nostack, preserves_flags));
+            let mut cr4: u64;
+            asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+            asm!("mov cr4, {}", in(reg) (cr4 | CR4_SMAP), options(nomem, nostack, preserves_flags));
+        }
     }
     Ok(())
 }
@@ -999,8 +1041,8 @@ pub unsafe fn initialize_cpu_with_external_interrupts(
 /// also retain supervisor-only mappings for this entry text, the per-CPU state,
 /// the syscall stack, and `context`; SYSCALL does not switch page tables. The
 /// assembly preserves the kernel ABI's callee-saved GPRs, eagerly switches the
-/// complete FXSAVE x87/SSE image, and restores the exact kernel stack before
-/// this function returns. XSAVE-only state is deliberately unavailable.
+/// complete enabled x87/SSE/AVX image, and restores the exact kernel stack before
+/// this function returns.
 pub unsafe fn enter_user(context: &mut UserContext) -> Result<KernelExit, EnterUserError> {
     context.validate().map_err(EnterUserError::InvalidContext)?;
 
@@ -1092,18 +1134,33 @@ fn interrupts_enabled() -> bool {
 pub fn cpu_capabilities() -> CpuCapabilities {
     #[cfg(target_arch = "x86_64")]
     {
+        let maximum_standard = core::arch::x86_64::__cpuid(0).eax;
         let maximum = core::arch::x86_64::__cpuid(0x8000_0000).eax;
         let extended_edx = if maximum >= EXTENDED_FEATURES_LEAF {
             core::arch::x86_64::__cpuid(EXTENDED_FEATURES_LEAF).edx
         } else {
             0
         };
-        let standard_edx = core::arch::x86_64::__cpuid(1).edx;
-        CpuCapabilities::from_cpuid(maximum, extended_edx, standard_edx)
+        let standard = core::arch::x86_64::__cpuid(1);
+        let standard_ecx = standard.ecx;
+        let standard_edx = standard.edx;
+        let structured_ebx = if maximum_standard >= 7 {
+            core::arch::x86_64::__cpuid_count(7, 0).ebx
+        } else {
+            0
+        };
+        CpuCapabilities::from_cpuid(
+            maximum,
+            extended_edx,
+            maximum_standard,
+            standard_ecx,
+            standard_edx,
+            structured_ebx,
+        )
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        CpuCapabilities::from_cpuid(0, 0, 0)
+        CpuCapabilities::from_cpuid(0, 0, 0, 0, 0, 0)
     }
 }
 
@@ -1111,11 +1168,18 @@ const fn fxsave_cr0(current: u64) -> u64 {
     (current | CR0_MONITOR_COPROCESSOR | CR0_NUMERIC_ERROR) & !(CR0_EMULATION | CR0_TASK_SWITCHED)
 }
 
-const fn fxsave_cr4(current: u64) -> u64 {
-    (current | CR4_OSFXSR | CR4_OSXMMEXCPT) & !CR4_OSXSAVE
+const fn fxsave_cr4(current: u64, xsave: bool) -> u64 {
+    let required = CR4_OSFXSR | CR4_OSXMMEXCPT;
+    if xsave {
+        current | required | CR4_OSXSAVE
+    } else {
+        current | required
+    }
 }
 
-unsafe fn configure_fxsave() {
+unsafe fn configure_extended_state(
+    capabilities: CpuCapabilities,
+) -> Result<Option<u64>, InitializeError> {
     let mut cr0: u64;
     let mut cr4: u64;
     unsafe {
@@ -1123,11 +1187,31 @@ unsafe fn configure_fxsave() {
         asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
     }
     cr0 = fxsave_cr0(cr0);
-    cr4 = fxsave_cr4(cr4);
+    cr4 = fxsave_cr4(cr4, capabilities.xsave);
     unsafe {
         asm!("mov cr0, {}", in(reg) cr0, options(nomem, nostack, preserves_flags));
         asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags));
     }
+
+    let xsave_mask = if capabilities.xsave {
+        let mask = XCR0_X87 | XCR0_SSE | if capabilities.avx { XCR0_AVX } else { 0 };
+        unsafe {
+            asm!(
+                "xsetbv",
+                in("ecx") 0_u32,
+                in("eax") mask as u32,
+                in("edx") (mask >> 32) as u32,
+                options(nostack),
+            );
+        }
+        let required = core::arch::x86_64::__cpuid_count(0x0d, 0).ebx;
+        if required as usize > FXSAVE_SIZE {
+            return Err(InitializeError::ExtendedStateTooLarge(required));
+        }
+        Some(mask)
+    } else {
+        None
+    };
 
     let mxcsr = INITIAL_MXCSR;
     unsafe {
@@ -1138,6 +1222,7 @@ unsafe fn configure_fxsave() {
             options(readonly, preserves_flags),
         );
     }
+    Ok(xsave_mask)
 }
 
 unsafe fn load_gdt_and_tss(gdtr: &DescriptorTablePointer) {
@@ -1244,6 +1329,16 @@ const STATE_FAULT_ADDRESS: usize =
     offset_of!(CpuPrivilegeState, syscall) + offset_of!(SyscallCpuState, fault_address);
 const STATE_INTERRUPT_EOI: usize =
     offset_of!(CpuPrivilegeState, syscall) + offset_of!(SyscallCpuState, interrupt_eoi);
+const STATE_USER_COPY_FIXUP: usize =
+    offset_of!(CpuPrivilegeState, syscall) + offset_of!(SyscallCpuState, user_copy_fixup);
+const STATE_SMAP_ENABLED: usize =
+    offset_of!(CpuPrivilegeState, syscall) + offset_of!(SyscallCpuState, smap_enabled);
+const STATE_XSAVE_ENABLED: usize =
+    offset_of!(CpuPrivilegeState, syscall) + offset_of!(SyscallCpuState, xsave_enabled);
+const STATE_XSAVE_MASK_LOW: usize =
+    offset_of!(CpuPrivilegeState, syscall) + offset_of!(SyscallCpuState, xsave_mask_low);
+const STATE_XSAVE_MASK_HIGH: usize =
+    offset_of!(CpuPrivilegeState, syscall) + offset_of!(SyscallCpuState, xsave_mask_high);
 
 const EXCEPTION_SAVED_GPRS_SIZE: usize = USER_CONTEXT_GPR_QWORDS * size_of::<u64>();
 const EXCEPTION_VECTOR_OFFSET: usize =
@@ -1257,8 +1352,22 @@ const EXCEPTION_RFLAGS_OFFSET: usize =
 const EXCEPTION_RSP_OFFSET: usize =
     EXCEPTION_SAVED_GPRS_SIZE + offset_of!(NormalizedExceptionFrame, rsp);
 const NORMALIZED_EXCEPTION_CS_OFFSET: usize = offset_of!(NormalizedExceptionFrame, cs);
+const KERNEL_EXCEPTION_RIP_OFFSET: usize = offset_of!(NormalizedExceptionFrame, rip);
+
+/// Copies a validated range while recovering a page fault as `false`.
+///
+/// # Safety
+/// Both ranges must be valid for `length`; exactly one range may refer to the
+/// active userspace address space. Interrupts must remain disabled.
+pub unsafe fn copy_user_bytes(destination: *mut u8, source: *const u8, length: usize) -> bool {
+    if length == 0 {
+        return true;
+    }
+    unsafe { ginkgo_x86_copy_user(destination, source, length) == 0 }
+}
 
 extern "C" {
+    fn ginkgo_x86_copy_user(destination: *mut u8, source: *const u8, length: usize) -> u64;
     fn ginkgo_x86_syscall_entry();
     fn ginkgo_x86_enter_user(context: *mut UserContext) -> u64;
     fn ginkgo_x86_exception_fail_stop();
@@ -1300,6 +1409,7 @@ global_asm!(
     r#"
     .text
     .global ginkgo_x86_enter_user
+    .global ginkgo_x86_copy_user
     .global ginkgo_x86_syscall_entry
     .global ginkgo_x86_exception_fail_stop
     .global ginkgo_x86_exception_divide_error
@@ -1324,6 +1434,29 @@ global_asm!(
     .global ginkgo_x86_exception_security
     .global ginkgo_x86_timer_interrupt
     .global ginkgo_x86_spurious_interrupt
+
+// Fault-contained copy used after page-table validation. The page-fault handler
+// redirects to the local failure label and clears AC before any Rust resumes.
+ginkgo_x86_copy_user:
+    leaq .Lginkgo_user_copy_fault(%rip), %rax
+    movq %rax, %gs:{state_user_copy_fixup}
+    cmpq $0, %gs:{state_smap_enabled}
+    je .Lginkgo_user_copy_access
+    stac
+.Lginkgo_user_copy_access:
+    movq %rdx, %rcx
+    cld
+    rep movsb
+    cmpq $0, %gs:{state_smap_enabled}
+    je .Lginkgo_user_copy_success
+    clac
+.Lginkgo_user_copy_success:
+    movq $0, %gs:{state_user_copy_fixup}
+    xorl %eax, %eax
+    retq
+.Lginkgo_user_copy_fault:
+    movl $1, %eax
+    retq
 
 // Unsupported vectors, NMI, #DF, and #MC use this through IDT-selected stacks.
 // This path is safe in every SWAPGS state: it never reads memory or GS.
@@ -1361,6 +1494,10 @@ ginkgo_x86_timer_interrupt:
 
 .Lginkgo_timer_from_user:
     swapgs
+    cmpq $0, %gs:{state_smap_enabled}
+    je .Lginkgo_timer_ac_clear
+    clac
+.Lginkgo_timer_ac_clear:
     cmpq $0, %gs:{state_active_context}
     je .Lginkgo_fail_stop
 
@@ -1396,8 +1533,18 @@ ginkgo_x86_timer_interrupt:
     movq %rax, 16(%rdi)
 
     movq %gs:{state_active_context}, %rax
+    cmpq $0, %gs:{state_xsave_enabled}
+    je .Lginkgo_timer_fxsave_user
+    movl %gs:{state_xsave_mask_low}, %eax
+    movl %gs:{state_xsave_mask_high}, %edx
+    movq %gs:{state_active_context}, %rcx
+    xsave64 {ctx_fx_state}(%rcx)
+    xrstor64 %gs:{state_kernel_fx}
+    jmp .Lginkgo_timer_fx_ready
+.Lginkgo_timer_fxsave_user:
     fxsave64 {ctx_fx_state}(%rax)
     fxrstor64 %gs:{state_kernel_fx}
+.Lginkgo_timer_fx_ready:
 
     // All user registers are captured, so RAX is scratch for the MMIO EOI.
     movq %gs:{state_interrupt_eoi}, %rax
@@ -1501,11 +1648,30 @@ ginkgo_x86_exception_security:
     pushq ${security_exception_vector}
 
 .Lginkgo_exception_common:
-    // This check uses only the protected hardware frame and does not clobber a
-    // GPR. Kernel faults must not SWAPGS or attempt user recovery.
+    // Kernel page faults are recoverable only while the explicit user-copy
+    // fixup is armed. All other kernel faults fail stop.
     testb $3, {normalized_exception_cs}(%rsp)
-    jz .Lginkgo_fail_stop
+    jnz .Lginkgo_exception_from_user
+    cmpq ${page_fault_vector}, 0(%rsp)
+    jne .Lginkgo_fail_stop
+    cmpq $0, %gs:{state_user_copy_fixup}
+    je .Lginkgo_fail_stop
+    movq %gs:{state_user_copy_fixup}, %rax
+    movq $0, %gs:{state_user_copy_fixup}
+    movq %rax, {kernel_exception_rip}(%rsp)
+    cmpq $0, %gs:{state_smap_enabled}
+    je .Lginkgo_user_copy_fault_return
+    clac
+.Lginkgo_user_copy_fault_return:
+    addq $16, %rsp
+    iretq
+
+.Lginkgo_exception_from_user:
     swapgs
+    cmpq $0, %gs:{state_smap_enabled}
+    je .Lginkgo_exception_ac_clear
+    clac
+.Lginkgo_exception_ac_clear:
     cmpq $0, %gs:{state_active_context}
     je .Lginkgo_fail_stop
 
@@ -1547,8 +1713,18 @@ ginkgo_x86_exception_security:
     clts
 .Lginkgo_fx_fault_ready:
     movq %gs:{state_active_context}, %rax
+    cmpq $0, %gs:{state_xsave_enabled}
+    je .Lginkgo_exception_fxsave_user
+    movl %gs:{state_xsave_mask_low}, %eax
+    movl %gs:{state_xsave_mask_high}, %edx
+    movq %gs:{state_active_context}, %rcx
+    xsave64 {ctx_fx_state}(%rcx)
+    xrstor64 %gs:{state_kernel_fx}
+    jmp .Lginkgo_exception_fx_ready
+.Lginkgo_exception_fxsave_user:
     fxsave64 {ctx_fx_state}(%rax)
     fxrstor64 %gs:{state_kernel_fx}
+.Lginkgo_exception_fx_ready:
 
     movq {exception_error_code}(%rsp), %r9
     movq %r8, %gs:{state_fault_vector}
@@ -1623,8 +1799,17 @@ ginkgo_x86_syscall_entry:
     movq %r11, {ctx_rflags}(%rsp)
     movq %gs:{state_user_rsp}, %rax
     movq %rax, {ctx_rsp}(%rsp)
+    cmpq $0, %gs:{state_xsave_enabled}
+    je .Lginkgo_syscall_fxsave_user
+    movl %gs:{state_xsave_mask_low}, %eax
+    movl %gs:{state_xsave_mask_high}, %edx
+    xsave64 {ctx_fx_state}(%rsp)
+    xrstor64 %gs:{state_kernel_fx}
+    jmp .Lginkgo_syscall_fx_ready
+.Lginkgo_syscall_fxsave_user:
     fxsave64 {ctx_fx_state}(%rsp)
     fxrstor64 %gs:{state_kernel_fx}
+.Lginkgo_syscall_fx_ready:
 
     cld
     movq %rsp, %rdi
@@ -1647,8 +1832,19 @@ ginkgo_x86_syscall_entry:
 // interrupted RCX/R11 values. FXSAVE state is consumed before the IRET frame
 // overwrites the top 40 bytes of a syscall-stack-resident temporary context.
 .Lginkgo_restore_user:
+    cmpq $0, %gs:{state_xsave_enabled}
+    je .Lginkgo_restore_user_fxsave
+    movq %rdx, %r8
+    movl %gs:{state_xsave_mask_low}, %eax
+    movl %gs:{state_xsave_mask_high}, %edx
+    xsave64 %gs:{state_kernel_fx}
+    xrstor64 {ctx_fx_state}(%r8)
+    movq %r8, %rdx
+    jmp .Lginkgo_restore_user_fx_ready
+.Lginkgo_restore_user_fxsave:
     fxsave64 %gs:{state_kernel_fx}
     fxrstor64 {ctx_fx_state}(%rdx)
+.Lginkgo_restore_user_fx_ready:
 
     // Build a trusted CPL3 hardware frame at the protected syscall stack top.
     movq %gs:{state_syscall_stack_top}, %rsp
@@ -1712,6 +1908,11 @@ ginkgo_x86_syscall_entry:
     state_fault_error_code = const STATE_FAULT_ERROR_CODE,
     state_fault_address = const STATE_FAULT_ADDRESS,
     state_interrupt_eoi = const STATE_INTERRUPT_EOI,
+    state_user_copy_fixup = const STATE_USER_COPY_FIXUP,
+    state_smap_enabled = const STATE_SMAP_ENABLED,
+    state_xsave_enabled = const STATE_XSAVE_ENABLED,
+    state_xsave_mask_low = const STATE_XSAVE_MASK_LOW,
+    state_xsave_mask_high = const STATE_XSAVE_MASK_HIGH,
     preemption_vector = const PREEMPTION_VECTOR,
     divide_error_vector = const DIVIDE_ERROR_VECTOR,
     debug_vector = const DEBUG_VECTOR,
@@ -1734,6 +1935,7 @@ ginkgo_x86_syscall_entry:
     vmm_communication_vector = const VMM_COMMUNICATION_VECTOR,
     security_exception_vector = const SECURITY_EXCEPTION_VECTOR,
     normalized_exception_cs = const NORMALIZED_EXCEPTION_CS_OFFSET,
+    kernel_exception_rip = const KERNEL_EXCEPTION_RIP_OFFSET,
     exception_vector = const EXCEPTION_VECTOR_OFFSET,
     exception_error_code = const EXCEPTION_ERROR_CODE_OFFSET,
     exception_rip = const EXCEPTION_RIP_OFFSET,
@@ -1800,20 +2002,26 @@ mod tests {
 
     #[test]
     fn extended_capabilities_gate_no_execute_requests() {
-        let absent = CpuCapabilities::from_cpuid(0x8000_0000, u32::MAX, 0);
+        let absent = CpuCapabilities::from_cpuid(0x8000_0000, u32::MAX, 0, 0, 0, 0);
         assert_eq!(
             absent,
             CpuCapabilities {
                 syscall_sysret: false,
                 no_execute: false,
                 fxsave_sse: false,
+                smap: false,
+                xsave: false,
+                avx: false,
             }
         );
 
         let syscall_only = CpuCapabilities::from_cpuid(
             EXTENDED_FEATURES_LEAF,
             CPUID_SYSCALL_SYSRET,
+            7,
+            0,
             CPUID_FPU | CPUID_FXSR | CPUID_SSE | CPUID_SSE2,
+            0,
         );
         assert!(syscall_only.syscall_sysret);
         assert!(!syscall_only.no_execute);
@@ -1826,15 +2034,24 @@ mod tests {
         let complete = CpuCapabilities::from_cpuid(
             EXTENDED_FEATURES_LEAF,
             CPUID_SYSCALL_SYSRET | CPUID_NO_EXECUTE,
+            7,
+            CPUID_XSAVE | CPUID_AVX,
             CPUID_FPU | CPUID_FXSR | CPUID_SSE | CPUID_SSE2,
+            CPUID_SMAP,
         );
         assert!(complete.syscall_sysret);
         assert!(complete.no_execute);
         assert!(complete.fxsave_sse);
+        assert!(complete.smap);
+        assert!(complete.xsave);
+        assert!(complete.avx);
         let missing_sse2 = CpuCapabilities::from_cpuid(
             EXTENDED_FEATURES_LEAF,
             CPUID_SYSCALL_SYSRET | CPUID_NO_EXECUTE,
+            7,
+            0,
             CPUID_FPU | CPUID_FXSR | CPUID_SSE,
+            0,
         );
         assert!(!missing_sse2.fxsave_sse);
         assert_eq!(validate_no_execute_requirement(true, complete), Ok(()));
@@ -1862,17 +2079,17 @@ mod tests {
     #[test]
     fn context_layout_matches_assembly_contract() {
         assert_eq!(size_of::<FxState>(), FXSAVE_SIZE);
-        assert_eq!(core::mem::align_of::<FxState>(), 16);
-        assert_eq!(size_of::<UserContext>(), 656);
-        assert_eq!(core::mem::align_of::<UserContext>(), 16);
+        assert_eq!(core::mem::align_of::<FxState>(), 64);
+        assert_eq!(size_of::<UserContext>(), 4288);
+        assert_eq!(core::mem::align_of::<UserContext>(), 64);
         assert_eq!(offset_of!(UserContext, rax), 0);
         assert_eq!(offset_of!(UserContext, rdx), 3 * 8);
         assert_eq!(offset_of!(UserContext, r15), 14 * 8);
         assert_eq!(offset_of!(UserContext, rip), 15 * 8);
         assert_eq!(offset_of!(UserContext, rsp), 16 * 8);
         assert_eq!(offset_of!(UserContext, rflags), 17 * 8);
-        assert_eq!(offset_of!(UserContext, fx_state), 18 * 8);
-        assert_eq!(USER_CONTEXT_QWORDS, 82);
+        assert_eq!(offset_of!(UserContext, fx_state), 24 * 8);
+        assert_eq!(USER_CONTEXT_QWORDS, 536);
 
         assert_eq!(STATE_SYSCALL_STACK_TOP, 0);
         assert_eq!(STATE_KERNEL_RSP, 8);
@@ -1884,8 +2101,13 @@ mod tests {
         assert_eq!(STATE_FAULT_ERROR_CODE, 56);
         assert_eq!(STATE_FAULT_ADDRESS, 64);
         assert_eq!(STATE_INTERRUPT_EOI, 72);
-        assert_eq!(STATE_KERNEL_FX, 80);
-        assert_eq!(STATE_KERNEL_FX % 16, 0);
+        assert_eq!(STATE_USER_COPY_FIXUP, 80);
+        assert_eq!(STATE_SMAP_ENABLED, 88);
+        assert_eq!(STATE_XSAVE_ENABLED, 96);
+        assert_eq!(STATE_XSAVE_MASK_LOW, 104);
+        assert_eq!(STATE_XSAVE_MASK_HIGH, 112);
+        assert_eq!(STATE_KERNEL_FX, 128);
+        assert_eq!(STATE_KERNEL_FX % 64, 0);
     }
 
     #[test]
@@ -1894,8 +2116,8 @@ mod tests {
             fxsave_cr0(CR0_EMULATION | CR0_TASK_SWITCHED),
             CR0_MONITOR_COPROCESSOR | CR0_NUMERIC_ERROR
         );
-        let cr4 = fxsave_cr4(CR4_OSXSAVE);
-        assert_eq!(cr4 & CR4_OSXSAVE, 0);
+        let cr4 = fxsave_cr4(0, true);
+        assert_ne!(cr4 & CR4_OSXSAVE, 0);
         assert_eq!(
             cr4 & (CR4_OSFXSR | CR4_OSXMMEXCPT),
             CR4_OSFXSR | CR4_OSXMMEXCPT

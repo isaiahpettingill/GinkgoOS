@@ -9,7 +9,7 @@ A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. Gi
 - Allocate-only 4 KiB physical frame allocation from usable memory
 - `x86_64`-backed address types, active page-table translation, mapping, and unmapping
 - Generation-tagged processes with isolated lower-half page tables and supervisor-only shared kernel mappings
-- Strict ELF64 `ET_EXEC` loading, guarded user stacks, x86-64 ring-3 entry, and contained user faults
+- Strict ELF64 `ET_EXEC` compatibility plus randomized static `ET_DYN`, guarded randomized user stacks, x86-64 ring-3 entry, and contained user faults
 - `SYSCALL`/`SYSRET` dispatch plus `no_std` userspace stubs for processes, handles, channels, waits, shared memory, files, directories, and debug output
 - Rights-checked shared-memory map/unmap with mapping leases that survive source-handle closure
 - `x86_64` port I/O plus `volatile`-backed checked MMIO capabilities
@@ -28,11 +28,14 @@ A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. Gi
 - Persistent RedoxFS transactions over a bounded-polling legacy ATA PIO disk backend
 - Talc-backed dynamic allocation for RedoxFS and future kernel services
 - Single-core round-robin userspace scheduling with local-APIC timer preemption
+- Hardware-seeded kernel CSPRNG with process-local random capabilities
+- SMAP user-copy protection with recoverable page-fault fixups
+- Ed25519-authenticated system manifests and per-process handle/memory/traffic/process-slot quotas
 - Monotonic time, deadline-aware blocking waits, and interrupt-backed kernel idle
 - Fixed-capacity stackless cooperative scheduling for bounded kernel tasks
 - A high-half ELF linker script
 - Embedded-graphics draw targets for volatile hardware framebuffers and ordinary XRGB/ARGB window RAM
-- UEFI ISO and no-ISO QEMU boot targets
+- UEFI ISO and no-ISO QEMU boot targets with a 1920×1080 preferred mode and larger default UI font
 
 Kernel tasks remain deliberately stackless and cooperative: each task performs one bounded step, stores its continuation in `TaskState`, and returns to yield. Userspace is preemptive: the process task arms a calibrated local-APIC one-shot timer before entering ring 3, and a 10 ms quantum captures the complete user context before returning to the scheduler. Syscalls and interrupt returns use protected per-CPU stacks, while `IRETQ` preserves asynchronously interrupted `RCX` and `R11`. Blocked waits retain kernel-owned requests and are polled in bounded scheduler steps until a signal or absolute monotonic deadline completes them. When no process is runnable, a short interrupt-backed `HLT` replaces busy spinning. USB input and Intel HDA audio still poll their DMA rings; general device IRQ routing, independent kernel-task stacks, and SMP are not yet provided.
 
@@ -48,9 +51,9 @@ Shared-memory objects are page-aligned, page-rounded, zero-filled heap allocatio
 
 ### Protected userspace execution
 
-At boot, after device initialization has installed its kernel mappings, GinkgoOS installs `/desktop.elf`, `/file-navigator.elf`, `/minimal-client.elf`, and `/programs.gkr` into RedoxFS and reads them back through the filesystem adapter. It validates the registry and desktop ELF, then creates an isolated page-table root for the desktop process. The process root starts with an empty lower half and clones only the kernel higher-half topology, clearing `USER_ACCESSIBLE` on every cloned P4 entry even when Limine supplied permissive flags. User mappings reject the zero page, noncanonical or higher-half addresses, writable-executable pages, overlaps, and permission-invalid copies.
+At boot, after device initialization has installed its kernel mappings, GinkgoOS installs `/desktop.elf`, `/file-navigator.elf`, `/minimal-client.elf`, and `/programs.gkr` into RedoxFS and reads them back through the filesystem adapter. An Ed25519-signed manifest authenticates each path, length, and SHA-256 digest before registry parsing or executable loading. It then validates the registry and desktop ELF and creates an isolated page-table root for the desktop process. The process root starts with an empty lower half and clones only the kernel higher-half topology, clearing `USER_ACCESSIBLE` on every cloned P4 entry even when Limine supplied permissive flags. User mappings reject the zero page, noncanonical or higher-half addresses, writable-executable pages, overlaps, and permission-invalid copies.
 
-The dependency-free ELF loader accepts only little-endian x86-64 `ET_EXEC` images in the Ginkgo executable profile. It validates every program header, mapped range, page overlap, permission, entry point, and stack/guard collision before installing image pages. Each process owns its address space, generation-tagged identity, register and x87/SSE state, capability table, shared mappings, and detailed exit/fault state.
+The dependency-free ELF loader accepts little-endian x86-64 `ET_EXEC` compatibility images and static position-independent `ET_DYN` images in the Ginkgo executable profile. Compatible PIE images, stacks, and automatic shared mappings receive independent randomized placement. It validates every program header, mapped range, page overlap, permission, entry point, and stack/guard collision before installing image pages. Each process owns its address space, generation-tagged identity, register and x87/SSE state, capability table, shared mappings, resource accounting, and detailed exit/fault state.
 
 The x86-64 entry path installs a GDT, TSS, IDT, `STAR`/`LSTAR`/`FMASK`, and five distinct 64 KiB supervisor stacks for RSP0, syscall entry, double fault, NMI, and machine check. Synchronous user exceptions are contained and returned to the process scheduler; kernel faults and unrecoverable exception classes fail stop. Every syscall immediately switches away from the untrusted user RSP, captures the complete user context, and returns to scheduler-side dispatch. Local-APIC timer interrupts capture asynchronous ring-3 state on RSP0 and acknowledge EOI without calling Rust. Return through `IRETQ` revalidates canonical RIP/RSP, flags, and floating-point state while preserving arbitrary interrupted `RCX` and `R11` values.
 
@@ -68,10 +71,13 @@ Current execution limitations are intentional and explicit:
 - Scheduling is single-core; SMP and CPU migration are not implemented.
 - Only the local-APIC timer has an external interrupt entry. Device drivers still poll, and general I/O-APIC/MSI routing is not implemented.
 - Blocked waits use bounded scheduler polling rather than per-object kernel wait queues.
-- SMAP is not enabled because checked user-copy operations do not yet have exception-fixup support.
-- x87/SSE/SSE2 state is isolated with FXSAVE/FXRSTOR; AVX/XSAVE is intentionally unavailable.
+- SMAP is enabled when supported; one CPU-local fixup contains faults during explicitly bracketed user copies.
+- XSAVE-capable CPUs preserve enabled x87/SSE/AVX state (including AVX2's YMM state) across every userspace transition; legacy CPUs use FXSAVE, and default system images retain an SSE2 baseline.
 - The physical allocator is monotonic, so retired process frames are accounted for but not recycled.
 - Early shared-memory and capability allocation still depends on the fixed bootstrap kernel heap.
+- Dynamic linking, runtime ELF relocations, signed rollback prevention, encrypted storage, and hardware-backed key sealing are not yet provided.
+
+See [`SECURITY.md`](SECURITY.md) for the threat model, trust/update policy, resource ceilings, CPU-feature audit, and unsupported hardware assumptions.
 
 ### Window system and desktop
 

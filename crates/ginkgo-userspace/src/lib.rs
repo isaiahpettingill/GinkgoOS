@@ -97,6 +97,23 @@ pub fn monotonic_time_ns() -> SyscallResult<u64> {
     Ok(output.now_ns)
 }
 
+/// Fills `output` with unpredictable bytes through an explicit random capability.
+#[inline]
+pub fn random_fill(source: Handle, output: &mut [u8]) -> SyscallResult<()> {
+    // SAFETY: output remains writable for the duration of the syscall.
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::RandomFill,
+            u64::from(source.raw()),
+            mut_slice_address(output),
+            output.len() as u64,
+            0,
+            0,
+            0,
+        )
+    })
+}
+
 /// Terminates the current process with `exit_code`.
 ///
 /// This function returns only if the kernel rejects the request. The returned

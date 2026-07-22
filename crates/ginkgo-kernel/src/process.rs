@@ -32,6 +32,9 @@ pub const USER_STACK_TOP: u64 = 0x0000_7fff_ffff_f000;
 pub const USER_STACK_BOTTOM: u64 = USER_STACK_TOP - USER_STACK_SIZE;
 pub const USER_STACK_GUARD_START: u64 = USER_STACK_BOTTOM - PAGE_SIZE;
 pub const SHARED_MAPPING_BASE: u64 = 0x0000_0001_0000_0000;
+const STACK_ASLR_ALIGNMENT: u64 = 2 * 1024 * 1024;
+const STACK_ASLR_SLOTS: u64 = 1024;
+const MAPPING_ASLR_SLOTS: u64 = 16_384;
 const USER_ADDRESS_END: u64 = 0x0000_8000_0000_0000;
 
 /// Stable process identity. Reused slots always receive a different generation.
@@ -74,6 +77,7 @@ pub enum ProcessFaultReason {
     GeneralProtection,
     InvalidOpcode,
     InvalidUserContext,
+    ResourceLimit,
     Other(u16),
 }
 
@@ -177,6 +181,47 @@ impl ProcessLayout {
     pub const fn stack_size(self) -> u64 {
         self.stack_top - self.stack_bottom
     }
+
+    pub const fn randomized(random: u64) -> Self {
+        let displacement = (random % STACK_ASLR_SLOTS) * STACK_ASLR_ALIGNMENT;
+        let stack_top = USER_STACK_TOP - displacement;
+        let stack_bottom = stack_top - USER_STACK_SIZE;
+        Self {
+            stack_guard_start: stack_bottom - PAGE_SIZE,
+            stack_bottom,
+            stack_top,
+        }
+    }
+}
+
+/// Per-process resource ceilings. Authority is still conveyed by capabilities;
+/// these limits only bound damage from an authorized but faulty application.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessLimits {
+    pub private_pages: u64,
+    pub shared_memory_bytes: u64,
+    pub mapped_shared_bytes: u64,
+    pub channel_traffic_bytes: u64,
+    /// Maximum uninterrupted execution before the scheduler rotates processes.
+    pub cpu_quantum_ns: u64,
+}
+
+impl ProcessLimits {
+    pub const STANDARD: Self = Self {
+        private_pages: 20_000,
+        shared_memory_bytes: 64 * 1024 * 1024,
+        mapped_shared_bytes: 64 * 1024 * 1024,
+        channel_traffic_bytes: 64 * 1024 * 1024,
+        cpu_quantum_ns: 10_000_000,
+    };
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProcessUsage {
+    pub shared_memory_bytes: u64,
+    pub mapped_shared_bytes: u64,
+    pub channel_traffic_bytes: u64,
+    pub cpu_time_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -204,6 +249,7 @@ pub enum ProcessCreateError {
     },
     EntryNotExecutable(AddressSpaceError),
     StackNotWritable(AddressSpaceError),
+    ResourceLimit,
 }
 
 /// One exact application-visible shared-memory mapping.
@@ -270,6 +316,7 @@ pub enum SharedMappingError {
     InvalidBackingAlignment(u64),
     InvalidBackingLength,
     OutOfMemory,
+    ResourceLimit,
     InvalidKernelAddress(u64),
     KernelAddressNotMapped(u64),
     PhysicalAddressNotPageAligned(u64),
@@ -363,6 +410,7 @@ impl fmt::Debug for ProcessRetireError {
 pub struct Process {
     address_space: Option<AddressSpace>,
     context: UserContext,
+    layout: ProcessLayout,
     handles: Option<HandleTable>,
     state: ProcessState,
     preemption_count: u64,
@@ -372,6 +420,8 @@ pub struct Process {
     // than releasing backing which may still have a live userspace alias.
     retained_failed_mapping_leases: Option<Vec<SharedMemoryMappingLease>>,
     next_mapping_cursor: u64,
+    limits: ProcessLimits,
+    usage: ProcessUsage,
 }
 
 impl Process {
@@ -385,11 +435,42 @@ impl Process {
         kernel: &ActivePageTable,
         allocator: &mut UsableFrameAllocator<'_>,
     ) -> Result<Self, ProcessCreateError> {
-        let parsed = elf::parse(file).map_err(ProcessCreateError::Elf)?;
+        Self::from_elf_with_randomness(file, kernel, allocator, None)
+    }
+
+    /// Builds a process with independently randomized PIE, stack, and mapping regions.
+    pub fn from_elf_randomized(
+        file: &[u8],
+        kernel: &ActivePageTable,
+        allocator: &mut UsableFrameAllocator<'_>,
+        randomness: [u64; 3],
+    ) -> Result<Self, ProcessCreateError> {
+        Self::from_elf_with_randomness(file, kernel, allocator, Some(randomness))
+    }
+
+    fn from_elf_with_randomness(
+        file: &[u8],
+        kernel: &ActivePageTable,
+        allocator: &mut UsableFrameAllocator<'_>,
+        randomness: Option<[u64; 3]>,
+    ) -> Result<Self, ProcessCreateError> {
+        let parsed = match randomness {
+            Some(values) => elf::parse_randomized(file, values[0]),
+            None => elf::parse(file),
+        }
+        .map_err(ProcessCreateError::Elf)?;
+        let layout = randomness
+            .map(|values| ProcessLayout::randomized(values[1]))
+            .unwrap_or(ProcessLayout::STANDARD);
+        let limits = ProcessLimits::STANDARD;
+        let stack_pages = layout.stack_size() / PAGE_SIZE;
+        if parsed.total_load_pages().saturating_add(stack_pages) > limits.private_pages {
+            return Err(ProcessCreateError::ResourceLimit);
+        }
         if parsed
             .overlaps_reserved_range(
-                USER_STACK_GUARD_START,
-                USER_STACK_TOP - USER_STACK_GUARD_START,
+                layout.stack_guard_start,
+                layout.stack_top - layout.stack_guard_start,
             )
             .expect("static stack reservation is a valid user range")
         {
@@ -413,8 +494,8 @@ impl Process {
             Err(LoadError::Page(error)) => return Err(ProcessCreateError::ElfPage(error)),
         };
 
-        let mut stack_page = USER_STACK_BOTTOM;
-        while stack_page < USER_STACK_TOP {
+        let mut stack_page = layout.stack_bottom;
+        while stack_page < layout.stack_top {
             address_space
                 .map_zeroed_user_4k(stack_page, UserPagePermissions::READ_WRITE, allocator)
                 .map_err(|error| ProcessCreateError::StackPage {
@@ -429,30 +510,37 @@ impl Process {
             .map_err(ProcessCreateError::EntryNotExecutable)?;
         address_space
             .validate_user_range(
-                USER_STACK_BOTTOM,
-                USER_STACK_SIZE as usize,
+                layout.stack_bottom,
+                layout.stack_size() as usize,
                 UserAccess::Write,
             )
             .map_err(ProcessCreateError::StackNotWritable)?;
 
-        let context = UserContext::new(image.entry, USER_STACK_TOP);
+        let context = UserContext::new(image.entry, layout.stack_top);
         debug_assert_eq!(context.rsp & 0xf, 0);
 
         Ok(Self {
             address_space: Some(address_space),
             context,
+            layout,
             handles: Some(HandleTable::new()),
             state: ProcessState::Ready,
             preemption_count: 0,
             blocked_syscall: None,
             shared_mappings: Some(Vec::new()),
             retained_failed_mapping_leases: Some(Vec::new()),
-            next_mapping_cursor: SHARED_MAPPING_BASE,
+            next_mapping_cursor: SHARED_MAPPING_BASE
+                + randomness
+                    .map(|values| values[2] % MAPPING_ASLR_SLOTS)
+                    .unwrap_or(0)
+                    * PAGE_SIZE,
+            limits,
+            usage: ProcessUsage::default(),
         })
     }
 
     pub const fn layout(&self) -> ProcessLayout {
-        ProcessLayout::STANDARD
+        self.layout
     }
 
     pub const fn state(&self) -> ProcessState {
@@ -461,6 +549,49 @@ impl Process {
 
     pub const fn is_runnable(&self) -> bool {
         self.state.is_runnable()
+    }
+
+    pub const fn limits(&self) -> ProcessLimits {
+        self.limits
+    }
+
+    pub const fn usage(&self) -> ProcessUsage {
+        self.usage
+    }
+
+    pub fn can_allocate_shared_memory(&self, bytes: usize) -> bool {
+        self.usage
+            .shared_memory_bytes
+            .checked_add(bytes as u64)
+            .is_some_and(|total| total <= self.limits.shared_memory_bytes)
+    }
+
+    pub fn record_shared_memory_allocation(&mut self, bytes: usize) {
+        self.usage.shared_memory_bytes =
+            self.usage.shared_memory_bytes.saturating_add(bytes as u64);
+    }
+
+    pub fn release_shared_memory_charge(&mut self, bytes: usize) {
+        self.usage.shared_memory_bytes =
+            self.usage.shared_memory_bytes.saturating_sub(bytes as u64);
+    }
+
+    pub fn can_send_channel_bytes(&self, bytes: usize) -> bool {
+        self.usage
+            .channel_traffic_bytes
+            .checked_add(bytes as u64)
+            .is_some_and(|total| total <= self.limits.channel_traffic_bytes)
+    }
+
+    pub fn record_channel_bytes(&mut self, bytes: usize) {
+        self.usage.channel_traffic_bytes = self
+            .usage
+            .channel_traffic_bytes
+            .saturating_add(bytes as u64);
+    }
+
+    pub fn record_cpu_time(&mut self, elapsed_ns: u64) {
+        self.usage.cpu_time_ns = self.usage.cpu_time_ns.saturating_add(elapsed_ns);
     }
 
     pub const fn preemption_count(&self) -> u64 {
@@ -547,14 +678,12 @@ impl Process {
         &self.context
     }
 
-    /// Sets the first three System V AMD64 arguments for the initial user entry.
-    ///
-    /// Call this after process creation and before the process is first entered.
-    /// The arguments are installed in `rdi`, `rsi`, and `rdx`, respectively.
-    pub fn set_start_arguments(&mut self, [rdi, rsi, rdx]: [u64; 3]) {
+    /// Sets the first four System V AMD64 arguments for the initial user entry.
+    pub fn set_start_arguments(&mut self, [rdi, rsi, rdx, rcx]: [u64; 4]) {
         self.context.rdi = rdi;
         self.context.rsi = rsi;
         self.context.rdx = rdx;
+        self.context.rcx = rcx;
     }
 
     pub fn context_mut(&mut self) -> &mut UserContext {
@@ -606,6 +735,12 @@ impl Process {
 
         let lease = self.handles().shared_memory_mapping_lease(handle, access)?;
         let request = validate_mapping_range(lease.info(), args.offset, args.length)?;
+        let new_mapped_total = self
+            .usage
+            .mapped_shared_bytes
+            .checked_add(request.mapped_len as u64)
+            .filter(|total| *total <= self.limits.mapped_shared_bytes)
+            .ok_or(SharedMappingError::ResourceLimit)?;
 
         let occupied = self.occupied_ranges()?;
         let address = select_mapping_address(
@@ -678,6 +813,7 @@ impl Process {
                 protection: args.protection,
                 _lease: lease,
             });
+        self.usage.mapped_shared_bytes = new_mapped_total;
         if !args.flags.contains(MapFlags::FIXED) {
             self.next_mapping_cursor = address
                 .checked_add(request.mapped_len as u64)
@@ -708,6 +844,10 @@ impl Process {
             .as_mut()
             .expect("live process lost its mapping records")
             .swap_remove(index);
+        self.usage.mapped_shared_bytes = self
+            .usage
+            .mapped_shared_bytes
+            .saturating_sub(mapped_len as u64);
         Ok(())
     }
 
@@ -767,7 +907,7 @@ impl Process {
             .try_reserve_exact(mappings.len() + 1)
             .map_err(|_| SharedMappingError::OutOfMemory)?;
         occupied.push(
-            VirtualRange::new(USER_STACK_GUARD_START, USER_STACK_TOP)
+            VirtualRange::new(self.layout.stack_guard_start, self.layout.stack_top)
                 .expect("static stack layout is valid"),
         );
         for mapping in mappings {
@@ -1070,6 +1210,8 @@ fn align_up(value: u64, alignment: u64) -> Option<u64> {
         .map(|rounded| rounded & !(alignment - 1))
 }
 
+pub const PROCESS_TABLE_CAPACITY: usize = 32;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessTableError {
     Full,
@@ -1096,7 +1238,29 @@ impl<T> GenerationalSlots<T> {
         }
     }
 
+    fn prepare_insert(&mut self) -> Result<(), ProcessTableError> {
+        if self.len >= PROCESS_TABLE_CAPACITY {
+            return Err(ProcessTableError::Full);
+        }
+        let has_vacant = self
+            .slots
+            .iter()
+            .any(|slot| slot.generation != 0 && slot.value.is_none());
+        if !has_vacant {
+            if self.slots.len() > u32::MAX as usize {
+                return Err(ProcessTableError::Full);
+            }
+            self.slots
+                .try_reserve(1)
+                .map_err(|_| ProcessTableError::OutOfMemory)?;
+        }
+        Ok(())
+    }
+
     fn insert(&mut self, value: T) -> Result<ProcessId, ProcessTableError> {
+        if self.len >= PROCESS_TABLE_CAPACITY {
+            return Err(ProcessTableError::Full);
+        }
         if let Some((index, slot)) = self
             .slots
             .iter_mut()
@@ -1204,6 +1368,11 @@ impl ProcessTable {
             .any(|slot| slot.value.as_ref().is_some_and(Process::is_runnable))
     }
 
+    /// Reserves capacity before callers allocate an address space and handles.
+    pub fn prepare_insert(&mut self) -> Result<(), ProcessTableError> {
+        self.inner.prepare_insert()
+    }
+
     pub fn insert(&mut self, process: Process) -> Result<ProcessId, ProcessTableError> {
         self.inner.insert(process)
     }
@@ -1269,6 +1438,7 @@ mod tests {
         Process {
             address_space: None,
             context: UserContext::new(0x1000, USER_STACK_TOP),
+            layout: ProcessLayout::STANDARD,
             handles: None,
             state,
             preemption_count: 0,
@@ -1276,6 +1446,8 @@ mod tests {
             shared_mappings: None,
             retained_failed_mapping_leases: None,
             next_mapping_cursor: SHARED_MAPPING_BASE,
+            limits: ProcessLimits::STANDARD,
+            usage: ProcessUsage::default(),
         }
     }
 
@@ -1561,6 +1733,33 @@ mod tests {
     }
 
     #[test]
+    fn randomized_layout_stays_aligned_bounded_and_seed_dependent() {
+        let first = ProcessLayout::randomized(1);
+        let second = ProcessLayout::randomized(2);
+        assert_ne!(first, second);
+        for layout in [first, second] {
+            assert_eq!(layout.stack_size(), USER_STACK_SIZE);
+            assert_eq!(layout.stack_top % 16, 0);
+            assert_eq!(layout.stack_guard_start % PAGE_SIZE, 0);
+            assert!(layout.stack_guard_start >= PAGE_SIZE);
+            assert!(layout.stack_top < USER_ADDRESS_END);
+        }
+    }
+
+    #[test]
+    fn resource_accounting_enforces_memory_and_traffic_ceilings() {
+        let mut process = test_process(ProcessState::Ready);
+        assert!(process.can_allocate_shared_memory(1024));
+        process.usage.shared_memory_bytes = process.limits.shared_memory_bytes;
+        assert!(!process.can_allocate_shared_memory(1));
+        assert!(process.can_send_channel_bytes(1));
+        process.usage.channel_traffic_bytes = process.limits.channel_traffic_bytes;
+        assert!(!process.can_send_channel_bytes(1));
+        process.record_cpu_time(25);
+        assert_eq!(process.usage.cpu_time_ns, 25);
+    }
+
+    #[test]
     fn start_arguments_set_abi_registers_without_changing_other_context() {
         let mut process = test_process(ProcessState::Ready);
         process.context.rax = 4;
@@ -1569,8 +1768,9 @@ mod tests {
         expected.rdi = 1;
         expected.rsi = 2;
         expected.rdx = 3;
+        expected.rcx = 4;
 
-        process.set_start_arguments([1, 2, 3]);
+        process.set_start_arguments([1, 2, 3, 4]);
 
         assert_eq!(process.context, expected);
     }

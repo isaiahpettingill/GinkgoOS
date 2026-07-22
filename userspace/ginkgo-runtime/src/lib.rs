@@ -18,7 +18,8 @@ static ALLOCATOR: TalcLock<RawSpinlock, Claim> = TalcLock::new(unsafe {
 
 /// Defines the assembly entry shim expected by the GinkgoOS ELF loader.
 ///
-/// The supplied function must have the signature `extern "C" fn(u64, u64, u64) -> !`.
+/// The supplied function must have the signature `extern "C" fn(u64, u64, u64, u64) -> !`.
+/// The fourth argument is the process's non-transferable random-source capability.
 #[macro_export]
 macro_rules! entry {
     ($entry:path) => {

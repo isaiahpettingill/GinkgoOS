@@ -32,7 +32,12 @@ const CHARACTER_WIDTH: usize = 8;
 
 ginkgo_runtime::entry!(process_main);
 
-extern "C" fn process_main(window_raw: u64, filesystem_raw: u64, _arg2: u64) -> ! {
+extern "C" fn process_main(
+    window_raw: u64,
+    filesystem_raw: u64,
+    _arg2: u64,
+    _random_raw: u64,
+) -> ! {
     let desktop =
         parse_handle(window_raw).unwrap_or_else(|| fail(b"terminal: invalid desktop channel\n", 1));
     let filesystem = parse_handle(filesystem_raw)

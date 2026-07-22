@@ -18,7 +18,7 @@ const MAX_EVENTS_PER_TURN: usize = 32;
 
 ginkgo_runtime::entry!(process_main);
 
-extern "C" fn process_main(channel_raw: u64, _arg1: u64, _arg2: u64) -> ! {
+extern "C" fn process_main(channel_raw: u64, _arg1: u64, _arg2: u64, _random_raw: u64) -> ! {
     let Some(channel) = u32::try_from(channel_raw)
         .ok()
         .map(Handle::from_raw)

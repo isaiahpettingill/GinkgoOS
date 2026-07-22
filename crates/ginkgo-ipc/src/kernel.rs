@@ -25,7 +25,7 @@ use spinning_top::Spinlock;
 /// Maximum number of complete messages queued in either direction.
 pub const CHANNEL_QUEUE_CAPACITY: usize = 64;
 /// Maximum number of live or vacant slots retained by one handle table.
-pub const HANDLE_TABLE_CAPACITY: usize = 4096;
+pub const HANDLE_TABLE_CAPACITY: usize = 256;
 /// Required allocation and mapping alignment for shared-memory backing.
 pub const SHARED_MEMORY_PAGE_SIZE: usize = 4096;
 /// Default number of equal shared-memory slots owned by [`HandleTable::window_create`].
@@ -159,6 +159,7 @@ enum KernelObject {
     Window(WindowEndpoint),
     FilesystemRoot,
     File(FileHandle),
+    RandomSource,
 }
 
 struct SharedMemoryObject {
@@ -475,6 +476,21 @@ impl HandleTable {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Creates a non-transferable capability authorizing kernel random bytes.
+    pub fn random_source_create(&mut self) -> Result<Handle, IpcError> {
+        let object = Arc::try_new(KernelObject::RandomSource).map_err(|_| IpcError::OutOfMemory)?;
+        let slot = self.reserve_slots(1)?[0];
+        Ok(self.insert_reserved(slot, object, Rights::READ))
+    }
+
+    pub fn random_source(&self, handle: Handle) -> Result<(), IpcError> {
+        let object = self.object_with_rights(handle, Rights::READ)?;
+        match object.as_ref() {
+            KernelObject::RandomSource => Ok(()),
+            _ => Err(IpcError::WrongObjectType),
+        }
     }
 
     /// Creates a non-transferable capability for the filesystem root namespace.
@@ -1189,6 +1205,7 @@ impl HandleTable {
         match self.entry(handle)?.object.as_ref() {
             KernelObject::Channel(_) => Ok(ObjectType::Channel),
             KernelObject::SharedMemory(_) => Ok(ObjectType::SharedMemory),
+            KernelObject::RandomSource => Ok(ObjectType::RandomSource),
             KernelObject::Window(_) => Ok(ObjectType::Window),
             KernelObject::FilesystemRoot => Ok(ObjectType::FilesystemRoot),
             KernelObject::File(_) => Ok(ObjectType::File),
@@ -1200,7 +1217,7 @@ impl HandleTable {
         let object = self.object_with_rights(handle, Rights::WAIT)?;
         match object.as_ref() {
             KernelObject::Channel(endpoint) => Ok(endpoint.signals()),
-            KernelObject::SharedMemory(_) => Ok(Signals::empty()),
+            KernelObject::SharedMemory(_) | KernelObject::RandomSource => Ok(Signals::empty()),
             KernelObject::Window(endpoint) => Ok(endpoint.signals()),
             KernelObject::FilesystemRoot | KernelObject::File(_) => Ok(Signals::empty()),
         }
@@ -1384,6 +1401,7 @@ fn channel_endpoint(object: &Arc<KernelObject>) -> Result<&ChannelEndpoint, IpcE
     match object.as_ref() {
         KernelObject::Channel(endpoint) => Ok(endpoint),
         KernelObject::SharedMemory(_)
+        | KernelObject::RandomSource
         | KernelObject::Window(_)
         | KernelObject::FilesystemRoot
         | KernelObject::File(_) => Err(IpcError::WrongObjectType),
@@ -1394,6 +1412,7 @@ fn shared_memory_object(object: &Arc<KernelObject>) -> Result<&SharedMemoryObjec
     match object.as_ref() {
         KernelObject::SharedMemory(memory) => Ok(memory),
         KernelObject::Channel(_)
+        | KernelObject::RandomSource
         | KernelObject::Window(_)
         | KernelObject::FilesystemRoot
         | KernelObject::File(_) => Err(IpcError::WrongObjectType),
@@ -1405,6 +1424,7 @@ fn window_endpoint(object: &Arc<KernelObject>) -> Result<&WindowEndpoint, IpcErr
         KernelObject::Window(endpoint) => Ok(endpoint),
         KernelObject::Channel(_)
         | KernelObject::SharedMemory(_)
+        | KernelObject::RandomSource
         | KernelObject::FilesystemRoot
         | KernelObject::File(_) => Err(IpcError::WrongObjectType),
     }
@@ -1707,6 +1727,19 @@ mod tests {
             Err(IpcError::WrongObjectType)
         );
         assert_eq!(IpcError::OutOfMemory.status(), Status::OutOfMemory);
+    }
+
+    #[test]
+    fn random_source_is_read_only_nontransferable_authority() {
+        let mut table = HandleTable::new();
+        let source = table.random_source_create().unwrap();
+        assert_eq!(table.object_type(source), Ok(ObjectType::RandomSource));
+        assert_eq!(table.handle_rights(source), Ok(Rights::READ));
+        assert_eq!(table.random_source(source), Ok(()));
+        assert_eq!(
+            table.handle_duplicate(source, Rights::READ),
+            Err(IpcError::AccessDenied)
+        );
     }
 
     #[test]

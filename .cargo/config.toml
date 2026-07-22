@@ -8,4 +8,5 @@ rustflags = [
     "-C", "relocation-model=static",
     "-C", "code-model=kernel",
     "-C", "force-frame-pointers=yes",
+    "--cfg", "curve25519_dalek_backend=\"serial\"",
 ]

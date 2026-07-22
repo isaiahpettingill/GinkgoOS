@@ -20,13 +20,14 @@ use ginkgo_ipc::{
 use ginkgo_sysapi::{
     FilesystemDirectoryEntry, FilesystemOpenFlags, Handle, MapFlags, MapProtection,
     SharedMemoryMapArgs, Status, SyscallNumber, CHANNEL_MAX_BYTES, CHANNEL_MAX_HANDLES,
-    DEADLINE_INFINITE, FILESYSTEM_NAME_MAX, FILESYSTEM_READ_MAX_BYTES,
+    DEADLINE_INFINITE, FILESYSTEM_NAME_MAX, FILESYSTEM_READ_MAX_BYTES, RANDOM_MAX_BYTES,
 };
 use redoxfs::Disk;
 
 use crate::{
     arch::UserContext,
     audio::AudioDevice,
+    entropy::EntropyPool,
     memory::UsableFrameAllocator,
     paging::{
         address_space::{AddressSpaceError, UserAccess},
@@ -107,6 +108,7 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
     frame_allocator: &mut UsableFrameAllocator<'_>,
     filesystem: &mut RedoxFs<B>,
     audio: &mut Option<AudioDevice>,
+    entropy: &mut EntropyPool,
     debug_sink: &mut D,
 ) -> SyscallOutcome {
     let Some(number) = decode_syscall_number(context.rax) else {
@@ -142,6 +144,7 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
             frame_allocator,
             filesystem,
             audio,
+            entropy,
             debug_sink,
         )
     };
@@ -163,6 +166,7 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
     frame_allocator: &mut UsableFrameAllocator<'_>,
     filesystem: &mut RedoxFs<B>,
     audio: &mut Option<AudioDevice>,
+    entropy: &mut EntropyPool,
     debug_sink: &mut D,
 ) -> DispatchResult {
     if number == SyscallNumber::WaitMany {
@@ -231,6 +235,9 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
         }
         SyscallNumber::AudioWrite => audio_write(process, audio, context.rdi, context.rsi),
         SyscallNumber::ClockGetMonotonic => clock_get_monotonic(process, context.rdi, now_ns),
+        SyscallNumber::RandomFill => {
+            random_fill(process, entropy, context.rdi, context.rsi, context.rdx)
+        }
     };
     DispatchResult::Complete(match result {
         Ok(()) => Status::Ok,
@@ -262,6 +269,7 @@ const fn decode_syscall_number(raw: u64) -> Option<SyscallNumber> {
         19 => SyscallNumber::FilesystemUnlink,
         20 => SyscallNumber::AudioWrite,
         21 => SyscallNumber::ClockGetMonotonic,
+        22 => SyscallNumber::RandomFill,
         _ => return None,
     })
 }
@@ -462,6 +470,25 @@ fn copy_wait_items_to_user(process: &Process, wait: &mut PendingWaitMany) -> Res
     copy_to_user(process, wait.items_address, &wait.encoded_items)
 }
 
+fn random_fill(
+    process: &Process,
+    entropy: &mut EntropyPool,
+    raw_source: u64,
+    output_address: u64,
+    raw_length: u64,
+) -> Result<(), Status> {
+    let source = decode_handle(raw_source)?;
+    process
+        .handles()
+        .random_source(source)
+        .map_err(map_ipc_error)?;
+    let length = checked_array_bytes(raw_length, 1, RANDOM_MAX_BYTES as u64, Status::OutOfRange)?;
+    validate_user_output(process, output_address, length)?;
+    let mut bytes = zeroed_vec(length)?;
+    entropy.fill_bytes(&mut bytes);
+    copy_to_user(process, output_address, &bytes)
+}
+
 fn clock_get_monotonic(process: &Process, output_address: u64, now_ns: u64) -> Result<(), Status> {
     validate_user_output(process, output_address, MONOTONIC_TIME_OUTPUT_SIZE)?;
     copy_to_user(process, output_address, &now_ns.to_le_bytes())
@@ -520,10 +547,15 @@ fn channel_write(process: &mut Process, raw_channel: u64, args_address: u64) -> 
         dispositions.push(parse_handle_disposition(raw)?);
     }
 
+    if !process.can_send_channel_bytes(byte_count) {
+        return Err(Status::ResourceLimit);
+    }
     process
         .handles_mut()
         .channel_write_with_handle_operations(channel, &bytes, &dispositions)
-        .map_err(map_ipc_error)
+        .map_err(map_ipc_error)?;
+    process.record_channel_bytes(byte_count);
+    Ok(())
 }
 
 fn channel_read(process: &mut Process, raw_channel: u64, args_address: u64) -> Result<(), Status> {
@@ -611,14 +643,19 @@ fn shared_memory_create(
     output_address: u64,
 ) -> Result<(), Status> {
     let size = usize::try_from(raw_size).map_err(|_| Status::OutOfRange)?;
+    if !process.can_allocate_shared_memory(size) {
+        return Err(Status::ResourceLimit);
+    }
     validate_user_output(process, output_address, HANDLE_OUTPUT_SIZE)?;
     let handle = process
         .handles_mut()
         .shared_memory_create(size)
         .map_err(map_ipc_error)?;
+    process.record_shared_memory_allocation(size);
     let output = encode_handle_output(handle);
     if let Err(status) = copy_to_user(process, output_address, &output) {
         close_handles(process, core::slice::from_ref(&handle));
+        process.release_shared_memory_charge(size);
         return Err(status);
     }
     Ok(())
@@ -1234,6 +1271,7 @@ const fn map_address_space_error(error: AddressSpaceError) -> Status {
         | AddressSpaceError::MappedFrameNotOwned(_)
         | AddressSpaceError::UntrackedMapping(_)
         | AddressSpaceError::ActiveAddressSpaceRequired
+        | AddressSpaceError::UserCopyFault
         | AddressSpaceError::ActiveKernelPageTableRequired
         | AddressSpaceError::UserAccessibleKernelP4Entry(_) => Status::InvalidAddress,
     }
@@ -1250,6 +1288,7 @@ const fn map_shared_mapping_error(error: SharedMappingError) -> Status {
             Status::OutOfRange
         }
         SharedMappingError::OutOfMemory | SharedMappingError::NoAddressSpace => Status::OutOfMemory,
+        SharedMappingError::ResourceLimit => Status::ResourceLimit,
         SharedMappingError::AlreadyMapped(_) => Status::AlreadyMapped,
         SharedMappingError::AddressSpace(error) => map_address_space_error(error),
         SharedMappingError::RollbackFailed {
@@ -1339,6 +1378,7 @@ mod tests {
             SyscallNumber::FilesystemUnlink,
             SyscallNumber::AudioWrite,
             SyscallNumber::ClockGetMonotonic,
+            SyscallNumber::RandomFill,
         ];
         for number in expected {
             assert_eq!(decode_syscall_number(number as u64), Some(number));
@@ -1347,7 +1387,8 @@ mod tests {
             decode_syscall_number(21),
             Some(SyscallNumber::ClockGetMonotonic)
         );
-        assert_eq!(decode_syscall_number(22), None);
+        assert_eq!(decode_syscall_number(22), Some(SyscallNumber::RandomFill));
+        assert_eq!(decode_syscall_number(23), None);
         assert_eq!(decode_syscall_number(u64::MAX), None);
     }
 

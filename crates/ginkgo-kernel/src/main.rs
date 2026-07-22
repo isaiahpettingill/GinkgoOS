@@ -32,6 +32,7 @@ use ginkgo_kernel::{
     ata::AtaPioDisk,
     audio::AudioDevice,
     desktop_runtime::{DesktopBroker, DesktopBrokerError, DesktopRuntimeEvent},
+    entropy::EntropyPool,
     input::{DeviceInputEvent, InputManager},
     io::SerialPort,
     limine::{
@@ -44,6 +45,7 @@ use ginkgo_kernel::{
     process::{Process, ProcessFault, ProcessFaultReason, ProcessId, ProcessState, ProcessTable},
     syscall::{self, DebugSink, SyscallOutcome},
     task::{Scheduler, TaskPoll, TaskState},
+    trust::TrustedManifest,
     usb::{self, UsbError},
 };
 use ginkgo_program_registry::{EntryFlags, Registry};
@@ -93,6 +95,11 @@ static FILE_NAVIGATOR_ELF: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-file-navigator.elf"));
 static TERMINAL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-terminal.elf"));
 static PROGRAM_REGISTRY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/programs.gkr"));
+static TRUST_MANIFEST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/system-trust.manifest"));
+static TRUST_SIGNATURE: &[u8; 64] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/system-trust.signature"));
+static TRUST_PUBLIC_KEY: &[u8; 32] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/system-trust.public"));
 static PREEMPTION_SMOKE_ELF: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-preemption-smoke.elf"));
 static GINKGO_SPLASH_RGBA: &[u8; 256 * 256 * 4] =
@@ -182,7 +189,7 @@ fn install_and_load_system_programs<D: Disk>(
     install_system_file(fs, TERMINAL_PATH, TERMINAL_ELF)?;
     install_system_file(fs, PROGRAM_REGISTRY_PATH, PROGRAM_REGISTRY)?;
 
-    let registry_bytes = read_system_file(fs, PROGRAM_REGISTRY_PATH, 16 * 1024)?;
+    let registry_bytes = read_trusted_system_file(fs, PROGRAM_REGISTRY_PATH, 16 * 1024)?;
     let registry = Registry::parse(&registry_bytes).ok()?;
     let desktop = registry.entries().find(|entry| entry.app_id == "desktop")?;
     if desktop.executable_path != DESKTOP_PATH || desktop.is_visible() {
@@ -200,8 +207,21 @@ fn install_and_load_system_programs<D: Disk>(
         catalog.len += 1;
     }
 
-    let desktop_image = read_system_file(fs, desktop.executable_path, MAX_EXECUTABLE_BYTES)?;
+    let desktop_image =
+        read_trusted_system_file(fs, desktop.executable_path, MAX_EXECUTABLE_BYTES)?;
     Some((desktop_image, catalog))
+}
+
+fn read_trusted_system_file<D: Disk>(
+    fs: &mut RedoxFs<D>,
+    path: &str,
+    maximum: usize,
+) -> Option<Vec<u8>> {
+    let manifest =
+        TrustedManifest::verify(TRUST_MANIFEST, TRUST_SIGNATURE, TRUST_PUBLIC_KEY).ok()?;
+    let bytes = read_system_file(fs, path, maximum)?;
+    manifest.verify_artifact(path, &bytes).ok()?;
+    Some(bytes)
 }
 
 fn read_system_file<D: Disk>(fs: &mut RedoxFs<D>, path: &str, maximum: usize) -> Option<Vec<u8>> {
@@ -288,6 +308,18 @@ pub extern "C" fn _start() -> ! {
         ui.render_boot_log(&mut screen, "timer: TSC frequency unavailable");
         halt_forever();
     };
+    let entropy = match EntropyPool::initialize(
+        tsc_frequency,
+        hhdm.offset ^ (&frames as *const UsableFrameAllocator<'_> as usize as u64),
+    ) {
+        Ok(entropy) => entropy,
+        Err(error) => {
+            let mut sink = SerialDebugSink::new(&mut serial);
+            let _ = writeln!(sink, "entropy: secure initialization failed: {error:?}\r");
+            ui.render_boot_log(&mut screen, "entropy: no secure hardware seed");
+            halt_forever();
+        }
+    };
     let timer =
         match unsafe { LocalApicTimer::initialize(&mut page_table, &mut frames, tsc_frequency) } {
             Ok(timer) => timer,
@@ -332,6 +364,7 @@ pub extern "C" fn _start() -> ! {
         input: None,
         audio: None,
         timer,
+        entropy,
         screen,
         ui,
         paging_verified: false,
@@ -432,23 +465,56 @@ pub extern "C" fn _start() -> ! {
             .render_boot_log(&mut context.screen, "userspace: CPU initialization failed");
         halt_forever();
     }
+    let user_copy_probe = [0x1000_u64, 0x0000_7000_0000_0000]
+        .into_iter()
+        .find(|address| {
+            context
+                .page_table
+                .translate_addr(VirtAddr::new(*address))
+                .is_none()
+        })
+        .unwrap_or_else(|| halt_forever());
+    let mut probe_output = 0_u8;
+    if unsafe {
+        arch::copy_user_bytes(
+            &mut probe_output,
+            user_copy_probe as *const u8,
+            core::mem::size_of::<u8>(),
+        )
+    } {
+        let mut sink = SerialDebugSink::new(&mut context.serial);
+        let _ = writeln!(
+            sink,
+            "userspace: user-copy fault probe unexpectedly succeeded\r"
+        );
+        halt_forever();
+    }
     context
         .ui
-        .render_boot_log(&mut context.screen, "userspace: privilege state ready");
+        .render_boot_log(&mut context.screen, "userspace: SMAP copy fixup verified");
     context.ui.render_splash(&mut context.screen);
 
-    let mut process =
-        match Process::from_elf(&desktop_image, &context.page_table, &mut context.frames) {
-            Ok(process) => process,
-            Err(error) => {
-                let mut sink = SerialDebugSink::new(&mut context.serial);
-                let _ = writeln!(sink, "desktop: ELF load failed: {error:?}\r");
-                context
-                    .ui
-                    .render_failure(&mut context.screen, "Desktop ELF validation failed");
-                halt_forever();
-            }
-        };
+    let desktop_randomness = [
+        context.entropy.next_u64(),
+        context.entropy.next_u64(),
+        context.entropy.next_u64(),
+    ];
+    let mut process = match Process::from_elf_randomized(
+        &desktop_image,
+        &context.page_table,
+        &mut context.frames,
+        desktop_randomness,
+    ) {
+        Ok(process) => process,
+        Err(error) => {
+            let mut sink = SerialDebugSink::new(&mut context.serial);
+            let _ = writeln!(sink, "desktop: ELF load failed: {error:?}\r");
+            context
+                .ui
+                .render_failure(&mut context.screen, "Desktop ELF validation failed");
+            halt_forever();
+        }
+    };
     let (desktop, process_channel) = match DesktopBroker::create(process.handles_mut()) {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -460,10 +526,15 @@ pub extern "C" fn _start() -> ! {
             halt_forever();
         }
     };
+    let random_source = process
+        .handles_mut()
+        .random_source_create()
+        .unwrap_or_else(|_| halt_forever());
     process.set_start_arguments([
         u64::from(process_channel.raw()),
         context.screen.width() as u64,
         context.screen.height() as u64,
+        u64::from(random_source.raw()),
     ]);
     context.desktop = Some(desktop);
 
@@ -489,10 +560,16 @@ pub extern "C" fn _start() -> ! {
     }
 
     if preemption_smoke_enabled() {
-        let smoke = match Process::from_elf(
+        let smoke_randomness = [
+            context.entropy.next_u64(),
+            context.entropy.next_u64(),
+            context.entropy.next_u64(),
+        ];
+        let smoke = match Process::from_elf_randomized(
             PREEMPTION_SMOKE_ELF,
             &context.page_table,
             &mut context.frames,
+            smoke_randomness,
         ) {
             Ok(process) => process,
             Err(error) => {
@@ -566,6 +643,7 @@ struct KernelContext {
     input: Option<InputManager>,
     audio: Option<AudioDevice>,
     timer: LocalApicTimer,
+    entropy: EntropyPool,
     screen: FramebufferWriter<'static>,
     ui: ValidationUi,
     paging_verified: bool,
@@ -591,7 +669,6 @@ const INPUT_BATCH_RECORDS: usize = 512;
 const INPUT_BATCH_CAPACITY: usize = INPUT_RECORD_SIZE * INPUT_BATCH_RECORDS;
 const INPUT_FLUSH_THRESHOLD: usize = INPUT_RECORD_SIZE * (INPUT_BATCH_RECORDS - 32);
 const LOG_FLUSH_DELAY_SECONDS: u64 = 2;
-const USER_QUANTUM_NS: u64 = 10_000_000;
 const KERNEL_IDLE_POLL_NS: u64 = 1_000_000;
 const TEXT_BUFFER_CAPACITY: usize = 512;
 const CURSOR_SIZE: usize = 19;
@@ -1189,7 +1266,12 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
         ProcessState::Ready => {
             unsafe { process.address_space().activate() };
             let mut user_context = *process.context();
-            if context.timer.arm_one_shot(USER_QUANTUM_NS).is_err() {
+            let started_ns = context.timer.clock().now_ns();
+            if context
+                .timer
+                .arm_one_shot(process.limits().cpu_quantum_ns)
+                .is_err()
+            {
                 process.mark_faulted(ProcessFault::new(ProcessFaultReason::InvalidUserContext, 0));
             } else {
                 let exit = unsafe { arch::enter_user(&mut user_context) };
@@ -1205,6 +1287,7 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                             &mut context.frames,
                             &mut context.fs,
                             &mut context.audio,
+                            &mut context.entropy,
                             &mut sink,
                         );
                         debug_assert!(
@@ -1267,6 +1350,8 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                 }
             }
             *process.context_mut() = user_context;
+            let elapsed_ns = context.timer.clock().now_ns().saturating_sub(started_ns);
+            process.record_cpu_time(elapsed_ns);
         }
         ProcessState::Blocked => {
             let now_ns = context.timer.clock().now_ns();
@@ -1421,9 +1506,17 @@ fn launch_program(
     program: ProgramSummary,
     startup: Option<ginkgo_sysapi::Handle>,
 ) -> Result<(), ()> {
-    let image = read_system_file(&mut context.fs, program.path(), MAX_EXECUTABLE_BYTES).ok_or(())?;
+    context.processes.prepare_insert().map_err(|_| ())?;
+    let image =
+        read_trusted_system_file(&mut context.fs, program.path(), MAX_EXECUTABLE_BYTES).ok_or(())?;
+    let randomness = [
+        context.entropy.next_u64(),
+        context.entropy.next_u64(),
+        context.entropy.next_u64(),
+    ];
     let mut process =
-        Process::from_elf(&image, &context.page_table, &mut context.frames).map_err(|_| ())?;
+        Process::from_elf_randomized(&image, &context.page_table, &mut context.frames, randomness)
+            .map_err(|_| ())?;
     let client_id = ClientId::new(context.next_client_id).ok_or(())?;
     context.next_client_id = context.next_client_id.checked_add(1).ok_or(())?;
     context.process_clients.try_reserve(1).map_err(|_| ())?;
@@ -1451,10 +1544,15 @@ fn launch_program(
                 .map_err(|_| ())?,
             None => ginkgo_sysapi::Handle::INVALID,
         };
+        let random_source = process
+            .handles_mut()
+            .random_source_create()
+            .map_err(|_| ())?;
         process.set_start_arguments([
             u64::from(channel.raw()),
             u64::from(filesystem.raw()),
             u64::from(startup.raw()),
+            u64::from(random_source.raw()),
         ]);
         context.processes.insert(process).map_err(|_| ())
     })();

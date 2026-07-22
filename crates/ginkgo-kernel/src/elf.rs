@@ -1,7 +1,7 @@
 //! Strict ELF64 loader planning for Ginkgo x86-64 executables.
 //!
-//! The Ginkgo executable profile accepts only little-endian ELF64 `ET_EXEC`
-//! files for x86-64. It uses only nonempty `PT_LOAD` headers, requires readable
+//! The Ginkgo executable profile accepts little-endian ELF64 `ET_EXEC` and
+//! static position-independent `ET_DYN` files for x86-64. It uses only nonempty `PT_LOAD` headers, requires readable
 //! segments with at least 4 KiB power-of-two alignment, enforces W^X, rejects
 //! page overlap and zero/noncanonical/higher-half mappings, and requires the
 //! entry point to lie in an executable segment. Program headers and total load
@@ -35,8 +35,15 @@ const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 const EV_CURRENT: u32 = 1;
 const ET_EXEC: u16 = 2;
+const ET_DYN: u16 = 3;
 const EM_X86_64: u16 = 62;
+const PIE_BASE_START: u64 = 0x0000_0000_2000_0000;
+const PIE_BASE_SLOTS: u64 = 512;
+const PIE_BASE_ALIGNMENT: u64 = 2 * 1024 * 1024;
 const PT_LOAD: u32 = 1;
+const PT_DYNAMIC: u32 = 2;
+const PT_INTERP: u32 = 3;
+const PT_TLS: u32 = 7;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
@@ -101,11 +108,13 @@ pub enum ElfError {
     UnsupportedEndian(u8),
     UnsupportedIdentVersion(u8),
     UnsupportedType(u16),
+    InvalidLoadBias(u64),
     UnsupportedMachine(u16),
     UnsupportedVersion(u32),
     InvalidHeaderSize(u16),
     InvalidProgramHeaderSize(u16),
     MissingProgramHeaders,
+    UnsupportedProgramHeader { index: u16, kind: u32 },
     TooManyProgramHeaders(u16),
     ProgramHeaderTableBeforeHeader(u64),
     ProgramHeaderTableOverflow,
@@ -147,8 +156,24 @@ impl<E> From<ElfError> for LoadError<E> {
     }
 }
 
-/// Parses and validates an ELF64 little-endian x86-64 `ET_EXEC` image.
+/// Parses and validates an ELF image without relocating legacy `ET_EXEC` files.
 pub fn parse(file: &[u8]) -> Result<ParsedElf<'_>, ElfError> {
+    parse_with_bias(file, 0)
+}
+
+/// Parses an image and randomizes compatible `ET_DYN` placement from `random`.
+pub fn parse_randomized(file: &[u8], random: u64) -> Result<ParsedElf<'_>, ElfError> {
+    let reader = Reader::new(file);
+    let elf_type = reader.u16(16)?;
+    let bias = if elf_type == ET_DYN {
+        PIE_BASE_START + (random % PIE_BASE_SLOTS) * PIE_BASE_ALIGNMENT
+    } else {
+        0
+    };
+    parse_with_bias(file, bias)
+}
+
+fn parse_with_bias(file: &[u8], load_bias: u64) -> Result<ParsedElf<'_>, ElfError> {
     let reader = Reader::new(file);
     let ident = reader.bytes::<16>(0)?;
     if ident[0..4] != [0x7f, b'E', b'L', b'F'] {
@@ -165,8 +190,11 @@ pub fn parse(file: &[u8]) -> Result<ParsedElf<'_>, ElfError> {
     }
 
     let elf_type = reader.u16(16)?;
-    if elf_type != ET_EXEC {
+    if elf_type != ET_EXEC && elf_type != ET_DYN {
         return Err(ElfError::UnsupportedType(elf_type));
+    }
+    if (elf_type == ET_EXEC && load_bias != 0) || load_bias % PIE_BASE_ALIGNMENT != 0 {
+        return Err(ElfError::InvalidLoadBias(load_bias));
     }
     let machine = reader.u16(18)?;
     if machine != EM_X86_64 {
@@ -177,7 +205,10 @@ pub fn parse(file: &[u8]) -> Result<ParsedElf<'_>, ElfError> {
         return Err(ElfError::UnsupportedVersion(version));
     }
 
-    let entry = reader.u64(24)?;
+    let entry = reader
+        .u64(24)?
+        .checked_add(load_bias)
+        .ok_or(ElfError::InvalidLoadBias(load_bias))?;
     let program_header_offset = reader.u64(32)?;
     let header_size = reader.u16(52)?;
     if header_size != ELF_HEADER_SIZE {
@@ -224,13 +255,20 @@ pub fn parse(file: &[u8]) -> Result<ParsedElf<'_>, ElfError> {
         let offset = program_header_offset
             .checked_add(u64::from(index) * u64::from(program_header_size))
             .ok_or(ElfError::ProgramHeaderTableOverflow)?;
-        if reader.u32(offset)? != PT_LOAD {
+        let kind = reader.u32(offset)?;
+        if kind != PT_LOAD {
+            if matches!(kind, PT_DYNAMIC | PT_INTERP | PT_TLS) {
+                return Err(ElfError::UnsupportedProgramHeader { index, kind });
+            }
             continue;
         }
 
         let flags = reader.u32(offset + 4)?;
         let file_offset = reader.u64(offset + 8)?;
-        let virtual_address = reader.u64(offset + 16)?;
+        let virtual_address = reader
+            .u64(offset + 16)?
+            .checked_add(load_bias)
+            .ok_or(ElfError::InvalidLoadBias(load_bias))?;
         let file_size = reader.u64(offset + 32)?;
         let memory_size = reader.u64(offset + 40)?;
         let alignment = reader.u64(offset + 48)?;
@@ -253,8 +291,14 @@ pub fn parse(file: &[u8]) -> Result<ParsedElf<'_>, ElfError> {
         if virtual_address < PAGE_SIZE || virtual_end > USER_ADDRESS_END {
             return Err(ElfError::InvalidUserRange { index });
         }
-        if alignment < PAGE_SIZE || !alignment.is_power_of_two() {
+        if alignment < PAGE_SIZE
+            || !alignment.is_power_of_two()
+            || (elf_type == ET_DYN && alignment > PIE_BASE_ALIGNMENT)
+        {
             return Err(ElfError::InvalidAlignment { index, alignment });
+        }
+        if load_bias % alignment != 0 {
+            return Err(ElfError::InvalidLoadBias(load_bias));
         }
         if virtual_address % alignment != file_offset % alignment {
             return Err(ElfError::IncongruentAlignment { index });
@@ -711,14 +755,29 @@ mod tests {
     #[test]
     fn rejects_wrong_type_machine_and_version() {
         let mut file = one_load();
-        put_u16(&mut file, 16, 3);
-        assert_eq!(parse(&file).err(), Some(ElfError::UnsupportedType(3)));
+        put_u16(&mut file, 16, 4);
+        assert_eq!(parse(&file).err(), Some(ElfError::UnsupportedType(4)));
         file = one_load();
         put_u16(&mut file, 18, 3);
         assert_eq!(parse(&file).err(), Some(ElfError::UnsupportedMachine(3)));
         file = one_load();
         put_u32(&mut file, 20, 0);
         assert_eq!(parse(&file).err(), Some(ElfError::UnsupportedVersion(0)));
+    }
+
+    #[test]
+    fn randomized_pie_bias_is_aligned_bounded_and_seed_dependent() {
+        let mut file = one_load();
+        put_u16(&mut file, 16, ET_DYN);
+        let first = parse_randomized(&file, 1).unwrap();
+        let second = parse_randomized(&file, 2).unwrap();
+        assert_ne!(first.entry(), second.entry());
+        for image in [first, second] {
+            let bias = image.entry() - 0x0040_1000;
+            assert!(bias >= PIE_BASE_START);
+            assert!(bias < PIE_BASE_START + PIE_BASE_SLOTS * PIE_BASE_ALIGNMENT);
+            assert_eq!(bias % PIE_BASE_ALIGNMENT, 0);
+        }
     }
 
     #[test]

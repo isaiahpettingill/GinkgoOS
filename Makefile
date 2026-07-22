@@ -35,7 +35,7 @@ else
 QEMU ?= qemu-system-x86_64
 QEMU_AUDIO_FLAGS ?= -audiodev sdl,id=ginkgo-audio
 endif
-QEMU_FLAGS ?= -m 512M -M pc,i8042=off -serial stdio -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 $(QEMU_AUDIO_FLAGS) -device ich9-intel-hda -device hda-output,audiodev=ginkgo-audio -no-reboot -no-shutdown
+QEMU_FLAGS ?= -cpu max -m 512M -M pc,i8042=off -serial stdio -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 $(QEMU_AUDIO_FLAGS) -device ich9-intel-hda -device hda-output,audiodev=ginkgo-audio -no-reboot -no-shutdown
 
 .PHONY: all userspace kernel iso qemu no-iso run check clean distclean reset-fs
 

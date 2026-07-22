@@ -1,12 +1,18 @@
 use std::{collections::BTreeMap, env, fs, fs::File, io::BufReader, path::PathBuf};
 
+use ed25519_dalek::{Signer, SigningKey};
 use ginkgo_program_registry::{encode, EncodeEntry, EntryFlags, Registry};
+use sha2::{Digest, Sha256};
 
 const ELF_HEADER_SIZE: usize = 64;
 const PROGRAM_HEADER_SIZE: usize = 56;
 const CODE_OFFSET: usize = ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE;
 const LOAD_ADDRESS: u64 = 0x0040_0000;
 const PAGE_SIZE: u64 = 4096;
+const DEVELOPMENT_TRUST_SIGNING_KEY: [u8; 32] = [
+    0x47, 0x69, 0x6e, 0x6b, 0x67, 0x6f, 0x4f, 0x53, 0x20, 0x64, 0x65, 0x76, 0x65, 0x6c, 0x6f, 0x70,
+    0x6d, 0x65, 0x6e, 0x74, 0x20, 0x6b, 0x65, 0x79, 0x20, 0x76, 0x31, 0x00, 0x13, 0x37, 0x96, 0x64,
+];
 
 const PROCESS_YIELD: u32 = 0;
 const PROCESS_EXIT: u32 = 1;
@@ -51,6 +57,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GINKGO_FILE_NAVIGATOR_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_TERMINAL_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_PREEMPTION_SMOKE");
+    println!("cargo:rerun-if-env-changed=GINKGO_TRUST_SIGNING_KEY_HEX");
     println!("cargo:rustc-link-arg-bin=ginkgo-os=-T{}", linker.display());
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("build output directory"));
@@ -72,14 +79,68 @@ fn main() {
         .unwrap_or_else(build_userspace_smoke_elf);
     let terminal =
         read_userspace_artifact("GINKGO_TERMINAL_ELF").unwrap_or_else(build_userspace_smoke_elf);
+    let registry = build_program_registry();
+    let artifacts = [
+        ("/desktop.elf", desktop.as_slice()),
+        ("/minimal-client.elf", minimal_client.as_slice()),
+        ("/file-navigator.elf", file_navigator.as_slice()),
+        ("/terminal.elf", terminal.as_slice()),
+        ("/programs.gkr", registry.as_slice()),
+    ];
+    let (manifest, signature, public_key) = build_trust_manifest(&artifacts);
     fs::write(out_dir.join("ginkgo-desktop.elf"), desktop).expect("write ginkgo desktop ELF");
     fs::write(out_dir.join("ginkgo-minimal-client.elf"), minimal_client)
         .expect("write Ginkgo minimal client ELF");
     fs::write(out_dir.join("ginkgo-file-navigator.elf"), file_navigator)
         .expect("write Ginkgo file navigator ELF");
     fs::write(out_dir.join("ginkgo-terminal.elf"), terminal).expect("write Ginkgo terminal ELF");
-    fs::write(out_dir.join("programs.gkr"), build_program_registry())
-        .expect("write Ginkgo program registry");
+    fs::write(out_dir.join("programs.gkr"), registry).expect("write Ginkgo program registry");
+    fs::write(out_dir.join("system-trust.manifest"), manifest).expect("write trust manifest");
+    fs::write(out_dir.join("system-trust.signature"), signature).expect("write trust signature");
+    fs::write(out_dir.join("system-trust.public"), public_key).expect("write trust public key");
+}
+
+fn build_trust_manifest(artifacts: &[(&str, &[u8])]) -> (Vec<u8>, [u8; 64], [u8; 32]) {
+    let mut manifest = Vec::new();
+    manifest.extend_from_slice(b"GKTM");
+    manifest.extend_from_slice(&1_u16.to_le_bytes());
+    manifest.extend_from_slice(
+        &u16::try_from(artifacts.len())
+            .expect("system artifact count fits trust manifest")
+            .to_le_bytes(),
+    );
+    for (path, artifact) in artifacts {
+        let path_len = u16::try_from(path.len()).expect("system path fits trust manifest");
+        manifest.extend_from_slice(&path_len.to_le_bytes());
+        manifest.extend_from_slice(&0_u16.to_le_bytes());
+        manifest.extend_from_slice(&(artifact.len() as u64).to_le_bytes());
+        manifest.extend_from_slice(&Sha256::digest(artifact));
+        manifest.extend_from_slice(path.as_bytes());
+    }
+    let signing_key = SigningKey::from_bytes(&trust_signing_key());
+    let signature = signing_key.sign(&manifest).to_bytes();
+    (manifest, signature, signing_key.verifying_key().to_bytes())
+}
+
+fn trust_signing_key() -> [u8; 32] {
+    let Some(encoded) = env::var_os("GINKGO_TRUST_SIGNING_KEY_HEX") else {
+        return DEVELOPMENT_TRUST_SIGNING_KEY;
+    };
+    let encoded = encoded
+        .into_string()
+        .expect("GINKGO_TRUST_SIGNING_KEY_HEX must be UTF-8");
+    assert_eq!(
+        encoded.len(),
+        64,
+        "trust signing key must be 64 hex characters"
+    );
+    let mut key = [0; 32];
+    for (index, byte) in key.iter_mut().enumerate() {
+        let start = index * 2;
+        *byte = u8::from_str_radix(&encoded[start..start + 2], 16)
+            .expect("trust signing key contains non-hex characters");
+    }
+    key
 }
 
 fn write_splash_rgba(source: &PathBuf, output: &PathBuf) {

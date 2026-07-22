@@ -15,6 +15,8 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 pub const CHANNEL_MAX_BYTES: usize = 16 * 1024;
 /// Maximum number of handles accepted by one channel message.
 pub const CHANNEL_MAX_HANDLES: usize = 16;
+/// Maximum random bytes returned by one bounded syscall.
+pub const RANDOM_MAX_BYTES: usize = 4096;
 /// Serialized size of [`RpcHeader`].
 pub const RPC_HEADER_SIZE: usize = core::mem::size_of::<RpcHeader>();
 /// A wait deadline which never expires.
@@ -48,6 +50,8 @@ pub enum SyscallNumber {
     AudioWrite = 20,
     /// Reads the kernel's monotonic nanosecond clock.
     ClockGetMonotonic = 21,
+    /// Fills a writable buffer through a random-source capability.
+    RandomFill = 22,
 }
 
 /// An opaque process-local reference to a kernel object.
@@ -165,6 +169,7 @@ pub enum ObjectType {
     Window = 3,
     FilesystemRoot = 4,
     File = 5,
+    RandomSource = 6,
 }
 
 /// Stable syscall status values. Additional detail is returned in output structs.
@@ -194,6 +199,7 @@ pub enum Status {
     EndOfDirectory = -20,
     Io = -21,
     TimedOut = -22,
+    ResourceLimit = -23,
 }
 
 impl Status {
@@ -223,6 +229,7 @@ impl Status {
             -20 => Self::EndOfDirectory,
             -21 => Self::Io,
             -22 => Self::TimedOut,
+            -23 => Self::ResourceLimit,
             _ => return None,
         })
     }

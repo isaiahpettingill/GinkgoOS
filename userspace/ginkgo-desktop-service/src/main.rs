@@ -43,7 +43,7 @@ const STARTUP_FORWARD_RIGHTS: Rights = Rights::from_bits_retain(
 
 ginkgo_runtime::entry!(process_main);
 
-extern "C" fn process_main(bootstrap_raw: u64, width: u64, height: u64) -> ! {
+extern "C" fn process_main(bootstrap_raw: u64, width: u64, height: u64, _random_raw: u64) -> ! {
     let Some(bootstrap) = u32::try_from(bootstrap_raw)
         .ok()
         .map(Handle::from_raw)

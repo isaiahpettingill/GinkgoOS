@@ -24,7 +24,12 @@ const MAX_EVENTS_PER_TURN: usize = 32;
 
 ginkgo_runtime::entry!(process_main);
 
-extern "C" fn process_main(window_raw: u64, filesystem_raw: u64, _arg2: u64) -> ! {
+extern "C" fn process_main(
+    window_raw: u64,
+    filesystem_raw: u64,
+    _arg2: u64,
+    _random_raw: u64,
+) -> ! {
     let window = parse_handle(window_raw)
         .unwrap_or_else(|| fail(b"file-navigator: invalid window channel\n", 1));
     let filesystem = parse_handle(filesystem_raw)

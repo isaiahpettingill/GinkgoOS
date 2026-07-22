@@ -17,7 +17,10 @@ use x86_64::VirtAddr;
 #[cfg(test)]
 use x86_64::PhysAddr;
 
-use crate::memory::{FrameAllocatorError, UsableFrameAllocator, PAGE_SIZE};
+use crate::{
+    arch,
+    memory::{FrameAllocatorError, UsableFrameAllocator, PAGE_SIZE},
+};
 
 use super::{ActivePageTable, MapError, PageTableFlags};
 
@@ -119,6 +122,7 @@ pub enum AddressSpaceError {
     UntrackedMapping(u64),
     InvalidRangeLength(usize),
     ActiveAddressSpaceRequired,
+    UserCopyFault,
     ActiveKernelPageTableRequired,
     /// Reserved for callers that require an already-hardened source root.
     /// `AddressSpace::new` instead clears this bit while copying kernel entries.
@@ -563,14 +567,17 @@ impl AddressSpace {
         }
         let source = VirtAddr::try_new(user_source)
             .map_err(|_| AddressSpaceError::NonCanonicalAddress(user_source))?;
-        unsafe {
-            ptr::copy(
-                source.as_ptr::<u8>(),
+        if unsafe {
+            arch::copy_user_bytes(
                 destination.as_mut_ptr(),
+                source.as_ptr::<u8>(),
                 destination.len(),
             )
-        };
-        Ok(())
+        } {
+            Ok(())
+        } else {
+            Err(AddressSpaceError::UserCopyFault)
+        }
     }
 
     /// Copies bytes into the currently active user address space after checking
@@ -589,14 +596,17 @@ impl AddressSpace {
         }
         let destination = VirtAddr::try_new(user_destination)
             .map_err(|_| AddressSpaceError::NonCanonicalAddress(user_destination))?;
-        unsafe {
-            ptr::copy(
-                source.as_ptr(),
+        if unsafe {
+            arch::copy_user_bytes(
                 destination.as_mut_ptr::<u8>(),
+                source.as_ptr(),
                 source.len(),
             )
-        };
-        Ok(())
+        } {
+            Ok(())
+        } else {
+            Err(AddressSpaceError::UserCopyFault)
+        }
     }
 
     /// Converts this address space into explicit retirement records.
