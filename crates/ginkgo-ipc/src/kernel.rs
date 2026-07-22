@@ -13,7 +13,12 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use core::{mem, ptr::NonNull, slice};
+use core::{
+    mem,
+    ptr::NonNull,
+    slice,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use ginkgo_filesystem::FileHandle;
 use ginkgo_sysapi::{
@@ -38,6 +43,37 @@ const HANDLE_GENERATION_MASK: u32 = (1 << (32 - HANDLE_INDEX_BITS)) - 1;
 // Serializes queue-edge additions while cycle detection traverses other channel
 // states. Reads and endpoint teardown only remove edges and need no graph lock.
 static CHANNEL_GRAPH_LOCK: Spinlock<()> = Spinlock::new(());
+
+static SHARED_MEMORY_LIVE_OBJECTS: AtomicUsize = AtomicUsize::new(0);
+static SHARED_MEMORY_LOGICAL_BYTES: AtomicUsize = AtomicUsize::new(0);
+static SHARED_MEMORY_MAPPED_ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
+static SHARED_MEMORY_CUMULATIVE_CREATIONS: AtomicUsize = AtomicUsize::new(0);
+static SHARED_MEMORY_CUMULATIVE_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+/// Global shared-memory backing allocation diagnostics.
+///
+/// Byte totals describe currently live backing allocations. Cumulative totals
+/// increase monotonically for each successfully allocated and subsequently dropped
+/// backing, including allocations whose enclosing handle creation later fails.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SharedMemoryBackingStats {
+    pub live_objects: usize,
+    pub logical_bytes: usize,
+    pub mapped_allocated_bytes: usize,
+    pub cumulative_creations: usize,
+    pub cumulative_drops: usize,
+}
+
+/// Returns a point-in-time snapshot of global shared-memory backing diagnostics.
+pub fn shared_memory_backing_stats() -> SharedMemoryBackingStats {
+    SharedMemoryBackingStats {
+        live_objects: SHARED_MEMORY_LIVE_OBJECTS.load(Ordering::Relaxed),
+        logical_bytes: SHARED_MEMORY_LOGICAL_BYTES.load(Ordering::Relaxed),
+        mapped_allocated_bytes: SHARED_MEMORY_MAPPED_ALLOCATED_BYTES.load(Ordering::Relaxed),
+        cumulative_creations: SHARED_MEMORY_CUMULATIVE_CREATIONS.load(Ordering::Relaxed),
+        cumulative_drops: SHARED_MEMORY_CUMULATIVE_DROPS.load(Ordering::Relaxed),
+    }
+}
 
 const CHANNEL_DEFAULT_RIGHTS: Rights = Rights::from_bits_retain(
     Rights::READ.bits()
@@ -182,6 +218,12 @@ impl SharedMemoryBacking {
         let layout = Layout::from_size_align(mapped_len, SHARED_MEMORY_PAGE_SIZE)
             .map_err(|_| IpcError::InvalidMessage)?;
         let base = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(IpcError::OutOfMemory)?;
+
+        SHARED_MEMORY_LIVE_OBJECTS.fetch_add(1, Ordering::Relaxed);
+        SHARED_MEMORY_LOGICAL_BYTES.fetch_add(logical_len, Ordering::Relaxed);
+        SHARED_MEMORY_MAPPED_ALLOCATED_BYTES.fetch_add(mapped_len, Ordering::Relaxed);
+        SHARED_MEMORY_CUMULATIVE_CREATIONS.fetch_add(1, Ordering::Relaxed);
+
         Ok(Self {
             base,
             logical_len,
@@ -203,6 +245,10 @@ unsafe impl Sync for SharedMemoryBacking {}
 impl Drop for SharedMemoryBacking {
     fn drop(&mut self) {
         unsafe { dealloc(self.base.as_ptr(), self.layout) };
+        SHARED_MEMORY_LIVE_OBJECTS.fetch_sub(1, Ordering::Relaxed);
+        SHARED_MEMORY_LOGICAL_BYTES.fetch_sub(self.logical_len, Ordering::Relaxed);
+        SHARED_MEMORY_MAPPED_ALLOCATED_BYTES.fetch_sub(self.mapped_len(), Ordering::Relaxed);
+        SHARED_MEMORY_CUMULATIVE_DROPS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1557,8 +1603,11 @@ where
 mod tests {
     use super::*;
 
+    static SHARED_MEMORY_TEST_LOCK: Spinlock<()> = Spinlock::new(());
+
     #[test]
     fn shared_memory_backing_is_page_aligned_rounded_zeroed_and_map_gated() {
+        let _shared_memory_test = SHARED_MEMORY_TEST_LOCK.lock();
         let mut table = HandleTable::new();
         let one_byte = table.shared_memory_create(1).unwrap();
         let exact_page = table.shared_memory_create(SHARED_MEMORY_PAGE_SIZE).unwrap();
@@ -1624,8 +1673,20 @@ mod tests {
 
     #[test]
     fn shared_memory_mapping_lease_keeps_backing_alive_after_handle_close() {
+        let _shared_memory_test = SHARED_MEMORY_TEST_LOCK.lock();
+        let baseline = shared_memory_backing_stats();
         let mut table = HandleTable::new();
         let memory = table.shared_memory_create(8).unwrap();
+        assert_eq!(
+            shared_memory_backing_stats(),
+            SharedMemoryBackingStats {
+                live_objects: baseline.live_objects + 1,
+                logical_bytes: baseline.logical_bytes + 8,
+                mapped_allocated_bytes: baseline.mapped_allocated_bytes + SHARED_MEMORY_PAGE_SIZE,
+                cumulative_creations: baseline.cumulative_creations + 1,
+                cumulative_drops: baseline.cumulative_drops,
+            }
+        );
         table.shared_memory_write(memory, 0, b"retained").unwrap();
         let lease = table
             .shared_memory_mapping_lease(memory, SharedMemoryMappingAccess::ReadWrite)
@@ -1635,6 +1696,16 @@ mod tests {
 
         table.handle_close(memory).unwrap();
         assert_eq!(table.object_type(memory), Err(IpcError::InvalidHandle));
+        assert_eq!(
+            shared_memory_backing_stats(),
+            SharedMemoryBackingStats {
+                live_objects: baseline.live_objects + 1,
+                logical_bytes: baseline.logical_bytes + 8,
+                mapped_allocated_bytes: baseline.mapped_allocated_bytes + SHARED_MEMORY_PAGE_SIZE,
+                cumulative_creations: baseline.cumulative_creations + 1,
+                cumulative_drops: baseline.cumulative_drops,
+            }
+        );
         assert_eq!(stored_lease.info(), info);
         assert_eq!(
             stored_lease.effective_rights(),
@@ -1644,10 +1715,24 @@ mod tests {
         assert_eq!(bytes, b"retained");
         drop(lease);
         assert_eq!(stored_lease.info(), info);
+        assert_eq!(
+            shared_memory_backing_stats().cumulative_drops,
+            baseline.cumulative_drops
+        );
+        drop(stored_lease);
+        assert_eq!(
+            shared_memory_backing_stats(),
+            SharedMemoryBackingStats {
+                cumulative_creations: baseline.cumulative_creations + 1,
+                cumulative_drops: baseline.cumulative_drops + 1,
+                ..baseline
+            }
+        );
     }
 
     #[test]
     fn shared_memory_checks_ranges_and_shares_bytes_across_aliases_and_transfer() {
+        let _shared_memory_test = SHARED_MEMORY_TEST_LOCK.lock();
         let mut sender = HandleTable::new();
         let mut receiver = HandleTable::new();
         assert_eq!(
@@ -1744,6 +1829,7 @@ mod tests {
 
     #[test]
     fn window_capabilities_have_stable_types_protected_roles_and_checked_backing() {
+        let _shared_memory_test = SHARED_MEMORY_TEST_LOCK.lock();
         assert_eq!(ObjectType::Channel as u32, 1);
         assert_eq!(ObjectType::SharedMemory as u32, 2);
         assert_eq!(ObjectType::Window as u32, 3);
@@ -1801,6 +1887,7 @@ mod tests {
 
     #[test]
     fn window_three_buffer_pool_reuses_generation_and_bounds_release_ownership() {
+        let _shared_memory_test = SHARED_MEMORY_TEST_LOCK.lock();
         let mut table = HandleTable::new();
         let memory = table.shared_memory_create(12).unwrap();
         assert_eq!(
@@ -1896,6 +1983,7 @@ mod tests {
 
     #[test]
     fn window_retirement_is_atomic_and_drains_the_displayed_release() {
+        let _shared_memory_test = SHARED_MEMORY_TEST_LOCK.lock();
         let mut table = HandleTable::new();
         let memory = table.shared_memory_create(8).unwrap();
         let (client, manager) = table
@@ -1961,6 +2049,7 @@ mod tests {
 
     #[test]
     fn window_final_role_closure_signals_peers_without_alias_false_positives() {
+        let _shared_memory_test = SHARED_MEMORY_TEST_LOCK.lock();
         let mut table = HandleTable::new();
         let memory = table.shared_memory_create(16).unwrap();
         let (client, manager) = table.window_create(memory).unwrap();
@@ -2009,6 +2098,7 @@ mod tests {
 
     #[test]
     fn window_two_buffer_lifecycle_is_atomic_and_signal_driven_across_transfer() {
+        let _shared_memory_test = SHARED_MEMORY_TEST_LOCK.lock();
         let mut manager_table = HandleTable::new();
         let mut client_table = HandleTable::new();
         let memory = manager_table.shared_memory_create(8).unwrap();
@@ -2380,6 +2470,7 @@ mod tests {
 
     #[test]
     fn mixed_channel_operations_move_duplicate_and_preserve_exact_rights() {
+        let _shared_memory_test = SHARED_MEMORY_TEST_LOCK.lock();
         let mut sender = HandleTable::new();
         let mut receiver = HandleTable::new();
         let (send, receive) = channel_create_between(&mut sender, &mut receiver).unwrap();
@@ -2442,6 +2533,7 @@ mod tests {
 
     #[test]
     fn mixed_channel_operation_validation_is_atomic() {
+        let _shared_memory_test = SHARED_MEMORY_TEST_LOCK.lock();
         let mut table = HandleTable::new();
         let (send, receive) = table.channel_create().unwrap();
         let move_candidate = table.shared_memory_create(8).unwrap();
@@ -2525,6 +2617,7 @@ mod tests {
 
     #[test]
     fn mixed_channel_operations_are_atomic_for_full_and_closed_queues() {
+        let _shared_memory_test = SHARED_MEMORY_TEST_LOCK.lock();
         let mut table = HandleTable::new();
         let (send, receive) = table.channel_create().unwrap();
         let move_source = table.shared_memory_create(8).unwrap();

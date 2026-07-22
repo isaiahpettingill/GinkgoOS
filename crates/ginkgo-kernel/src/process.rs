@@ -21,7 +21,8 @@ use crate::{
     memory::{UsableFrameAllocator, PAGE_SIZE},
     paging::{
         address_space::{
-            AddressSpace, AddressSpaceError, RetiredAddressSpace, UserAccess, UserPagePermissions,
+            AddressSpace, AddressSpaceError, FrameReclaimStats, RetiredAddressSpace, UserAccess,
+            UserPagePermissions,
         },
         ActivePageTable,
     },
@@ -348,6 +349,48 @@ pub struct ProcessTeardown {
     pub retained_failed_mapping_leases_released: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessReclaimStats {
+    pub frames: FrameReclaimStats,
+    pub teardown: ProcessTeardown,
+}
+
+/// Reclaim failure retaining the retired process's unreclaimed frame ownership.
+pub struct RetiredProcessReclaimError {
+    process: RetiredProcess,
+    error: crate::memory::FrameAllocatorError,
+    reclaimed: FrameReclaimStats,
+}
+
+impl RetiredProcessReclaimError {
+    pub const fn error(&self) -> crate::memory::FrameAllocatorError {
+        self.error
+    }
+
+    pub const fn reclaimed(&self) -> FrameReclaimStats {
+        self.reclaimed
+    }
+
+    pub const fn process(&self) -> &RetiredProcess {
+        &self.process
+    }
+
+    pub fn into_process(self) -> RetiredProcess {
+        self.process
+    }
+}
+
+impl fmt::Debug for RetiredProcessReclaimError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetiredProcessReclaimError")
+            .field("error", &self.error)
+            .field("reclaimed", &self.reclaimed)
+            .field("remaining", &self.process.address_space.accounting())
+            .finish()
+    }
+}
+
 /// Inactive process resources after capability and mapping leases have been torn down.
 pub struct RetiredProcess {
     address_space: RetiredAddressSpace,
@@ -375,6 +418,39 @@ impl RetiredProcess {
 
     pub fn into_address_space(self) -> RetiredAddressSpace {
         self.address_space
+    }
+
+    /// Consumes this retired process and returns all uniquely owned frames.
+    ///
+    /// A failure returns the process owner with only unreclaimed frames, allowing
+    /// an exact retry without replaying already successful batches.
+    pub fn reclaim(
+        self,
+        allocator: &mut UsableFrameAllocator<'_>,
+    ) -> Result<ProcessReclaimStats, RetiredProcessReclaimError> {
+        let Self {
+            address_space,
+            context,
+            final_state,
+            teardown,
+        } = self;
+        match address_space.reclaim(allocator) {
+            Ok(frames) => Ok(ProcessReclaimStats { frames, teardown }),
+            Err(error) => {
+                let allocator_error = error.error();
+                let reclaimed = error.reclaimed();
+                Err(RetiredProcessReclaimError {
+                    process: Self {
+                        address_space: error.into_address_space(),
+                        context,
+                        final_state,
+                        teardown,
+                    },
+                    error: allocator_error,
+                    reclaimed,
+                })
+            }
+        }
     }
 }
 
@@ -478,9 +554,28 @@ impl Process {
         }
 
         let hhdm_offset = kernel.hhdm_offset();
-        let mut address_space =
+        let address_space =
             AddressSpace::new(kernel, allocator).map_err(ProcessCreateError::AddressSpace)?;
+        Self::finish_construction(
+            parsed,
+            address_space,
+            hhdm_offset,
+            layout,
+            limits,
+            allocator,
+            randomness,
+        )
+    }
 
+    fn finish_construction(
+        parsed: elf::ParsedElf<'_>,
+        mut address_space: AddressSpace,
+        hhdm_offset: VirtAddr,
+        layout: ProcessLayout,
+        limits: ProcessLimits,
+        allocator: &mut UsableFrameAllocator<'_>,
+        randomness: Option<[u64; 3]>,
+    ) -> Result<Self, ProcessCreateError> {
         let loaded = parsed.load_with(|address, permissions, contents| {
             let permissions = user_permissions(permissions);
             let frame = address_space
@@ -490,31 +585,59 @@ impl Process {
         });
         let image = match loaded {
             Ok(image) => image,
-            Err(LoadError::Elf(error)) => return Err(ProcessCreateError::Elf(error)),
-            Err(LoadError::Page(error)) => return Err(ProcessCreateError::ElfPage(error)),
+            Err(LoadError::Elf(error)) => {
+                return reclaim_failed_construction(
+                    address_space,
+                    allocator,
+                    ProcessCreateError::Elf(error),
+                )
+            }
+            Err(LoadError::Page(error)) => {
+                return reclaim_failed_construction(
+                    address_space,
+                    allocator,
+                    ProcessCreateError::ElfPage(error),
+                )
+            }
         };
 
         let mut stack_page = layout.stack_bottom;
         while stack_page < layout.stack_top {
-            address_space
-                .map_zeroed_user_4k(stack_page, UserPagePermissions::READ_WRITE, allocator)
-                .map_err(|error| ProcessCreateError::StackPage {
-                    address: stack_page,
-                    error,
-                })?;
+            if let Err(error) = address_space.map_zeroed_user_4k(
+                stack_page,
+                UserPagePermissions::READ_WRITE,
+                allocator,
+            ) {
+                return reclaim_failed_construction(
+                    address_space,
+                    allocator,
+                    ProcessCreateError::StackPage {
+                        address: stack_page,
+                        error,
+                    },
+                );
+            }
             stack_page += PAGE_SIZE;
         }
 
-        address_space
-            .validate_user_range(image.entry, 1, UserAccess::Execute)
-            .map_err(ProcessCreateError::EntryNotExecutable)?;
-        address_space
-            .validate_user_range(
-                layout.stack_bottom,
-                layout.stack_size() as usize,
-                UserAccess::Write,
-            )
-            .map_err(ProcessCreateError::StackNotWritable)?;
+        if let Err(error) = address_space.validate_user_range(image.entry, 1, UserAccess::Execute) {
+            return reclaim_failed_construction(
+                address_space,
+                allocator,
+                ProcessCreateError::EntryNotExecutable(error),
+            );
+        }
+        if let Err(error) = address_space.validate_user_range(
+            layout.stack_bottom,
+            layout.stack_size() as usize,
+            UserAccess::Write,
+        ) {
+            return reclaim_failed_construction(
+                address_space,
+                allocator,
+                ProcessCreateError::StackNotWritable(error),
+            );
+        }
 
         let context = UserContext::new(image.entry, layout.stack_top);
         debug_assert_eq!(context.rsp & 0xf, 0);
@@ -937,6 +1060,21 @@ fn retain_unretired_resource<T>(resource: &mut Option<T>) {
     if let Some(resource) = resource.take() {
         mem::forget(resource);
     }
+}
+
+fn reclaim_failed_construction(
+    address_space: AddressSpace,
+    allocator: &mut UsableFrameAllocator<'_>,
+    original_error: ProcessCreateError,
+) -> Result<Process, ProcessCreateError> {
+    if let Err(cleanup_error) = address_space.cleanup_inactive(allocator) {
+        // Reclamation failure is a kernel ownership-invariant violation, not the
+        // original malformed-image or exhaustion error. Preserve the exact owner
+        // for postmortem safety before entering the kernel's fail-stop path.
+        mem::forget(cleanup_error);
+        panic!("failed to reclaim partial process construction");
+    }
+    Err(original_error)
 }
 
 fn user_permissions(permissions: SegmentPermissions) -> UserPagePermissions {
@@ -1414,9 +1552,39 @@ impl Default for ProcessTable {
 
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use alloc::alloc::{alloc_zeroed, dealloc, Layout};
+    use core::{
+        ptr::NonNull,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use super::*;
+
+    static FRAME_RECLAIM_TEST_ELF: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-frame-reclaim-exit.elf"));
+
+    struct TestFrameRegion {
+        pointer: NonNull<u8>,
+        layout: Layout,
+    }
+
+    impl TestFrameRegion {
+        fn allocator(pages: usize) -> (Self, UsableFrameAllocator<'static>) {
+            let size = pages * PAGE_SIZE as usize;
+            let layout = Layout::from_size_align(size, PAGE_SIZE as usize).unwrap();
+            let pointer = NonNull::new(unsafe { alloc_zeroed(layout) }).expect("test frame region");
+            let allocator = unsafe {
+                UsableFrameAllocator::from_test_region(pointer.as_ptr() as u64, size as u64)
+            };
+            (Self { pointer, layout }, allocator)
+        }
+    }
+
+    impl Drop for TestFrameRegion {
+        fn drop(&mut self) {
+            unsafe { dealloc(self.pointer.as_ptr(), self.layout) };
+        }
+    }
 
     struct DropProbe<'a>(&'a AtomicUsize);
 
@@ -1434,6 +1602,23 @@ mod tests {
         }
     }
 
+    fn construct_test_process(
+        allocator: &mut UsableFrameAllocator<'_>,
+    ) -> Result<Process, ProcessCreateError> {
+        let parsed = elf::parse(FRAME_RECLAIM_TEST_ELF).map_err(ProcessCreateError::Elf)?;
+        let address_space =
+            AddressSpace::new_for_test(allocator).map_err(ProcessCreateError::AddressSpace)?;
+        Process::finish_construction(
+            parsed,
+            address_space,
+            VirtAddr::zero(),
+            ProcessLayout::STANDARD,
+            ProcessLimits::STANDARD,
+            allocator,
+            None,
+        )
+    }
+
     fn test_process(state: ProcessState) -> Process {
         Process {
             address_space: None,
@@ -1449,6 +1634,71 @@ mod tests {
             limits: ProcessLimits::STANDARD,
             usage: ProcessUsage::default(),
         }
+    }
+
+    #[test]
+    fn partial_elf_load_exhaustion_reclaims_every_allocated_frame() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(4);
+
+        assert!(matches!(
+            construct_test_process(&mut allocator),
+            Err(ProcessCreateError::ElfPage(_))
+        ));
+        assert_eq!(allocator.allocated_count(), 0);
+        assert_eq!(allocator.free_count(), 4);
+    }
+
+    #[test]
+    fn partial_stack_exhaustion_reclaims_every_allocated_frame() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(10);
+
+        assert!(matches!(
+            construct_test_process(&mut allocator),
+            Err(ProcessCreateError::StackPage { .. })
+        ));
+        assert_eq!(allocator.allocated_count(), 0);
+        assert_eq!(allocator.free_count(), 10);
+    }
+
+    #[test]
+    fn exhausted_allocator_recovers_after_constructor_and_external_reclamation() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(40);
+        let mut held = Vec::new();
+        for _ in 0..30 {
+            held.push(allocator.allocate_frame().unwrap().unwrap());
+        }
+        let baseline = allocator.allocated_count();
+
+        assert!(matches!(
+            construct_test_process(&mut allocator),
+            Err(ProcessCreateError::StackPage { .. })
+        ));
+        assert_eq!(allocator.allocated_count(), baseline);
+
+        allocator.reclaim_frames(&held).unwrap();
+        let process =
+            construct_test_process(&mut allocator).expect("reclaimed frames are reusable");
+        let retired = process
+            .retire()
+            .expect("host test address space is inactive");
+        retired
+            .reclaim(&mut allocator)
+            .expect("process reclamation");
+        assert_eq!(allocator.allocated_count(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "failed to reclaim partial process construction")]
+    fn construction_cleanup_failure_is_fail_stop_not_the_original_error() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(1);
+        let address_space = AddressSpace::new_for_test(&mut allocator).unwrap();
+        allocator.reserve_frame(address_space.root_frame()).unwrap();
+
+        let _ = reclaim_failed_construction(
+            address_space,
+            &mut allocator,
+            ProcessCreateError::ResourceLimit,
+        );
     }
 
     #[test]

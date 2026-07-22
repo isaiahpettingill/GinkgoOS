@@ -6,7 +6,7 @@ A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. Gi
 
 - Nightly Rust and the built-in `x86_64-unknown-none` target
 - Limine framebuffer, memory-map, and higher-half direct-map requests
-- Allocate-only 4 KiB physical frame allocation from usable memory
+- Reclaiming 4 KiB physical-frame allocation with exact ownership and reservation tracking
 - `x86_64`-backed address types, active page-table translation, mapping, and unmapping
 - Generation-tagged processes with isolated lower-half page tables and supervisor-only shared kernel mappings
 - Strict ELF64 `ET_EXEC` compatibility plus randomized static `ET_DYN`, guarded randomized user stacks, x86-64 ring-3 entry, and contained user faults
@@ -64,16 +64,16 @@ desktop: loaded /desktop.elf from RedoxFS pid=...
 desktop: protected Rust userland ready
 ```
 
-The build script retains generated smoke ELFs for focused execution testing, but they are not production binaries used by normal Makefile builds. Setting `GINKGO_PREEMPTION_SMOKE=1` launches an opt-in probe that verifies forced preemption, `RCX`/`R11` preservation, concurrent desktop progress, monotonic time, and finite blocked-wait timeout in QEMU.
+The build script retains generated smoke ELFs for focused execution testing, but they are not production binaries used by normal Makefile builds. Setting `GINKGO_PREEMPTION_SMOKE=1` launches an opt-in probe that verifies forced preemption, `RCX`/`R11` preservation, concurrent desktop progress, monotonic time, and finite blocked-wait timeout in QEMU. `make frame-reclaim-smoke` runs 512 real scheduler launch/retirement cycles, alternating clean exits and invalid-opcode faults while exercising shared-memory leases, and requires physical-frame and IPC backing counts to return to a stable post-warmup baseline.
 
 Current execution limitations are intentional and explicit:
 
 - Scheduling is single-core; SMP and CPU migration are not implemented.
-- Only the local-APIC timer has an external interrupt entry. Device drivers still poll, and general I/O-APIC/MSI routing is not implemented.
+- The local-APIC timer and xHCI MSI have dedicated external interrupt entries; other device drivers still poll, and general I/O-APIC routing is not implemented.
 - Blocked waits use bounded scheduler polling rather than per-object kernel wait queues.
 - SMAP is enabled when supported; one CPU-local fixup contains faults during explicitly bracketed user copies.
 - XSAVE-capable CPUs preserve enabled x87/SSE/AVX state (including AVX2's YMM state) across every userspace transition; legacy CPUs use FXSAVE, and default system images retain an SSE2 baseline.
-- The physical allocator is monotonic, so retired process frames are accounted for but not recycled.
+- Physical reclamation is single-core: process roots are recycled only after switching back to the kernel CR3; future SMP requires remote TLB shootdown before reuse.
 - Early shared-memory and capability allocation still depends on the fixed bootstrap kernel heap.
 - Dynamic linking, runtime ELF relocations, signed rollback prevention, encrypted storage, and hardware-backed key sealing are not yet provided.
 
@@ -140,7 +140,7 @@ make run
 
 The first run downloads Limine and OVMF, builds the kernel, creates `build/ginkgo-os.iso`, creates a persistent 16 MiB GPT `build/ginkgo-redoxfs.img` if needed, and starts QEMU. The default `pc` machine attaches that image through transitional `virtio-blk` plus an xHCI USB hub containing a keyboard and tablet. Subsequent runs reuse the same filesystem image.
 
-Run `make usb-smoke` for automated headless QEMU/QMP coverage. The test verifies hub enumeration, MSI delivery, disconnect with an outstanding HID transfer, repeated keyboard reconnects, and restoration of the live-interface baseline while an unrelated tablet remains active.
+Run `make usb-smoke` for automated headless QEMU/QMP coverage. The test verifies hub enumeration, MSI delivery, disconnect with an outstanding HID transfer, repeated keyboard reconnects, and restoration of the live-interface baseline while an unrelated tablet remains active. Run `make frame-reclaim-smoke` to stress normal exits, faults, shared-memory final-owner release, and frame reuse across 512 sequential processes.
 
 To boot directly from a QEMU virtual FAT disk without creating an ISO or requiring `xorriso`:
 

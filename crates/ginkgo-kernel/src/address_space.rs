@@ -1,9 +1,8 @@
 //! Isolated four-level x86_64 user address spaces.
 //!
 //! User roots own their lower-half page-table tree and share only the kernel
-//! half of the P4. The physical allocator is monotonic, so dropping or retiring
-//! an address space does not return any physical frames. Frame lists below are
-//! accounting records for a future reclaiming allocator, not deallocation.
+//! half of the P4. Dropping an address space does not implicitly edit page tables
+//! or return frames; inactive spaces must be explicitly retired and reclaimed.
 
 use alloc::vec::Vec;
 use core::ptr;
@@ -165,6 +164,56 @@ pub struct FrameAccounting {
     pub page_table_frames: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameReclaimStats {
+    pub mapped_data_frames: usize,
+    pub retired_data_frames: usize,
+    pub page_table_frames: usize,
+    pub shared_alias_mappings_excluded: usize,
+}
+
+impl FrameReclaimStats {
+    pub const fn total_frames(self) -> usize {
+        self.mapped_data_frames + self.retired_data_frames + self.page_table_frames
+    }
+}
+
+/// A reclaim failure with exact ownership of every frame not yet reclaimed.
+pub struct RetiredAddressSpaceReclaimError {
+    address_space: RetiredAddressSpace,
+    error: FrameAllocatorError,
+    reclaimed: FrameReclaimStats,
+}
+
+impl RetiredAddressSpaceReclaimError {
+    pub const fn error(&self) -> FrameAllocatorError {
+        self.error
+    }
+
+    pub const fn reclaimed(&self) -> FrameReclaimStats {
+        self.reclaimed
+    }
+
+    pub const fn address_space(&self) -> &RetiredAddressSpace {
+        &self.address_space
+    }
+
+    pub fn into_address_space(self) -> RetiredAddressSpace {
+        self.address_space
+    }
+}
+
+impl core::fmt::Debug for RetiredAddressSpaceReclaimError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("RetiredAddressSpaceReclaimError")
+            .field("error", &self.error)
+            .field("reclaimed", &self.reclaimed)
+            .field("remaining", &self.address_space.accounting())
+            .finish()
+    }
+}
+
 /// Owned physical frames and non-owning alias metadata retained after retirement.
 ///
 /// Kernel higher-half paging structures are shared and therefore deliberately
@@ -205,6 +254,101 @@ impl RetiredAddressSpace {
             retired_data_frames: self.retired_data_frames.len(),
             shared_alias_mappings: self.shared_alias_mappings.len(),
             page_table_frames: self.page_table_frames.len(),
+        }
+    }
+
+    /// Returns every owned frame to `allocator` exactly once.
+    ///
+    /// Shared aliases are never submitted. Each category is reclaimed atomically;
+    /// if a later category fails, the returned owner contains only the categories
+    /// that remain live and may be passed to `reclaim` again.
+    pub fn reclaim(
+        self,
+        allocator: &mut UsableFrameAllocator<'_>,
+    ) -> Result<FrameReclaimStats, RetiredAddressSpaceReclaimError> {
+        self.reclaim_with(allocator)
+    }
+
+    fn reclaim_with<R: FrameReclaimer>(
+        mut self,
+        allocator: &mut R,
+    ) -> Result<FrameReclaimStats, RetiredAddressSpaceReclaimError> {
+        let mut reclaimed = FrameReclaimStats {
+            shared_alias_mappings_excluded: self.shared_alias_mappings.len(),
+            ..FrameReclaimStats::default()
+        };
+
+        for category in [
+            ReclaimCategory::MappedData,
+            ReclaimCategory::RetiredData,
+            ReclaimCategory::PageTable,
+        ] {
+            if let Err(error) = reclaim_category(&mut self, allocator, category, &mut reclaimed) {
+                return Err(RetiredAddressSpaceReclaimError {
+                    address_space: self,
+                    error,
+                    reclaimed,
+                });
+            }
+        }
+        Ok(reclaimed)
+    }
+}
+
+trait FrameReclaimer {
+    fn reclaim(&mut self, frames: &[PhysFrame<Size4KiB>]) -> Result<(), FrameAllocatorError>;
+}
+
+impl FrameReclaimer for UsableFrameAllocator<'_> {
+    fn reclaim(&mut self, frames: &[PhysFrame<Size4KiB>]) -> Result<(), FrameAllocatorError> {
+        self.reclaim_frames(frames)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReclaimCategory {
+    MappedData,
+    RetiredData,
+    PageTable,
+}
+
+fn reclaim_category<R: FrameReclaimer>(
+    address_space: &mut RetiredAddressSpace,
+    allocator: &mut R,
+    category: ReclaimCategory,
+    reclaimed: &mut FrameReclaimStats,
+) -> Result<(), FrameAllocatorError> {
+    let frames = match category {
+        ReclaimCategory::MappedData => &mut address_space.mapped_data_frames,
+        ReclaimCategory::RetiredData => &mut address_space.retired_data_frames,
+        ReclaimCategory::PageTable => &mut address_space.page_table_frames,
+    };
+    allocator.reclaim(frames)?;
+
+    let count = frames.len();
+    frames.clear();
+    match category {
+        ReclaimCategory::MappedData => reclaimed.mapped_data_frames += count,
+        ReclaimCategory::RetiredData => reclaimed.retired_data_frames += count,
+        ReclaimCategory::PageTable => reclaimed.page_table_frames += count,
+    }
+    Ok(())
+}
+
+/// Failure to clean up an address space that must no longer be active.
+pub enum InactiveAddressSpaceCleanupError {
+    Active(AddressSpace),
+    Reclaim(RetiredAddressSpaceReclaimError),
+}
+
+impl core::fmt::Debug for InactiveAddressSpaceCleanupError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Active(address_space) => formatter
+                .debug_tuple("Active")
+                .field(&address_space.root_frame())
+                .finish(),
+            Self::Reclaim(error) => formatter.debug_tuple("Reclaim").field(error).finish(),
         }
     }
 }
@@ -250,7 +394,15 @@ impl AddressSpace {
             .allocate_frame()
             .map_err(AddressSpaceError::FrameAllocator)?
             .ok_or(AddressSpaceError::OutOfFrames)?;
-        let root_address = frame_hhdm_address(hhdm_offset, root)?;
+        let root_address = match frame_hhdm_address(hhdm_offset, root) {
+            Ok(address) => address,
+            Err(error) => {
+                allocator
+                    .deallocate_frame(root)
+                    .map_err(AddressSpaceError::FrameAllocator)?;
+                return Err(error);
+            }
+        };
         let root_table = unsafe { &mut *root_address.as_mut_ptr::<PageTable>() };
         copy_kernel_half(kernel.mapper.level_4_table(), root_table);
         let mapper = unsafe { OffsetPageTable::new(root_table, hhdm_offset) };
@@ -258,6 +410,28 @@ impl AddressSpace {
         Ok(Self {
             root,
             hhdm_offset,
+            mapper,
+            mappings: Vec::new(),
+            owned_data_frames: Vec::new(),
+            retired_data_frames: Vec::new(),
+            owned_page_table_frames: alloc::vec![root],
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        allocator: &mut UsableFrameAllocator<'_>,
+    ) -> Result<Self, AddressSpaceError> {
+        let root = allocator
+            .allocate_frame()
+            .map_err(AddressSpaceError::FrameAllocator)?
+            .ok_or(AddressSpaceError::OutOfFrames)?;
+        let root_table = unsafe { &mut *(root.start_address().as_u64() as *mut PageTable) };
+        root_table.zero();
+        let mapper = unsafe { OffsetPageTable::new(root_table, VirtAddr::zero()) };
+        Ok(Self {
+            root,
+            hhdm_offset: VirtAddr::zero(),
             mapper,
             mappings: Vec::new(),
             owned_data_frames: Vec::new(),
@@ -609,11 +783,29 @@ impl AddressSpace {
         }
     }
 
-    /// Converts this address space into explicit retirement records.
+    /// Retires and reclaims an address space after verifying it is not the
+    /// current CPU's active root.
     ///
-    /// The caller must first switch CR3 away from this root on every CPU. No
-    /// frame is deallocated; this only preserves ownership information for a
-    /// future allocator that supports safe reclamation and TLB shootdown.
+    /// Callers must still ensure no other CPU can use this root. On any failure,
+    /// exact ownership is returned in the error for retry or deliberate retention.
+    pub fn cleanup_inactive(
+        self,
+        allocator: &mut UsableFrameAllocator<'_>,
+    ) -> Result<FrameReclaimStats, InactiveAddressSpaceCleanupError> {
+        if self.is_active() {
+            return Err(InactiveAddressSpaceCleanupError::Active(self));
+        }
+        let retired = unsafe { self.retire() };
+        retired
+            .reclaim(allocator)
+            .map_err(InactiveAddressSpaceCleanupError::Reclaim)
+    }
+
+    /// Converts this inactive address space into explicit ownership records.
+    ///
+    /// The caller must first switch CR3 away from this root on every CPU and
+    /// ensure no other CPU can use it. Reclamation is then performed by
+    /// [`RetiredAddressSpace::reclaim`].
     pub unsafe fn retire(self) -> RetiredAddressSpace {
         let shared_alias_mappings = self
             .mappings
@@ -926,6 +1118,51 @@ mod tests {
 
     struct FakeFrameAllocator {
         tables: Vec<Box<PageTable>>,
+    }
+
+    #[derive(Default)]
+    struct TrackingReclaimer {
+        calls: usize,
+        fail_call: Option<usize>,
+        reclaimed: Vec<PhysFrame<Size4KiB>>,
+    }
+
+    impl FrameReclaimer for TrackingReclaimer {
+        fn reclaim(&mut self, frames: &[PhysFrame<Size4KiB>]) -> Result<(), FrameAllocatorError> {
+            self.calls += 1;
+            if self.fail_call == Some(self.calls) {
+                return Err(FrameAllocatorError::OwnershipTrackingAllocationFailed);
+            }
+            for frame in frames {
+                if self.reclaimed.contains(frame) {
+                    return Err(FrameAllocatorError::DoubleFree {
+                        address: frame.start_address().as_u64(),
+                    });
+                }
+            }
+            self.reclaimed.extend_from_slice(frames);
+            Ok(())
+        }
+    }
+
+    fn frame(address: u64) -> PhysFrame<Size4KiB> {
+        PhysFrame::from_start_address(PhysAddr::new(address)).unwrap()
+    }
+
+    fn retired_with_all_backing_kinds() -> RetiredAddressSpace {
+        let root = frame(0x5000);
+        RetiredAddressSpace {
+            root,
+            mapped_data_frames: alloc::vec![frame(0x1000)],
+            retired_data_frames: alloc::vec![frame(0x2000)],
+            shared_alias_mappings: alloc::vec![UserPageMapping {
+                virtual_address: 0x8000,
+                frame: frame(0x3000),
+                backing: UserMappingBacking::SharedAlias,
+                permissions: UserPagePermissions::READ_WRITE,
+            }],
+            page_table_frames: alloc::vec![root, frame(0x6000)],
+        }
     }
 
     impl FakeFrameAllocator {
@@ -1306,6 +1543,99 @@ mod tests {
         assert!(second.retired_data_frames().is_empty());
         assert_eq!(second.accounting().mapped_data_frames, 0);
         assert_eq!(second.accounting().shared_alias_mappings, 0);
+    }
+
+    #[test]
+    fn retired_reclaim_submits_exact_ownership_and_excludes_shared_aliases() {
+        let retired = retired_with_all_backing_kinds();
+        let mut allocator = TrackingReclaimer::default();
+
+        let stats = retired.reclaim_with(&mut allocator).unwrap();
+
+        assert_eq!(
+            stats,
+            FrameReclaimStats {
+                mapped_data_frames: 1,
+                retired_data_frames: 1,
+                page_table_frames: 2,
+                shared_alias_mappings_excluded: 1,
+            }
+        );
+        assert_eq!(stats.total_frames(), 4);
+        assert_eq!(allocator.reclaimed.len(), 4);
+        assert!(allocator.reclaimed.contains(&frame(0x1000)));
+        assert!(allocator.reclaimed.contains(&frame(0x2000)));
+        assert!(allocator.reclaimed.contains(&frame(0x5000)));
+        assert!(allocator.reclaimed.contains(&frame(0x6000)));
+        assert!(!allocator.reclaimed.contains(&frame(0x3000)));
+        assert_eq!(
+            allocator
+                .reclaimed
+                .iter()
+                .filter(|candidate| **candidate == frame(0x5000))
+                .count(),
+            1,
+            "the root is reclaimed only through the page-table ownership list"
+        );
+        // `retired` was consumed and success returns only stats, so a second
+        // reclaim is structurally impossible.
+    }
+
+    #[test]
+    fn failed_reclaim_retains_only_unreclaimed_ownership_for_exact_retry() {
+        let retired = retired_with_all_backing_kinds();
+        let mut allocator = TrackingReclaimer {
+            fail_call: Some(2),
+            ..TrackingReclaimer::default()
+        };
+
+        let failure = retired.reclaim_with(&mut allocator).unwrap_err();
+        assert_eq!(
+            failure.error(),
+            FrameAllocatorError::OwnershipTrackingAllocationFailed
+        );
+        assert_eq!(failure.reclaimed().mapped_data_frames, 1);
+        assert_eq!(failure.address_space().mapped_data_frames(), &[]);
+        assert_eq!(
+            failure.address_space().retired_data_frames(),
+            &[frame(0x2000)]
+        );
+        assert_eq!(failure.address_space().page_table_frames().len(), 2);
+
+        allocator.fail_call = None;
+        let retry = failure
+            .into_address_space()
+            .reclaim_with(&mut allocator)
+            .unwrap();
+        assert_eq!(retry.mapped_data_frames, 0);
+        assert_eq!(retry.retired_data_frames, 1);
+        assert_eq!(retry.page_table_frames, 2);
+        assert_eq!(allocator.reclaimed.len(), 4);
+    }
+
+    #[test]
+    fn duplicate_owned_frame_is_rejected_without_losing_the_owner() {
+        let root = frame(0x5000);
+        let retired = RetiredAddressSpace {
+            root,
+            mapped_data_frames: alloc::vec![frame(0x1000)],
+            retired_data_frames: alloc::vec![frame(0x1000)],
+            shared_alias_mappings: Vec::new(),
+            page_table_frames: alloc::vec![root],
+        };
+        let mut allocator = TrackingReclaimer::default();
+
+        let failure = retired.reclaim_with(&mut allocator).unwrap_err();
+        assert!(matches!(
+            failure.error(),
+            FrameAllocatorError::DoubleFree { address: 0x1000 }
+        ));
+        assert!(failure.address_space().mapped_data_frames().is_empty());
+        assert_eq!(
+            failure.address_space().retired_data_frames(),
+            &[frame(0x1000)]
+        );
+        assert_eq!(allocator.reclaimed, alloc::vec![frame(0x1000)]);
     }
 
     #[test]

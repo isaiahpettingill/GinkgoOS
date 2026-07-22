@@ -22,8 +22,8 @@ pub const PAGE_SIZE: u64 = 4096;
 pub const MAX_PROGRAM_HEADERS: usize = 128;
 /// Maximum pages mapped from all `PT_LOAD` segments: 64 MiB at 4 KiB/page.
 ///
-/// The current kernel eagerly allocates every image page from a monotonic frame
-/// allocator and cannot reclaim it. Keeping one executable below one eighth of
+/// The kernel eagerly allocates every image page and reclaims partial loads on
+/// construction failure. Keeping one executable below one eighth of
 /// the standard 512 MiB development machine prevents a malformed image from
 /// consuming nearly all boot memory before stacks and page tables are created.
 pub const MAX_TOTAL_LOAD_PAGES: u64 = 16_384;

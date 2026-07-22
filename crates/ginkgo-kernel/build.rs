@@ -57,6 +57,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GINKGO_FILE_NAVIGATOR_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_TERMINAL_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_PREEMPTION_SMOKE");
+    println!("cargo:rerun-if-env-changed=GINKGO_FRAME_RECLAIM_STRESS");
     println!("cargo:rerun-if-env-changed=GINKGO_TRUST_SIGNING_KEY_HEX");
     println!("cargo:rustc-link-arg-bin=ginkgo-os=-T{}", linker.display());
 
@@ -72,6 +73,16 @@ fn main() {
         build_preemption_smoke_elf(),
     )
     .expect("write Ginkgo preemption smoke ELF");
+    fs::write(
+        out_dir.join("ginkgo-frame-reclaim-exit.elf"),
+        build_frame_reclaim_elf(false),
+    )
+    .expect("write Ginkgo frame reclaim exit ELF");
+    fs::write(
+        out_dir.join("ginkgo-frame-reclaim-fault.elf"),
+        build_frame_reclaim_elf(true),
+    )
+    .expect("write Ginkgo frame reclaim fault ELF");
     let desktop = read_userspace_artifact("GINKGO_DESKTOP_ELF").unwrap_or_else(build_desktop_elf);
     let minimal_client = read_userspace_artifact("GINKGO_MINIMAL_CLIENT_ELF")
         .unwrap_or_else(build_userspace_smoke_elf);
@@ -354,6 +365,80 @@ fn emit_userspace_smoke_code() -> Vec<u8> {
     assembler.finish()
 }
 
+fn emit_frame_reclaim_code(fault: bool) -> Vec<u8> {
+    let mut assembler = Assembler::default();
+
+    assembler.label("entry");
+    assembler.emit(&[0x48, 0x83, 0xe4, 0xf0]); // and rsp, -16
+    assembler.emit(&[0x48, 0x83, 0xec, 0x30]); // sub rsp, 48
+
+    // SharedMemoryCreate(4097, &handle_output).
+    assembler.emit(&[0xbf]); // mov edi, imm32
+    assembler.u32(SHARED_MEMORY_SIZE);
+    assembler.emit(&[0x48, 0x8d, 0x34, 0x24]); // lea rsi, [rsp]
+    assembler.checked_syscall(SHARED_MEMORY_CREATE);
+    assembler.emit(&[0x44, 0x8b, 0x24, 0x24]); // mov r12d, [rsp]
+
+    // Build SharedMemoryMapArgs at rsp + 16 and leave rsp + 8 for the output.
+    assembler.emit(&[0x48, 0xc7, 0x44, 0x24, 0x10]); // mov qword [rsp + 16], 0
+    assembler.u32(0);
+    assembler.emit(&[0x48, 0xc7, 0x44, 0x24, 0x18]); // mov qword [rsp + 24], 0
+    assembler.u32(0);
+    assembler.emit(&[0x48, 0xc7, 0x44, 0x24, 0x20]); // mov qword [rsp + 32], 4097
+    assembler.u32(SHARED_MEMORY_SIZE);
+    assembler.emit(&[0xc7, 0x44, 0x24, 0x28]); // mov dword [rsp + 40], RW
+    assembler.u32(MAP_PROTECTION_READ_WRITE);
+    assembler.emit(&[0xc7, 0x44, 0x24, 0x2c]); // mov dword [rsp + 44], no flags
+    assembler.u32(0);
+
+    // SharedMemoryMap(handle, &args, &output).
+    assembler.emit(&[0x44, 0x89, 0xe7]); // mov edi, r12d
+    assembler.emit(&[0x48, 0x8d, 0x74, 0x24, 0x10]); // lea rsi, [rsp + 16]
+    assembler.emit(&[0x48, 0x8d, 0x54, 0x24, 0x08]); // lea rdx, [rsp + 8]
+    assembler.checked_syscall(SHARED_MEMORY_MAP);
+    assembler.emit(&[0x4c, 0x8b, 0x6c, 0x24, 0x08]); // mov r13, [rsp + 8]
+
+    // Close the source handle while the mapping lease keeps the backing alive.
+    assembler.emit(&[0x44, 0x89, 0xe7]); // mov edi, r12d
+    assembler.checked_syscall(HANDLE_CLOSE);
+
+    // Touch and read both backing pages after the source handle is gone.
+    assembler.emit(&[0x41, 0xc6, 0x45, 0x00, 0x5a]); // mov byte [r13], 0x5a
+    assembler.emit(&[0x41, 0xc6, 0x85]); // mov byte [r13 + 4096], 0xa5
+    assembler.u32(PAGE_SIZE as u32);
+    assembler.emit(&[0xa5]);
+    assembler.emit(&[0x41, 0x80, 0x7d, 0x00, 0x5a]); // cmp byte [r13], 0x5a
+    assembler.rel32(&[0x0f, 0x85], "failure"); // jne failure
+    assembler.emit(&[0x41, 0x80, 0xbd]); // cmp byte [r13 + 4096], 0xa5
+    assembler.u32(PAGE_SIZE as u32);
+    assembler.emit(&[0xa5]);
+    assembler.rel32(&[0x0f, 0x85], "failure"); // jne failure
+
+    if fault {
+        // Deliberately retire with a live mapping lease so teardown must reclaim it.
+        assembler.emit(&[0x0f, 0x0b]); // ud2
+    } else {
+        // SharedMemoryUnmap(mapped_address, 4097).
+        assembler.emit(&[0x4c, 0x89, 0xef]); // mov rdi, r13
+        assembler.emit(&[0xbe]); // mov esi, imm32
+        assembler.u32(SHARED_MEMORY_SIZE);
+        assembler.checked_syscall(SHARED_MEMORY_UNMAP);
+
+        assembler.emit(&[0x31, 0xff]); // xor edi, edi
+        assembler.checked_syscall(PROCESS_EXIT);
+        assembler.emit(&[0x0f, 0x0b]); // ud2 if a successful exit unexpectedly returns
+    }
+
+    assembler.label("failure");
+    assembler.emit(&[0xbf]); // mov edi, 1
+    assembler.u32(1);
+    assembler.emit(&[0xb8]); // mov eax, ProcessExit
+    assembler.u32(PROCESS_EXIT);
+    assembler.emit(&[0x0f, 0x05, 0x0f, 0x0b]); // syscall; ud2 if exit returns
+
+    assembler.finish()
+}
+
 fn emit_preemption_smoke_code() -> Vec<u8> {
     const RCX_SENTINEL: u64 = 0x1122_3344_5566_7788;
     const R11_SENTINEL: u64 = 0x8877_6655_4433_2211;
@@ -553,6 +638,15 @@ fn build_userspace_smoke_elf() -> Vec<u8> {
 
 fn build_preemption_smoke_elf() -> Vec<u8> {
     build_userspace_elf(emit_preemption_smoke_code(), "preemption-smoke")
+}
+
+fn build_frame_reclaim_elf(fault: bool) -> Vec<u8> {
+    let artifact = if fault {
+        "frame-reclaim-fault"
+    } else {
+        "frame-reclaim-exit"
+    };
+    build_userspace_elf(emit_frame_reclaim_code(fault), artifact)
 }
 
 fn build_desktop_elf() -> Vec<u8> {

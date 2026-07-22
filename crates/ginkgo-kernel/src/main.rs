@@ -26,7 +26,7 @@ use framebuffer::{FramebufferWriter, Rgb};
 use ginkgo_desktop::ClientId;
 use ginkgo_filesystem::RedoxFs;
 use ginkgo_hid::{ApplicationKind, Axis, InputEvent, AXIS_MAX, AXIS_MIN};
-use ginkgo_ipc::IpcError;
+use ginkgo_ipc::{shared_memory_backing_stats, IpcError};
 use ginkgo_kernel::{
     ahci::{AhciDisk, AhciError},
     arch::{self, CpuPrivilegeState, ExternalInterruptState, KernelExit, PrivilegeStackTops},
@@ -104,10 +104,18 @@ static TRUST_PUBLIC_KEY: &[u8; 32] =
     include_bytes!(concat!(env!("OUT_DIR"), "/system-trust.public"));
 static PREEMPTION_SMOKE_ELF: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-preemption-smoke.elf"));
+static FRAME_RECLAIM_EXIT_ELF: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-frame-reclaim-exit.elf"));
+static FRAME_RECLAIM_FAULT_ELF: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-frame-reclaim-fault.elf"));
 static GINKGO_SPLASH_RGBA: &[u8; 256 * 256 * 4] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-splash.rgba"));
 fn preemption_smoke_enabled() -> bool {
     option_env!("GINKGO_PREEMPTION_SMOKE") == Some("1")
+}
+
+fn frame_reclaim_stress_enabled() -> bool {
+    option_env!("GINKGO_FRAME_RECLAIM_STRESS") == Some("1")
 }
 
 const DESKTOP_PATH: &str = "/desktop.elf";
@@ -117,6 +125,22 @@ const TERMINAL_PATH: &str = "/terminal.elf";
 const PROGRAM_REGISTRY_PATH: &str = "/programs.gkr";
 const MAX_EXECUTABLE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LAUNCHER_PROGRAMS: usize = 6;
+const FRAME_RECLAIM_STRESS_CYCLES: u32 = 512;
+
+#[derive(Clone, Copy)]
+struct FrameReclaimBaseline {
+    live_frames: u64,
+    shared_live_objects: usize,
+    shared_logical_bytes: usize,
+    shared_mapped_bytes: usize,
+}
+
+struct FrameReclaimStress {
+    current: Option<ProcessId>,
+    completed: u32,
+    reuse_verified: u32,
+    baseline: Option<FrameReclaimBaseline>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StorageError {
@@ -443,6 +467,12 @@ pub extern "C" fn _start() -> ! {
         paging_verified: false,
         preemption_observed: false,
         preemption_smoke_id: None,
+        frame_reclaim_stress: frame_reclaim_stress_enabled().then_some(FrameReclaimStress {
+            current: None,
+            completed: 0,
+            reuse_verified: 0,
+            baseline: None,
+        }),
         processes: ProcessTable::new(),
         desktop: None,
         process_clients: Vec::new(),
@@ -755,6 +785,7 @@ struct KernelContext {
     paging_verified: bool,
     preemption_observed: bool,
     preemption_smoke_id: Option<ProcessId>,
+    frame_reclaim_stress: Option<FrameReclaimStress>,
     processes: ProcessTable,
     desktop: Option<DesktopBroker>,
     process_clients: Vec<ProcessClient>,
@@ -1338,6 +1369,7 @@ fn verify_paging(context: &mut KernelContext) -> bool {
     }
     .is_err()
     {
+        let _ = context.frames.deallocate_frame(frame);
         return false;
     }
 
@@ -1356,10 +1388,13 @@ fn verify_paging(context: &mut KernelContext) -> bool {
         })
         .unwrap_or(false);
 
-    let unmapped = unsafe { context.page_table.unmap_4k(page) }
-        .map(|unmapped_frame| unmapped_frame == frame)
-        .unwrap_or(false);
-    verified && unmapped && context.page_table.translate_addr(address).is_none()
+    let reclaimed = match unsafe { context.page_table.unmap_4k(page) } {
+        Ok(unmapped_frame) if unmapped_frame == frame => {
+            context.frames.deallocate_frame(unmapped_frame).is_ok()
+        }
+        Ok(_) | Err(_) => false,
+    };
+    verified && reclaimed && context.page_table.translate_addr(address).is_none()
 }
 
 fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll {
@@ -1485,6 +1520,10 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
         .map(Process::preemption_count)
         .unwrap_or(0);
     let is_preemption_smoke = context.preemption_smoke_id == Some(process_id);
+    let is_frame_reclaim_stress = context
+        .frame_reclaim_stress
+        .as_ref()
+        .is_some_and(|stress| stress.current == Some(process_id));
     let Some(process) = context.processes.take_for_retirement(process_id) else {
         return TaskPoll::Pending;
     };
@@ -1508,15 +1547,18 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
         }
     }
 
+    let retired_state = retired.final_state();
     let mut sink = SerialDebugSink::new(&mut context.serial);
-    match retired.final_state() {
+    match retired_state {
         ProcessState::Exited(status) => {
-            let _ = writeln!(
-                sink,
-                "userspace: pid={} exited status={}\r",
-                process_id.raw(),
-                status
-            );
+            if !is_frame_reclaim_stress {
+                let _ = writeln!(
+                    sink,
+                    "userspace: pid={} exited status={}\r",
+                    process_id.raw(),
+                    status
+                );
+            }
             if is_preemption_smoke {
                 context.preemption_smoke_id = None;
                 if status == 0 && preemption_count != 0 {
@@ -1536,17 +1578,49 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
             }
         }
         ProcessState::Faulted(fault) => {
-            let _ = writeln!(
-                sink,
-                "userspace: pid={} faulted reason={:?} code={} address={:?}\r",
-                process_id.raw(),
-                fault.reason,
-                fault.code,
-                fault.address
-            );
+            if !is_frame_reclaim_stress {
+                let _ = writeln!(
+                    sink,
+                    "userspace: pid={} faulted reason={:?} code={} address={:?}\r",
+                    process_id.raw(),
+                    fault.reason,
+                    fault.code,
+                    fault.address
+                );
+            }
         }
         ProcessState::Ready | ProcessState::Blocked => {
             unreachable!("live process reached retirement")
+        }
+    }
+    drop(sink);
+    match retired.reclaim(&mut context.frames) {
+        Ok(reclaimed) => {
+            if !is_frame_reclaim_stress {
+                let mut sink = SerialDebugSink::new(&mut context.serial);
+                let _ = writeln!(
+                    sink,
+                    "memory: pid={} reclaimed={} live={} free={} shared_live={}\r",
+                    process_id.raw(),
+                    reclaimed.frames.total_frames(),
+                    context.frames.allocated_count(),
+                    context.frames.free_count(),
+                    shared_memory_backing_stats().live_objects
+                );
+            }
+            if is_frame_reclaim_stress {
+                finish_frame_reclaim_stress(context, process_id, retired_state);
+            }
+        }
+        Err(error) => {
+            let mut sink = SerialDebugSink::new(&mut context.serial);
+            let _ = writeln!(
+                sink,
+                "memory: process reclaim invariant failed: {error:?}\r"
+            );
+            let owner = error.into_process();
+            core::mem::forget(owner);
+            halt_forever();
         }
     }
     TaskPoll::Pending
@@ -1609,6 +1683,34 @@ fn console_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll 
     TaskPoll::Pending
 }
 
+fn discard_unstarted_process(context: &mut KernelContext, process: Process) {
+    let retired = match process.retire() {
+        Ok(retired) => retired,
+        Err(error) => {
+            let process = error.into_process();
+            core::mem::forget(process);
+            halt_forever();
+        }
+    };
+    if let Err(error) = retired.reclaim(&mut context.frames) {
+        let owner = error.into_process();
+        core::mem::forget(owner);
+        halt_forever();
+    }
+}
+
+fn reject_unstarted_client(
+    context: &mut KernelContext,
+    client_id: ClientId,
+    process: Process,
+) -> Result<(), ()> {
+    if let Some(desktop) = context.desktop.as_mut() {
+        let _ = desktop.cleanup_client(client_id);
+    }
+    discard_unstarted_process(context, process);
+    Err(())
+}
+
 fn launch_program(
     context: &mut KernelContext,
     program: ProgramSummary,
@@ -1625,54 +1727,65 @@ fn launch_program(
     let mut process =
         Process::from_elf_randomized(&image, &context.page_table, &mut context.frames, randomness)
             .map_err(|_| ())?;
-    let client_id = ClientId::new(context.next_client_id).ok_or(())?;
-    context.next_client_id = context.next_client_id.checked_add(1).ok_or(())?;
-    context.process_clients.try_reserve(1).map_err(|_| ())?;
-    let channel = context
-        .desktop
-        .as_mut()
-        .ok_or(())?
-        .connect_client(client_id, process.handles_mut())
-        .map_err(|_| ())?;
-    let setup = (|| {
-        let filesystem = if program.filesystem {
-            process
-                .handles_mut()
-                .filesystem_root_create()
-                .map_err(|_| ())?
-        } else {
-            ginkgo_sysapi::Handle::INVALID
-        };
-        let startup = match startup {
-            Some(startup) => context
-                .desktop
-                .as_mut()
-                .ok_or(())?
-                .move_startup_channel(startup, process.handles_mut())
-                .map_err(|_| ())?,
-            None => ginkgo_sysapi::Handle::INVALID,
-        };
-        let random_source = process
-            .handles_mut()
-            .random_source_create()
-            .map_err(|_| ())?;
-        process.set_start_arguments([
-            u64::from(channel.raw()),
-            u64::from(filesystem.raw()),
-            u64::from(startup.raw()),
-            u64::from(random_source.raw()),
-        ]);
-        context.processes.insert(process).map_err(|_| ())
-    })();
-    let process_id = match setup {
-        Ok(process_id) => process_id,
+
+    let Some(client_id) = ClientId::new(context.next_client_id) else {
+        discard_unstarted_process(context, process);
+        return Err(());
+    };
+    let Some(next_client_id) = context.next_client_id.checked_add(1) else {
+        discard_unstarted_process(context, process);
+        return Err(());
+    };
+    if context.process_clients.try_reserve(1).is_err() {
+        discard_unstarted_process(context, process);
+        return Err(());
+    }
+    let channel = match context.desktop.as_mut().ok_or(()).and_then(|desktop| {
+        desktop
+            .connect_client(client_id, process.handles_mut())
+            .map_err(|_| ())
+    }) {
+        Ok(channel) => channel,
         Err(()) => {
-            if let Some(desktop) = context.desktop.as_mut() {
-                let _ = desktop.cleanup_client(client_id);
-            }
+            discard_unstarted_process(context, process);
             return Err(());
         }
     };
+    context.next_client_id = next_client_id;
+
+    let filesystem = if program.filesystem {
+        match process.handles_mut().filesystem_root_create() {
+            Ok(handle) => handle,
+            Err(_) => return reject_unstarted_client(context, client_id, process),
+        }
+    } else {
+        ginkgo_sysapi::Handle::INVALID
+    };
+    let startup = match startup {
+        Some(startup) => match context.desktop.as_mut().ok_or(()).and_then(|desktop| {
+            desktop
+                .move_startup_channel(startup, process.handles_mut())
+                .map_err(|_| ())
+        }) {
+            Ok(handle) => handle,
+            Err(()) => return reject_unstarted_client(context, client_id, process),
+        },
+        None => ginkgo_sysapi::Handle::INVALID,
+    };
+    let random_source = match process.handles_mut().random_source_create() {
+        Ok(handle) => handle,
+        Err(_) => return reject_unstarted_client(context, client_id, process),
+    };
+    process.set_start_arguments([
+        u64::from(channel.raw()),
+        u64::from(filesystem.raw()),
+        u64::from(startup.raw()),
+        u64::from(random_source.raw()),
+    ]);
+    let process_id = context
+        .processes
+        .insert(process)
+        .expect("prepared process insertion must succeed");
     context.process_clients.push(ProcessClient {
         process_id,
         client_id,
@@ -1692,6 +1805,137 @@ fn launch_program(
 fn launch_registered_program(context: &mut KernelContext, program_index: usize) -> Result<(), ()> {
     let program = context.ui.catalog.get(program_index).ok_or(())?;
     launch_program(context, program, None)
+}
+
+fn spawn_frame_reclaim_stress(context: &mut KernelContext) -> Result<(), ()> {
+    context.processes.prepare_insert().map_err(|_| ())?;
+    let completed = context.frame_reclaim_stress.as_ref().ok_or(())?.completed;
+    let image = if completed % 2 == 0 {
+        FRAME_RECLAIM_EXIT_ELF
+    } else {
+        FRAME_RECLAIM_FAULT_ELF
+    };
+    let randomness = [
+        context.entropy.next_u64(),
+        context.entropy.next_u64(),
+        context.entropy.next_u64(),
+    ];
+    let fresh_before = context.frames.fresh_issued_count();
+    let process =
+        Process::from_elf_randomized(image, &context.page_table, &mut context.frames, randomness)
+            .map_err(|_| ())?;
+    let fresh_after = context.frames.fresh_issued_count();
+    if completed > 0 && fresh_after != fresh_before {
+        let mut sink = SerialDebugSink::new(&mut context.serial);
+        let _ = writeln!(
+            sink,
+            "frame-reclaim stress fresh allocation cycle={} fresh={}->{}\r",
+            completed, fresh_before, fresh_after
+        );
+        halt_forever();
+    }
+    let process_id = context
+        .processes
+        .insert(process)
+        .expect("prepared frame-reclaim stress insertion must succeed");
+    let stress = context
+        .frame_reclaim_stress
+        .as_mut()
+        .expect("stress state disappeared");
+    stress.current = Some(process_id);
+    stress.reuse_verified += u32::from(completed > 0);
+    Ok(())
+}
+
+fn finish_frame_reclaim_stress(
+    context: &mut KernelContext,
+    process_id: ProcessId,
+    final_state: ProcessState,
+) {
+    let Some(stress) = context.frame_reclaim_stress.as_mut() else {
+        return;
+    };
+    if stress.current != Some(process_id) {
+        return;
+    }
+    let expected_normal_exit = stress.completed % 2 == 0;
+    let state_matches = if expected_normal_exit {
+        final_state == ProcessState::Exited(0)
+    } else {
+        matches!(
+            final_state,
+            ProcessState::Faulted(ProcessFault {
+                reason: ProcessFaultReason::InvalidOpcode,
+                ..
+            })
+        )
+    };
+    if !state_matches {
+        let mut sink = SerialDebugSink::new(&mut context.serial);
+        let _ = writeln!(
+            sink,
+            "frame-reclaim stress unexpected state cycle={} state={final_state:?}\r",
+            stress.completed
+        );
+        halt_forever();
+    }
+
+    stress.current = None;
+    stress.completed += 1;
+    let shared = shared_memory_backing_stats();
+    let current = FrameReclaimBaseline {
+        live_frames: context.frames.allocated_count(),
+
+        shared_live_objects: shared.live_objects,
+        shared_logical_bytes: shared.logical_bytes,
+        shared_mapped_bytes: shared.mapped_allocated_bytes,
+    };
+    match stress.baseline {
+        None => stress.baseline = Some(current),
+        Some(baseline)
+            if baseline.live_frames != current.live_frames
+                || baseline.shared_live_objects != current.shared_live_objects
+                || baseline.shared_logical_bytes != current.shared_logical_bytes
+                || baseline.shared_mapped_bytes != current.shared_mapped_bytes =>
+        {
+            let mut sink = SerialDebugSink::new(&mut context.serial);
+            let _ = writeln!(
+                sink,
+                "frame-reclaim stress leak cycle={} frames={}->{} shared_objects={}->{} shared_bytes={}->{}\r",
+                stress.completed,
+                baseline.live_frames,
+                current.live_frames,
+                baseline.shared_live_objects,
+                current.shared_live_objects,
+                baseline.shared_mapped_bytes,
+                current.shared_mapped_bytes
+            );
+            halt_forever();
+        }
+        Some(_) => {}
+    }
+
+    if stress.completed == FRAME_RECLAIM_STRESS_CYCLES {
+        let baseline = stress.baseline.expect("stress baseline missing");
+        let mut sink = SerialDebugSink::new(&mut context.serial);
+        let _ = writeln!(
+            sink,
+            "frame-reclaim stress passed cycles={} reuse_checks={} baseline_live={} final_live={} reusable={} baseline_shared={} final_shared={}\r",
+            stress.completed,
+            stress.reuse_verified,
+            baseline.live_frames,
+            current.live_frames,
+            context.frames.free_count(),
+            baseline.shared_live_objects,
+            current.shared_live_objects
+        );
+        return;
+    }
+    if spawn_frame_reclaim_stress(context).is_err() {
+        let mut sink = SerialDebugSink::new(&mut context.serial);
+        let _ = writeln!(sink, "frame-reclaim stress respawn failed\r");
+        halt_forever();
+    }
 }
 
 fn redraw_desktop(context: &mut KernelContext) {
@@ -1741,6 +1985,15 @@ fn desktop_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                     context.ui.render(&mut context.screen);
                     let mut sink = SerialDebugSink::new(&mut context.serial);
                     let _ = writeln!(sink, "desktop: protected Rust userland ready\r");
+                }
+                let should_start_stress = context
+                    .frame_reclaim_stress
+                    .as_ref()
+                    .is_some_and(|stress| stress.current.is_none() && stress.completed == 0);
+                if should_start_stress && spawn_frame_reclaim_stress(context).is_err() {
+                    let mut sink = SerialDebugSink::new(&mut context.serial);
+                    let _ = writeln!(sink, "frame-reclaim stress failed to start\r");
+                    halt_forever();
                 }
             }
             DesktopRuntimeEvent::LauncherVisibility(visible) => {

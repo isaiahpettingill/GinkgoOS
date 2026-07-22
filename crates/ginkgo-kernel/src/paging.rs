@@ -100,9 +100,16 @@ impl ActivePageTable {
         &self,
         allocator: &mut UsableFrameAllocator<'_>,
     ) -> Result<usize, MapError> {
+        self.reserve_active_frames_with(allocator)
+    }
+
+    fn reserve_active_frames_with<R: FrameReserver>(
+        &self,
+        allocator: &mut R,
+    ) -> Result<usize, MapError> {
         let mut reserved = usize::from(
             allocator
-                .reserve_frame(self.root)
+                .reserve(self.root)
                 .map_err(MapError::FrameAllocator)?,
         );
 
@@ -114,13 +121,11 @@ impl ActivePageTable {
                 return Err(MapError::CorruptPageTable);
             }
             let p3_frame = p4_entry.frame().map_err(|_| MapError::CorruptPageTable)?;
-            let newly_reserved = allocator
-                .reserve_frame(p3_frame)
-                .map_err(MapError::FrameAllocator)?;
-            reserved += usize::from(newly_reserved);
-            if !newly_reserved {
-                continue;
-            }
+            reserved += usize::from(
+                allocator
+                    .reserve(p3_frame)
+                    .map_err(MapError::FrameAllocator)?,
+            );
 
             for p3_entry in self.table(p3_frame)?.iter() {
                 let flags = p3_entry.flags();
@@ -130,13 +135,11 @@ impl ActivePageTable {
                     continue;
                 }
                 let p2_frame = p3_entry.frame().map_err(|_| MapError::CorruptPageTable)?;
-                let newly_reserved = allocator
-                    .reserve_frame(p2_frame)
-                    .map_err(MapError::FrameAllocator)?;
-                reserved += usize::from(newly_reserved);
-                if !newly_reserved {
-                    continue;
-                }
+                reserved += usize::from(
+                    allocator
+                        .reserve(p2_frame)
+                        .map_err(MapError::FrameAllocator)?,
+                );
 
                 for p2_entry in self.table(p2_frame)?.iter() {
                     let flags = p2_entry.flags();
@@ -148,7 +151,7 @@ impl ActivePageTable {
                     let p1_frame = p2_entry.frame().map_err(|_| MapError::CorruptPageTable)?;
                     reserved += usize::from(
                         allocator
-                            .reserve_frame(p1_frame)
+                            .reserve(p1_frame)
                             .map_err(MapError::FrameAllocator)?,
                     );
                 }
@@ -255,5 +258,73 @@ impl ActivePageTable {
             .and_then(|address| VirtAddr::try_new(address).ok())
             .ok_or(MapError::AddressOverflow)?;
         Ok(unsafe { &*address.as_ptr::<PageTable>() })
+    }
+}
+
+trait FrameReserver {
+    fn reserve(&mut self, frame: PhysFrame<Size4KiB>) -> Result<bool, FrameAllocatorError>;
+}
+
+impl FrameReserver for UsableFrameAllocator<'_> {
+    fn reserve(&mut self, frame: PhysFrame<Size4KiB>) -> Result<bool, FrameAllocatorError> {
+        self.reserve_frame(frame)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{boxed::Box, vec::Vec};
+    use x86_64::{structures::paging::OffsetPageTable, PhysAddr};
+
+    use super::*;
+
+    #[derive(Default)]
+    struct TrackingReserver {
+        frames: Vec<PhysFrame<Size4KiB>>,
+    }
+
+    impl FrameReserver for TrackingReserver {
+        fn reserve(&mut self, frame: PhysFrame<Size4KiB>) -> Result<bool, FrameAllocatorError> {
+            if self.frames.contains(&frame) {
+                return Ok(false);
+            }
+            self.frames.push(frame);
+            Ok(true)
+        }
+    }
+
+    fn leaked_table() -> (&'static mut PageTable, PhysFrame<Size4KiB>) {
+        let table = Box::leak(Box::new(PageTable::new()));
+        let address = table as *mut PageTable as u64;
+        let frame = PhysFrame::from_start_address(PhysAddr::new(address)).unwrap();
+        (table, frame)
+    }
+
+    #[test]
+    fn repeated_reservation_discovers_descendants_below_reserved_ancestors() {
+        let (root, root_frame) = leaked_table();
+        let (p3, p3_frame) = leaked_table();
+        let (p2, p2_frame) = leaked_table();
+        let (_p1, p1_frame) = leaked_table();
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        root[0].set_frame(p3_frame, flags);
+        let p3_pointer = p3 as *mut PageTable;
+        let p2_pointer = p2 as *mut PageTable;
+        let mapper = unsafe { OffsetPageTable::new(root, VirtAddr::zero()) };
+        let active = ActivePageTable {
+            root: root_frame,
+            hhdm_offset: VirtAddr::zero(),
+            mapper,
+        };
+        let mut reserver = TrackingReserver::default();
+
+        assert_eq!(active.reserve_active_frames_with(&mut reserver), Ok(2));
+
+        unsafe {
+            (&mut *p3_pointer)[0].set_frame(p2_frame, flags);
+            (&mut *p2_pointer)[0].set_frame(p1_frame, flags);
+        }
+        assert_eq!(active.reserve_active_frames_with(&mut reserver), Ok(2));
+        assert_eq!(reserver.frames.len(), 4);
     }
 }
