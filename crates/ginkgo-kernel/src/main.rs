@@ -370,16 +370,8 @@ pub extern "C" fn _start() -> ! {
         let _ = writeln!(sink, "audio: probing Intel HDA\r");
     }
     match unsafe { AudioDevice::initialize(&mut context.page_table, &mut context.frames) } {
-        Ok(mut audio) => {
-            let tone_result = if audio.is_qemu_ich9() {
-                audio.queue_test_tone()
-            } else {
-                Ok(())
-            };
+        Ok(audio) => {
             let mut sink = SerialDebugSink::new(&mut context.serial);
-            if let Err(error) = tone_result {
-                let _ = writeln!(sink, "audio: test tone queue failed: {error:?}\r");
-            }
             let _ = writeln!(sink, "audio: Intel HDA ready (44.1 kHz S16LE stereo)\r");
             context.audio = Some(audio);
             context

@@ -190,7 +190,6 @@ pub struct AudioDevice {
     bdl: DmaPage,
     periods: Vec<DmaPage>,
     queue: VecDeque<u8>,
-    qemu_ich9: bool,
     last_period: usize,
     running: bool,
 }
@@ -269,7 +268,6 @@ impl AudioDevice {
             bdl,
             periods,
             queue: VecDeque::with_capacity(QUEUE_BYTES),
-            qemu_ich9: device.vendor_id == 0x8086 && device.device_id == 0x293e,
             last_period: 0,
             running: false,
         };
@@ -324,35 +322,6 @@ impl AudioDevice {
 
     pub fn available_bytes(&self) -> usize {
         QUEUE_BYTES - self.queue.len()
-    }
-
-    pub const fn is_qemu_ich9(&self) -> bool {
-        self.qemu_ich9
-    }
-
-    /// Queues a short 440 Hz square wave used to validate QEMU playback.
-    pub fn queue_test_tone(&mut self) -> Result<(), AudioError> {
-        const FRAMES: usize = 11_025;
-        const HALF_PERIOD: usize = 50;
-        const AMPLITUDE: i16 = 6_000;
-
-        let mut pcm = Vec::with_capacity(FRAMES * FRAME_BYTES);
-        for frame in 0..FRAMES {
-            let sample = if (frame / HALF_PERIOD) & 1 == 0 {
-                AMPLITUDE
-            } else {
-                -AMPLITUDE
-            };
-            let bytes = sample.to_le_bytes();
-            pcm.extend_from_slice(&bytes);
-            pcm.extend_from_slice(&bytes);
-        }
-        let accepted = self.write_pcm(&pcm)?;
-        if accepted == pcm.len() {
-            Ok(())
-        } else {
-            Err(AudioError::AddressOverflow)
-        }
     }
 
     fn refill(&mut self, index: usize) -> Result<(), AudioError> {
