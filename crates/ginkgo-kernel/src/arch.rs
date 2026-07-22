@@ -1,4 +1,4 @@
-//! x86-64 privilege separation and `SYSCALL` entry foundation.
+//! x86-64 privilege separation, `SYSCALL` entry, and ring-3 preemption foundation.
 //!
 //! This module allocates no stacks and chooses no process-specific syscall ABI.
 //! Integration must create one [`CpuPrivilegeState`] per CPU, provide five
@@ -9,13 +9,18 @@
 //!
 //! # Current interrupt assumptions
 //!
-//! Interrupts must be disabled before initialization and remain disabled while
-//! user code is running. `IA32_FMASK` clears IF, TF, DF, NT, and AC on every
-//! syscall, and context validation rejects IF (as well as the other
-//! privileged/debug flags) on return to user mode. Synchronous user exceptions
-//! are contained on TSS RSP0. #DF, NMI, and #MC use dedicated IST1/IST2/IST3
-//! stacks and always fail-stop without accessing GS. No external interrupts or
-//! nested entries are supported.
+//! Kernel Rust normally runs with interrupts disabled. [`idle_until_interrupt`]
+//! is the sole supported CPL0 site that briefly executes `STI; HLT; CLI` to wait
+//! for an armed timer. Validated user contexts require IF, while `IA32_FMASK`
+//! clears IF, TF, DF, NT, and AC atomically on every syscall.
+//! Synchronous user exceptions and the local APIC preemption interrupt are
+//! contained on TSS RSP0. The preemption path captures the complete user context,
+//! acknowledges the APIC, and returns [`KernelExit::Preempted`] to the suspended
+//! scheduler continuation. A timer arriving at the CPL0 idle site preserves the
+//! interrupted register state, acknowledges EOI, and returns to the idle `CLI`.
+//! #DF, NMI, and #MC use dedicated IST1/IST2/IST3 stacks and always fail-stop
+//! without accessing GS. Other external interrupts, nested kernel entries, and
+//! enabling IF elsewhere in kernel Rust remain unsupported.
 //!
 //! # Fault-handling limitation
 //!
@@ -24,13 +29,13 @@
 //! faults without an active user context, and unsupported vectors halt the CPU.
 //! There is no resume-from-fault path, IRQ handling, recoverable NMI/MCE policy,
 //! stack-overflow detection, or nested-entry accounting. Context validation
-//! prevents the known non-canonical `SYSRETQ` hazard, but cannot prove mappings
+//! prevents non-canonical IRET control state, but cannot prove mappings
 //! are present or correctly executable/writable. Successful [`initialize_cpu`]
 //! guarantees CPU NX support and enables EFER.NXE; address-space code can use
 //! [`validate_no_execute_requirement`] before accepting `NO_EXECUTE` mappings.
 //!
 //! [`UserContext`] owns an aligned legacy x87/SSE FXSAVE image, so XMM state is
-//! eagerly isolated across syscall, fault, and process switches. CR4.OSXSAVE is
+//! eagerly isolated across syscall, fault, preemption, and process switches. CR4.OSXSAVE is
 //! cleared: AVX/XSAVE instructions are intentionally unavailable and fault as
 //! #UD; the supported userspace target baseline is x86-64 plus x87/SSE/SSE2.
 //! Debug-register, FS-base, and user GS-base state remain unsupported. User GS
@@ -42,15 +47,27 @@ use core::{
     ptr,
 };
 
+use crate::local_apic::{PREEMPTION_VECTOR, SPURIOUS_VECTOR};
+
 pub const KERNEL_CODE_SELECTOR: u16 = 1 << 3;
 pub const KERNEL_DATA_SELECTOR: u16 = 2 << 3;
 pub const USER_DATA_SELECTOR: u16 = (3 << 3) | 3;
 pub const USER_CODE_SELECTOR: u16 = (4 << 3) | 3;
 pub const TSS_SELECTOR: u16 = 5 << 3;
 
-pub const USER_RFLAGS_DEFAULT: u64 = 1 << 1;
-const USER_RFLAGS_ALLOWED: u64 =
-    (1 << 0) | (1 << 1) | (1 << 2) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 11);
+const RFLAGS_INTERRUPT_ENABLE: u64 = 1 << 9;
+const RFLAGS_RESUME: u64 = 1 << 16;
+const USER_RFLAGS_REQUIRED: u64 = (1 << 1) | RFLAGS_INTERRUPT_ENABLE;
+pub const USER_RFLAGS_DEFAULT: u64 = USER_RFLAGS_REQUIRED;
+const USER_RFLAGS_ALLOWED: u64 = (1 << 0)
+    | (1 << 1)
+    | (1 << 2)
+    | (1 << 4)
+    | (1 << 6)
+    | (1 << 7)
+    | (1 << 9)
+    | (1 << 11)
+    | RFLAGS_RESUME;
 
 const IA32_EFER: u32 = 0xc000_0080;
 const IA32_STAR: u32 = 0xc000_0081;
@@ -81,7 +98,7 @@ const FXSAVE_MXCSR_OFFSET: usize = 24;
 const INITIAL_FCW: u16 = 0x037f;
 const INITIAL_MXCSR: u32 = 0x1f80;
 const SUPPORTED_MXCSR_BITS: u32 = 0x0000_ffbf;
-const FMASK_VALUE: u64 = (1 << 8) | (1 << 9) | (1 << 10) | (1 << 14) | (1 << 18); // TF, IF, DF, NT, AC
+const FMASK_VALUE: u64 = (1 << 8) | (1 << 9) | (1 << 10) | (1 << 14) | RFLAGS_RESUME | (1 << 18); // TF, IF, DF, NT, RF, AC
 const STAR_VALUE: u64 =
     ((((USER_DATA_SELECTOR & !3) - 8) as u64) << 48) | ((KERNEL_CODE_SELECTOR as u64) << 32);
 
@@ -118,6 +135,7 @@ const DOUBLE_FAULT_IST_INDEX: u8 = 1;
 const NMI_IST_INDEX: u8 = 2;
 const MACHINE_CHECK_IST_INDEX: u8 = 3;
 const KERNEL_EXIT_FAULT: u64 = 3;
+const KERNEL_EXIT_PREEMPTED: u64 = 4;
 const USER_CONTEXT_GPR_QWORDS: usize = offset_of!(UserContext, rip) / size_of::<u64>();
 const USER_CONTEXT_QWORDS: usize = size_of::<UserContext>() / size_of::<u64>();
 
@@ -167,13 +185,15 @@ impl Default for FxState {
     }
 }
 
-/// General-purpose, SYSRET-visible, and x87/SSE state for one user thread.
+/// General-purpose, IRET-visible, and x87/SSE state for one user thread.
 ///
-/// `rcx` and `r11` are snapshots of the architectural values produced by
-/// `SYSCALL` (the return RIP and RFLAGS). They are provided for diagnostics;
-/// `rip` and `rflags` are authoritative when resuming because `SYSRETQ` itself
-/// consumes RCX and R11. `fx_state` is eagerly switched with FXSAVE64/FXRSTOR64;
-/// AVX and other XSAVE-only state are intentionally unsupported.
+/// All general-purpose registers are preserved by the IRET return path. After a
+/// `SYSCALL`, `rcx` and `r11` naturally contain the architectural syscall-clobbered
+/// values (the return RIP and pre-syscall RFLAGS); after an interrupt they retain
+/// the ordinary user register values from the interrupted instruction. `rip` and
+/// `rflags` are always the authoritative control state. `fx_state` is eagerly
+/// switched with FXSAVE64/FXRSTOR64; AVX and other XSAVE-only state are
+/// intentionally unsupported.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UserContext {
@@ -240,7 +260,9 @@ impl UserContext {
         if !is_user_canonical_address(self.rsp) || self.rsp == 0 {
             return Err(ContextValidationError::InvalidStackPointer);
         }
-        if self.rflags & USER_RFLAGS_DEFAULT == 0 || self.rflags & !USER_RFLAGS_ALLOWED != 0 {
+        if self.rflags & USER_RFLAGS_REQUIRED != USER_RFLAGS_REQUIRED
+            || self.rflags & !USER_RFLAGS_ALLOWED != 0
+        {
             return Err(ContextValidationError::InvalidFlags);
         }
         if !self.fx_state.is_valid() {
@@ -261,7 +283,7 @@ pub enum ContextValidationError {
 /// Action selected by the syscall dispatcher.
 ///
 /// `ResumeUser` is honored only if the possibly modified context passes a fresh
-/// validation immediately before `SYSRETQ`. Invalid state is converted to
+/// validation immediately before `IRETQ`. Invalid state is converted to
 /// `ExitToKernel` and returned to [`enter_user`] instead.
 #[repr(u64)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -286,6 +308,8 @@ pub enum KernelExit {
     YieldToKernel,
     ExitToKernel,
     Fault(UserFaultFrame),
+    /// The local APIC timer captured this runnable context asynchronously.
+    Preempted,
 }
 
 /// Dispatcher invoked on the protected per-CPU syscall stack.
@@ -344,6 +368,38 @@ pub const fn validate_no_execute_requirement(
     }
 }
 
+/// External-interrupt resources installed into one CPU's entry state.
+///
+/// A zero EOI address disables the preemption entry and is used by the legacy
+/// [`initialize_cpu`] wrapper. A configured address must be the permanently
+/// mapped, supervisor-only virtual address returned by
+/// [`crate::local_apic::LocalApicTimer::eoi_register_address`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExternalInterruptState {
+    pub local_apic_eoi: u64,
+}
+
+impl ExternalInterruptState {
+    pub const DISABLED: Self = Self { local_apic_eoi: 0 };
+
+    pub const fn local_apic(local_apic_eoi: u64) -> Self {
+        Self { local_apic_eoi }
+    }
+
+    const fn validate(self) -> Result<(), InitializeError> {
+        if self.local_apic_eoi == 0 {
+            return Ok(());
+        }
+        if !is_canonical_address(self.local_apic_eoi)
+            || self.local_apic_eoi < 0xffff_8000_0000_0000
+            || self.local_apic_eoi & 3 != 0
+        {
+            return Err(InitializeError::InvalidInterruptEoiAddress);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InitializeError {
     InterruptsEnabled,
@@ -352,6 +408,7 @@ pub enum InitializeError {
     FloatingPointUnsupported,
     InvalidStackTop,
     SharedStackTop,
+    InvalidInterruptEoiAddress,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -359,11 +416,49 @@ pub enum EnterUserError {
     InvalidContext(ContextValidationError),
 }
 
+/// Failure to enter the interrupt-driven idle state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdleError {
+    /// The caller already had IF set, which would violate the kernel entry model.
+    InterruptsEnabled,
+    /// Privileged `STI`/`HLT`/`CLI` execution is unavailable in a hosted build.
+    UnsupportedEnvironment,
+}
+
+/// Sleeps until the armed local APIC timer delivers an interrupt.
+///
+/// This is the only supported site at which kernel code temporarily enables
+/// maskable interrupts. The caller must have initialized the current CPU with
+/// [`initialize_cpu_with_external_interrupts`] and armed its local APIC timer.
+/// If no interrupt is capable of arriving, the CPU may remain halted forever.
+///
+/// The function first verifies that IF is clear. On bare metal, `STI; HLT` is a
+/// lost-wakeup-safe pair because interrupt recognition is inhibited until after
+/// the instruction following `STI` begins. A CPL0 timer interrupt acknowledges
+/// the APIC and IRETs to the following `CLI`, so this function always returns to
+/// its caller with IF clear. Other CPL0 interrupt sites remain unsupported.
+pub fn idle_until_interrupt() -> Result<(), IdleError> {
+    if interrupts_enabled() {
+        return Err(IdleError::InterruptsEnabled);
+    }
+
+    #[cfg(target_os = "none")]
+    unsafe {
+        asm!("sti", "hlt", "cli", options(nostack, preserves_flags));
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "none"))]
+    {
+        Err(IdleError::UnsupportedEnvironment)
+    }
+}
+
 /// Top addresses of five caller-owned, downward-growing kernel stacks.
 ///
 /// RSP0 receives contained CPL3 exceptions. Dedicated IST1, IST2, and IST3
 /// stacks fail-stop double fault, NMI, and machine check even during a
-/// SWAPGS/SYSRET window. `syscall` is used by LSTAR. All five extents must be
+/// SWAPGS/IRET window. `syscall` is used by LSTAR. All five extents must be
 /// disjoint, not merely have distinct top addresses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrivilegeStackTops {
@@ -552,6 +647,7 @@ struct SyscallCpuState {
     fault_vector: u64,
     fault_error_code: u64,
     fault_address: u64,
+    interrupt_eoi: u64,
 }
 
 impl SyscallCpuState {
@@ -566,6 +662,7 @@ impl SyscallCpuState {
             fault_vector: 0,
             fault_error_code: 0,
             fault_address: 0,
+            interrupt_eoi: 0,
         }
     }
 }
@@ -688,7 +785,7 @@ const fn valid_kernel_stack_top(address: u64) -> bool {
 }
 
 /// Installs GDT/TSS/IDT, enables EFER.SCE/NXE, configures eager FXSAVE, and
-/// configures `SYSCALL`.
+/// configures `SYSCALL` without an active external-interrupt controller.
 ///
 /// Success is also the capability boundary for address-space setup: both
 /// `SYSCALL/SYSRET`, execute-disable, FXSAVE, SSE, and SSE2 have been verified
@@ -713,6 +810,29 @@ pub unsafe fn initialize_cpu(
     stacks: PrivilegeStackTops,
     dispatcher: SyscallDispatcher,
 ) -> Result<(), InitializeError> {
+    unsafe {
+        initialize_cpu_with_external_interrupts(
+            state,
+            stacks,
+            dispatcher,
+            ExternalInterruptState::DISABLED,
+        )
+    }
+}
+
+/// Installs the privilege foundation and a local-APIC preemption EOI target.
+///
+/// This is the interrupt-capable form of [`initialize_cpu`]. In addition to that
+/// function's safety contract, `external.local_apic_eoi` must remain mapped,
+/// writable, supervisor-only, and uncached in every user address space activated
+/// on this CPU. Kernel code must keep IF clear; only validated ring-3 contexts
+/// run with maskable interrupts enabled.
+pub unsafe fn initialize_cpu_with_external_interrupts(
+    state: &'static mut CpuPrivilegeState,
+    stacks: PrivilegeStackTops,
+    dispatcher: SyscallDispatcher,
+    external: ExternalInterruptState,
+) -> Result<(), InitializeError> {
     if interrupts_enabled() {
         return Err(InitializeError::InterruptsEnabled);
     }
@@ -727,10 +847,12 @@ pub unsafe fn initialize_cpu(
         return Err(InitializeError::FloatingPointUnsupported);
     }
     stacks.validate()?;
+    external.validate()?;
     unsafe { configure_fxsave() };
 
     state.syscall.syscall_stack_top = stacks.syscall;
     state.syscall.dispatcher = dispatcher as usize as u64;
+    state.syscall.interrupt_eoi = external.local_apic_eoi;
     unsafe { state.tss.set_stack_tops(stacks) };
 
     let tss_base = ptr::addr_of!(state.tss) as u64;
@@ -823,6 +945,14 @@ pub unsafe fn initialize_cpu(
                 SECURITY_EXCEPTION_VECTOR,
                 ginkgo_x86_exception_security as *const () as usize as u64,
             ),
+            ExceptionGate::ring0(
+                usize::from(PREEMPTION_VECTOR),
+                ginkgo_x86_timer_interrupt as *const () as usize as u64,
+            ),
+            ExceptionGate::ring0(
+                usize::from(SPURIOUS_VECTOR),
+                ginkgo_x86_spurious_interrupt as *const () as usize as u64,
+            ),
         ],
     );
 
@@ -862,8 +992,8 @@ pub unsafe fn initialize_cpu(
 ///
 /// # Safety
 ///
-/// The current CPU must have been initialized by [`initialize_cpu`], interrupts
-/// must remain disabled, `context` must stay exclusively borrowed for the whole
+/// The current CPU must have been initialized by [`initialize_cpu`], the kernel
+/// caller must have IF clear, `context` must stay exclusively borrowed for the whole
 /// user run, and its user mappings (including the stack and instruction pages)
 /// must remain valid. If the caller has switched CR3, that address space must
 /// also retain supervisor-only mappings for this entry text, the per-CPU state,
@@ -876,7 +1006,7 @@ pub unsafe fn enter_user(context: &mut UserContext) -> Result<KernelExit, EnterU
 
     // Do not leak a previous thread's user GS base across scheduler entries.
     // During kernel execution GS_BASE is per-CPU and KERNEL_GS_BASE is the value
-    // that SWAPGS will install immediately before SYSRETQ.
+    // that SWAPGS will install immediately before IRETQ.
     unsafe { write_msr(IA32_KERNEL_GS_BASE, 0) };
     let action = unsafe { ginkgo_x86_enter_user(context) };
     Ok(match action {
@@ -888,6 +1018,7 @@ pub unsafe fn enter_user(context: &mut UserContext) -> Result<KernelExit, EnterU
             };
             KernelExit::Fault(fault)
         }
+        KERNEL_EXIT_PREEMPTED => KernelExit::Preempted,
         _ => fail_stop(),
     })
 }
@@ -945,12 +1076,16 @@ fn fail_stop() -> ! {
     }
 }
 
+const fn rflags_interrupts_enabled(rflags: u64) -> bool {
+    rflags & RFLAGS_INTERRUPT_ENABLE != 0
+}
+
 fn interrupts_enabled() -> bool {
     let rflags: u64;
     unsafe {
         asm!("pushfq", "pop {}", out(reg) rflags, options(preserves_flags));
     }
-    rflags & (1 << 9) != 0
+    rflags_interrupts_enabled(rflags)
 }
 
 /// Reports the CPU features required by this privilege foundation.
@@ -1107,6 +1242,8 @@ const STATE_FAULT_ERROR_CODE: usize =
     offset_of!(CpuPrivilegeState, syscall) + offset_of!(SyscallCpuState, fault_error_code);
 const STATE_FAULT_ADDRESS: usize =
     offset_of!(CpuPrivilegeState, syscall) + offset_of!(SyscallCpuState, fault_address);
+const STATE_INTERRUPT_EOI: usize =
+    offset_of!(CpuPrivilegeState, syscall) + offset_of!(SyscallCpuState, interrupt_eoi);
 
 const EXCEPTION_SAVED_GPRS_SIZE: usize = USER_CONTEXT_GPR_QWORDS * size_of::<u64>();
 const EXCEPTION_VECTOR_OFFSET: usize =
@@ -1145,9 +1282,11 @@ extern "C" {
     fn ginkgo_x86_exception_hypervisor_injection();
     fn ginkgo_x86_exception_vmm_communication();
     fn ginkgo_x86_exception_security();
+    fn ginkgo_x86_timer_interrupt();
+    fn ginkgo_x86_spurious_interrupt();
 }
 
-/// Assembly's final guard against a dispatcher attempting an unsafe SYSRET.
+/// Assembly's final guard against a dispatcher attempting an unsafe user IRET.
 #[no_mangle]
 extern "C" fn ginkgo_x86_validate_user_context(context: *const UserContext) -> u64 {
     if context.is_null() {
@@ -1183,6 +1322,8 @@ global_asm!(
     .global ginkgo_x86_exception_hypervisor_injection
     .global ginkgo_x86_exception_vmm_communication
     .global ginkgo_x86_exception_security
+    .global ginkgo_x86_timer_interrupt
+    .global ginkgo_x86_spurious_interrupt
 
 // Unsupported vectors, NMI, #DF, and #MC use this through IDT-selected stacks.
 // This path is safe in every SWAPGS state: it never reads memory or GS.
@@ -1192,6 +1333,80 @@ ginkgo_x86_exception_fail_stop:
 .Lginkgo_halted:
     hlt
     jmp .Lginkgo_halted
+
+// A local-APIC spurious interrupt has no in-service bit and requires no EOI.
+// It touches neither GS nor interrupted register state and is valid from CPL0/3.
+ginkgo_x86_spurious_interrupt:
+    iretq
+
+// The timer is the only supported maskable external interrupt. It either wakes
+// idle_until_interrupt at CPL0 or preempts an active user context at CPL3.
+ginkgo_x86_timer_interrupt:
+    pushq $0
+    pushq ${preemption_vector}
+    testb $3, {normalized_exception_cs}(%rsp)
+    jnz .Lginkgo_timer_from_user
+
+    // CPL0 entry retains kernel GS. Preserve the only scratch register, issue
+    // EOI, discard the two software-normalization words, and return to the CLI
+    // immediately following idle_until_interrupt's HLT. IRET restores RFLAGS.
+    pushq %rax
+    movq %gs:{state_interrupt_eoi}, %rax
+    testq %rax, %rax
+    jz .Lginkgo_fail_stop
+    movl $0, (%rax)
+    popq %rax
+    addq $16, %rsp
+    iretq
+
+.Lginkgo_timer_from_user:
+    swapgs
+    cmpq $0, %gs:{state_active_context}
+    je .Lginkgo_fail_stop
+
+    // Save GPRs in exact UserContext field order at the new stack top.
+    pushq %r15
+    pushq %r14
+    pushq %r13
+    pushq %r12
+    pushq %r11
+    pushq %r10
+    pushq %r9
+    pushq %r8
+    pushq %rbp
+    pushq %rdi
+    pushq %rsi
+    pushq %rdx
+    pushq %rcx
+    pushq %rbx
+    pushq %rax
+
+    cld
+    movq %gs:{state_active_context}, %rdi
+    movq %rsp, %rsi
+    movq ${context_gpr_qwords}, %rcx
+    rep movsq
+
+    // RDI now points at UserContext.rip. The CPL transition guarantees RSP/SS.
+    movq {exception_rip}(%rsp), %rax
+    movq %rax, 0(%rdi)
+    movq {exception_rsp}(%rsp), %rax
+    movq %rax, 8(%rdi)
+    movq {exception_rflags}(%rsp), %rax
+    movq %rax, 16(%rdi)
+
+    movq %gs:{state_active_context}, %rax
+    fxsave64 {ctx_fx_state}(%rax)
+    fxrstor64 %gs:{state_kernel_fx}
+
+    // All user registers are captured, so RAX is scratch for the MMIO EOI.
+    movq %gs:{state_interrupt_eoi}, %rax
+    testq %rax, %rax
+    jz .Lginkgo_fail_stop
+    movl $0, (%rax)
+
+    movq ${preempted_action}, %rax
+    jmp .Lginkgo_restore_kernel
 
 // No-error-code exceptions synthesize zero before pushing their vector.
 ginkgo_x86_exception_divide_error:
@@ -1366,7 +1581,7 @@ ginkgo_x86_enter_user:
     movq $0, %gs:{state_fault_valid}
 
     // Rust validates before this call, then this final assembly-side check makes
-    // first entry obey the same no-unsafe-SYSRET rule as syscall resumption.
+    // first entry obey the same safe-IRET rule as syscall resumption.
     subq $8, %rsp
     callq ginkgo_x86_validate_user_context
     addq $8, %rsp
@@ -1428,32 +1643,40 @@ ginkgo_x86_syscall_entry:
 .Lginkgo_resume_syscall:
     movq %rsp, %rdx
 
-// RDX points at the validated frame. RSP is changed only after every memory
-// load; after that point the only instructions are SWAPGS and SYSRETQ.
+// RDX points at the validated frame. IRETQ, unlike SYSRETQ, preserves arbitrary
+// interrupted RCX/R11 values. FXSAVE state is consumed before the IRET frame
+// overwrites the top 40 bytes of a syscall-stack-resident temporary context.
 .Lginkgo_restore_user:
     fxsave64 %gs:{state_kernel_fx}
     fxrstor64 {ctx_fx_state}(%rdx)
-    movq {ctx_rsp}(%rdx), %rax
-    movq %rax, %gs:{state_user_rsp}
 
+    // Build a trusted CPL3 hardware frame at the protected syscall stack top.
+    movq %gs:{state_syscall_stack_top}, %rsp
+    pushq ${user_data_selector}
+    pushq {ctx_rsp}(%rdx)
+    pushq {ctx_rflags}(%rdx)
+    pushq ${user_code_selector}
+    pushq {ctx_rip}(%rdx)
+
+    // RDX remains the frame pointer until the final load. No memory access may
+    // follow its restoration.
     movq {ctx_rax}(%rdx), %rax
     movq {ctx_rbx}(%rdx), %rbx
+    movq {ctx_rcx}(%rdx), %rcx
     movq {ctx_rsi}(%rdx), %rsi
     movq {ctx_rdi}(%rdx), %rdi
     movq {ctx_rbp}(%rdx), %rbp
     movq {ctx_r8}(%rdx), %r8
     movq {ctx_r9}(%rdx), %r9
     movq {ctx_r10}(%rdx), %r10
+    movq {ctx_r11}(%rdx), %r11
     movq {ctx_r12}(%rdx), %r12
     movq {ctx_r13}(%rdx), %r13
     movq {ctx_r14}(%rdx), %r14
     movq {ctx_r15}(%rdx), %r15
-    movq {ctx_rip}(%rdx), %rcx
-    movq {ctx_rflags}(%rdx), %r11
     movq {ctx_rdx}(%rdx), %rdx
-    movq %gs:{state_user_rsp}, %rsp
     swapgs
-    sysretq
+    iretq
 
 // Keep the latest user frame in scheduler-owned storage, then restore the
 // exact kernel continuation and its callee-saved register set. Kernel GS stays
@@ -1488,6 +1711,8 @@ ginkgo_x86_syscall_entry:
     state_fault_vector = const STATE_FAULT_VECTOR,
     state_fault_error_code = const STATE_FAULT_ERROR_CODE,
     state_fault_address = const STATE_FAULT_ADDRESS,
+    state_interrupt_eoi = const STATE_INTERRUPT_EOI,
+    preemption_vector = const PREEMPTION_VECTOR,
     divide_error_vector = const DIVIDE_ERROR_VECTOR,
     debug_vector = const DEBUG_VECTOR,
     breakpoint_vector = const BREAKPOINT_VECTOR,
@@ -1519,6 +1744,9 @@ ginkgo_x86_syscall_entry:
     context_qwords = const USER_CONTEXT_QWORDS,
     exit_action = const DispatchAction::ExitToKernel as u64,
     fault_action = const KERNEL_EXIT_FAULT,
+    preempted_action = const KERNEL_EXIT_PREEMPTED,
+    user_data_selector = const USER_DATA_SELECTOR,
+    user_code_selector = const USER_CODE_SELECTOR,
     ctx_rax = const offset_of!(UserContext, rax),
     ctx_rbx = const offset_of!(UserContext, rbx),
     ctx_rcx = const offset_of!(UserContext, rcx),
@@ -1563,7 +1791,7 @@ mod tests {
     }
 
     #[test]
-    fn first_entry_context_is_sysret_safe() {
+    fn first_entry_context_is_iret_safe_and_interruptible() {
         let context = UserContext::new(0x4000_1000, 0x7fff_ffff_f000);
         assert_eq!(context.rflags, USER_RFLAGS_DEFAULT);
         assert_eq!(context.validate(), Ok(()));
@@ -1655,6 +1883,7 @@ mod tests {
         assert_eq!(STATE_FAULT_VECTOR, 48);
         assert_eq!(STATE_FAULT_ERROR_CODE, 56);
         assert_eq!(STATE_FAULT_ADDRESS, 64);
+        assert_eq!(STATE_INTERRUPT_EOI, 72);
         assert_eq!(STATE_KERNEL_FX, 80);
         assert_eq!(STATE_KERNEL_FX % 16, 0);
     }
@@ -1700,6 +1929,8 @@ mod tests {
 
         let fail_stop = 0xffff_8000_0000_1000;
         let contained = 0xffff_8000_0000_2000;
+        let timer = 0xffff_8000_0000_3000;
+        let spurious = 0xffff_8000_0000_4000;
         let gates = [
             ExceptionGate::ring0(DIVIDE_ERROR_VECTOR, contained),
             ExceptionGate::ring0(DEBUG_VECTOR, contained),
@@ -1724,6 +1955,8 @@ mod tests {
             ExceptionGate::ring0(HYPERVISOR_INJECTION_VECTOR, contained),
             ExceptionGate::ring0(VMM_COMMUNICATION_VECTOR, contained),
             ExceptionGate::ring0(SECURITY_EXCEPTION_VECTOR, contained),
+            ExceptionGate::ring0(usize::from(PREEMPTION_VECTOR), timer),
+            ExceptionGate::ring0(usize::from(SPURIOUS_VECTOR), spurious),
         ];
         let idt = exception_idt(fail_stop, &gates);
 
@@ -1774,7 +2007,14 @@ mod tests {
             assert_eq!(gate.reserved, 0);
         }
         assert_eq!(idt.entries[9].handler(), fail_stop);
-        assert_eq!(idt.entries[255].handler(), fail_stop);
+        let timer_gate = idt.entries[usize::from(PREEMPTION_VECTOR)];
+        assert_eq!(timer_gate.handler(), timer);
+        assert_eq!(timer_gate.ist, 0);
+        assert_eq!(timer_gate.type_attributes, INTERRUPT_GATE_PRESENT_RING0);
+        let spurious_gate = idt.entries[usize::from(SPURIOUS_VECTOR)];
+        assert_eq!(spurious_gate.handler(), spurious);
+        assert_eq!(spurious_gate.ist, 0);
+        assert_eq!(spurious_gate.type_attributes, INTERRUPT_GATE_PRESENT_RING0);
     }
 
     #[test]
@@ -1887,6 +2127,21 @@ mod tests {
     }
 
     #[test]
+    fn idle_entry_requires_interrupts_disabled() {
+        assert!(!rflags_interrupts_enabled(0));
+        assert!(!rflags_interrupts_enabled(1 << 1));
+        assert!(rflags_interrupts_enabled(RFLAGS_INTERRUPT_ENABLE));
+        assert!(rflags_interrupts_enabled(u64::MAX));
+        assert_eq!(RFLAGS_INTERRUPT_ENABLE, 0x200);
+
+        #[cfg(not(target_os = "none"))]
+        assert!(matches!(
+            idle_until_interrupt(),
+            Err(IdleError::InterruptsEnabled | IdleError::UnsupportedEnvironment)
+        ));
+    }
+
+    #[test]
     fn canonical_address_checks_cover_both_halves_and_hole() {
         assert!(is_canonical_address(0));
         assert!(is_canonical_address(0x0000_7fff_ffff_ffff));
@@ -1900,7 +2155,7 @@ mod tests {
     }
 
     #[test]
-    fn context_validation_rejects_sysret_hazards() {
+    fn context_validation_rejects_unsafe_iret_state_and_requires_if() {
         let valid = UserContext::new(0x4000_1000, 0x7fff_ffff_f000);
         assert_eq!(valid.validate(), Ok(()));
 
@@ -1918,7 +2173,22 @@ mod tests {
             Err(ContextValidationError::InvalidStackPointer)
         );
 
-        for forbidden in [1 << 8, 1 << 9, 1 << 10, 3 << 12, 1 << 14, 1 << 17, 1 << 18] {
+        assert_eq!(USER_RFLAGS_REQUIRED, 0x202);
+        assert_eq!(USER_RFLAGS_DEFAULT, 0x202);
+        assert_eq!(USER_RFLAGS_ALLOWED, 0x1_0ad7);
+
+        context = valid;
+        context.rflags |= RFLAGS_RESUME;
+        assert_eq!(context.validate(), Ok(()));
+
+        context = valid;
+        context.rflags &= !(1 << 9);
+        assert_eq!(
+            context.validate(),
+            Err(ContextValidationError::InvalidFlags)
+        );
+
+        for forbidden in [1 << 8, 1 << 10, 3 << 12, 1 << 14, 1 << 17, 1 << 18] {
             context = valid;
             context.rflags |= forbidden;
             assert_eq!(
@@ -1933,6 +2203,25 @@ mod tests {
             context.validate(),
             Err(ContextValidationError::InvalidFlags)
         );
+    }
+
+    #[test]
+    fn external_interrupt_state_accepts_disabled_or_canonical_eoi_only() {
+        assert_eq!(ExternalInterruptState::DISABLED.validate(), Ok(()));
+        assert_eq!(
+            ExternalInterruptState::local_apic(0xffff_f700_0000_00b0).validate(),
+            Ok(())
+        );
+        for invalid in [
+            0x0000_8000_0000_00b0,
+            0x0000_0000_fee0_00b0,
+            0xffff_f700_0000_00b1,
+        ] {
+            assert_eq!(
+                ExternalInterruptState::local_apic(invalid).validate(),
+                Err(InitializeError::InvalidInterruptEoiAddress)
+            );
+        }
     }
 
     #[test]

@@ -28,7 +28,7 @@ use ginkgo_filesystem::RedoxFs;
 use ginkgo_hid::{ApplicationKind, Axis, InputEvent, AXIS_MAX, AXIS_MIN};
 use ginkgo_ipc::IpcError;
 use ginkgo_kernel::{
-    arch::{self, CpuPrivilegeState, KernelExit, PrivilegeStackTops},
+    arch::{self, CpuPrivilegeState, ExternalInterruptState, KernelExit, PrivilegeStackTops},
     ata::AtaPioDisk,
     audio::AudioDevice,
     desktop_runtime::{DesktopBroker, DesktopBrokerError, DesktopRuntimeEvent},
@@ -38,6 +38,7 @@ use ginkgo_kernel::{
         self, BaseRevision, FramebufferRequest, HhdmRequest, MemoryMapRequest, StackSizeRequest,
         TscFrequencyRequest,
     },
+    local_apic::LocalApicTimer,
     memory::{UsableFrameAllocator, VirtAddr, VirtPage},
     paging::{ActivePageTable, PageTableFlags},
     process::{Process, ProcessFault, ProcessFaultReason, ProcessId, ProcessState, ProcessTable},
@@ -92,6 +93,13 @@ static FILE_NAVIGATOR_ELF: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-file-navigator.elf"));
 static TERMINAL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-terminal.elf"));
 static PROGRAM_REGISTRY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/programs.gkr"));
+static PREEMPTION_SMOKE_ELF: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-preemption-smoke.elf"));
+static GINKGO_SPLASH_RGBA: &[u8; 256 * 256 * 4] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-splash.rgba"));
+fn preemption_smoke_enabled() -> bool {
+    option_env!("GINKGO_PREEMPTION_SMOKE") == Some("1")
+}
 
 const DESKTOP_PATH: &str = "/desktop.elf";
 const MINIMAL_CLIENT_PATH: &str = "/minimal-client.elf";
@@ -262,14 +270,35 @@ pub extern "C" fn _start() -> ! {
     let Ok(mut frames) = UsableFrameAllocator::new(memory_map) else {
         halt_forever();
     };
-    let Ok(page_table) = (unsafe { ActivePageTable::from_current(hhdm.offset) }) else {
+    let Ok(mut page_table) = (unsafe { ActivePageTable::from_current(hhdm.offset) }) else {
         halt_forever();
     };
     if page_table.reserve_active_frames(&mut frames).is_err() {
         ui.render_boot_log(&mut screen, "paging: failed to reserve active tables");
         halt_forever();
     }
-    let serial = unsafe { SerialPort::new(SerialPort::COM1_BASE) };
+    let mut serial = unsafe { SerialPort::new(SerialPort::COM1_BASE) };
+    let Some(tsc_frequency) = TSC_FREQUENCY_REQUEST
+        .response()
+        .map(|response| response.frequency)
+        .filter(|frequency| *frequency != 0)
+    else {
+        let mut sink = SerialDebugSink::new(&mut serial);
+        let _ = writeln!(sink, "timer: TSC frequency unavailable\r");
+        ui.render_boot_log(&mut screen, "timer: TSC frequency unavailable");
+        halt_forever();
+    };
+    let timer =
+        match unsafe { LocalApicTimer::initialize(&mut page_table, &mut frames, tsc_frequency) } {
+            Ok(timer) => timer,
+            Err(error) => {
+                let mut sink = SerialDebugSink::new(&mut serial);
+                let _ = writeln!(sink, "timer: local APIC initialization failed: {error:?}\r");
+                ui.render_boot_log(&mut screen, "timer: local APIC initialization failed");
+                halt_forever();
+            }
+        };
+    usb::configure_timestamp_frequency(Some(tsc_frequency));
     let Ok(mut disk) = (unsafe { AtaPioDisk::primary_master() }) else {
         ui.render_boot_log(&mut screen, "ata: persistent disk unavailable");
         halt_forever();
@@ -302,9 +331,12 @@ pub extern "C" fn _start() -> ! {
         serial,
         input: None,
         audio: None,
+        timer,
         screen,
         ui,
         paging_verified: false,
+        preemption_observed: false,
+        preemption_smoke_id: None,
         processes: ProcessTable::new(),
         desktop: None,
         process_clients: Vec::new(),
@@ -327,11 +359,7 @@ pub extern "C" fn _start() -> ! {
     context
         .ui
         .render_boot_log(&mut context.screen, "paging: mappings verified");
-    usb::configure_timestamp_frequency(
-        TSC_FREQUENCY_REQUEST
-            .response()
-            .map(|response| response.frequency),
-    );
+
     match unsafe {
         InputManager::initialize(
             &mut context.page_table,
@@ -390,10 +418,11 @@ pub extern "C" fn _start() -> ! {
     let cpu_state: &'static mut CpuPrivilegeState =
         unsafe { &mut *ptr::addr_of_mut!(CPU_PRIVILEGE_STATE) };
     if let Err(error) = unsafe {
-        arch::initialize_cpu(
+        arch::initialize_cpu_with_external_interrupts(
             cpu_state,
             privilege_stack_tops(),
             arch::capture_syscall_and_yield,
+            ExternalInterruptState::local_apic(context.timer.eoi_register_address()),
         )
     } {
         let mut sink = SerialDebugSink::new(&mut context.serial);
@@ -459,6 +488,40 @@ pub extern "C" fn _start() -> ! {
         );
     }
 
+    if preemption_smoke_enabled() {
+        let smoke = match Process::from_elf(
+            PREEMPTION_SMOKE_ELF,
+            &context.page_table,
+            &mut context.frames,
+        ) {
+            Ok(process) => process,
+            Err(error) => {
+                let mut sink = SerialDebugSink::new(&mut context.serial);
+                let _ = writeln!(sink, "scheduler: preemption smoke load failed: {error:?}\r");
+                halt_forever();
+            }
+        };
+        match context.processes.insert(smoke) {
+            Ok(smoke_id) => {
+                context.preemption_smoke_id = Some(smoke_id);
+                let mut sink = SerialDebugSink::new(&mut context.serial);
+                let _ = writeln!(
+                    sink,
+                    "scheduler: preemption smoke started pid={}\r",
+                    smoke_id.raw()
+                );
+            }
+            Err(error) => {
+                let mut sink = SerialDebugSink::new(&mut context.serial);
+                let _ = writeln!(
+                    sink,
+                    "scheduler: preemption smoke insertion failed: {error:?}\r"
+                );
+                halt_forever();
+            }
+        }
+    }
+
     let mut scheduler = Scheduler::<KernelContext, 8>::new();
     if scheduler.spawn(filesystem_task).is_err()
         || scheduler.spawn(console_task).is_err()
@@ -476,7 +539,14 @@ pub extern "C" fn _start() -> ! {
 
     loop {
         scheduler.run_round(&mut context);
-        core::hint::spin_loop();
+        if !context.processes.has_runnable()
+            && context.timer.arm_one_shot(KERNEL_IDLE_POLL_NS).is_ok()
+        {
+            let _ = arch::idle_until_interrupt();
+            context.timer.disarm();
+        } else {
+            core::hint::spin_loop();
+        }
     }
 }
 
@@ -495,9 +565,12 @@ struct KernelContext {
     serial: Option<SerialPort>,
     input: Option<InputManager>,
     audio: Option<AudioDevice>,
+    timer: LocalApicTimer,
     screen: FramebufferWriter<'static>,
     ui: ValidationUi,
     paging_verified: bool,
+    preemption_observed: bool,
+    preemption_smoke_id: Option<ProcessId>,
     processes: ProcessTable,
     desktop: Option<DesktopBroker>,
     process_clients: Vec<ProcessClient>,
@@ -518,6 +591,8 @@ const INPUT_BATCH_RECORDS: usize = 512;
 const INPUT_BATCH_CAPACITY: usize = INPUT_RECORD_SIZE * INPUT_BATCH_RECORDS;
 const INPUT_FLUSH_THRESHOLD: usize = INPUT_RECORD_SIZE * (INPUT_BATCH_RECORDS - 32);
 const LOG_FLUSH_DELAY_SECONDS: u64 = 2;
+const USER_QUANTUM_NS: u64 = 10_000_000;
+const KERNEL_IDLE_POLL_NS: u64 = 1_000_000;
 const TEXT_BUFFER_CAPACITY: usize = 512;
 const CURSOR_SIZE: usize = 19;
 
@@ -572,6 +647,11 @@ const LAUNCHER_MAX_WIDTH: usize = 620;
 const LAUNCHER_SEARCH_HEIGHT: usize = 58;
 const LAUNCHER_ROW_HEIGHT: usize = 66;
 const LAUNCHER_GAP: usize = 10;
+
+const fn blend_channel(source: u8, background: u8, alpha: u8) -> u8 {
+    let alpha = alpha as u32;
+    ((source as u32 * alpha + background as u32 * (255 - alpha) + 127) / 255) as u8
+}
 
 struct ValidationUi {
     text: [u8; TEXT_BUFFER_CAPACITY],
@@ -651,39 +731,30 @@ impl ValidationUi {
     }
 
     fn render_splash(&mut self, screen: &mut FramebufferWriter<'_>) {
-        const LEAF: [u16; 14] = [
-            0b000_0110_0110_000,
-            0b000_1111_1111_000,
-            0b001_1111_1111_100,
-            0b011_1111_1111_110,
-            0b111_1111_1111_111,
-            0b111_1111_1111_111,
-            0b011_1111_1111_110,
-            0b001_1111_1111_100,
-            0b000_1111_1111_000,
-            0b000_0111_1110_000,
-            0b000_0011_1100_000,
-            0b000_0001_1000_000,
-            0b000_0001_1000_000,
-            0b000_0001_1000_000,
-        ];
-        const SCALE: usize = 10;
-        const COLUMNS: usize = 15;
+        const SPLASH_WIDTH: usize = 256;
+        const SPLASH_HEIGHT: usize = 256;
+        const BACKGROUND: [u8; 3] = [14, 20, 32];
 
-        screen.clear(Rgb::new(14, 20, 32));
-        let x = self.width.saturating_sub(COLUMNS * SCALE) / 2;
-        let y = self.height.saturating_sub(LEAF.len() * SCALE) / 2;
-        for (row, bits) in LEAF.into_iter().enumerate() {
-            let color = if row < 6 {
-                Rgb::new(110, 231, 183)
-            } else {
-                Rgb::new(52, 211, 153)
-            };
-            for column in 0..COLUMNS {
-                if bits & (1 << (COLUMNS - column - 1)) != 0 {
-                    screen.fill_rect(x + column * SCALE, y + row * SCALE, SCALE, SCALE, color);
-                }
+        screen.clear(Rgb::new(BACKGROUND[0], BACKGROUND[1], BACKGROUND[2]));
+        let origin_x = self.width.saturating_sub(SPLASH_WIDTH) / 2;
+        let origin_y = self.height.saturating_sub(SPLASH_HEIGHT) / 2;
+        for (index, pixel) in GINKGO_SPLASH_RGBA.chunks_exact(4).enumerate() {
+            let alpha = pixel[3];
+            if alpha == 0 {
+                continue;
             }
+            let x = origin_x + index % SPLASH_WIDTH;
+            let y = origin_y + index / SPLASH_WIDTH;
+            let color = if alpha == u8::MAX {
+                Rgb::new(pixel[0], pixel[1], pixel[2])
+            } else {
+                Rgb::new(
+                    blend_channel(pixel[0], BACKGROUND[0], alpha),
+                    blend_channel(pixel[1], BACKGROUND[1], alpha),
+                    blend_channel(pixel[2], BACKGROUND[2], alpha),
+                )
+            };
+            let _ = screen.write_rgb_pixel(x, y, color);
         }
         self.cursor_visible = false;
     }
@@ -1114,54 +1185,113 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
         return TaskPoll::Pending;
     };
 
-    if process.is_runnable() {
-        unsafe { process.address_space().activate() };
-        let mut user_context = *process.context();
-        match unsafe { arch::enter_user(&mut user_context) } {
-            Ok(KernelExit::YieldToKernel) => {
-                let mut sink = SerialDebugSink::new(&mut context.serial);
-                let outcome = syscall::dispatch(
-                    process,
-                    &mut user_context,
-                    &context.page_table,
-                    &mut context.frames,
-                    &mut context.fs,
-                    &mut context.audio,
-                    &mut sink,
-                );
-                debug_assert!(
-                    outcome == SyscallOutcome::Yield || !process.is_runnable(),
-                    "exit syscall must update process state"
-                );
-            }
-            Ok(KernelExit::Fault(fault)) => {
-                let reason = match fault.vector {
-                    14 => ProcessFaultReason::PageFault,
-                    13 => ProcessFaultReason::GeneralProtection,
-                    6 => ProcessFaultReason::InvalidOpcode,
-                    vector => ProcessFaultReason::Other(u16::try_from(vector).unwrap_or(u16::MAX)),
-                };
-                process.mark_faulted(ProcessFault {
-                    reason,
-                    code: fault.error_code,
-                    address: fault.fault_address,
-                });
-            }
-            Ok(KernelExit::ExitToKernel) | Err(_) => {
+    match process.state() {
+        ProcessState::Ready => {
+            unsafe { process.address_space().activate() };
+            let mut user_context = *process.context();
+            if context.timer.arm_one_shot(USER_QUANTUM_NS).is_err() {
                 process.mark_faulted(ProcessFault::new(ProcessFaultReason::InvalidUserContext, 0));
+            } else {
+                let exit = unsafe { arch::enter_user(&mut user_context) };
+                context.timer.disarm();
+                match exit {
+                    Ok(KernelExit::YieldToKernel) => {
+                        let mut sink = SerialDebugSink::new(&mut context.serial);
+                        let outcome = syscall::dispatch(
+                            process,
+                            &mut user_context,
+                            context.timer.clock().now_ns(),
+                            &context.page_table,
+                            &mut context.frames,
+                            &mut context.fs,
+                            &mut context.audio,
+                            &mut sink,
+                        );
+                        debug_assert!(
+                            matches!(outcome, SyscallOutcome::Yield | SyscallOutcome::Blocked)
+                                || !process.is_runnable(),
+                            "exit syscall must update process state"
+                        );
+                    }
+                    Ok(KernelExit::Preempted) => {
+                        process.record_preemption();
+                        if !context.preemption_observed {
+                            context.preemption_observed = true;
+                            let mut sink = SerialDebugSink::new(&mut context.serial);
+                            let _ = writeln!(sink, "scheduler: timer preemption verified\r");
+                        }
+                    }
+                    Ok(KernelExit::Fault(fault)) => {
+                        let reason = match fault.vector {
+                            14 => ProcessFaultReason::PageFault,
+                            13 => ProcessFaultReason::GeneralProtection,
+                            6 => ProcessFaultReason::InvalidOpcode,
+                            vector => {
+                                ProcessFaultReason::Other(u16::try_from(vector).unwrap_or(u16::MAX))
+                            }
+                        };
+                        process.mark_faulted(ProcessFault {
+                            reason,
+                            code: fault.error_code,
+                            address: fault.fault_address,
+                        });
+                    }
+                    Ok(KernelExit::ExitToKernel) => {
+                        let mut sink = SerialDebugSink::new(&mut context.serial);
+                        let _ = writeln!(
+                            sink,
+                            "userspace: assembly rejected context rip={:#x} rsp={:#x} rflags={:#x}\r",
+                            user_context.rip,
+                            user_context.rsp,
+                            user_context.rflags
+                        );
+                        process.mark_faulted(ProcessFault::new(
+                            ProcessFaultReason::InvalidUserContext,
+                            1,
+                        ));
+                    }
+                    Err(error) => {
+                        let mut sink = SerialDebugSink::new(&mut context.serial);
+                        let _ = writeln!(
+                            sink,
+                            "userspace: context validation failed: {error:?} rip={:#x} rsp={:#x} rflags={:#x}\r",
+                            user_context.rip,
+                            user_context.rsp,
+                            user_context.rflags
+                        );
+                        process.mark_faulted(ProcessFault::new(
+                            ProcessFaultReason::InvalidUserContext,
+                            2,
+                        ));
+                    }
+                }
+            }
+            *process.context_mut() = user_context;
+        }
+        ProcessState::Blocked => {
+            let now_ns = context.timer.clock().now_ns();
+            if syscall::poll_blocked(process, now_ns) == syscall::BlockedPoll::Complete {
+                unsafe { process.address_space().activate() };
+                let _ = syscall::complete_blocked(process);
             }
         }
-        *process.context_mut() = user_context;
+        ProcessState::Exited(_) | ProcessState::Faulted(_) => {}
     }
 
     unsafe { context.page_table.activate() };
     let Some(final_state) = context.processes.get(process_id).map(Process::state) else {
         return TaskPoll::Pending;
     };
-    if final_state.is_runnable() {
+    if !final_state.is_terminal() {
         return TaskPoll::Pending;
     }
 
+    let preemption_count = context
+        .processes
+        .get(process_id)
+        .map(Process::preemption_count)
+        .unwrap_or(0);
+    let is_preemption_smoke = context.preemption_smoke_id == Some(process_id);
     let Some(process) = context.processes.take_for_retirement(process_id) else {
         return TaskPoll::Pending;
     };
@@ -1194,6 +1324,23 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                 process_id.raw(),
                 status
             );
+            if is_preemption_smoke {
+                context.preemption_smoke_id = None;
+                if status == 0 && preemption_count != 0 {
+                    let _ = writeln!(
+                        sink,
+                        "scheduler: preemption smoke passed ({} preemptions)\r",
+                        preemption_count
+                    );
+                } else {
+                    let _ = writeln!(
+                        sink,
+                        "scheduler: preemption smoke failed status={} preemptions={}\r",
+                        status, preemption_count
+                    );
+                    halt_forever();
+                }
+            }
         }
         ProcessState::Faulted(fault) => {
             let _ = writeln!(
@@ -1205,7 +1352,9 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                 fault.address
             );
         }
-        ProcessState::Ready => unreachable!("runnable process reached retirement"),
+        ProcessState::Ready | ProcessState::Blocked => {
+            unreachable!("live process reached retirement")
+        }
     }
     TaskPoll::Pending
 }

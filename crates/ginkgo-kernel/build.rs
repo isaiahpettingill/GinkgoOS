@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, env, fs, path::PathBuf};
+use std::{collections::BTreeMap, env, fs, fs::File, io::BufReader, path::PathBuf};
 
 use ginkgo_program_registry::{encode, EncodeEntry, EntryFlags, Registry};
 
@@ -11,16 +11,20 @@ const PAGE_SIZE: u64 = 4096;
 const PROCESS_YIELD: u32 = 0;
 const PROCESS_EXIT: u32 = 1;
 const HANDLE_CLOSE: u32 = 2;
+const WAIT_MANY: u32 = 4;
+const CHANNEL_CREATE: u32 = 5;
 const CHANNEL_WRITE: u32 = 6;
 const CHANNEL_READ: u32 = 7;
 const SHARED_MEMORY_CREATE: u32 = 8;
 const SHARED_MEMORY_MAP: u32 = 10;
 const SHARED_MEMORY_UNMAP: u32 = 11;
 const DEBUG_WRITE: u32 = 12;
+const CLOCK_GET_MONOTONIC: u32 = 21;
 
 const SHARED_MEMORY_SIZE: u32 = 4097;
 const MAP_PROTECTION_READ_WRITE: u32 = 3;
 const STATUS_SHOULD_WAIT: i8 = -8;
+const STATUS_TIMED_OUT: i8 = -22;
 
 // Desktop bootstrap protocol. Every message is exactly eight bytes. LauncherState's
 // final byte is the current boolean launcher visibility (0 = hidden, 1 = visible).
@@ -32,24 +36,35 @@ const ENTERED: &[u8] = b"ginkgo-userspace-smoke: entered\n";
 const ALIAS: &[u8] = b"ginkgo-userspace-smoke: mapped alias\n";
 const RESUMED: &[u8] = b"ginkgo-userspace-smoke: resumed\n";
 const FAILURE: &[u8] = b"ginkgo-userspace-smoke: failure\n";
+const PREEMPTION_PASSED: &[u8] = b"ginkgo-preemption-smoke: workload complete\n";
+const PREEMPTION_FAILED: &[u8] = b"ginkgo-preemption-smoke: register corruption\n";
 
 fn main() {
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
     let linker = manifest.join("linker.ld");
+    let splash = manifest.join("../..").join("Ginkgo.png");
     println!("cargo:rerun-if-changed={}", linker.display());
+    println!("cargo:rerun-if-changed={}", splash.display());
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=GINKGO_DESKTOP_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_MINIMAL_CLIENT_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_FILE_NAVIGATOR_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_TERMINAL_ELF");
+    println!("cargo:rerun-if-env-changed=GINKGO_PREEMPTION_SMOKE");
     println!("cargo:rustc-link-arg-bin=ginkgo-os=-T{}", linker.display());
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("build output directory"));
+    write_splash_rgba(&splash, &out_dir.join("ginkgo-splash.rgba"));
     fs::write(
         out_dir.join("ginkgo-userspace-smoke.elf"),
         build_userspace_smoke_elf(),
     )
     .expect("write ginkgo userspace smoke ELF");
+    fs::write(
+        out_dir.join("ginkgo-preemption-smoke.elf"),
+        build_preemption_smoke_elf(),
+    )
+    .expect("write Ginkgo preemption smoke ELF");
     let desktop = read_userspace_artifact("GINKGO_DESKTOP_ELF").unwrap_or_else(build_desktop_elf);
     let minimal_client = read_userspace_artifact("GINKGO_MINIMAL_CLIENT_ELF")
         .unwrap_or_else(build_userspace_smoke_elf);
@@ -65,6 +80,26 @@ fn main() {
     fs::write(out_dir.join("ginkgo-terminal.elf"), terminal).expect("write Ginkgo terminal ELF");
     fs::write(out_dir.join("programs.gkr"), build_program_registry())
         .expect("write Ginkgo program registry");
+}
+
+fn write_splash_rgba(source: &PathBuf, output: &PathBuf) {
+    let mut decoder = png::Decoder::new(BufReader::new(
+        File::open(source).expect("open Ginkgo splash PNG"),
+    ));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder
+        .read_info()
+        .expect("read Ginkgo splash PNG metadata");
+    let mut pixels = vec![0; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut pixels)
+        .expect("decode Ginkgo splash PNG");
+    assert_eq!((info.width, info.height), (256, 256));
+    assert_eq!(info.color_type, png::ColorType::Rgba);
+    assert_eq!(info.bit_depth, png::BitDepth::Eight);
+    pixels.truncate(info.buffer_size());
+    assert_eq!(pixels.len(), 256 * 256 * 4);
+    fs::write(output, pixels).expect("write Ginkgo splash RGBA artifact");
 }
 
 fn read_userspace_artifact(variable: &str) -> Option<Vec<u8>> {
@@ -258,6 +293,96 @@ fn emit_userspace_smoke_code() -> Vec<u8> {
     assembler.finish()
 }
 
+fn emit_preemption_smoke_code() -> Vec<u8> {
+    const RCX_SENTINEL: u64 = 0x1122_3344_5566_7788;
+    const R11_SENTINEL: u64 = 0x8877_6655_4433_2211;
+    const ITERATIONS: u32 = 100_000_000;
+
+    let mut assembler = Assembler::default();
+    assembler.label("entry");
+    assembler.emit(&[0x48, 0x83, 0xe4, 0xf0]); // and rsp, -16
+    assembler.emit(&[0x48, 0x83, 0xec, 0x50]); // sub rsp, 80
+    assembler.emit(&[0x48, 0xb9]); // movabs rcx, sentinel
+    assembler.u64(RCX_SENTINEL);
+    assembler.emit(&[0x49, 0xbb]); // movabs r11, sentinel
+    assembler.u64(R11_SENTINEL);
+    assembler.emit(&[0xbb]); // mov ebx, iterations
+    assembler.u32(ITERATIONS);
+
+    assembler.label("busy_loop");
+    assembler.emit(&[0x48, 0xff, 0xcb]); // dec rbx
+    assembler.rel32(&[0x0f, 0x85], "busy_loop"); // jnz busy_loop
+
+    assembler.emit(&[0x48, 0xb8]); // movabs rax, RCX sentinel
+    assembler.u64(RCX_SENTINEL);
+    assembler.emit(&[0x48, 0x39, 0xc1]); // cmp rcx, rax
+    assembler.rel32(&[0x0f, 0x85], "failure");
+    assembler.emit(&[0x48, 0xb8]); // movabs rax, R11 sentinel
+    assembler.u64(R11_SENTINEL);
+    assembler.emit(&[0x49, 0x39, 0xc3]); // cmp r11, rax
+    assembler.rel32(&[0x0f, 0x85], "failure");
+
+    // Create a quiet channel pair and wait for READABLE with a finite deadline.
+    assembler.emit(&[0x48, 0x8d, 0x3c, 0x24]); // lea rdi, [rsp]
+    assembler.checked_syscall(CHANNEL_CREATE);
+    assembler.emit(&[0x48, 0x8d, 0x7c, 0x24, 0x08]); // lea rdi, [rsp + 8]
+    assembler.checked_syscall(CLOCK_GET_MONOTONIC);
+
+    assembler.emit(&[0x8b, 0x04, 0x24]); // mov eax, [rsp]
+    assembler.emit(&[0x89, 0x44, 0x24, 0x10]); // item.handle = eax
+    assembler.emit(&[0xc7, 0x44, 0x24, 0x14]); // item.wait_for = READABLE
+    assembler.u32(1);
+    assembler.emit(&[0xc7, 0x44, 0x24, 0x18]); // item.pending = 0
+    assembler.u32(0);
+
+    assembler.emit(&[0x48, 0x8d, 0x44, 0x24, 0x10]); // lea rax, [rsp + 16]
+    assembler.emit(&[0x48, 0x89, 0x44, 0x24, 0x20]); // args.items_address
+    assembler.emit(&[0x48, 0xc7, 0x44, 0x24, 0x28]); // args.item_count = 1
+    assembler.u32(1);
+    assembler.emit(&[0x48, 0x8b, 0x44, 0x24, 0x08]); // mov rax, now_ns
+    assembler.emit(&[0x48, 0x05]); // add rax, 5 ms
+    assembler.u32(5_000_000);
+    assembler.emit(&[0x48, 0x89, 0x44, 0x24, 0x30]); // args.deadline_ns
+
+    assembler.emit(&[0x48, 0x8d, 0x7c, 0x24, 0x20]); // lea rdi, args
+    assembler.emit(&[0x48, 0x8d, 0x74, 0x24, 0x38]); // lea rsi, output
+    assembler.emit(&[0xb8]);
+    assembler.u32(WAIT_MANY);
+    assembler.emit(&[0x0f, 0x05]);
+    assembler.emit(&[0x48, 0x83, 0xf8]); // cmp rax, TimedOut
+    assembler.i8(STATUS_TIMED_OUT);
+    assembler.rel32(&[0x0f, 0x85], "failure");
+
+    assembler.emit(&[0x8b, 0x3c, 0x24]); // mov edi, first channel handle
+    assembler.checked_syscall(HANDLE_CLOSE);
+    assembler.emit(&[0x8b, 0x7c, 0x24, 0x04]); // mov edi, second channel handle
+    assembler.checked_syscall(HANDLE_CLOSE);
+
+    assembler.debug_write("passed", PREEMPTION_PASSED.len());
+    assembler.emit(&[0x31, 0xff]); // xor edi, edi
+    assembler.checked_syscall(PROCESS_EXIT);
+    assembler.emit(&[0x0f, 0x0b]); // ud2
+
+    assembler.label("failure");
+    assembler.rel32(&[0x48, 0x8d, 0x3d], "failed"); // lea rdi, [rip + failed]
+    assembler.emit(&[0xbe]);
+    assembler.u32(PREEMPTION_FAILED.len() as u32);
+    assembler.emit(&[0xb8]);
+    assembler.u32(DEBUG_WRITE);
+    assembler.emit(&[0x0f, 0x05]);
+    assembler.emit(&[0xbf]); // mov edi, 1
+    assembler.u32(1);
+    assembler.emit(&[0xb8]);
+    assembler.u32(PROCESS_EXIT);
+    assembler.emit(&[0x0f, 0x05, 0x0f, 0x0b]);
+
+    assembler.label("passed");
+    assembler.emit(PREEMPTION_PASSED);
+    assembler.label("failed");
+    assembler.emit(PREEMPTION_FAILED);
+    assembler.finish()
+}
+
 fn emit_desktop_code() -> Vec<u8> {
     let mut assembler = Assembler::default();
 
@@ -363,6 +488,10 @@ fn emit_desktop_code() -> Vec<u8> {
 
 fn build_userspace_smoke_elf() -> Vec<u8> {
     build_userspace_elf(emit_userspace_smoke_code(), "smoke")
+}
+
+fn build_preemption_smoke_elf() -> Vec<u8> {
+    build_userspace_elf(emit_preemption_smoke_code(), "preemption-smoke")
 }
 
 fn build_desktop_elf() -> Vec<u8> {

@@ -11,6 +11,7 @@ pub mod elf;
 pub mod input;
 pub mod io;
 pub mod limine;
+pub mod local_apic;
 pub mod memory;
 pub mod paging;
 pub mod pci;

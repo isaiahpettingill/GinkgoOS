@@ -77,6 +77,26 @@ pub fn process_yield() -> SyscallResult<()> {
     status_result(unsafe { raw_syscall6(SyscallNumber::ProcessYield, 0, 0, 0, 0, 0, 0) })
 }
 
+/// Returns nanoseconds elapsed on the kernel's monotonic clock.
+#[inline]
+pub fn monotonic_time_ns() -> SyscallResult<u64> {
+    let mut output = MonotonicTimeOutput::default();
+    // SAFETY: output is writable and remains alive until the syscall returns.
+    let raw = unsafe {
+        raw_syscall6(
+            SyscallNumber::ClockGetMonotonic,
+            mut_pointer_address(&mut output),
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    status_result(raw)?;
+    Ok(output.now_ns)
+}
+
 /// Terminates the current process with `exit_code`.
 ///
 /// This function returns only if the kernel rejects the request. The returned
@@ -292,8 +312,8 @@ pub fn handle_duplicate(handle: Handle, rights: Rights) -> SyscallResult<Handle>
 
 /// Waits until one requested signal is pending or `deadline_ns` is reached.
 ///
-/// The kernel updates every item's `pending` field before a successful return
-/// and returns the first ready item's index.
+/// The kernel updates every item's `pending` field before returning success or
+/// [`Status::TimedOut`]. On success it returns the first ready item's index.
 #[inline]
 pub fn wait_many(items: &mut [WaitItem], deadline_ns: i64) -> SyscallResult<usize> {
     let args = WaitManyArgs {
@@ -623,6 +643,7 @@ mod tests {
             Status::NotFound,
             Status::EndOfDirectory,
             Status::Io,
+            Status::TimedOut,
         ] {
             assert_eq!(status_result(status.raw().into()), Err(status));
         }

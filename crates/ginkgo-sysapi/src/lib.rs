@@ -46,6 +46,8 @@ pub enum SyscallNumber {
     FilesystemUnlink = 19,
     /// Queues interleaved 44.1 kHz signed 16-bit little-endian stereo PCM.
     AudioWrite = 20,
+    /// Reads the kernel's monotonic nanosecond clock.
+    ClockGetMonotonic = 21,
 }
 
 /// An opaque process-local reference to a kernel object.
@@ -191,6 +193,7 @@ pub enum Status {
     NotFound = -19,
     EndOfDirectory = -20,
     Io = -21,
+    TimedOut = -22,
 }
 
 impl Status {
@@ -219,6 +222,7 @@ impl Status {
             -19 => Self::NotFound,
             -20 => Self::EndOfDirectory,
             -21 => Self::Io,
+            -22 => Self::TimedOut,
             _ => return None,
         })
     }
@@ -280,10 +284,21 @@ pub struct WaitManyArgs {
 }
 
 /// Output block for [`SyscallNumber::WaitMany`].
+///
+/// `ready_index` is defined only when the syscall returns [`Status::Ok`]. The
+/// kernel still updates every [`WaitItem::pending`] field when it returns
+/// [`Status::TimedOut`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WaitManyOutput {
     pub ready_index: u64,
+}
+
+/// Output block for [`SyscallNumber::ClockGetMonotonic`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MonotonicTimeOutput {
+    pub now_ns: u64,
 }
 
 /// Output block for syscalls that create one handle.
@@ -537,6 +552,7 @@ const _: () = {
     assert!(core::mem::size_of::<WaitItem>() == 12);
     assert!(core::mem::size_of::<WaitManyArgs>() == 24);
     assert!(core::mem::size_of::<WaitManyOutput>() == 8);
+    assert!(core::mem::size_of::<MonotonicTimeOutput>() == 8);
     assert!(core::mem::size_of::<HandleOutput>() == 8);
     assert!(core::mem::size_of::<HandleDisposition>() == 16);
     assert!(core::mem::size_of::<ReceivedHandle>() == 16);
@@ -583,6 +599,7 @@ mod tests {
         assert_eq!(SyscallNumber::FilesystemReadDirectory as u64, 17);
         assert_eq!(SyscallNumber::FilesystemTruncate as u64, 18);
         assert_eq!(SyscallNumber::FilesystemUnlink as u64, 19);
+        assert_eq!(SyscallNumber::ClockGetMonotonic as u64, 21);
     }
 
     #[test]
@@ -610,6 +627,7 @@ mod tests {
             Status::NotFound,
             Status::EndOfDirectory,
             Status::Io,
+            Status::TimedOut,
         ];
 
         for (index, status) in statuses.into_iter().enumerate() {
@@ -619,6 +637,11 @@ mod tests {
         }
         assert_eq!(Status::from_raw(1), None);
         assert_eq!(Status::from_raw(i64::from(i32::MIN)), None);
+    }
+
+    #[test]
+    fn wait_deadline_sentinel_is_stable() {
+        assert_eq!(DEADLINE_INFINITE, i64::MAX);
     }
 
     #[test]
@@ -636,6 +659,8 @@ mod tests {
     fn argument_blocks_have_stable_layouts() {
         assert_eq!(size_of::<WaitManyArgs>(), 24);
         assert_eq!(offset_of!(WaitManyArgs, deadline_ns), 16);
+        assert_eq!(size_of::<MonotonicTimeOutput>(), 8);
+        assert_eq!(offset_of!(MonotonicTimeOutput, now_ns), 0);
 
         assert_eq!(size_of::<ChannelWriteArgs>(), 40);
         assert_eq!(align_of::<ChannelWriteArgs>(), 8);

@@ -37,3 +37,4 @@ x86_64.workspace = true
 
 [build-dependencies]
 ginkgo-program-registry = { workspace = true, features = ["host"] }
+png = "0.17.16"

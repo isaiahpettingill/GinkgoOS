@@ -4,10 +4,10 @@
 //! [`UserContext`] and yielded to the scheduler. The process address space must
 //! still be active while this module copies syscall arguments and results.
 //!
-//! [`SyscallNumber::WaitMany`] is currently one nonblocking signal poll. Its
-//! deadline is validated as ABI input, but this dispatcher neither waits nor
-//! simulates deadline expiry: no ready item returns [`Status::ShouldWait`], and
-//! the normal syscall outcome gives the cooperative scheduler another turn.
+//! [`SyscallNumber::WaitMany`] copies its complete request into process-owned
+//! kernel memory before blocking. The process scheduler polls that continuation
+//! with [`poll_blocked`] and, after activating the process address space, calls
+//! [`complete_blocked`] to publish user output and the deferred syscall status.
 
 use alloc::{string::String, vec, vec::Vec};
 use core::mem::size_of;
@@ -20,7 +20,7 @@ use ginkgo_ipc::{
 use ginkgo_sysapi::{
     FilesystemDirectoryEntry, FilesystemOpenFlags, Handle, MapFlags, MapProtection,
     SharedMemoryMapArgs, Status, SyscallNumber, CHANNEL_MAX_BYTES, CHANNEL_MAX_HANDLES,
-    FILESYSTEM_NAME_MAX, FILESYSTEM_READ_MAX_BYTES,
+    DEADLINE_INFINITE, FILESYSTEM_NAME_MAX, FILESYSTEM_READ_MAX_BYTES,
 };
 use redoxfs::Disk;
 
@@ -32,23 +32,20 @@ use crate::{
         address_space::{AddressSpaceError, UserAccess},
         ActivePageTable, MapError,
     },
-    process::{Process, SharedMappingError},
+    process::{PendingWaitMany, Process, SharedMappingError, WaitDeadline, WaitManyCompletion},
 };
 
 /// Maximum bytes accepted by one [`SyscallNumber::DebugWrite`] call.
 pub const DEBUG_WRITE_MAX_BYTES: usize = 4096;
 /// Maximum frame-aligned PCM bytes accepted by one audio write.
 pub const AUDIO_WRITE_MAX_BYTES: usize = 16 * 1024;
-/// Maximum objects inspected by one nonblocking wait-many poll.
-///
-/// The current scheduler never blocks inside WaitMany. It validates the supplied
-/// deadline, polls at most this many objects once, then returns `ShouldWait` when
-/// none of the requested signals are pending.
+/// Maximum objects inspected by one bounded wait-many scheduler poll.
 pub const WAIT_MANY_MAX_ITEMS: usize = 64;
 
 const WAIT_MANY_ARGS_SIZE: usize = 24;
 const WAIT_ITEM_SIZE: usize = 12;
 const WAIT_MANY_OUTPUT_SIZE: usize = 8;
+const MONOTONIC_TIME_OUTPUT_SIZE: usize = 8;
 const HANDLE_OUTPUT_SIZE: usize = 8;
 const HANDLE_DISPOSITION_SIZE: usize = 16;
 const RECEIVED_HANDLE_SIZE: usize = 16;
@@ -75,18 +72,37 @@ pub enum SyscallOutcome {
     /// The syscall completed (successfully or with an error) and the process is
     /// a candidate for a later cooperative scheduling turn.
     Yield,
+    /// Syscall completion is deferred until the scheduler wakes the process.
+    Blocked,
     /// The process requested termination with this code.
     Exit(i32),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DispatchResult {
+    Complete(Status),
+    Blocked,
+}
+
+/// Result of one bounded scheduler poll of a blocked process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockedPoll {
+    /// No signal is ready and the deadline has not expired.
+    Pending,
+    /// Completion is staged in the process and [`complete_blocked`] must be
+    /// called with the process address space active.
+    Complete,
+}
+
 /// Dispatches the syscall saved in `context`.
 ///
-/// Every outcome except a valid process exit writes a sign-extended [`Status`]
-/// to RAX and yields. Unknown syscall numbers are decoded without converting an
-/// arbitrary integer into a Rust enum.
+/// Completed outcomes write a sign-extended [`Status`] to RAX. A blocked
+/// outcome leaves RAX untouched until [`complete_blocked`] runs. Unknown syscall
+/// numbers are decoded without converting an arbitrary integer into a Rust enum.
 pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
     process: &mut Process,
     context: &mut UserContext,
+    now_ns: u64,
     kernel_page_table: &ActivePageTable,
     frame_allocator: &mut UsableFrameAllocator<'_>,
     filesystem: &mut RedoxFs<B>,
@@ -114,13 +130,14 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
     // User copies require the process CR3. Checking this before all non-exit
     // operations also prevents a state change followed by an avoidable copy
     // failure when the dispatcher contract is violated by its caller.
-    let status = if !process.address_space().is_active() {
-        Status::InvalidAddress
+    let result = if !process.address_space().is_active() {
+        DispatchResult::Complete(Status::InvalidAddress)
     } else {
         dispatch_non_exit(
             number,
             process,
             context,
+            now_ns,
             kernel_page_table,
             frame_allocator,
             filesystem,
@@ -128,20 +145,30 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
             debug_sink,
         )
     };
-    set_status(context, status);
-    SyscallOutcome::Yield
+    match result {
+        DispatchResult::Complete(status) => {
+            set_status(context, status);
+            SyscallOutcome::Yield
+        }
+        DispatchResult::Blocked => SyscallOutcome::Blocked,
+    }
 }
 
 fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
     number: SyscallNumber,
     process: &mut Process,
     context: &UserContext,
+    now_ns: u64,
     kernel_page_table: &ActivePageTable,
     frame_allocator: &mut UsableFrameAllocator<'_>,
     filesystem: &mut RedoxFs<B>,
     audio: &mut Option<AudioDevice>,
     debug_sink: &mut D,
-) -> Status {
+) -> DispatchResult {
+    if number == SyscallNumber::WaitMany {
+        return wait_many(process, context.rdi, context.rsi, now_ns);
+    }
+
     let result = match number {
         SyscallNumber::ProcessYield => Ok(()),
         SyscallNumber::ProcessExit => unreachable!("process exit is handled before dispatch"),
@@ -149,7 +176,7 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
         SyscallNumber::HandleDuplicate => {
             handle_duplicate(process, context.rdi, context.rsi, context.rdx)
         }
-        SyscallNumber::WaitMany => wait_many(process, context.rdi, context.rsi),
+        SyscallNumber::WaitMany => unreachable!("wait-many is handled before ordinary dispatch"),
         SyscallNumber::ChannelCreate => channel_create(process, context.rdi),
         SyscallNumber::ChannelWrite => channel_write(process, context.rdi, context.rsi),
         SyscallNumber::ChannelRead => channel_read(process, context.rdi, context.rsi),
@@ -203,11 +230,12 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
             filesystem_unlink(process, filesystem, context.rdi, context.rsi, context.rdx)
         }
         SyscallNumber::AudioWrite => audio_write(process, audio, context.rdi, context.rsi),
+        SyscallNumber::ClockGetMonotonic => clock_get_monotonic(process, context.rdi, now_ns),
     };
-    match result {
+    DispatchResult::Complete(match result {
         Ok(()) => Status::Ok,
         Err(status) => status,
-    }
+    })
 }
 
 const fn decode_syscall_number(raw: u64) -> Option<SyscallNumber> {
@@ -233,6 +261,7 @@ const fn decode_syscall_number(raw: u64) -> Option<SyscallNumber> {
         18 => SyscallNumber::FilesystemTruncate,
         19 => SyscallNumber::FilesystemUnlink,
         20 => SyscallNumber::AudioWrite,
+        21 => SyscallNumber::ClockGetMonotonic,
         _ => return None,
     })
 }
@@ -275,9 +304,24 @@ fn handle_duplicate(
     Ok(())
 }
 
-// This is deliberately a single poll. Deadline-aware blocking belongs in a
-// future scheduler wait queue, not in syscall dispatch.
-fn wait_many(process: &mut Process, args_address: u64, output_address: u64) -> Result<(), Status> {
+fn wait_many(
+    process: &mut Process,
+    args_address: u64,
+    output_address: u64,
+    now_ns: u64,
+) -> DispatchResult {
+    match submit_wait_many(process, args_address, output_address, now_ns) {
+        Ok(result) => result,
+        Err(status) => DispatchResult::Complete(status),
+    }
+}
+
+fn submit_wait_many(
+    process: &mut Process,
+    args_address: u64,
+    output_address: u64,
+    now_ns: u64,
+) -> Result<DispatchResult, Status> {
     let raw_args = copy_block_from_user::<WAIT_MANY_ARGS_SIZE>(process, args_address)?;
     let items_address = read_u64(&raw_args, 0);
     let item_count = read_u64(&raw_args, 8);
@@ -285,6 +329,11 @@ fn wait_many(process: &mut Process, args_address: u64, output_address: u64) -> R
     if deadline_ns < 0 {
         return Err(Status::InvalidArgument);
     }
+    let deadline = if deadline_ns == DEADLINE_INFINITE {
+        WaitDeadline::Infinite
+    } else {
+        WaitDeadline::At(deadline_ns as u64)
+    };
 
     let items_bytes_len = checked_array_bytes(
         item_count,
@@ -307,19 +356,115 @@ fn wait_many(process: &mut Process, args_address: u64, output_address: u64) -> R
     for raw in raw_items.chunks_exact(WAIT_ITEM_SIZE) {
         items.push(parse_wait_item(raw)?);
     }
+    let mut encoded_items = zeroed_vec(items_bytes_len)?;
 
     let ready = process
         .handles()
         .poll_wait_many(&mut items)
         .map_err(map_ipc_error)?;
-    let encoded_items = encode_wait_items(&items)?;
-    copy_to_user(process, items_address, &encoded_items)?;
+    if let Some(completion) = resolve_wait_completion(ready, deadline, now_ns) {
+        encode_wait_items_into(&items, &mut encoded_items);
+        copy_to_user(process, items_address, &encoded_items)?;
+        return match completion {
+            WaitManyCompletion::Ready(ready_index) => {
+                let ready_index = u64::try_from(ready_index).map_err(|_| Status::OutOfRange)?;
+                copy_to_user(process, output_address, &ready_index.to_le_bytes())?;
+                Ok(DispatchResult::Complete(Status::Ok))
+            }
+            WaitManyCompletion::Failed(status) => Ok(DispatchResult::Complete(status)),
+        };
+    }
 
-    let Some(ready_index) = ready else {
-        return Err(Status::ShouldWait);
+    process.block_wait_many(PendingWaitMany {
+        items,
+        encoded_items,
+        items_address,
+        output_address,
+        deadline,
+        completion: None,
+    });
+    Ok(DispatchResult::Blocked)
+}
+
+fn resolve_wait_completion(
+    ready: Option<usize>,
+    deadline: WaitDeadline,
+    now_ns: u64,
+) -> Option<WaitManyCompletion> {
+    ready.map(WaitManyCompletion::Ready).or_else(|| {
+        deadline
+            .is_expired(now_ns)
+            .then_some(WaitManyCompletion::Failed(Status::TimedOut))
+    })
+}
+
+/// Polls one process-owned blocked syscall without activating userspace memory.
+///
+/// A [`BlockedPoll::Complete`] result leaves the completion staged in `process`.
+/// The scheduler must activate that process's address space and immediately call
+/// [`complete_blocked`] before scheduling the process again.
+pub fn poll_blocked(process: &mut Process, now_ns: u64) -> BlockedPoll {
+    let (handles, wait) = process.blocked_wait_many_parts();
+    if wait.completion.is_some() {
+        return BlockedPoll::Complete;
+    }
+
+    let ready = match handles.poll_wait_many(&mut wait.items) {
+        Ok(ready) => ready,
+        Err(error) => {
+            wait.completion = Some(WaitManyCompletion::Failed(map_ipc_error(error)));
+            return BlockedPoll::Complete;
+        }
     };
-    let ready_index = u64::try_from(ready_index).map_err(|_| Status::OutOfRange)?;
-    copy_to_user(process, output_address, &ready_index.to_le_bytes())
+    wait.completion = resolve_wait_completion(ready, wait.deadline, now_ns);
+    if wait.completion.is_some() {
+        BlockedPoll::Complete
+    } else {
+        BlockedPoll::Pending
+    }
+}
+
+/// Completes a staged blocked syscall and makes the process runnable.
+///
+/// The process address space must be active. If it is not, the wait is aborted
+/// with [`Status::InvalidAddress`] so the process cannot remain permanently
+/// blocked because of a scheduler integration error.
+pub fn complete_blocked(process: &mut Process) -> Status {
+    let mut wait = process.take_blocked_wait_many();
+    let completion = wait
+        .completion
+        .expect("blocked syscall completion was not staged by poll_blocked");
+    let status = if !process.address_space().is_active() {
+        Status::InvalidAddress
+    } else {
+        match completion {
+            WaitManyCompletion::Ready(ready_index) => copy_wait_items_to_user(process, &mut wait)
+                .and_then(|()| {
+                    let ready_index = u64::try_from(ready_index).map_err(|_| Status::OutOfRange)?;
+                    copy_to_user(process, wait.output_address, &ready_index.to_le_bytes())
+                }),
+            WaitManyCompletion::Failed(Status::TimedOut) => {
+                copy_wait_items_to_user(process, &mut wait).and(Err(Status::TimedOut))
+            }
+            WaitManyCompletion::Failed(status) => Err(status),
+        }
+        .err()
+        .unwrap_or(Status::Ok)
+    };
+
+    set_status(process.context_mut(), status);
+    process.resume_from_block();
+    status
+}
+
+fn copy_wait_items_to_user(process: &Process, wait: &mut PendingWaitMany) -> Result<(), Status> {
+    encode_wait_items_into(&wait.items, &mut wait.encoded_items);
+    copy_to_user(process, wait.items_address, &wait.encoded_items)
+}
+
+fn clock_get_monotonic(process: &Process, output_address: u64, now_ns: u64) -> Result<(), Status> {
+    validate_user_output(process, output_address, MONOTONIC_TIME_OUTPUT_SIZE)?;
+    copy_to_user(process, output_address, &now_ns.to_le_bytes())
 }
 
 fn channel_create(process: &mut Process, output_address: u64) -> Result<(), Status> {
@@ -983,19 +1128,18 @@ fn encode_channel_read_output(info: MessageInfo) -> [u8; CHANNEL_READ_OUTPUT_SIZ
     output
 }
 
-fn encode_wait_items(items: &[WaitItem]) -> Result<Vec<u8>, Status> {
-    let length = items
-        .len()
-        .checked_mul(WAIT_ITEM_SIZE)
-        .ok_or(Status::OutOfRange)?;
-    let mut output = zeroed_vec(length)?;
+fn encode_wait_items_into(items: &[WaitItem], output: &mut [u8]) {
+    assert_eq!(
+        output.len(),
+        items.len() * WAIT_ITEM_SIZE,
+        "wait-many encoding storage has the wrong length"
+    );
     for (index, item) in items.iter().enumerate() {
         let offset = index * WAIT_ITEM_SIZE;
-        put_u32(&mut output, offset, item.handle.raw());
-        put_u32(&mut output, offset + 4, item.wait_for.bits());
-        put_u32(&mut output, offset + 8, item.pending.bits());
+        put_u32(output, offset, item.handle.raw());
+        put_u32(output, offset + 4, item.wait_for.bits());
+        put_u32(output, offset + 8, item.pending.bits());
     }
-    Ok(output)
 }
 
 fn fill_received_handle_metadata(
@@ -1193,13 +1337,53 @@ mod tests {
             SyscallNumber::FilesystemReadDirectory,
             SyscallNumber::FilesystemTruncate,
             SyscallNumber::FilesystemUnlink,
+            SyscallNumber::AudioWrite,
+            SyscallNumber::ClockGetMonotonic,
         ];
         for number in expected {
             assert_eq!(decode_syscall_number(number as u64), Some(number));
         }
-        assert_eq!(decode_syscall_number(20), Some(SyscallNumber::AudioWrite));
-        assert_eq!(decode_syscall_number(21), None);
+        assert_eq!(
+            decode_syscall_number(21),
+            Some(SyscallNumber::ClockGetMonotonic)
+        );
+        assert_eq!(decode_syscall_number(22), None);
         assert_eq!(decode_syscall_number(u64::MAX), None);
+    }
+
+    #[test]
+    fn wait_resolution_prefers_readiness_then_uses_inclusive_deadlines() {
+        assert_eq!(
+            resolve_wait_completion(Some(3), WaitDeadline::At(10), 10),
+            Some(WaitManyCompletion::Ready(3))
+        );
+        assert_eq!(resolve_wait_completion(None, WaitDeadline::At(10), 9), None);
+        assert_eq!(
+            resolve_wait_completion(None, WaitDeadline::At(10), 10),
+            Some(WaitManyCompletion::Failed(Status::TimedOut))
+        );
+        assert_eq!(
+            resolve_wait_completion(None, WaitDeadline::Infinite, u64::MAX),
+            None
+        );
+    }
+
+    #[test]
+    fn wait_item_encoding_updates_complete_fixed_layout_records() {
+        let items = [WaitItem {
+            handle: Handle::from_raw(0x1122_3344),
+            wait_for: Signals::READABLE | Signals::PEER_CLOSED,
+            pending: Signals::PEER_CLOSED,
+        }];
+        let mut output = [0_u8; WAIT_ITEM_SIZE];
+        encode_wait_items_into(&items, &mut output);
+
+        assert_eq!(read_u32(&output, 0), 0x1122_3344);
+        assert_eq!(
+            read_u32(&output, 4),
+            (Signals::READABLE | Signals::PEER_CLOSED).bits()
+        );
+        assert_eq!(read_u32(&output, 8), Signals::PEER_CLOSED.bits());
     }
 
     #[test]

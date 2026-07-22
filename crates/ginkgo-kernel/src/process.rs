@@ -5,11 +5,11 @@ use core::{fmt, mem, ptr};
 
 use ginkgo_ipc::{
     Handle, HandleTable, IpcError, SharedMemoryMappingAccess, SharedMemoryMappingInfo,
-    SharedMemoryMappingLease,
+    SharedMemoryMappingLease, WaitItem,
 };
 #[cfg(test)]
 use ginkgo_sysapi::Rights;
-use ginkgo_sysapi::{MapFlags, MapProtection, SharedMemoryMapArgs};
+use ginkgo_sysapi::{MapFlags, MapProtection, SharedMemoryMapArgs, Status};
 use x86_64::{
     structures::paging::{PhysFrame, Size4KiB},
     VirtAddr,
@@ -105,6 +105,7 @@ impl ProcessFault {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessState {
     Ready,
+    Blocked,
     Exited(i32),
     Faulted(ProcessFault),
 }
@@ -113,6 +114,49 @@ impl ProcessState {
     pub const fn is_runnable(self) -> bool {
         matches!(self, Self::Ready)
     }
+
+    pub const fn is_blocked(self) -> bool {
+        matches!(self, Self::Blocked)
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Exited(_) | Self::Faulted(_))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WaitDeadline {
+    Infinite,
+    At(u64),
+}
+
+impl WaitDeadline {
+    pub(crate) const fn is_expired(self, now_ns: u64) -> bool {
+        matches!(self, Self::At(deadline_ns) if now_ns >= deadline_ns)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WaitManyCompletion {
+    Ready(usize),
+    Failed(Status),
+}
+
+/// Kernel-owned continuation for a blocked wait-many syscall.
+///
+/// User memory is represented only by validated virtual-address integers. No
+/// userspace pointer or Rust borrow survives syscall dispatch.
+pub(crate) struct PendingWaitMany {
+    pub(crate) items: Vec<WaitItem>,
+    pub(crate) encoded_items: Vec<u8>,
+    pub(crate) items_address: u64,
+    pub(crate) output_address: u64,
+    pub(crate) deadline: WaitDeadline,
+    pub(crate) completion: Option<WaitManyCompletion>,
+}
+
+pub(crate) enum BlockedSyscall {
+    WaitMany(PendingWaitMany),
 }
 
 /// Fixed initial userspace stack layout.
@@ -321,6 +365,8 @@ pub struct Process {
     context: UserContext,
     handles: Option<HandleTable>,
     state: ProcessState,
+    preemption_count: u64,
+    blocked_syscall: Option<BlockedSyscall>,
     shared_mappings: Option<Vec<SharedMemoryMapping>>,
     // If a corrupt page table prevents rollback, retaining the lease is safer
     // than releasing backing which may still have a live userspace alias.
@@ -397,6 +443,8 @@ impl Process {
             context,
             handles: Some(HandleTable::new()),
             state: ProcessState::Ready,
+            preemption_count: 0,
+            blocked_syscall: None,
             shared_mappings: Some(Vec::new()),
             retained_failed_mapping_leases: Some(Vec::new()),
             next_mapping_cursor: SHARED_MAPPING_BASE,
@@ -415,11 +463,71 @@ impl Process {
         self.state.is_runnable()
     }
 
+    pub const fn preemption_count(&self) -> u64 {
+        self.preemption_count
+    }
+
+    pub fn record_preemption(&mut self) {
+        self.preemption_count = self.preemption_count.saturating_add(1);
+    }
+
+    pub(crate) fn block_wait_many(&mut self, wait: PendingWaitMany) {
+        assert_eq!(
+            self.state,
+            ProcessState::Ready,
+            "only a ready process can block"
+        );
+        assert!(
+            self.blocked_syscall.is_none(),
+            "ready process retained a blocked syscall"
+        );
+        self.blocked_syscall = Some(BlockedSyscall::WaitMany(wait));
+        self.state = ProcessState::Blocked;
+    }
+
+    pub(crate) fn blocked_wait_many_parts(&mut self) -> (&HandleTable, &mut PendingWaitMany) {
+        assert_eq!(self.state, ProcessState::Blocked, "process is not blocked");
+        let handles = self
+            .handles
+            .as_ref()
+            .expect("live process lost its handle table");
+        let wait = match self
+            .blocked_syscall
+            .as_mut()
+            .expect("blocked process lost its syscall continuation")
+        {
+            BlockedSyscall::WaitMany(wait) => wait,
+        };
+        (handles, wait)
+    }
+
+    pub(crate) fn take_blocked_wait_many(&mut self) -> PendingWaitMany {
+        assert_eq!(self.state, ProcessState::Blocked, "process is not blocked");
+        match self
+            .blocked_syscall
+            .take()
+            .expect("blocked process lost its syscall continuation")
+        {
+            BlockedSyscall::WaitMany(wait) => wait,
+        }
+    }
+
+    pub(crate) fn resume_from_block(&mut self) {
+        assert_eq!(self.state, ProcessState::Blocked, "process is not blocked");
+        assert!(
+            self.blocked_syscall.is_none(),
+            "blocked syscall must be consumed before resuming"
+        );
+        self.state = ProcessState::Ready;
+    }
+
     pub fn mark_exited(&mut self, code: i32) {
+        self.blocked_syscall = None;
         self.state = ProcessState::Exited(code);
     }
 
     pub fn mark_faulted(&mut self, reason: ProcessFault) {
+        self.blocked_syscall = None;
         self.state = ProcessState::Faulted(reason);
     }
 
@@ -1088,6 +1196,14 @@ impl ProcessTable {
         self.len() == 0
     }
 
+    /// Returns whether any live process is eligible to enter userspace.
+    pub fn has_runnable(&self) -> bool {
+        self.inner
+            .slots
+            .iter()
+            .any(|slot| slot.value.as_ref().is_some_and(Process::is_runnable))
+    }
+
     pub fn insert(&mut self, process: Process) -> Result<ProcessId, ProcessTableError> {
         self.inner.insert(process)
     }
@@ -1103,8 +1219,8 @@ impl ProcessTable {
     /// Selects the next live process ID in deterministic round-robin slot order.
     ///
     /// Selection includes non-runnable processes so a permanent process-runner
-    /// task can observe and retire exited or faulted entries. Empty and retired
-    /// slots are skipped. Reused slots are returned with their current generation,
+    /// task can poll blocked syscalls and retire exited or faulted entries. Empty
+    /// and retired slots are skipped. Reused slots are returned with their current generation,
     /// so an ID returned before removal never aliases its replacement.
     pub fn next_id(&mut self) -> Option<ProcessId> {
         self.inner.next_id()
@@ -1155,6 +1271,8 @@ mod tests {
             context: UserContext::new(0x1000, USER_STACK_TOP),
             handles: None,
             state,
+            preemption_count: 0,
+            blocked_syscall: None,
             shared_mappings: None,
             retained_failed_mapping_leases: None,
             next_mapping_cursor: SHARED_MAPPING_BASE,
@@ -1171,6 +1289,17 @@ mod tests {
 
         drop(DropProbe(&drops));
         assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    fn pending_wait(deadline: WaitDeadline) -> PendingWaitMany {
+        PendingWaitMany {
+            items: Vec::new(),
+            encoded_items: Vec::new(),
+            items_address: 0x1000,
+            output_address: 0x2000,
+            deadline,
+            completion: None,
+        }
     }
 
     #[test]
@@ -1235,6 +1364,19 @@ mod tests {
         assert_eq!(table.next_id(), Some(first));
         assert_eq!(table.next_id(), Some(second));
         assert_eq!(table.next_id(), Some(third));
+    }
+
+    #[test]
+    fn process_table_reports_only_ready_entries_as_runnable() {
+        let mut table = ProcessTable::new();
+        assert!(!table.has_runnable());
+
+        let ready = table.insert(test_process(ProcessState::Ready)).unwrap();
+        let _blocked = table.insert(test_process(ProcessState::Blocked)).unwrap();
+        assert!(table.has_runnable());
+
+        table.get_mut(ready).unwrap().mark_exited(0);
+        assert!(!table.has_runnable());
     }
 
     #[test]
@@ -1309,6 +1451,9 @@ mod tests {
     #[test]
     fn process_table_selection_includes_non_runnable_live_processes() {
         let mut table = ProcessTable::new();
+        let mut blocked_process = test_process(ProcessState::Ready);
+        blocked_process.block_wait_many(pending_wait(WaitDeadline::Infinite));
+        let blocked = table.insert(blocked_process).unwrap();
         let exited = table
             .insert(test_process(ProcessState::Exited(23)))
             .unwrap();
@@ -1317,8 +1462,10 @@ mod tests {
             .insert(test_process(ProcessState::Faulted(fault)))
             .unwrap();
 
+        assert_eq!(table.next_id(), Some(blocked));
         assert_eq!(table.next_id(), Some(exited));
         assert_eq!(table.next_id(), Some(faulted));
+        assert_eq!(table.get(blocked).unwrap().state(), ProcessState::Blocked);
         assert_eq!(table.get(exited).unwrap().state(), ProcessState::Exited(23));
         assert_eq!(
             table.get(faulted).unwrap().state(),
@@ -1327,15 +1474,34 @@ mod tests {
     }
 
     #[test]
-    fn process_states_retain_completion_details_and_only_ready_is_runnable() {
+    fn process_preemption_accounting_saturates() {
+        let mut process = test_process(ProcessState::Ready);
+        assert_eq!(process.preemption_count(), 0);
+        process.record_preemption();
+        assert_eq!(process.preemption_count(), 1);
+        process.preemption_count = u64::MAX;
+        process.record_preemption();
+        assert_eq!(process.preemption_count(), u64::MAX);
+    }
+
+    #[test]
+    fn process_states_retain_completion_details_and_classify_lifecycle() {
         let fault = ProcessFault::at_address(ProcessFaultReason::PageFault, 0b101, 0xdead_beef);
         let ready = ProcessState::Ready;
+        let blocked = ProcessState::Blocked;
         let exited = ProcessState::Exited(-17);
         let faulted = ProcessState::Faulted(fault);
 
         assert!(ready.is_runnable());
+        assert!(!ready.is_blocked());
+        assert!(!ready.is_terminal());
+        assert!(!blocked.is_runnable());
+        assert!(blocked.is_blocked());
+        assert!(!blocked.is_terminal());
         assert!(!exited.is_runnable());
+        assert!(exited.is_terminal());
         assert!(!faulted.is_runnable());
+        assert!(faulted.is_terminal());
         assert_eq!(exited, ProcessState::Exited(-17));
         assert_eq!(fault.reason, ProcessFaultReason::PageFault);
         assert_eq!(fault.code, 0b101);
@@ -1344,6 +1510,44 @@ mod tests {
             ProcessFault::new(ProcessFaultReason::InvalidOpcode, 6),
             fault
         );
+    }
+
+    #[test]
+    fn blocked_wait_state_is_owned_and_cleared_before_resume() {
+        let mut process = test_process(ProcessState::Ready);
+        process.block_wait_many(pending_wait(WaitDeadline::At(25)));
+        assert_eq!(process.state(), ProcessState::Blocked);
+        assert!(process.blocked_syscall.is_some());
+
+        let wait = process.take_blocked_wait_many();
+        assert_eq!(wait.deadline, WaitDeadline::At(25));
+        assert!(process.blocked_syscall.is_none());
+        process.resume_from_block();
+        assert_eq!(process.state(), ProcessState::Ready);
+    }
+
+    #[test]
+    fn terminal_transition_drops_blocked_wait_state() {
+        let mut exited = test_process(ProcessState::Ready);
+        exited.block_wait_many(pending_wait(WaitDeadline::Infinite));
+        exited.mark_exited(7);
+        assert_eq!(exited.state(), ProcessState::Exited(7));
+        assert!(exited.blocked_syscall.is_none());
+
+        let mut faulted = test_process(ProcessState::Ready);
+        faulted.block_wait_many(pending_wait(WaitDeadline::Infinite));
+        let fault = ProcessFault::new(ProcessFaultReason::InvalidOpcode, 6);
+        faulted.mark_faulted(fault);
+        assert_eq!(faulted.state(), ProcessState::Faulted(fault));
+        assert!(faulted.blocked_syscall.is_none());
+    }
+
+    #[test]
+    fn finite_deadlines_expire_inclusively_and_infinite_never_expires() {
+        assert!(!WaitDeadline::At(25).is_expired(24));
+        assert!(WaitDeadline::At(25).is_expired(25));
+        assert!(WaitDeadline::At(25).is_expired(26));
+        assert!(!WaitDeadline::Infinite.is_expired(u64::MAX));
     }
 
     #[test]

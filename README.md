@@ -1,6 +1,6 @@
 # GinkgoOS
 
-A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. GinkgoOS boots through an on-screen kernel log and splash into a persistent protected ring-3 desktop service with a program-registry-backed launcher. The kernel also includes framebuffer output, physical frame allocation, isolated userspace address spaces, syscalls and capability IPC, shared-memory mappings, checked device-I/O capabilities, polling xHCI USB HID input, polling Intel HDA audio, a kernel-adapted RedoxFS filesystem, and cooperative task/process scheduling.
+A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. GinkgoOS boots through an on-screen kernel log and Ginkgo splash into a persistent protected ring-3 desktop service with a program-registry-backed launcher. The kernel also includes framebuffer output, physical frame allocation, isolated userspace address spaces, syscalls and capability IPC, shared-memory mappings, checked device-I/O capabilities, polling xHCI USB HID input, polling Intel HDA audio, a kernel-adapted RedoxFS filesystem, timer-preempted userspace, deadline-aware blocking waits, and cooperative bounded kernel tasks.
 
 ## What is included
 
@@ -27,22 +27,24 @@ A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. Gi
 - Packed bitmap-font rendering and a validated, versioned `.gkf` format
 - Persistent RedoxFS transactions over a bounded-polling legacy ATA PIO disk backend
 - Talc-backed dynamic allocation for RedoxFS and future kernel services
-- Fixed-capacity round-robin cooperative task scheduling
+- Single-core round-robin userspace scheduling with local-APIC timer preemption
+- Monotonic time, deadline-aware blocking waits, and interrupt-backed kernel idle
+- Fixed-capacity stackless cooperative scheduling for bounded kernel tasks
 - A high-half ELF linker script
 - Embedded-graphics draw targets for volatile hardware framebuffers and ordinary XRGB/ARGB window RAM
 - UEFI ISO and no-ISO QEMU boot targets
 
-The scheduler is deliberately stackless and cooperative: each kernel task performs one bounded step, stores its continuation in `TaskState`, and returns to yield. A process task enters ring 3 until the application makes one syscall or faults, dispatches that syscall while the process CR3 remains active, restores the kernel CR3, and then yields to the next scheduler turn. USB input and Intel HDA audio follow the same model and poll their DMA rings without interrupts. The kernel does not yet provide independent kernel-task stacks, timer preemption, external interrupt delivery, SMP, or blocking waits.
+Kernel tasks remain deliberately stackless and cooperative: each task performs one bounded step, stores its continuation in `TaskState`, and returns to yield. Userspace is preemptive: the process task arms a calibrated local-APIC one-shot timer before entering ring 3, and a 10 ms quantum captures the complete user context before returning to the scheduler. Syscalls and interrupt returns use protected per-CPU stacks, while `IRETQ` preserves asynchronously interrupted `RCX` and `R11`. Blocked waits retain kernel-owned requests and are polled in bounded scheduler steps until a signal or absolute monotonic deadline completes them. When no process is runnable, a short interrupt-backed `HLT` replaces busy spinning. USB input and Intel HDA audio still poll their DMA rings; general device IRQ routing, independent kernel-task stacks, and SMP are not yet provided.
 
 ### IPC groundwork
 
-Each process owns a `ginkgo-ipc::HandleTable`. Handles are opaque generation-tagged integers carrying explicit rights. Channel endpoints are asynchronous and bidirectional, preserve datagram boundaries and ordering, and maintain a bounded queue in each direction. Messages carry up to 16 KiB and 16 atomically moved handles. Transfer dispositions can reduce the rights installed in the receiver; validation, queueing, and source-handle consumption remain atomic, so failed writes leave every source handle unchanged. Level-triggered `READABLE`, `WRITABLE`, and `PEER_CLOSED` state supports nonblocking wait-many scans under the current cooperative scheduler.
+Each process owns a `ginkgo-ipc::HandleTable`. Handles are opaque generation-tagged integers carrying explicit rights. Channel endpoints are asynchronous and bidirectional, preserve datagram boundaries and ordering, and maintain a bounded queue in each direction. Messages carry up to 16 KiB and 16 atomically moved handles. Transfer dispositions can reduce the rights installed in the receiver; validation, queueing, and source-handle consumption remain atomic, so failed writes leave every source handle unchanged. Level-triggered `READABLE`, `WRITABLE`, and `PEER_CLOSED` state supports bounded wait-many scans and scheduler-backed process blocking.
 
 The same capability table holds zero-filled shared-memory objects and protected window client/manager endpoints. Production windows use two equal buffer slots per surface generation. A presented slot remains unavailable until its matching `BufferReleased` event; failed composition does not change ownership or emit a release. Resize is generation-staged: the compositor keeps the old displayed frame until the first frame from the new generation is successfully published, then retires the old pool and releases its final buffer.
 
 Shared-memory objects are page-aligned, page-rounded, zero-filled heap allocations with a distinct logical length. Processes may map them read-only or read-write only when the capability has the corresponding `MAP`, `READ`, and optional `WRITE` rights. Each mapping retains an owning lease, so closing or transferring the source handle cannot invalidate a live alias; unmapping or retiring the process releases that lease only after its PTEs are unreachable. Window capabilities protect lifecycle and management authority, not pixel immutability: a holder of a writable alias can still violate the presentation contract by modifying an in-flight buffer before its `BufferReleased` event.
 
-`ginkgo-sysapi` defines append-only syscall numbers and fixed-layout argument blocks alongside the handle, rights, object type, signal, status, wait, mapping, filesystem, and RPC-header contracts. Filesystem syscalls cover open/create, positional read/write, stat, root-directory enumeration, truncate, and unlink. Files and the filesystem root are generation-protected process-local capabilities; only registry entries carrying `EntryFlags::FILESYSTEM` receive a root capability, and file capabilities cannot be duplicated or transferred. Kernel-owned executables, the registry, and kernel logs remain readable but reject userspace write, truncate, and unlink operations. Structured messages use a 24-byte `zerocopy` RPC header followed by a `postcard` payload; the kernel channel remains unaware of application protocols. `ginkgo-userspace` exposes inline x86-64 syscall stubs, ergonomic wrappers, the codec, and the transport-independent window facade without pulling in the kernel handle backend. Wait-many currently performs one nonblocking signal poll; scheduler wait queues and deadline-aware blocking remain future work.
+`ginkgo-sysapi` defines append-only syscall numbers and fixed-layout argument blocks alongside the handle, rights, object type, signal, status, wait, mapping, filesystem, and RPC-header contracts. Filesystem syscalls cover open/create, positional read/write, stat, root-directory enumeration, truncate, and unlink. Files and the filesystem root are generation-protected process-local capabilities; only registry entries carrying `EntryFlags::FILESYSTEM` receive a root capability, and file capabilities cannot be duplicated or transferred. Kernel-owned executables, the registry, and kernel logs remain readable but reject userspace write, truncate, and unlink operations. Structured messages use a 24-byte `zerocopy` RPC header followed by a `postcard` payload; the kernel channel remains unaware of application protocols. `ginkgo-userspace` exposes inline x86-64 syscall stubs, ergonomic wrappers, monotonic time, the codec, and the transport-independent window facade without pulling in the kernel handle backend. Wait-many validates and copies its complete request before blocking, retains only kernel-owned state, and resumes after a requested signal or absolute monotonic deadline. Ready signals take precedence over timeout at the same scheduler scan.
 
 ### Protected userspace execution
 
@@ -50,7 +52,7 @@ At boot, after device initialization has installed its kernel mappings, GinkgoOS
 
 The dependency-free ELF loader accepts only little-endian x86-64 `ET_EXEC` images in the Ginkgo executable profile. It validates every program header, mapped range, page overlap, permission, entry point, and stack/guard collision before installing image pages. Each process owns its address space, generation-tagged identity, register and x87/SSE state, capability table, shared mappings, and detailed exit/fault state.
 
-The x86-64 entry path installs a GDT, TSS, IDT, `STAR`/`LSTAR`/`FMASK`, and five distinct 64 KiB supervisor stacks for RSP0, syscall entry, double fault, NMI, and machine check. Synchronous user exceptions are contained and returned to the process scheduler; kernel faults and unrecoverable exception classes fail stop. Every syscall immediately switches away from the untrusted user RSP, captures the complete user context, and returns to scheduler-side dispatch. Return through `SYSRETQ` revalidates canonical RIP/RSP, flags, and floating-point state.
+The x86-64 entry path installs a GDT, TSS, IDT, `STAR`/`LSTAR`/`FMASK`, and five distinct 64 KiB supervisor stacks for RSP0, syscall entry, double fault, NMI, and machine check. Synchronous user exceptions are contained and returned to the process scheduler; kernel faults and unrecoverable exception classes fail stop. Every syscall immediately switches away from the untrusted user RSP, captures the complete user context, and returns to scheduler-side dispatch. Local-APIC timer interrupts capture asynchronous ring-3 state on RSP0 and acknowledge EOI without calling Rust. Return through `IRETQ` revalidates canonical RIP/RSP, flags, and floating-point state while preserving arbitrary interrupted `RCX` and `R11` values.
 
 Normal Makefile builds first compile the production Rust `ginkgo-desktop-service`, `ginkgo-file-navigator`, and `ginkgo-minimal-client` release ELFs from the independent `userspace/` workspace. The kernel build consumes and embeds those artifacts with the generated registry; they become `/desktop.elf`, `/file-navigator.elf`, `/minimal-client.elf`, and `/programs.gkr` in the boot filesystem. The desktop receives only one bootstrap channel plus the display dimensions. Every launched app receives its per-app desktop channel, while only registry-authorized apps receive a filesystem-root capability. The service remains resident, announces readiness, owns launcher and window policy, polls bounded channels cooperatively, and yields when idle. A successful serial trace includes:
 
@@ -59,13 +61,13 @@ desktop: loaded /desktop.elf from RedoxFS pid=...
 desktop: protected Rust userland ready
 ```
 
-The build script retains generated smoke ELFs for focused execution testing, but they are not the production binaries used by normal Makefile builds.
+The build script retains generated smoke ELFs for focused execution testing, but they are not production binaries used by normal Makefile builds. Setting `GINKGO_PREEMPTION_SMOKE=1` launches an opt-in probe that verifies forced preemption, `RCX`/`R11` preservation, concurrent desktop progress, monotonic time, and finite blocked-wait timeout in QEMU.
 
 Current execution limitations are intentional and explicit:
 
-- Scheduling is single-core and cooperative. A process that never makes a syscall can monopolize the CPU until timer preemption exists.
-- Interrupts remain disabled while userspace runs; there is no external IRQ entry or asynchronous preemption path yet.
-- Wait-many is a single nonblocking poll, not a scheduler-backed blocking operation.
+- Scheduling is single-core; SMP and CPU migration are not implemented.
+- Only the local-APIC timer has an external interrupt entry. Device drivers still poll, and general I/O-APIC/MSI routing is not implemented.
+- Blocked waits use bounded scheduler polling rather than per-object kernel wait queues.
 - SMAP is not enabled because checked user-copy operations do not yet have exception-fixup support.
 - x87/SSE/SSE2 state is isolated with FXSAVE/FXRSTOR; AVX/XSAVE is intentionally unavailable.
 - The physical allocator is monotonic, so retired process frames are accounted for but not recycled.
@@ -203,9 +205,9 @@ Disable Secure Boot unless you sign the Limine EFI executable and configure its 
 The normal Makefile pipeline builds the nested userspace workspace first and passes its production ELFs into the kernel build for embedding. At boot, `crates/ginkgo-kernel/src/main.rs` installs and reopens `/desktop.elf`, `/file-navigator.elf`, `/minimal-client.elf`, and `/programs.gkr` through RedoxFS, validates the registry, loads the desktop, and gives it a minimal cross-table bootstrap channel. Registered apps are loaded on demand with their own attenuated desktop channels and explicitly granted capabilities. Startup deliberately progresses through three visual phases:
 
 1. An append-only kernel initialization log.
-2. A splash screen while protected userland starts.
+2. The embedded `Ginkgo.png` splash while protected userland starts.
 3. The empty desktop after its readiness message arrives; applications start only from an explicit launcher action.
 
 Runtime status and launcher transitions use bounded dirty-region redraws and bounded background restoration. Solid 32-bpp framebuffer fills and completed compositor scenes use packed volatile writes rather than byte-at-a-time publication.
 
-The next sensible milestones include nested directories and richer file management, the broader desktop hotkey work tracked in #5, scheduler-backed blocking waits, xHCI interrupt delivery and USB hotplug/hubs, timer preemption, SMP, frame deallocation, and a panic screen with serial diagnostics.
+The next sensible milestones include nested directories and richer file management, the broader desktop hotkey work tracked in #5, xHCI interrupt delivery and USB hotplug/hubs, general device IRQ routing, SMP, frame deallocation, and a panic screen with serial diagnostics.
