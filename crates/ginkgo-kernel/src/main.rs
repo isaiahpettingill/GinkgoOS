@@ -24,7 +24,7 @@ use embedded_icon::{
 };
 use framebuffer::{FramebufferWriter, Rgb};
 use ginkgo_desktop::ClientId;
-use ginkgo_filesystem::RedoxFs;
+use ginkgo_filesystem::{FsError, NodeKind, NodeMetadata, RedoxFs, RenameMode};
 use ginkgo_hid::{ApplicationKind, Axis, InputEvent, AXIS_MAX, AXIS_MIN};
 use ginkgo_ipc::{shared_memory_backing_stats, IpcError};
 use ginkgo_kernel::{
@@ -116,6 +116,10 @@ fn preemption_smoke_enabled() -> bool {
 
 fn frame_reclaim_stress_enabled() -> bool {
     option_env!("GINKGO_FRAME_RECLAIM_STRESS") == Some("1")
+}
+
+fn filesystem_hierarchy_smoke_enabled() -> bool {
+    option_env!("GINKGO_FILESYSTEM_HIERARCHY_SMOKE") == Some("1")
 }
 
 const DESKTOP_PATH: &str = "/desktop.elf";
@@ -332,6 +336,229 @@ fn install_system_file<D: Disk>(fs: &mut RedoxFs<D>, path: &str, bytes: &[u8]) -
     (fs.write(file, 0, bytes).ok()? == bytes.len()).then_some(())
 }
 
+const FILESYSTEM_SMOKE_INITIAL_CONTENT: &[u8] = b"GinkgoOS hierarchy smoke: moved\n";
+const FILESYSTEM_SMOKE_PERSISTED_CONTENT: &[u8] = b"GinkgoOS hierarchy smoke: persisted\n";
+const FILESYSTEM_SMOKE_REPLACED_CONTENT: &[u8] = b"GinkgoOS hierarchy smoke: replaced\n";
+const FILESYSTEM_SMOKE_METADATA_LEN: usize = 54;
+
+fn filesystem_smoke_write<D: Disk>(
+    fs: &mut RedoxFs<D>,
+    file: ginkgo_filesystem::FileHandle,
+    bytes: &[u8],
+) -> Result<(), &'static str> {
+    if fs.write(file, 0, bytes).map_err(|_| "write failed")? != bytes.len() {
+        return Err("short write");
+    }
+    Ok(())
+}
+
+fn filesystem_smoke_read<D: Disk>(
+    fs: &mut RedoxFs<D>,
+    file: ginkgo_filesystem::FileHandle,
+    expected: &[u8],
+) -> Result<(), &'static str> {
+    let mut bytes = [0_u8; 64];
+    let output = bytes
+        .get_mut(..expected.len())
+        .ok_or("smoke content exceeds fixed buffer")?;
+    if fs.read(file, 0, output).map_err(|_| "read failed")? != expected.len() || output != expected
+    {
+        return Err("content mismatch");
+    }
+    Ok(())
+}
+
+fn filesystem_smoke_metadata_bytes(metadata: NodeMetadata) -> [u8; FILESYSTEM_SMOKE_METADATA_LEN] {
+    let mut bytes = [0_u8; FILESYSTEM_SMOKE_METADATA_LEN];
+    bytes[0..8].copy_from_slice(&metadata.identity.to_le_bytes());
+    bytes[8..16].copy_from_slice(&metadata.size.to_le_bytes());
+    bytes[16..18].copy_from_slice(&metadata.mode.to_le_bytes());
+    bytes[18..22].copy_from_slice(&metadata.policy.to_le_bytes());
+    bytes[22..26].copy_from_slice(&metadata.uid.to_le_bytes());
+    bytes[26..30].copy_from_slice(&metadata.gid.to_le_bytes());
+    bytes[30..38].copy_from_slice(&metadata.ctime.seconds.to_le_bytes());
+    bytes[38..42].copy_from_slice(&metadata.ctime.nanoseconds.to_le_bytes());
+    bytes[42..50].copy_from_slice(&metadata.mtime.seconds.to_le_bytes());
+    bytes[50..54].copy_from_slice(&metadata.mtime.nanoseconds.to_le_bytes());
+    bytes
+}
+
+fn validate_filesystem_smoke_metadata(
+    metadata: NodeMetadata,
+    expected_size: usize,
+) -> Result<(), &'static str> {
+    if metadata.kind != NodeKind::File
+        || metadata.size != expected_size as u64
+        || metadata.identity == 0
+        || metadata.mode & 0o777 != 0o644
+        || metadata.policy != 0
+        || metadata.uid != 0
+        || metadata.gid != 0
+        || metadata.ctime.nanoseconds >= 1_000_000_000
+        || metadata.mtime.nanoseconds >= 1_000_000_000
+    {
+        return Err("invalid file metadata");
+    }
+    Ok(())
+}
+
+fn initialize_filesystem_hierarchy_smoke<D: Disk>(
+    fs: &mut RedoxFs<D>,
+    root: ginkgo_filesystem::DirectoryHandle,
+) -> Result<(), &'static str> {
+    let suite = fs
+        .create_directory_at(root, "filesystem-smoke")
+        .map_err(|_| "create suite directory failed")?;
+    let source = fs
+        .create_directory_at(suite, "source")
+        .map_err(|_| "create source directory failed")?;
+    let destination = fs
+        .create_directory_at(suite, "destination")
+        .map_err(|_| "create destination directory failed")?;
+    let archive = fs
+        .create_directory_at(suite, "archive")
+        .map_err(|_| "create archive directory failed")?;
+    let sibling = fs
+        .create_file_at(root, "filesystem-smoke-sibling")
+        .map_err(|_| "create scoped sibling failed")?;
+    filesystem_smoke_write(fs, sibling, b"outside delegated directory\n")?;
+
+    let moving = fs
+        .create_file_at(source, "payload")
+        .map_err(|_| "create moving file failed")?;
+    filesystem_smoke_write(fs, moving, FILESYSTEM_SMOKE_INITIAL_CONTENT)?;
+    let occupied = fs
+        .create_file_at(destination, "current")
+        .map_err(|_| "create occupied destination failed")?;
+    filesystem_smoke_write(fs, occupied, b"old destination\n")?;
+
+    if fs.rename_at(
+        source,
+        "payload",
+        destination,
+        "current",
+        RenameMode::NoReplace,
+    ) != Err(FsError::AlreadyExists)
+    {
+        return Err("no-replace did not preserve an occupied destination");
+    }
+    filesystem_smoke_read(fs, moving, FILESYSTEM_SMOKE_INITIAL_CONTENT)?;
+    filesystem_smoke_read(fs, occupied, b"old destination\n")?;
+    fs.rename_at(source, "payload", archive, "moved", RenameMode::NoReplace)
+        .map_err(|_| "cross-directory move failed")?;
+
+    let replacement = fs
+        .create_file_at(destination, "replacement")
+        .map_err(|_| "create replacement failed")?;
+    filesystem_smoke_write(fs, replacement, FILESYSTEM_SMOKE_PERSISTED_CONTENT)?;
+    fs.atomic_replace_file_at(destination, "replacement", destination, "current")
+        .map_err(|_| "initial atomic replacement failed")?;
+    let mut stale_probe = [0_u8; 1];
+    if fs.read(occupied, 0, &mut stale_probe) != Err(FsError::InvalidHandle) {
+        return Err("initial replaced handle remained valid");
+    }
+
+    let current = fs
+        .open_file_at(destination, "current")
+        .map_err(|_| "open initialized current file failed")?;
+    filesystem_smoke_read(fs, current, FILESYSTEM_SMOKE_PERSISTED_CONTENT)?;
+    let metadata = fs
+        .file_metadata(current)
+        .map_err(|_| "read initialized metadata failed")?;
+    validate_filesystem_smoke_metadata(metadata, FILESYSTEM_SMOKE_PERSISTED_CONTENT.len())?;
+    let metadata_file = fs
+        .create_file_at(suite, "metadata")
+        .map_err(|_| "create metadata record failed")?;
+    filesystem_smoke_write(
+        fs,
+        metadata_file,
+        &filesystem_smoke_metadata_bytes(metadata),
+    )?;
+    fs.sync().map_err(|_| "initial sync failed")
+}
+
+fn verify_filesystem_hierarchy_smoke<D: Disk>(
+    fs: &mut RedoxFs<D>,
+    root: ginkgo_filesystem::DirectoryHandle,
+    suite: ginkgo_filesystem::DirectoryHandle,
+) -> Result<(), &'static str> {
+    let source = fs
+        .open_directory_at(suite, "source")
+        .map_err(|_| "source directory did not persist")?;
+    let destination = fs
+        .open_directory_at(suite, "destination")
+        .map_err(|_| "destination directory did not persist")?;
+    let archive = fs
+        .open_directory_at(suite, "archive")
+        .map_err(|_| "archive directory did not persist")?;
+    if fs.open_file_at(source, "payload") != Err(FsError::NotFound) {
+        return Err("moved source unexpectedly persisted");
+    }
+    let moved = fs
+        .open_file_at(archive, "moved")
+        .map_err(|_| "moved file did not persist")?;
+    filesystem_smoke_read(fs, moved, FILESYSTEM_SMOKE_INITIAL_CONTENT)?;
+    let current = fs
+        .open_file_at(destination, "current")
+        .map_err(|_| "current file did not persist")?;
+    filesystem_smoke_read(fs, current, FILESYSTEM_SMOKE_PERSISTED_CONTENT)?;
+    let metadata = fs
+        .file_metadata(current)
+        .map_err(|_| "persisted metadata unavailable")?;
+    validate_filesystem_smoke_metadata(metadata, FILESYSTEM_SMOKE_PERSISTED_CONTENT.len())?;
+    let metadata_file = fs
+        .open_file_at(suite, "metadata")
+        .map_err(|_| "metadata record did not persist")?;
+    filesystem_smoke_read(
+        fs,
+        metadata_file,
+        &filesystem_smoke_metadata_bytes(metadata),
+    )?;
+
+    if fs.open_file_at(destination, "filesystem-smoke-sibling") != Err(FsError::NotFound)
+        || fs.open_file_at(destination, "../filesystem-smoke-sibling") != Err(FsError::InvalidName)
+    {
+        return Err("directory capability escaped its namespace");
+    }
+    let sibling = fs
+        .open_file_at(root, "filesystem-smoke-sibling")
+        .map_err(|_| "root sibling did not persist")?;
+    filesystem_smoke_read(fs, sibling, b"outside delegated directory\n")?;
+
+    let replacement = fs
+        .create_file_at(destination, "next")
+        .map_err(|_| "create persisted replacement failed")?;
+    filesystem_smoke_write(fs, replacement, FILESYSTEM_SMOKE_REPLACED_CONTENT)?;
+    fs.atomic_replace_file_at(destination, "next", destination, "current")
+        .map_err(|_| "persisted atomic replacement failed")?;
+    let mut stale_probe = [0_u8; 1];
+    if fs.read(current, 0, &mut stale_probe) != Err(FsError::InvalidHandle) {
+        return Err("persisted replaced handle remained valid");
+    }
+    let replaced = fs
+        .open_file_at(destination, "current")
+        .map_err(|_| "open persisted replacement failed")?;
+    filesystem_smoke_read(fs, replaced, FILESYSTEM_SMOKE_REPLACED_CONTENT)?;
+    fs.sync().map_err(|_| "persisted sync failed")
+}
+
+fn run_filesystem_hierarchy_smoke<D: Disk>(
+    fs: &mut RedoxFs<D>,
+) -> Result<&'static str, &'static str> {
+    let root = fs.root_directory().map_err(|_| "open root failed")?;
+    match fs.open_directory_at(root, "filesystem-smoke") {
+        Ok(suite) => {
+            verify_filesystem_hierarchy_smoke(fs, root, suite)?;
+            Ok("filesystem-smoke: persisted")
+        }
+        Err(FsError::NotFound) => {
+            initialize_filesystem_hierarchy_smoke(fs, root)?;
+            Ok("filesystem-smoke: initialized")
+        }
+        Err(_) => Err("inspect smoke hierarchy failed"),
+    }
+}
+
 const PRIVILEGE_STACK_SIZE: usize = 64 * 1024;
 
 #[repr(C, align(16))]
@@ -445,6 +672,21 @@ pub extern "C" fn _start() -> ! {
         ui.render_boot_log(&mut screen, "redoxfs: persistent disk mount failed");
         halt_forever();
     };
+    if filesystem_hierarchy_smoke_enabled() {
+        let result = run_filesystem_hierarchy_smoke(&mut fs);
+        let mut sink = SerialDebugSink::new(&mut serial);
+        match result {
+            Ok(marker) => {
+                let _ = writeln!(sink, "{marker}\r");
+                halt_forever();
+            }
+            Err(detail) => {
+                let _ = writeln!(sink, "filesystem-smoke: failure\r");
+                let _ = writeln!(sink, "filesystem-smoke-detail: {detail}\r");
+                halt_forever();
+            }
+        }
+    }
     let Some((desktop_image, catalog)) = install_and_load_system_programs(&mut fs) else {
         ui.render_boot_log(&mut screen, "redoxfs: system program installation failed");
         halt_forever();
@@ -1401,117 +1643,142 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
     let Some(process_id) = context.processes.next_id() else {
         return TaskPoll::Pending;
     };
-    let Some(process) = context.processes.get_mut(process_id) else {
-        return TaskPoll::Pending;
-    };
+    let child_slot_reserved = context.processes.prepare_insert().is_ok();
+    let mut created_child = None;
+    {
+        let Some(process) = context.processes.get_mut(process_id) else {
+            return TaskPoll::Pending;
+        };
+        if process.termination_requested() {
+            process.mark_terminated();
+        }
 
-    match process.state() {
-        ProcessState::Ready => {
-            unsafe { process.address_space().activate() };
-            let mut user_context = *process.context();
-            let started_ns = context.timer.clock().now_ns();
-            if context
-                .timer
-                .arm_one_shot(process.limits().cpu_quantum_ns)
-                .is_err()
-            {
-                process.mark_faulted(ProcessFault::new(ProcessFaultReason::InvalidUserContext, 0));
-            } else {
-                let exit = unsafe { arch::enter_user(&mut user_context) };
-                context.timer.disarm();
-                match exit {
-                    Ok(KernelExit::YieldToKernel) => {
-                        let mut sink = SerialDebugSink::new(&mut context.serial);
-                        let outcome = syscall::dispatch(
-                            process,
-                            &mut user_context,
-                            context.timer.clock().now_ns(),
-                            &context.page_table,
-                            &mut context.frames,
-                            &mut context.fs,
-                            &mut context.audio,
-                            &mut context.entropy,
-                            &mut sink,
-                        );
-                        debug_assert!(
-                            matches!(outcome, SyscallOutcome::Yield | SyscallOutcome::Blocked)
-                                || !process.is_runnable(),
-                            "exit syscall must update process state"
-                        );
-                    }
-                    Ok(KernelExit::Preempted) => {
-                        process.record_preemption();
-                        if !context.preemption_observed {
-                            context.preemption_observed = true;
+        match process.state() {
+            ProcessState::Ready => {
+                unsafe { process.address_space().activate() };
+                let mut user_context = *process.context();
+                let started_ns = context.timer.clock().now_ns();
+                if context
+                    .timer
+                    .arm_one_shot(process.limits().cpu_quantum_ns)
+                    .is_err()
+                {
+                    process
+                        .mark_faulted(ProcessFault::new(ProcessFaultReason::InvalidUserContext, 0));
+                } else {
+                    let exit = unsafe { arch::enter_user(&mut user_context) };
+                    context.timer.disarm();
+                    match exit {
+                        Ok(KernelExit::YieldToKernel) => {
                             let mut sink = SerialDebugSink::new(&mut context.serial);
-                            let _ = writeln!(sink, "scheduler: timer preemption verified\r");
-                        }
-                    }
-                    Ok(KernelExit::Fault(fault)) => {
-                        let reason = match fault.vector {
-                            14 => ProcessFaultReason::PageFault,
-                            13 => ProcessFaultReason::GeneralProtection,
-                            6 => ProcessFaultReason::InvalidOpcode,
-                            vector => {
-                                ProcessFaultReason::Other(u16::try_from(vector).unwrap_or(u16::MAX))
+                            let outcome = syscall::dispatch(
+                                process,
+                                &mut user_context,
+                                context.timer.clock().now_ns(),
+                                &context.page_table,
+                                &mut context.frames,
+                                &mut context.fs,
+                                &mut context.audio,
+                                &mut context.entropy,
+                                child_slot_reserved,
+                                &mut sink,
+                            );
+                            debug_assert!(
+                                matches!(
+                                    &outcome,
+                                    SyscallOutcome::Yield
+                                        | SyscallOutcome::Blocked
+                                        | SyscallOutcome::ChildCreated(_)
+                                ) || !process.is_runnable(),
+                                "exit syscall must update process state"
+                            );
+                            if let SyscallOutcome::ChildCreated(child) = outcome {
+                                created_child = Some(child);
                             }
-                        };
-                        process.mark_faulted(ProcessFault {
-                            reason,
-                            code: fault.error_code,
-                            address: fault.fault_address,
-                        });
-                    }
-                    Ok(KernelExit::ExitToKernel) => {
-                        let mut sink = SerialDebugSink::new(&mut context.serial);
-                        let _ = writeln!(
+                        }
+                        Ok(KernelExit::Preempted) => {
+                            process.record_preemption();
+                            if !context.preemption_observed {
+                                context.preemption_observed = true;
+                                let mut sink = SerialDebugSink::new(&mut context.serial);
+                                let _ = writeln!(sink, "scheduler: timer preemption verified\r");
+                            }
+                        }
+                        Ok(KernelExit::Fault(fault)) => {
+                            let reason = match fault.vector {
+                                14 => ProcessFaultReason::PageFault,
+                                13 => ProcessFaultReason::GeneralProtection,
+                                6 => ProcessFaultReason::InvalidOpcode,
+                                vector => ProcessFaultReason::Other(
+                                    u16::try_from(vector).unwrap_or(u16::MAX),
+                                ),
+                            };
+                            process.mark_faulted(ProcessFault {
+                                reason,
+                                code: fault.error_code,
+                                address: fault.fault_address,
+                            });
+                        }
+                        Ok(KernelExit::ExitToKernel) => {
+                            let mut sink = SerialDebugSink::new(&mut context.serial);
+                            let _ = writeln!(
                             sink,
                             "userspace: assembly rejected context rip={:#x} rsp={:#x} rflags={:#x}\r",
                             user_context.rip,
                             user_context.rsp,
                             user_context.rflags
                         );
-                        process.mark_faulted(ProcessFault::new(
-                            ProcessFaultReason::InvalidUserContext,
-                            1,
-                        ));
-                    }
-                    Err(error) => {
-                        let mut sink = SerialDebugSink::new(&mut context.serial);
-                        let _ = writeln!(
+                            process.mark_faulted(ProcessFault::new(
+                                ProcessFaultReason::InvalidUserContext,
+                                1,
+                            ));
+                        }
+                        Err(error) => {
+                            let mut sink = SerialDebugSink::new(&mut context.serial);
+                            let _ = writeln!(
                             sink,
                             "userspace: context validation failed: {error:?} rip={:#x} rsp={:#x} rflags={:#x}\r",
                             user_context.rip,
                             user_context.rsp,
                             user_context.rflags
                         );
-                        process.mark_faulted(ProcessFault::new(
-                            ProcessFaultReason::InvalidUserContext,
-                            2,
-                        ));
+                            process.mark_faulted(ProcessFault::new(
+                                ProcessFaultReason::InvalidUserContext,
+                                2,
+                            ));
+                        }
                     }
                 }
+                *process.context_mut() = user_context;
+                let elapsed_ns = context.timer.clock().now_ns().saturating_sub(started_ns);
+                process.record_cpu_time(elapsed_ns);
             }
-            *process.context_mut() = user_context;
-            let elapsed_ns = context.timer.clock().now_ns().saturating_sub(started_ns);
-            process.record_cpu_time(elapsed_ns);
-        }
-        ProcessState::Blocked => {
-            let now_ns = context.timer.clock().now_ns();
-            if syscall::poll_blocked(process, now_ns) == syscall::BlockedPoll::Complete {
-                unsafe { process.address_space().activate() };
-                let _ = syscall::complete_blocked(process);
+            ProcessState::Blocked => {
+                let now_ns = context.timer.clock().now_ns();
+                if syscall::poll_blocked(process, now_ns) == syscall::BlockedPoll::Complete {
+                    unsafe { process.address_space().activate() };
+                    let _ = syscall::complete_blocked(process);
+                }
             }
+            ProcessState::Exited(_) | ProcessState::Faulted(_) | ProcessState::Terminated => {}
         }
-        ProcessState::Exited(_) | ProcessState::Faulted(_) => {}
     }
 
     unsafe { context.page_table.activate() };
+    if let Some(child) = created_child {
+        context
+            .processes
+            .insert(child)
+            .expect("reserved child process insertion must succeed");
+    }
     let Some(final_state) = context.processes.get(process_id).map(Process::state) else {
         return TaskPoll::Pending;
     };
     if !final_state.is_terminal() {
         return TaskPoll::Pending;
+    }
+    if let Some(process) = context.processes.get(process_id) {
+        process.publish_terminal_status();
     }
 
     let preemption_count = context
@@ -1586,6 +1853,15 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                     fault.reason,
                     fault.code,
                     fault.address
+                );
+            }
+        }
+        ProcessState::Terminated => {
+            if !is_frame_reclaim_stress {
+                let _ = writeln!(
+                    sink,
+                    "userspace: pid={} externally terminated\r",
+                    process_id.raw()
                 );
             }
         }
@@ -1754,7 +2030,14 @@ fn launch_program(
     context.next_client_id = next_client_id;
 
     let filesystem = if program.filesystem {
-        match process.handles_mut().filesystem_root_create() {
+        let mut rights = ginkgo_sysapi::Rights::READ | ginkgo_sysapi::Rights::WRITE;
+        if program.process_launch {
+            rights |= ginkgo_sysapi::Rights::EXECUTE;
+        }
+        match process
+            .handles_mut()
+            .filesystem_root_create_with_rights(rights)
+        {
             Ok(handle) => handle,
             Err(_) => return reject_unstarted_client(context, client_id, process),
         }

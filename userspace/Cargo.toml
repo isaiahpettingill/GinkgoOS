@@ -16,6 +16,7 @@ publish = false
 license = "MIT"
 
 [workspace.dependencies]
+ginkgo-app-package = { path = "../crates/ginkgo-app-package" }
 ginkgo-desktop = { path = "../crates/ginkgo-desktop" }
 ginkgo-graphics = { path = "../crates/ginkgo-graphics" }
 ginkgo-runtime = { path = "ginkgo-runtime" }

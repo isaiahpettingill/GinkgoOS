@@ -64,7 +64,7 @@ desktop: loaded /desktop.elf from RedoxFS pid=...
 desktop: protected Rust userland ready
 ```
 
-The build script retains generated smoke ELFs for focused execution testing, but they are not production binaries used by normal Makefile builds. Setting `GINKGO_PREEMPTION_SMOKE=1` launches an opt-in probe that verifies forced preemption, `RCX`/`R11` preservation, concurrent desktop progress, monotonic time, and finite blocked-wait timeout in QEMU. `make frame-reclaim-smoke` runs 512 real scheduler launch/retirement cycles, alternating clean exits and invalid-opcode faults while exercising shared-memory leases, and requires physical-frame and IPC backing counts to return to a stable post-warmup baseline.
+The build script retains generated smoke ELFs for focused execution testing, but they are not production binaries used by normal Makefile builds. Setting `GINKGO_PREEMPTION_SMOKE=1` launches an opt-in probe that verifies forced preemption, `RCX`/`R11` preservation, concurrent desktop progress, monotonic time, and finite blocked-wait timeout in QEMU. `make frame-reclaim-smoke` runs 512 real scheduler launch/retirement cycles, alternating clean exits and invalid-opcode faults while exercising shared-memory leases, and requires physical-frame and IPC backing counts to return to a stable post-warmup baseline. Setting `GINKGO_FILESYSTEM_HIERARCHY_SMOKE=1` runs a bounded adapter-level hierarchy check immediately after RedoxFS mounts and before desktop launch.
 
 Current execution limitations are intentional and explicit:
 
@@ -111,7 +111,7 @@ The kernel uses the RedoxFS 0.9.1 transaction engine and filesystem format, adap
 
 Storage discovery validates GPT header and partition-array CRCs and bounds, understands protective and legacy MBRs, and mounts the first usable partition. Media with no partition table remains supported as a whole-disk volume. RedoxFS writes explicitly flush the selected block device before completion. A blank selected volume is formatted once; later boots reopen it, while trusted embedded programs are refreshed without deleting ordinary files.
 
-The default QEMU targets attach the persistent GPT image `build/ginkgo-redoxfs.img` through `virtio-blk` with writethrough caching. `make clean` preserves this image, `make reset-fs` deletes it, and the deliberately destructive `make distclean` removes the entire build directory. AHCI provides the modern physical SATA path; NVMe and USB mass storage remain separate future phases.
+The default QEMU targets attach the persistent GPT image `build/ginkgo-redoxfs.img` through `virtio-blk` with writethrough caching. `make clean` preserves this image, `make reset-fs` deletes it, and the deliberately destructive `make distclean` removes the entire build directory. The filesystem smoke copies that GPT image to the dedicated disposable `build/filesystem-hierarchy-smoke.img`; `make clean` removes the copy and its boot staging tree without touching the persistent source image. AHCI provides the modern physical SATA path; NVMe and USB mass storage remain separate future phases.
 
 ## Dependencies
 
@@ -141,6 +141,8 @@ make run
 The first run downloads Limine and OVMF, builds the kernel, creates `build/ginkgo-os.iso`, creates a persistent 16 MiB GPT `build/ginkgo-redoxfs.img` if needed, and starts QEMU. The default `pc` machine attaches that image through transitional `virtio-blk` plus an xHCI USB hub containing a keyboard and tablet. Subsequent runs reuse the same filesystem image.
 
 Run `make usb-smoke` for automated headless QEMU/QMP coverage. The test verifies hub enumeration, MSI delivery, disconnect with an outstanding HID transfer, repeated keyboard reconnects, and restoration of the live-interface baseline while an unrelated tablet remains active. Run `make frame-reclaim-smoke` to stress normal exits, faults, shared-memory final-owner release, and frame reuse across 512 sequential processes.
+
+Run `make filesystem-smoke` for deterministic persistence coverage of the hierarchy adapter. The target builds the opt-in `GINKGO_FILESYSTEM_HIERARCHY_SMOKE=1` kernel, copies the normal GPT image to a dedicated disposable disk, and boots that same copy twice in headless QEMU with a 60-second timeout per boot. The first boot must emit exactly `filesystem-smoke: initialized`; the second must emit exactly `filesystem-smoke: persisted`; either boot emitting `filesystem-smoke: failure` fails the harness. The kernel checks nested creation, content, no-replace and cross-directory moves, atomic replacement, persisted metadata, directory-capability isolation from siblings and traversal, stale-handle rejection, and explicit sync.
 
 To boot directly from a QEMU virtual FAT disk without creating an ISO or requiring `xorriso`:
 
@@ -220,4 +222,4 @@ The normal Makefile pipeline builds the nested userspace workspace first and pas
 
 Runtime status and launcher transitions use bounded dirty-region redraws and bounded background restoration. Solid 32-bpp framebuffer fills and completed compositor scenes use packed volatile writes rather than byte-at-a-time publication.
 
-The next sensible milestones include nested directories and richer file management, the broader desktop hotkey work tracked in #5, xHCI interrupt delivery and USB hotplug/hubs, general device IRQ routing, SMP, frame deallocation, and a panic screen with serial diagnostics.
+The next sensible milestones include richer file management, the broader desktop hotkey work tracked in #5, general device IRQ routing, SMP, and a panic screen with serial diagnostics.

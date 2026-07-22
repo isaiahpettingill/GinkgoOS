@@ -7,10 +7,12 @@ use alloc::{format, string::String, vec, vec::Vec};
 
 use ginkgo_graphics::Rgb;
 use ginkgo_userspace::{
-    debug_write, filesystem_open, filesystem_read, filesystem_read_directory, filesystem_stat,
-    filesystem_unlink, handle_close, process_yield,
+    debug_write, filesystem_open, filesystem_open_directory, filesystem_read,
+    filesystem_read_directory2, filesystem_remove_directory, filesystem_stat, filesystem_unlink,
+    handle_close, process_yield,
     window::{ButtonState, ClientError, Event, WindowClient, WindowOptions},
-    FilesystemOpenFlags, Handle, Status, WindowTransport, WindowTransportError,
+    FilesystemEntryKind, FilesystemOpenFlags, Handle, Status, WindowTransport,
+    WindowTransportError,
 };
 
 const UP_USAGE: u16 = 0x52;
@@ -65,7 +67,9 @@ extern "C" fn process_main(
                     redraw = true;
                 }
                 Event::CloseRequested { .. } => {
+                    navigator.shutdown();
                     destroy_window(&mut client);
+                    drop(client);
                     ginkgo_runtime::exit(0);
                 }
                 Event::WindowCreated { .. }
@@ -97,21 +101,38 @@ fn parse_handle(raw: u64) -> Option<Handle> {
 
 struct Entry {
     name: String,
-    len: u64,
+    kind: FilesystemEntryKind,
+    size: u64,
+}
+
+struct DirectoryLevel {
+    handle: Handle,
+    name: String,
+    owned: bool,
+}
+
+struct Preview {
+    name: String,
+    bytes: Vec<u8>,
+    size: u64,
 }
 
 struct Navigator {
-    filesystem: Handle,
+    directories: Vec<DirectoryLevel>,
     entries: Vec<Entry>,
     selected: usize,
-    preview: Option<(String, Vec<u8>, bool)>,
+    preview: Option<Preview>,
     status: String,
 }
 
 impl Navigator {
     fn new(filesystem: Handle) -> Self {
         Self {
-            filesystem,
+            directories: vec![DirectoryLevel {
+                handle: filesystem,
+                name: String::new(),
+                owned: false,
+            }],
             entries: Vec::new(),
             selected: 0,
             preview: None,
@@ -119,38 +140,71 @@ impl Navigator {
         }
     }
 
+    fn current_directory(&self) -> Handle {
+        self.directories
+            .last()
+            .map(|directory| directory.handle)
+            .unwrap_or(Handle::INVALID)
+    }
+
+    fn current_path(&self) -> String {
+        let mut path = String::from("/");
+        for (index, directory) in self.directories.iter().skip(1).enumerate() {
+            if index != 0 {
+                path.push('/');
+            }
+            path.push_str(&directory.name);
+        }
+        path
+    }
+
     fn refresh(&mut self) {
         self.entries.clear();
+        self.preview = None;
+
+        let directory = self.current_directory();
+
         let mut cookie = 0;
+        let mut error = None;
         while self.entries.len() < MAX_DIRECTORY_ENTRIES {
-            let entry = match filesystem_read_directory(self.filesystem, cookie) {
+            let entry = match filesystem_read_directory2(directory, cookie) {
                 Ok(entry) => entry,
                 Err(Status::EndOfDirectory) => break,
-                Err(error) => {
-                    self.status = format!("Directory error: {:?}", error);
-                    return;
+                Err(status) => {
+                    error = Some(format!("Directory error: {:?}", status));
+                    break;
                 }
             };
             let name_length = usize::from(entry.name_length).min(entry.name.len());
             let name = match core::str::from_utf8(&entry.name[..name_length]) {
                 Ok(name) => String::from(name),
                 Err(_) => {
-                    self.status = String::from("Directory contains an invalid name");
-                    return;
+                    error = Some(String::from("Directory contains an invalid name"));
+                    break;
                 }
+            };
+            let Some(kind) = entry.entry_kind() else {
+                error = Some(format!("{} has an unknown file type", name));
+                break;
             };
             self.entries.push(Entry {
                 name,
-                len: entry.length,
+                kind,
+                size: entry.size,
             });
             cookie = entry.next_cookie;
         }
+        if let Some(error) = error {
+            self.entries.clear();
+            self.selected = 0;
+            self.status = error;
+            return;
+        }
         self.selected = self.selected.min(self.entries.len().saturating_sub(1));
-        self.preview = None;
         self.status = if self.entries.len() == MAX_DIRECTORY_ENTRIES {
-            String::from("Showing first 128 files")
+            String::from("Showing first 128 entries")
         } else {
-            format!("{} files", self.entries.len())
+            format!("{} entries", self.entries.len())
         };
     }
 
@@ -169,10 +223,31 @@ impl Navigator {
         if self.preview.is_some() {
             return;
         }
-        let Some(entry) = self.entries.get(self.selected) else {
+        let Some((name, kind, metadata_size)) = self
+            .entries
+            .get(self.selected)
+            .map(|entry| (entry.name.clone(), entry.kind, entry.size))
+        else {
             return;
         };
-        let file = match filesystem_open(self.filesystem, &entry.name, FilesystemOpenFlags::READ) {
+        let anchor = self.current_directory();
+        if kind == FilesystemEntryKind::Directory {
+            match filesystem_open_directory(anchor, &name) {
+                Ok(directory) => {
+                    self.directories.push(DirectoryLevel {
+                        handle: directory,
+                        name,
+                        owned: true,
+                    });
+                    self.selected = 0;
+                    self.refresh();
+                }
+                Err(error) => self.status = format!("Open directory failed: {:?}", error),
+            }
+            return;
+        }
+
+        let file = match filesystem_open(anchor, &name, FilesystemOpenFlags::READ) {
             Ok(file) => file,
             Err(error) => {
                 self.status = format!("Open failed: {:?}", error);
@@ -187,18 +262,21 @@ impl Navigator {
             let mut bytes = vec![0; length];
             let count = filesystem_read(file, 0, &mut bytes)?;
             bytes.truncate(count);
-            Ok::<_, Status>((bytes, stat.length > MAX_PREVIEW_BYTES as u64))
+            Ok::<_, Status>((bytes, stat.length))
         })();
         let _ = handle_close(file);
         match result {
-            Ok((bytes, truncated)) => {
-                let name = entry.name.clone();
-                self.status = if truncated {
+            Ok((bytes, size)) => {
+                self.status = if size > MAX_PREVIEW_BYTES as u64 {
                     String::from("Preview truncated to 8 KiB")
                 } else {
-                    format!("{} bytes", bytes.len())
+                    format!("{} bytes read", bytes.len())
                 };
-                self.preview = Some((name, bytes, truncated));
+                self.preview = Some(Preview {
+                    name,
+                    bytes,
+                    size: metadata_size,
+                });
             }
             Err(error) => self.status = format!("Read failed: {:?}", error),
         }
@@ -208,28 +286,55 @@ impl Navigator {
         if self.preview.is_some() {
             return;
         }
-        let Some(name) = self
+        let Some((name, kind)) = self
             .entries
             .get(self.selected)
-            .map(|entry| entry.name.clone())
+            .map(|entry| (entry.name.clone(), entry.kind))
         else {
             return;
         };
-        match filesystem_unlink(self.filesystem, &name) {
+        let anchor = self.current_directory();
+        let result = match kind {
+            FilesystemEntryKind::File => filesystem_unlink(anchor, &name),
+            FilesystemEntryKind::Directory => filesystem_remove_directory(anchor, &name),
+        };
+        match result {
             Ok(()) => {
-                self.status = format!("Deleted {}", name);
                 self.refresh();
+                self.status = format!("Deleted {}", name);
             }
             Err(Status::AccessDenied) => {
-                self.status = String::from("That file is owned by the operating system")
+                self.status = String::from("That entry is owned by the operating system")
             }
+            Err(Status::DirectoryNotEmpty) => self.status = String::from("Directory is not empty"),
             Err(error) => self.status = format!("Delete failed: {:?}", error),
         }
     }
 
     fn show_directory(&mut self) {
         if self.preview.take().is_some() {
-            self.status = format!("{} files", self.entries.len());
+            self.status = format!("{} entries", self.entries.len());
+            return;
+        }
+        if self.directories.len() <= 1 {
+            return;
+        }
+        if let Some(directory) = self.directories.pop() {
+            if directory.owned {
+                let _ = handle_close(directory.handle);
+            }
+        }
+        self.selected = 0;
+        self.refresh();
+    }
+
+    fn shutdown(&mut self) {
+        while self.directories.len() > 1 {
+            if let Some(directory) = self.directories.pop() {
+                if directory.owned {
+                    let _ = handle_close(directory.handle);
+                }
+            }
         }
     }
 }
@@ -282,18 +387,32 @@ fn submit_frame(client: &mut WindowClient<WindowTransport>, navigator: &Navigato
     };
     surface.as_bytes_mut().fill(20);
     surface.draw_text(20, 18, 2, "Files", Rgb::new(110, 231, 183));
-    surface.draw_text(20, 50, 1, &navigator.status, Rgb::new(165, 180, 200));
+    surface.draw_text(
+        20,
+        50,
+        1,
+        &format!("Path: {}", navigator.current_path()),
+        Rgb::new(245, 190, 90),
+    );
+    surface.draw_text(20, 68, 1, &navigator.status, Rgb::new(165, 180, 200));
 
-    let available_lines = surface.height().saturating_sub(96) / 18;
-    if let Some((name, bytes, _)) = navigator.preview.as_ref() {
-        surface.draw_text(20, 78, 1, name, Rgb::new(245, 190, 90));
-        let preview = printable_preview(bytes, available_lines.saturating_sub(1), 74);
+    let available_lines = surface.height().saturating_sub(116) / 18;
+    if let Some(preview) = navigator.preview.as_ref() {
+        surface.draw_text(20, 96, 1, &preview.name, Rgb::new(245, 190, 90));
+        surface.draw_text(
+            20,
+            114,
+            1,
+            &format!("file   metadata size: {} B", preview.size),
+            Rgb::new(165, 180, 200),
+        );
+        let text = printable_preview(&preview.bytes, available_lines.saturating_sub(2), 74);
         surface.draw_text_wrapped(
             20,
-            100,
+            136,
             surface.width().saturating_sub(40),
             1,
-            &preview,
+            &text,
             Rgb::new(220, 225, 235),
         );
         surface.draw_text(
@@ -320,19 +439,26 @@ fn submit_frame(client: &mut WindowClient<WindowTransport>, navigator: &Navigato
             } else {
                 " "
             };
-            let line = format!("{} {:<42} {:>8} B", marker, entry.name, entry.len);
+            let kind = match entry.kind {
+                FilesystemEntryKind::File => "file",
+                FilesystemEntryKind::Directory => "dir ",
+            };
+            let line = format!(
+                "{} {:<4} {:<35} {:>8} B",
+                marker, kind, entry.name, entry.size
+            );
             let color = if index == navigator.selected {
                 Rgb::new(110, 231, 183)
             } else {
                 Rgb::new(220, 225, 235)
             };
-            surface.draw_text(20, 82 + row * 18, 1, &line, color);
+            surface.draw_text(20, 100 + row * 18, 1, &line, color);
         }
         surface.draw_text(
             20,
             surface.height().saturating_sub(22),
             1,
-            "Up/Down: select   Enter: preview   Delete: remove",
+            "Up/Down: select   Enter: open   Backspace: up   Delete: remove",
             Rgb::new(120, 140, 160),
         );
     }

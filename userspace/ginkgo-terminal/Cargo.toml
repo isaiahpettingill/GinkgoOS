@@ -11,6 +11,7 @@ name = "ginkgo-terminal"
 path = "src/main.rs"
 
 [dependencies]
+ginkgo-app-package.workspace = true
 ginkgo-terminal-protocol.workspace = true
 ginkgo-graphics.workspace = true
 ginkgo-runtime.workspace = true

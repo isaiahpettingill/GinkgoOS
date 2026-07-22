@@ -12,15 +12,18 @@
 use alloc::{string::String, vec, vec::Vec};
 use core::mem::size_of;
 
-use ginkgo_filesystem::{FsError, RedoxFs};
+use ginkgo_filesystem::{
+    DirectoryHandle, FsError, NodeKind, NodeMetadata, RedoxFs, RenameMode, MAX_TRAVERSAL_DEPTH,
+};
 use ginkgo_ipc::{
-    HandleOperation, HandleOperationDisposition, IpcError, MessageInfo, ObjectType, Rights,
-    Signals, WaitItem,
+    handle_transfer_batch_between, HandleOperation, HandleOperationDisposition, IpcError,
+    MessageInfo, ObjectType, Rights, Signals, WaitItem,
 };
 use ginkgo_sysapi::{
-    FilesystemDirectoryEntry, FilesystemOpenFlags, Handle, MapFlags, MapProtection,
-    SharedMemoryMapArgs, Status, SyscallNumber, CHANNEL_MAX_BYTES, CHANNEL_MAX_HANDLES,
-    DEADLINE_INFINITE, FILESYSTEM_NAME_MAX, FILESYSTEM_READ_MAX_BYTES, RANDOM_MAX_BYTES,
+    FilesystemDirectoryEntry, FilesystemOpenFlags, FilesystemRenameFlags, Handle, MapFlags,
+    MapProtection, ProcessInfo, SharedMemoryMapArgs, Status, SyscallNumber, CHANNEL_MAX_BYTES,
+    CHANNEL_MAX_HANDLES, DEADLINE_INFINITE, FILESYSTEM_NAME_MAX, FILESYSTEM_READ_MAX_BYTES,
+    PROCESS_MAX_STARTUP_BYTES, PROCESS_MAX_STARTUP_HANDLES, RANDOM_MAX_BYTES,
 };
 use redoxfs::Disk;
 
@@ -33,7 +36,10 @@ use crate::{
         address_space::{AddressSpaceError, UserAccess},
         ActivePageTable, MapError,
     },
-    process::{PendingWaitMany, Process, SharedMappingError, WaitDeadline, WaitManyCompletion},
+    process::{
+        DirectStartupBlock, PendingWaitMany, Process, ProcessCreateError, SharedMappingError,
+        WaitDeadline, WaitManyCompletion,
+    },
 };
 
 /// Maximum bytes accepted by one [`SyscallNumber::DebugWrite`] call.
@@ -61,6 +67,22 @@ const FILESYSTEM_OPEN_ARGS_SIZE: usize = 24;
 const FILESYSTEM_READ_OUTPUT_SIZE: usize = 8;
 const FILESYSTEM_STAT_SIZE: usize = 24;
 const FILESYSTEM_DIRECTORY_ENTRY_SIZE: usize = size_of::<FilesystemDirectoryEntry>();
+const FILESYSTEM_OPEN_DIRECTORY_ARGS_SIZE: usize = 32;
+const FILESYSTEM_CREATE_DIRECTORY_ARGS_SIZE: usize = 24;
+const FILESYSTEM_REMOVE_DIRECTORY_ARGS_SIZE: usize = 24;
+const FILESYSTEM_RENAME_ARGS_SIZE: usize = 48;
+const FILESYSTEM_SYNC_ARGS_SIZE: usize = 8;
+const FILESYSTEM_GET_INFO_ARGS_SIZE: usize = 16;
+const FILESYSTEM_INFO_SIZE: usize = 64;
+const FILESYSTEM_GET_METADATA_ARGS_SIZE: usize = 32;
+const FILESYSTEM_METADATA_SIZE: usize = 64;
+const FILESYSTEM_READ_DIRECTORY2_ARGS_SIZE: usize = 24;
+const FILESYSTEM_DIRECTORY_ENTRY2_SIZE: usize = 288;
+const FILESYSTEM_PATH_MAX: usize =
+    MAX_TRAVERSAL_DEPTH * FILESYSTEM_NAME_MAX + (MAX_TRAVERSAL_DEPTH - 1);
+const PROCESS_CREATE_ARGS_SIZE: usize = 64;
+const PROCESS_INFO_SIZE: usize = size_of::<ProcessInfo>();
+const MAX_EXECUTABLE_BYTES: usize = 4 * 1024 * 1024;
 
 /// A bounded destination for early userspace diagnostics.
 pub trait DebugSink {
@@ -68,7 +90,6 @@ pub trait DebugSink {
 }
 
 /// Scheduler action produced by one syscall dispatch.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SyscallOutcome {
     /// The syscall completed (successfully or with an error) and the process is
     /// a candidate for a later cooperative scheduling turn.
@@ -77,12 +98,14 @@ pub enum SyscallOutcome {
     Blocked,
     /// The process requested termination with this code.
     Exit(i32),
+    /// A fully initialized child whose scheduler slot was reserved before dispatch.
+    ChildCreated(Process),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DispatchResult {
     Complete(Status),
     Blocked,
+    ChildCreated(Process),
 }
 
 /// Result of one bounded scheduler poll of a blocked process.
@@ -109,6 +132,7 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
     filesystem: &mut RedoxFs<B>,
     audio: &mut Option<AudioDevice>,
     entropy: &mut EntropyPool,
+    child_slot_reserved: bool,
     debug_sink: &mut D,
 ) -> SyscallOutcome {
     let Some(number) = decode_syscall_number(context.rax) else {
@@ -145,6 +169,7 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
             filesystem,
             audio,
             entropy,
+            child_slot_reserved,
             debug_sink,
         )
     };
@@ -154,6 +179,10 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
             SyscallOutcome::Yield
         }
         DispatchResult::Blocked => SyscallOutcome::Blocked,
+        DispatchResult::ChildCreated(child) => {
+            set_status(context, Status::Ok);
+            SyscallOutcome::ChildCreated(child)
+        }
     }
 }
 
@@ -167,6 +196,7 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
     filesystem: &mut RedoxFs<B>,
     audio: &mut Option<AudioDevice>,
     entropy: &mut EntropyPool,
+    child_slot_reserved: bool,
     debug_sink: &mut D,
 ) -> DispatchResult {
     if number == SyscallNumber::WaitMany {
@@ -238,6 +268,41 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
         SyscallNumber::RandomFill => {
             random_fill(process, entropy, context.rdi, context.rsi, context.rdx)
         }
+        SyscallNumber::ProcessCreate => {
+            return match process_create(
+                process,
+                filesystem,
+                context.rdi,
+                kernel_page_table,
+                frame_allocator,
+                entropy,
+                child_slot_reserved,
+            ) {
+                Ok(child) => DispatchResult::ChildCreated(child),
+                Err(status) => DispatchResult::Complete(status),
+            };
+        }
+        SyscallNumber::ProcessGetInfo => process_get_info(process, context.rdi, context.rsi),
+        SyscallNumber::ProcessTerminate => process_terminate(process, context.rdi),
+        SyscallNumber::ApplicationGetDataDirectory => Err(Status::NotFound),
+        SyscallNumber::FilesystemOpenDirectory => {
+            filesystem_open_directory(process, filesystem, context.rdi)
+        }
+        SyscallNumber::FilesystemCreateDirectory => {
+            filesystem_create_directory(process, filesystem, context.rdi)
+        }
+        SyscallNumber::FilesystemRemoveDirectory => {
+            filesystem_remove_directory(process, filesystem, context.rdi)
+        }
+        SyscallNumber::FilesystemRename => filesystem_rename(process, filesystem, context.rdi),
+        SyscallNumber::FilesystemSync => filesystem_sync(process, filesystem, context.rdi),
+        SyscallNumber::FilesystemGetInfo => filesystem_get_info(process, filesystem, context.rdi),
+        SyscallNumber::FilesystemGetMetadata => {
+            filesystem_get_metadata(process, filesystem, context.rdi)
+        }
+        SyscallNumber::FilesystemReadDirectory2 => {
+            filesystem_read_directory2(process, filesystem, context.rdi)
+        }
     };
     DispatchResult::Complete(match result {
         Ok(()) => Status::Ok,
@@ -270,6 +335,18 @@ const fn decode_syscall_number(raw: u64) -> Option<SyscallNumber> {
         20 => SyscallNumber::AudioWrite,
         21 => SyscallNumber::ClockGetMonotonic,
         22 => SyscallNumber::RandomFill,
+        23 => SyscallNumber::ProcessCreate,
+        24 => SyscallNumber::ProcessGetInfo,
+        25 => SyscallNumber::ProcessTerminate,
+        26 => SyscallNumber::ApplicationGetDataDirectory,
+        27 => SyscallNumber::FilesystemOpenDirectory,
+        28 => SyscallNumber::FilesystemCreateDirectory,
+        29 => SyscallNumber::FilesystemRemoveDirectory,
+        30 => SyscallNumber::FilesystemRename,
+        31 => SyscallNumber::FilesystemSync,
+        32 => SyscallNumber::FilesystemGetInfo,
+        33 => SyscallNumber::FilesystemGetMetadata,
+        34 => SyscallNumber::FilesystemReadDirectory2,
         _ => return None,
     })
 }
@@ -726,47 +803,55 @@ fn debug_write<D: DebugSink + ?Sized>(
 fn filesystem_open<B: Disk>(
     process: &mut Process,
     filesystem: &mut RedoxFs<B>,
-    raw_root: u64,
+    raw_anchor: u64,
     args_address: u64,
     output_address: u64,
 ) -> Result<(), Status> {
-    let root = decode_handle(raw_root)?;
+    let anchor_handle = decode_handle(raw_anchor)?;
     let raw = copy_block_from_user::<FILESYSTEM_OPEN_ARGS_SIZE>(process, args_address)?;
-    let name_address = read_u64(&raw, 0);
-    let name_length = read_u64(&raw, 8);
+    let path_address = read_u64(&raw, 0);
+    let path_length = read_u64(&raw, 8);
     let flags =
         FilesystemOpenFlags::from_bits(read_u32(&raw, 16)).ok_or(Status::InvalidArgument)?;
+    let execute = flags.contains(FilesystemOpenFlags::EXECUTE);
     if read_u32(&raw, 20) != 0
         || !flags.intersects(FilesystemOpenFlags::READ | FilesystemOpenFlags::WRITE)
         || (flags.intersects(FilesystemOpenFlags::CREATE | FilesystemOpenFlags::TRUNCATE)
             && !flags.contains(FilesystemOpenFlags::WRITE))
+        || (execute
+            && (!flags.contains(FilesystemOpenFlags::READ)
+                || flags.intersects(
+                    FilesystemOpenFlags::WRITE
+                        | FilesystemOpenFlags::CREATE
+                        | FilesystemOpenFlags::TRUNCATE,
+                )))
     {
         return Err(Status::InvalidArgument);
     }
     validate_user_output(process, output_address, HANDLE_OUTPUT_SIZE)?;
-    let name = copy_filesystem_name(process, name_address, name_length)?;
-    let mut required_root = Rights::READ;
+    let path = copy_filesystem_path(process, path_address, path_length)?;
+    let mut required = Rights::READ;
+    if execute {
+        required |= Rights::EXECUTE;
+    }
     if flags.intersects(
         FilesystemOpenFlags::WRITE | FilesystemOpenFlags::CREATE | FilesystemOpenFlags::TRUNCATE,
     ) {
-        required_root |= Rights::WRITE;
-        if is_protected_system_file(&name) {
-            return Err(Status::AccessDenied);
-        }
+        required |= Rights::WRITE;
     }
-    process
-        .handles()
-        .filesystem_root(root, required_root)
-        .map_err(map_ipc_error)?;
+    let anchor = resolve_directory_anchor(process, filesystem, anchor_handle, required)?;
+    if anchor.is_root && required.contains(Rights::WRITE) && is_protected_system_path(&path) {
+        return Err(Status::AccessDenied);
+    }
 
-    let mut path = String::from("/");
-    path.push_str(&name);
     let mut created = false;
-    let file = match filesystem.open(&path) {
+    let file = match filesystem.open_file_at(anchor.directory, &path) {
         Ok(file) => file,
         Err(FsError::NotFound) if flags.contains(FilesystemOpenFlags::CREATE) => {
             created = true;
-            filesystem.create(&path).map_err(map_fs_error)?
+            filesystem
+                .create_file_at(anchor.directory, &path)
+                .map_err(map_fs_error)?
         }
         Err(error) => return Err(map_fs_error(error)),
     };
@@ -777,11 +862,14 @@ fn filesystem_open<B: Disk>(
     if flags.contains(FilesystemOpenFlags::WRITE) {
         rights |= Rights::WRITE;
     }
+    if execute {
+        rights |= Rights::EXECUTE | Rights::DUPLICATE | Rights::TRANSFER;
+    }
     let handle = match process.handles_mut().filesystem_file_create(file, rights) {
         Ok(handle) => handle,
         Err(error) => {
             if created {
-                let _ = filesystem.remove(file);
+                let _ = remove_file_path(filesystem, anchor.directory, &path);
             }
             return Err(map_ipc_error(error));
         }
@@ -879,24 +967,27 @@ fn filesystem_stat<B: Disk>(
 fn filesystem_read_directory<B: Disk>(
     process: &Process,
     filesystem: &mut RedoxFs<B>,
-    raw_root: u64,
+    raw_anchor: u64,
     cookie: u64,
     output_address: u64,
 ) -> Result<(), Status> {
-    let root = decode_handle(raw_root)?;
+    let anchor_handle = decode_handle(raw_anchor)?;
     validate_user_output(process, output_address, FILESYSTEM_DIRECTORY_ENTRY_SIZE)?;
-    process
-        .handles()
-        .filesystem_root(root, Rights::READ)
-        .map_err(map_ipc_error)?;
+    let anchor = resolve_directory_anchor(process, filesystem, anchor_handle, Rights::READ)?;
     let index = usize::try_from(cookie).map_err(|_| Status::OutOfRange)?;
-    let entries = filesystem.list_root().map_err(map_fs_error)?;
-    let entry = entries.get(index).ok_or(Status::EndOfDirectory)?;
+    let entries = filesystem
+        .list_directory(anchor.directory)
+        .map_err(map_fs_error)?;
+    let entry = entries
+        .iter()
+        .filter(|entry| entry.metadata.kind == NodeKind::File)
+        .nth(index)
+        .ok_or(Status::EndOfDirectory)?;
     let next_cookie = cookie.checked_add(1).ok_or(Status::OutOfRange)?;
     let mut output = vec![0_u8; FILESYSTEM_DIRECTORY_ENTRY_SIZE];
-    output[0..8].copy_from_slice(&next_cookie.to_le_bytes());
-    output[8..16].copy_from_slice(&entry.len.to_le_bytes());
-    output[16..18].copy_from_slice(&(entry.name.len() as u16).to_le_bytes());
+    put_u64(&mut output, 0, next_cookie);
+    put_u64(&mut output, 8, entry.len);
+    put_u16(&mut output, 16, entry.name.len() as u16);
     output[24..24 + entry.name.len()].copy_from_slice(entry.name.as_bytes());
     copy_to_user(process, output_address, &output)
 }
@@ -918,26 +1009,325 @@ fn filesystem_truncate<B: Disk>(
 fn filesystem_unlink<B: Disk>(
     process: &Process,
     filesystem: &mut RedoxFs<B>,
-    raw_root: u64,
-    name_address: u64,
-    name_length: u64,
+    raw_anchor: u64,
+    path_address: u64,
+    path_length: u64,
 ) -> Result<(), Status> {
-    let root = decode_handle(raw_root)?;
-    process
-        .handles()
-        .filesystem_root(root, Rights::WRITE)
-        .map_err(map_ipc_error)?;
-    let name = copy_filesystem_name(process, name_address, name_length)?;
-    if is_protected_system_file(&name) {
+    let anchor_handle = decode_handle(raw_anchor)?;
+    let path = copy_filesystem_path(process, path_address, path_length)?;
+    let anchor = resolve_directory_anchor(process, filesystem, anchor_handle, Rights::WRITE)?;
+    if anchor.is_root && is_protected_system_path(&path) {
         return Err(Status::AccessDenied);
     }
-    let mut path = String::from("/");
-    path.push_str(&name);
-    let file = filesystem.open(&path).map_err(map_fs_error)?;
-    filesystem.remove(file).map_err(map_fs_error)
+    remove_file_path(filesystem, anchor.directory, &path).map_err(map_fs_error)
 }
 
-fn copy_filesystem_name(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectoryAnchor {
+    directory: DirectoryHandle,
+    rights: Rights,
+    is_root: bool,
+}
+
+fn resolve_directory_anchor<B: Disk>(
+    process: &Process,
+    filesystem: &mut RedoxFs<B>,
+    handle: Handle,
+    required_rights: Rights,
+) -> Result<DirectoryAnchor, Status> {
+    let object_type = process
+        .handles()
+        .object_type(handle)
+        .map_err(map_ipc_error)?;
+    let rights = process
+        .handles()
+        .handle_rights(handle)
+        .map_err(map_ipc_error)?;
+    match object_type {
+        ObjectType::FilesystemRoot => {
+            process
+                .handles()
+                .filesystem_root(handle, required_rights)
+                .map_err(map_ipc_error)?;
+            Ok(DirectoryAnchor {
+                directory: filesystem.root_directory().map_err(map_fs_error)?,
+                rights,
+                is_root: true,
+            })
+        }
+        ObjectType::Directory => Ok(DirectoryAnchor {
+            directory: process
+                .handles()
+                .filesystem_directory(handle, required_rights)
+                .map_err(map_ipc_error)?,
+            rights,
+            is_root: false,
+        }),
+        _ => Err(Status::WrongObjectType),
+    }
+}
+
+fn child_directory_rights(anchor_rights: Rights, is_root: bool) -> Rights {
+    let namespace_rights = anchor_rights & (Rights::READ | Rights::WRITE);
+    let delegation_rights = if is_root {
+        Rights::DUPLICATE | Rights::TRANSFER
+    } else {
+        anchor_rights & (Rights::DUPLICATE | Rights::TRANSFER)
+    };
+    namespace_rights | delegation_rights
+}
+
+fn filesystem_open_directory<B: Disk>(
+    process: &mut Process,
+    filesystem: &mut RedoxFs<B>,
+    args_address: u64,
+) -> Result<(), Status> {
+    let raw = copy_block_from_user::<FILESYSTEM_OPEN_DIRECTORY_ARGS_SIZE>(process, args_address)?;
+    let (anchor_handle, path_address, path_length) = parse_filesystem_path_args(&raw)?;
+    let output_address = read_u64(&raw, 24);
+    validate_user_output(process, output_address, HANDLE_OUTPUT_SIZE)?;
+    let path = copy_filesystem_path(process, path_address, path_length)?;
+    let anchor = resolve_directory_anchor(process, filesystem, anchor_handle, Rights::READ)?;
+    let directory = filesystem
+        .open_directory_at(anchor.directory, &path)
+        .map_err(map_fs_error)?;
+    let rights = child_directory_rights(anchor.rights, anchor.is_root);
+    let handle = process
+        .handles_mut()
+        .filesystem_directory_create(directory, rights)
+        .map_err(map_ipc_error)?;
+    if let Err(status) = copy_to_user(process, output_address, &encode_handle_output(handle)) {
+        close_handles(process, core::slice::from_ref(&handle));
+        return Err(status);
+    }
+    Ok(())
+}
+
+fn filesystem_create_directory<B: Disk>(
+    process: &Process,
+    filesystem: &mut RedoxFs<B>,
+    args_address: u64,
+) -> Result<(), Status> {
+    let raw = copy_block_from_user::<FILESYSTEM_CREATE_DIRECTORY_ARGS_SIZE>(process, args_address)?;
+    let (anchor_handle, path_address, path_length) = parse_filesystem_path_args(&raw)?;
+    let path = copy_filesystem_path(process, path_address, path_length)?;
+    let anchor = resolve_directory_anchor(process, filesystem, anchor_handle, Rights::WRITE)?;
+    if anchor.is_root && is_protected_system_path(&path) {
+        return Err(Status::AccessDenied);
+    }
+    filesystem
+        .create_directory_at(anchor.directory, &path)
+        .map(|_| ())
+        .map_err(map_fs_error)
+}
+
+fn filesystem_remove_directory<B: Disk>(
+    process: &Process,
+    filesystem: &mut RedoxFs<B>,
+    args_address: u64,
+) -> Result<(), Status> {
+    let raw = copy_block_from_user::<FILESYSTEM_REMOVE_DIRECTORY_ARGS_SIZE>(process, args_address)?;
+    let (anchor_handle, path_address, path_length) = parse_filesystem_path_args(&raw)?;
+    let path = copy_filesystem_path(process, path_address, path_length)?;
+    let anchor = resolve_directory_anchor(process, filesystem, anchor_handle, Rights::WRITE)?;
+    if anchor.is_root && is_protected_system_path(&path) {
+        return Err(Status::AccessDenied);
+    }
+    let (parent, name) = resolve_parent_directory(filesystem, anchor.directory, &path)?;
+    filesystem
+        .remove_directory_at(parent, name)
+        .map_err(map_fs_error)
+}
+
+fn filesystem_rename<B: Disk>(
+    process: &Process,
+    filesystem: &mut RedoxFs<B>,
+    args_address: u64,
+) -> Result<(), Status> {
+    let raw = copy_block_from_user::<FILESYSTEM_RENAME_ARGS_SIZE>(process, args_address)?;
+    let args = parse_filesystem_rename_args(&raw)?;
+    let source_path = copy_filesystem_path(process, args.source_address, args.source_length)?;
+    let destination_path =
+        copy_filesystem_path(process, args.destination_address, args.destination_length)?;
+    let source = resolve_directory_anchor(process, filesystem, args.source_anchor, Rights::WRITE)?;
+    let destination =
+        resolve_directory_anchor(process, filesystem, args.destination_anchor, Rights::WRITE)?;
+    if (source.is_root && is_protected_system_path(&source_path))
+        || (destination.is_root && is_protected_system_path(&destination_path))
+    {
+        return Err(Status::AccessDenied);
+    }
+    let mode = if args.flags.contains(FilesystemRenameFlags::REPLACE) {
+        RenameMode::Replace
+    } else {
+        RenameMode::NoReplace
+    };
+    filesystem
+        .rename_at(
+            source.directory,
+            &source_path,
+            destination.directory,
+            &destination_path,
+            mode,
+        )
+        .map_err(map_fs_error)
+}
+
+fn filesystem_sync<B: Disk>(
+    process: &Process,
+    filesystem: &mut RedoxFs<B>,
+    args_address: u64,
+) -> Result<(), Status> {
+    let raw = copy_block_from_user::<FILESYSTEM_SYNC_ARGS_SIZE>(process, args_address)?;
+    let handle = Handle::from_raw(read_u32(&raw, 0));
+    if read_u32(&raw, 4) != 0 {
+        return Err(Status::InvalidArgument);
+    }
+    match process
+        .handles()
+        .object_type(handle)
+        .map_err(map_ipc_error)?
+    {
+        ObjectType::FilesystemRoot => process
+            .handles()
+            .filesystem_root(handle, Rights::WRITE)
+            .map_err(map_ipc_error)?,
+        ObjectType::Directory => {
+            process
+                .handles()
+                .filesystem_directory(handle, Rights::WRITE)
+                .map_err(map_ipc_error)?;
+        }
+        ObjectType::File => {
+            process
+                .handles()
+                .filesystem_file(handle, Rights::WRITE)
+                .map_err(map_ipc_error)?;
+        }
+        _ => return Err(Status::WrongObjectType),
+    }
+    filesystem.sync().map_err(map_fs_error)
+}
+
+fn filesystem_get_info<B: Disk>(
+    process: &Process,
+    filesystem: &mut RedoxFs<B>,
+    args_address: u64,
+) -> Result<(), Status> {
+    let raw = copy_block_from_user::<FILESYSTEM_GET_INFO_ARGS_SIZE>(process, args_address)?;
+    let anchor_handle = Handle::from_raw(read_u32(&raw, 0));
+    if read_u32(&raw, 4) != 0 {
+        return Err(Status::InvalidArgument);
+    }
+    let output_address = read_u64(&raw, 8);
+    validate_user_output(process, output_address, FILESYSTEM_INFO_SIZE)?;
+    resolve_directory_anchor(process, filesystem, anchor_handle, Rights::READ)?;
+    let info = filesystem.filesystem_info().map_err(map_fs_error)?;
+    let block_size = u32::try_from(info.block_size).map_err(|_| Status::OutOfRange)?;
+    let max_name_length = u32::try_from(FILESYSTEM_NAME_MAX).map_err(|_| Status::OutOfRange)?;
+    let max_path_depth = u32::try_from(MAX_TRAVERSAL_DEPTH).map_err(|_| Status::OutOfRange)?;
+    let free_bytes = info.free_bytes.unwrap_or(0);
+    let mut output = [0_u8; FILESYSTEM_INFO_SIZE];
+    put_u64(&mut output, 0, info.capacity_bytes);
+    put_u64(&mut output, 8, free_bytes);
+    put_u64(&mut output, 16, free_bytes);
+    put_u32(&mut output, 24, block_size);
+    put_u32(&mut output, 28, max_name_length);
+    put_u32(&mut output, 32, max_path_depth);
+    copy_to_user(process, output_address, &output)
+}
+
+fn filesystem_get_metadata<B: Disk>(
+    process: &Process,
+    filesystem: &mut RedoxFs<B>,
+    args_address: u64,
+) -> Result<(), Status> {
+    let raw = copy_block_from_user::<FILESYSTEM_GET_METADATA_ARGS_SIZE>(process, args_address)?;
+    let (anchor_handle, path_address, path_length) = parse_filesystem_path_args(&raw)?;
+    let output_address = read_u64(&raw, 24);
+    validate_user_output(process, output_address, FILESYSTEM_METADATA_SIZE)?;
+    let path = copy_filesystem_path(process, path_address, path_length)?;
+    let anchor = resolve_directory_anchor(process, filesystem, anchor_handle, Rights::READ)?;
+    let metadata = metadata_at(filesystem, anchor.directory, &path)?;
+    let output = encode_filesystem_metadata(metadata)?;
+    copy_to_user(process, output_address, &output)
+}
+
+fn filesystem_read_directory2<B: Disk>(
+    process: &Process,
+    filesystem: &mut RedoxFs<B>,
+    args_address: u64,
+) -> Result<(), Status> {
+    let raw = copy_block_from_user::<FILESYSTEM_READ_DIRECTORY2_ARGS_SIZE>(process, args_address)?;
+    let directory_handle = Handle::from_raw(read_u32(&raw, 0));
+    if read_u32(&raw, 4) != 0 {
+        return Err(Status::InvalidArgument);
+    }
+    let cookie = read_u64(&raw, 8);
+    let output_address = read_u64(&raw, 16);
+    validate_user_output(process, output_address, FILESYSTEM_DIRECTORY_ENTRY2_SIZE)?;
+    let anchor = resolve_directory_anchor(process, filesystem, directory_handle, Rights::READ)?;
+    let mut entries = filesystem
+        .list_directory(anchor.directory)
+        .map_err(map_fs_error)?;
+    entries.sort_by_key(|entry| entry.metadata.identity);
+    let entry = entries
+        .iter()
+        .find(|entry| entry.metadata.identity > cookie)
+        .ok_or(Status::EndOfDirectory)?;
+    let next_cookie = entry.metadata.identity;
+    let mut output = [0_u8; FILESYSTEM_DIRECTORY_ENTRY2_SIZE];
+    put_u64(&mut output, 0, next_cookie);
+    put_u64(&mut output, 8, entry.metadata.size);
+    put_u64(&mut output, 16, entry.metadata.identity);
+    put_u32(&mut output, 24, filesystem_kind(entry.metadata.kind));
+    put_u16(&mut output, 28, entry.name.len() as u16);
+    output[36..36 + entry.name.len()].copy_from_slice(entry.name.as_bytes());
+    copy_to_user(process, output_address, &output)
+}
+
+fn parse_filesystem_path_args(bytes: &[u8]) -> Result<(Handle, u64, u64), Status> {
+    if bytes.len() < FILESYSTEM_CREATE_DIRECTORY_ARGS_SIZE || read_u32(bytes, 4) != 0 {
+        return Err(Status::InvalidArgument);
+    }
+    Ok((
+        Handle::from_raw(read_u32(bytes, 0)),
+        read_u64(bytes, 8),
+        read_u64(bytes, 16),
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ParsedFilesystemRenameArgs {
+    source_anchor: Handle,
+    destination_anchor: Handle,
+    source_address: u64,
+    source_length: u64,
+    destination_address: u64,
+    destination_length: u64,
+    flags: FilesystemRenameFlags,
+}
+
+fn parse_filesystem_rename_args(
+    bytes: &[u8; FILESYSTEM_RENAME_ARGS_SIZE],
+) -> Result<ParsedFilesystemRenameArgs, Status> {
+    let flags =
+        FilesystemRenameFlags::from_bits(read_u32(bytes, 40)).ok_or(Status::InvalidArgument)?;
+    if read_u32(bytes, 44) != 0 {
+        return Err(Status::InvalidArgument);
+    }
+    Ok(ParsedFilesystemRenameArgs {
+        source_anchor: Handle::from_raw(read_u32(bytes, 0)),
+        destination_anchor: Handle::from_raw(read_u32(bytes, 4)),
+        source_address: read_u64(bytes, 8),
+        source_length: read_u64(bytes, 16),
+        destination_address: read_u64(bytes, 24),
+        destination_length: read_u64(bytes, 32),
+        flags,
+    })
+}
+
+fn copy_filesystem_path(
     process: &Process,
     address: u64,
     raw_length: u64,
@@ -945,23 +1335,127 @@ fn copy_filesystem_name(
     let length = checked_array_bytes(
         raw_length,
         1,
-        FILESYSTEM_NAME_MAX as u64,
+        FILESYSTEM_PATH_MAX as u64,
         Status::OutOfRange,
     )?;
     if length == 0 {
         return Err(Status::InvalidArgument);
     }
     let bytes = copy_vec_from_user(process, address, length)?;
-    let name = core::str::from_utf8(&bytes).map_err(|_| Status::InvalidArgument)?;
-    if name == "."
-        || name == ".."
-        || name.contains('/')
-        || name.contains(':')
-        || name.as_bytes().contains(&0)
+    let path = core::str::from_utf8(&bytes).map_err(|_| Status::InvalidArgument)?;
+    validate_filesystem_path(path)?;
+    Ok(String::from(path))
+}
+
+fn validate_filesystem_path(path: &str) -> Result<(), Status> {
+    if path.is_empty()
+        || path.len() > FILESYSTEM_PATH_MAX
+        || path.starts_with('/')
+        || path.starts_with('\\')
     {
         return Err(Status::InvalidArgument);
     }
-    Ok(String::from(name))
+    let mut depth = 0;
+    for component in path.split('/') {
+        if component.is_empty()
+            || component == "."
+            || component == ".."
+            || component.len() > FILESYSTEM_NAME_MAX
+            || component.contains(':')
+            || component.contains('\\')
+            || component.as_bytes().contains(&0)
+        {
+            return Err(Status::InvalidArgument);
+        }
+        depth += 1;
+        if depth > MAX_TRAVERSAL_DEPTH {
+            return Err(Status::OutOfRange);
+        }
+    }
+    Ok(())
+}
+
+fn resolve_parent_directory<'a, B: Disk>(
+    filesystem: &mut RedoxFs<B>,
+    anchor: DirectoryHandle,
+    path: &'a str,
+) -> Result<(DirectoryHandle, &'a str), Status> {
+    match path.rsplit_once('/') {
+        Some((parent_path, name)) => Ok((
+            filesystem
+                .open_directory_at(anchor, parent_path)
+                .map_err(map_fs_error)?,
+            name,
+        )),
+        None => Ok((anchor, path)),
+    }
+}
+
+fn remove_file_path<B: Disk>(
+    filesystem: &mut RedoxFs<B>,
+    anchor: DirectoryHandle,
+    path: &str,
+) -> Result<(), FsError> {
+    let (parent, name) = match path.rsplit_once('/') {
+        Some((parent_path, name)) => (filesystem.open_directory_at(anchor, parent_path)?, name),
+        None => (anchor, path),
+    };
+    filesystem.remove_file_at(parent, name)
+}
+
+fn metadata_at<B: Disk>(
+    filesystem: &mut RedoxFs<B>,
+    anchor: DirectoryHandle,
+    path: &str,
+) -> Result<NodeMetadata, Status> {
+    match filesystem.open_file_at(anchor, path) {
+        Ok(file) => filesystem.file_metadata(file).map_err(map_fs_error),
+        Err(FsError::IsDirectory) => {
+            let directory = filesystem
+                .open_directory_at(anchor, path)
+                .map_err(map_fs_error)?;
+            filesystem
+                .directory_metadata(directory)
+                .map_err(map_fs_error)
+        }
+        Err(error) => Err(map_fs_error(error)),
+    }
+}
+
+fn encode_filesystem_metadata(
+    metadata: NodeMetadata,
+) -> Result<[u8; FILESYSTEM_METADATA_SIZE], Status> {
+    let ctime_ns = timestamp_ns(metadata.ctime.seconds, metadata.ctime.nanoseconds)?;
+    let mtime_ns = timestamp_ns(metadata.mtime.seconds, metadata.mtime.nanoseconds)?;
+    let mut output = [0_u8; FILESYSTEM_METADATA_SIZE];
+    put_u32(&mut output, 0, filesystem_kind(metadata.kind));
+    put_u32(&mut output, 4, u32::from(metadata.mode));
+    put_u64(&mut output, 8, metadata.size);
+    put_u64(&mut output, 16, metadata.identity);
+    put_u64(&mut output, 24, ctime_ns);
+    put_u64(&mut output, 32, mtime_ns);
+    put_u32(&mut output, 40, metadata.uid);
+    put_u32(&mut output, 44, metadata.gid);
+    put_u32(&mut output, 48, metadata.policy);
+    Ok(output)
+}
+
+fn timestamp_ns(seconds: u64, nanoseconds: u32) -> Result<u64, Status> {
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(u64::from(nanoseconds)))
+        .ok_or(Status::OutOfRange)
+}
+
+const fn filesystem_kind(kind: NodeKind) -> u32 {
+    match kind {
+        NodeKind::File => 1,
+        NodeKind::Directory => 2,
+    }
+}
+
+fn is_protected_system_path(path: &str) -> bool {
+    path.split('/').next().is_some_and(is_protected_system_file)
 }
 
 fn is_protected_system_file(name: &str) -> bool {
@@ -978,10 +1472,15 @@ fn is_protected_system_file(name: &str) -> bool {
 const fn map_fs_error(error: FsError) -> Status {
     match error {
         FsError::InvalidName => Status::InvalidArgument,
-        FsError::AlreadyExists => Status::InvalidArgument,
+        FsError::TraversalTooDeep => Status::OutOfRange,
+        FsError::AlreadyExists => Status::AlreadyExists,
         FsError::NotFound => Status::NotFound,
         FsError::NoSpace => Status::OutOfMemory,
         FsError::InvalidHandle => Status::InvalidHandle,
+        FsError::NotDirectory => Status::NotDirectory,
+        FsError::IsDirectory => Status::IsDirectory,
+        FsError::DirectoryNotEmpty => Status::DirectoryNotEmpty,
+        FsError::WouldCycle => Status::InvalidArgument,
         FsError::OffsetOverflow => Status::OutOfRange,
         FsError::Io => Status::Io,
     }
@@ -1011,6 +1510,189 @@ fn audio_write(
         Ok(accepted) if accepted == length => Ok(()),
         Ok(_) => Err(Status::ShouldWait),
         Err(_) => Err(Status::Io),
+    }
+}
+
+fn process_create<B: Disk>(
+    process: &mut Process,
+    filesystem: &mut RedoxFs<B>,
+    args_address: u64,
+    kernel_page_table: &ActivePageTable,
+    frame_allocator: &mut UsableFrameAllocator<'_>,
+    entropy: &mut EntropyPool,
+    child_slot_reserved: bool,
+) -> Result<Process, Status> {
+    if !child_slot_reserved {
+        return Err(Status::ResourceLimit);
+    }
+    let raw = copy_block_from_user::<PROCESS_CREATE_ARGS_SIZE>(process, args_address)?;
+    let executable = Handle::from_raw(read_u32(&raw, 0));
+    if read_u32(&raw, 4) != 0 {
+        return Err(Status::InvalidArgument);
+    }
+    let args_address = read_u64(&raw, 8);
+    let args_length = bounded_startup_length(read_u64(&raw, 16))?;
+    let dispositions_address = read_u64(&raw, 24);
+    let disposition_count = checked_array_bytes(
+        read_u64(&raw, 32),
+        1,
+        PROCESS_MAX_STARTUP_HANDLES as u64,
+        Status::ResourceLimit,
+    )?;
+    let config_address = read_u64(&raw, 40);
+    let config_length = bounded_startup_length(read_u64(&raw, 48))?;
+    let output_address = read_u64(&raw, 56);
+    if args_length
+        .checked_add(config_length)
+        .is_none_or(|length| length > PROCESS_MAX_STARTUP_BYTES)
+    {
+        return Err(Status::ResourceLimit);
+    }
+    validate_user_output(process, output_address, HANDLE_OUTPUT_SIZE)?;
+
+    let args = copy_vec_from_user(process, args_address, args_length)?;
+    let config = copy_vec_from_user(process, config_address, config_length)?;
+    let disposition_bytes = checked_array_bytes(
+        disposition_count as u64,
+        HANDLE_DISPOSITION_SIZE,
+        PROCESS_MAX_STARTUP_HANDLES as u64,
+        Status::ResourceLimit,
+    )?;
+    let raw_dispositions = copy_vec_from_user(process, dispositions_address, disposition_bytes)?;
+    let mut dispositions = Vec::new();
+    dispositions
+        .try_reserve_exact(disposition_count)
+        .map_err(|_| Status::OutOfMemory)?;
+    for raw in raw_dispositions.chunks_exact(HANDLE_DISPOSITION_SIZE) {
+        dispositions.push(parse_handle_disposition(raw)?);
+    }
+    let mut startup = DirectStartupBlock::new(&args, &config, disposition_count)?;
+
+    let file = process
+        .handles()
+        .filesystem_file(executable, Rights::EXECUTE)
+        .map_err(map_ipc_error)?;
+    let executable_length = usize::try_from(filesystem.stat(file).map_err(map_fs_error)?.len)
+        .map_err(|_| Status::ResourceLimit)?;
+    if executable_length == 0 || executable_length > MAX_EXECUTABLE_BYTES {
+        return Err(Status::ResourceLimit);
+    }
+    let mut image = zeroed_vec(executable_length)?;
+    if filesystem.read(file, 0, &mut image).map_err(map_fs_error)? != executable_length {
+        return Err(Status::Io);
+    }
+
+    let randomness = [entropy.next_u64(), entropy.next_u64(), entropy.next_u64()];
+    let mut child =
+        Process::from_elf_randomized(&image, kernel_page_table, frame_allocator, randomness)
+            .map_err(map_process_create_error)?;
+    let (process_handle, control) = match process.handles_mut().process_create() {
+        Ok(created) => created,
+        Err(error) => {
+            reclaim_unstarted_process(child, frame_allocator);
+            return Err(map_ipc_error(error));
+        }
+    };
+    child.attach_control(control);
+
+    let child_handles = match handle_transfer_batch_between(
+        process.handles_mut(),
+        child.handles_mut(),
+        &dispositions,
+    ) {
+        Ok(handles) => handles,
+        Err(error) => {
+            let _ = process.handles_mut().handle_close(process_handle);
+            reclaim_unstarted_process(child, frame_allocator);
+            return Err(map_ipc_error(error));
+        }
+    };
+    startup.set_handles(&child_handles);
+
+    // All fallible allocation, parsing, range validation, and handle reservation
+    // completed before the atomic transfer. These active-address-space copies are
+    // therefore invariant checks rather than recoverable post-commit failures.
+    unsafe { child.address_space().activate() };
+    child
+        .install_direct_startup(&startup)
+        .expect("validated child stack startup copy failed after handle commit");
+    unsafe { process.address_space().activate() };
+    copy_to_user(
+        process,
+        output_address,
+        &encode_handle_output(process_handle),
+    )
+    .expect("validated process-create output failed after handle commit");
+    Ok(child)
+}
+
+fn process_get_info(
+    process: &Process,
+    raw_process: u64,
+    output_address: u64,
+) -> Result<(), Status> {
+    let handle = decode_handle(raw_process)?;
+    validate_user_output(process, output_address, PROCESS_INFO_SIZE)?;
+    let info = process
+        .handles()
+        .process_info(handle)
+        .map_err(map_ipc_error)?;
+    let mut output = [0_u8; PROCESS_INFO_SIZE];
+    put_u32(&mut output, 0, info.state);
+    put_u32(&mut output, 4, info.cause);
+    output[8..12].copy_from_slice(&info.exit_code.to_le_bytes());
+    put_u32(&mut output, 12, info.fault);
+    output[16..24].copy_from_slice(&info.fault_code.to_le_bytes());
+    output[24..32].copy_from_slice(&info.fault_address.to_le_bytes());
+    copy_to_user(process, output_address, &output)
+}
+
+fn process_terminate(process: &Process, raw_process: u64) -> Result<(), Status> {
+    let handle = decode_handle(raw_process)?;
+    process
+        .handles()
+        .process_terminate(handle)
+        .map_err(map_ipc_error)
+}
+
+fn bounded_startup_length(raw: u64) -> Result<usize, Status> {
+    checked_array_bytes(
+        raw,
+        1,
+        PROCESS_MAX_STARTUP_BYTES as u64,
+        Status::ResourceLimit,
+    )
+}
+
+fn reclaim_unstarted_process(process: Process, frame_allocator: &mut UsableFrameAllocator<'_>) {
+    let retired = process
+        .retire()
+        .expect("unstarted child address space unexpectedly active");
+    retired
+        .reclaim(frame_allocator)
+        .expect("failed to reclaim unstarted child process");
+}
+
+const fn map_process_create_error(error: ProcessCreateError) -> Status {
+    match error {
+        ProcessCreateError::ResourceLimit => Status::ResourceLimit,
+        ProcessCreateError::AddressSpace(AddressSpaceError::OutOfFrames)
+        | ProcessCreateError::AddressSpace(AddressSpaceError::FrameAllocator(_))
+        | ProcessCreateError::StackPage {
+            error: AddressSpaceError::OutOfFrames,
+            ..
+        }
+        | ProcessCreateError::StackPage {
+            error: AddressSpaceError::FrameAllocator(_),
+            ..
+        } => Status::OutOfMemory,
+        ProcessCreateError::AddressSpace(_)
+        | ProcessCreateError::Elf(_)
+        | ProcessCreateError::ElfPage(_)
+        | ProcessCreateError::StackCollision
+        | ProcessCreateError::StackPage { .. }
+        | ProcessCreateError::EntryNotExecutable(_)
+        | ProcessCreateError::StackNotWritable(_) => Status::InvalidArgument,
     }
 }
 
@@ -1349,6 +2031,10 @@ fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
 }
 
+fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1379,6 +2065,18 @@ mod tests {
             SyscallNumber::AudioWrite,
             SyscallNumber::ClockGetMonotonic,
             SyscallNumber::RandomFill,
+            SyscallNumber::ProcessCreate,
+            SyscallNumber::ProcessGetInfo,
+            SyscallNumber::ProcessTerminate,
+            SyscallNumber::ApplicationGetDataDirectory,
+            SyscallNumber::FilesystemOpenDirectory,
+            SyscallNumber::FilesystemCreateDirectory,
+            SyscallNumber::FilesystemRemoveDirectory,
+            SyscallNumber::FilesystemRename,
+            SyscallNumber::FilesystemSync,
+            SyscallNumber::FilesystemGetInfo,
+            SyscallNumber::FilesystemGetMetadata,
+            SyscallNumber::FilesystemReadDirectory2,
         ];
         for number in expected {
             assert_eq!(decode_syscall_number(number as u64), Some(number));
@@ -1388,7 +2086,23 @@ mod tests {
             Some(SyscallNumber::ClockGetMonotonic)
         );
         assert_eq!(decode_syscall_number(22), Some(SyscallNumber::RandomFill));
-        assert_eq!(decode_syscall_number(23), None);
+        assert_eq!(
+            decode_syscall_number(23),
+            Some(SyscallNumber::ProcessCreate)
+        );
+        assert_eq!(
+            decode_syscall_number(26),
+            Some(SyscallNumber::ApplicationGetDataDirectory)
+        );
+        assert_eq!(
+            decode_syscall_number(27),
+            Some(SyscallNumber::FilesystemOpenDirectory)
+        );
+        assert_eq!(
+            decode_syscall_number(34),
+            Some(SyscallNumber::FilesystemReadDirectory2)
+        );
+        assert_eq!(decode_syscall_number(35), None);
         assert_eq!(decode_syscall_number(u64::MAX), None);
     }
 
@@ -1563,6 +2277,170 @@ mod tests {
             map_shared_mapping_error(SharedMappingError::NoAddressSpace),
             Status::OutOfMemory
         );
+    }
+
+    #[test]
+    fn filesystem_argument_parsers_follow_fixed_layouts() {
+        let mut path = [0_u8; FILESYSTEM_CREATE_DIRECTORY_ARGS_SIZE];
+        put_u32(&mut path, 0, 0x1122_3344);
+        put_u64(&mut path, 8, 0x0102_0304_0506_0708);
+        put_u64(&mut path, 16, 99);
+        assert_eq!(
+            parse_filesystem_path_args(&path),
+            Ok((Handle::from_raw(0x1122_3344), 0x0102_0304_0506_0708, 99))
+        );
+        put_u32(&mut path, 4, 1);
+        assert_eq!(
+            parse_filesystem_path_args(&path),
+            Err(Status::InvalidArgument)
+        );
+
+        let mut rename = [0_u8; FILESYSTEM_RENAME_ARGS_SIZE];
+        put_u32(&mut rename, 0, 7);
+        put_u32(&mut rename, 4, 9);
+        put_u64(&mut rename, 8, 0x1000);
+        put_u64(&mut rename, 16, 5);
+        put_u64(&mut rename, 24, 0x2000);
+        put_u64(&mut rename, 32, 6);
+        put_u32(&mut rename, 40, FilesystemRenameFlags::REPLACE.bits());
+        assert_eq!(
+            parse_filesystem_rename_args(&rename),
+            Ok(ParsedFilesystemRenameArgs {
+                source_anchor: Handle::from_raw(7),
+                destination_anchor: Handle::from_raw(9),
+                source_address: 0x1000,
+                source_length: 5,
+                destination_address: 0x2000,
+                destination_length: 6,
+                flags: FilesystemRenameFlags::REPLACE,
+            })
+        );
+        put_u32(&mut rename, 40, 2);
+        assert_eq!(
+            parse_filesystem_rename_args(&rename),
+            Err(Status::InvalidArgument)
+        );
+        put_u32(&mut rename, 40, 0);
+        put_u32(&mut rename, 44, 1);
+        assert_eq!(
+            parse_filesystem_rename_args(&rename),
+            Err(Status::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn filesystem_paths_are_relative_bounded_and_non_traversing() {
+        assert_eq!(validate_filesystem_path("file"), Ok(()));
+        assert_eq!(validate_filesystem_path("one/two/three"), Ok(()));
+        for invalid in [
+            "",
+            "/absolute",
+            "\\absolute",
+            ".",
+            "..",
+            "one/./two",
+            "one/../two",
+            "one//two",
+            "one/",
+            "one\\two",
+            "drive:name",
+            "nul\0name",
+        ] {
+            assert_eq!(
+                validate_filesystem_path(invalid),
+                Err(Status::InvalidArgument),
+                "accepted invalid path {invalid:?}"
+            );
+        }
+
+        let long_component = "a".repeat(FILESYSTEM_NAME_MAX + 1);
+        assert_eq!(
+            validate_filesystem_path(&long_component),
+            Err(Status::InvalidArgument)
+        );
+        let deepest = vec!["a"; MAX_TRAVERSAL_DEPTH].join("/");
+        assert_eq!(validate_filesystem_path(&deepest), Ok(()));
+        let too_deep = vec!["a"; MAX_TRAVERSAL_DEPTH + 1].join("/");
+        assert_eq!(validate_filesystem_path(&too_deep), Err(Status::OutOfRange));
+    }
+
+    #[test]
+    fn filesystem_namespace_protection_covers_top_level_nodes() {
+        for protected in [
+            "desktop.elf",
+            "programs.gkr/metadata",
+            "system.log/archive",
+            "console/child",
+        ] {
+            assert!(is_protected_system_path(protected));
+        }
+        assert!(!is_protected_system_path("apps/desktop.elf"));
+        assert!(!is_protected_system_path("desktop.elf.backup"));
+    }
+
+    #[test]
+    fn directory_rights_are_attenuated_to_anchor_authority() {
+        let full = Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER;
+        assert_eq!(child_directory_rights(full, false), full);
+        assert_eq!(
+            child_directory_rights(Rights::READ | Rights::TRANSFER, false),
+            Rights::READ | Rights::TRANSFER
+        );
+        assert_eq!(
+            child_directory_rights(Rights::READ | Rights::WRITE, true),
+            full
+        );
+        assert_eq!(
+            child_directory_rights(Rights::READ, true),
+            Rights::READ | Rights::DUPLICATE | Rights::TRANSFER
+        );
+    }
+
+    #[test]
+    fn filesystem_metadata_encoding_uses_the_stable_layout() {
+        let metadata = NodeMetadata {
+            kind: NodeKind::Directory,
+            size: 123,
+            identity: 456,
+            mode: 0o40755,
+            policy: 0,
+            uid: 10,
+            gid: 20,
+            ctime: ginkgo_filesystem::Timestamp {
+                seconds: 2,
+                nanoseconds: 3,
+            },
+            mtime: ginkgo_filesystem::Timestamp {
+                seconds: 4,
+                nanoseconds: 5,
+            },
+        };
+        let encoded = encode_filesystem_metadata(metadata).unwrap();
+        assert_eq!(read_u32(&encoded, 0), 2);
+        assert_eq!(read_u32(&encoded, 4), 0o40755);
+        assert_eq!(read_u64(&encoded, 8), 123);
+        assert_eq!(read_u64(&encoded, 16), 456);
+        assert_eq!(read_u64(&encoded, 24), 2_000_000_003);
+        assert_eq!(read_u64(&encoded, 32), 4_000_000_005);
+        assert_eq!(read_u32(&encoded, 40), 10);
+        assert_eq!(read_u32(&encoded, 44), 20);
+        assert_eq!(read_u32(&encoded, 48), 0);
+        assert_eq!(&encoded[52..], &[0; 12]);
+        assert_eq!(timestamp_ns(u64::MAX, 0), Err(Status::OutOfRange));
+    }
+
+    #[test]
+    fn filesystem_errors_map_to_rich_abi_statuses() {
+        assert_eq!(map_fs_error(FsError::InvalidName), Status::InvalidArgument);
+        assert_eq!(map_fs_error(FsError::TraversalTooDeep), Status::OutOfRange);
+        assert_eq!(map_fs_error(FsError::AlreadyExists), Status::AlreadyExists);
+        assert_eq!(map_fs_error(FsError::NotDirectory), Status::NotDirectory);
+        assert_eq!(map_fs_error(FsError::IsDirectory), Status::IsDirectory);
+        assert_eq!(
+            map_fs_error(FsError::DirectoryNotEmpty),
+            Status::DirectoryNotEmpty
+        );
+        assert_eq!(map_fs_error(FsError::WouldCycle), Status::InvalidArgument);
     }
 
     #[test]

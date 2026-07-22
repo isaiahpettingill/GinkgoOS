@@ -4,12 +4,15 @@ use alloc::vec::Vec;
 use core::{fmt, mem, ptr};
 
 use ginkgo_ipc::{
-    Handle, HandleTable, IpcError, SharedMemoryMappingAccess, SharedMemoryMappingInfo,
-    SharedMemoryMappingLease, WaitItem,
+    Handle, HandleTable, IpcError, ProcessControl, SharedMemoryMappingAccess,
+    SharedMemoryMappingInfo, SharedMemoryMappingLease, WaitItem,
 };
 #[cfg(test)]
 use ginkgo_sysapi::Rights;
-use ginkgo_sysapi::{MapFlags, MapProtection, SharedMemoryMapArgs, Status};
+use ginkgo_sysapi::{
+    MapFlags, MapProtection, ProcessFault as PublicProcessFault, SharedMemoryMapArgs, Status,
+    PROCESS_MAX_ARGS, PROCESS_MAX_STARTUP_BYTES, PROCESS_MAX_STARTUP_HANDLES,
+};
 use x86_64::{
     structures::paging::{PhysFrame, Size4KiB},
     VirtAddr,
@@ -33,6 +36,22 @@ pub const USER_STACK_TOP: u64 = 0x0000_7fff_ffff_f000;
 pub const USER_STACK_BOTTOM: u64 = USER_STACK_TOP - USER_STACK_SIZE;
 pub const USER_STACK_GUARD_START: u64 = USER_STACK_BOTTOM - PAGE_SIZE;
 pub const SHARED_MAPPING_BASE: u64 = 0x0000_0001_0000_0000;
+
+/// Magic (`GKSP`) and version for the direct-process startup block passed in RDI.
+///
+/// Version 1 begins with a 64-byte little-endian header. Every offset is relative
+/// to the block address. The header contains, in order: magic (u32), version
+/// (u16), header size (u16), total size, argc, argv-offset-table offset, argument
+/// blob offset/length, configuration offset/length, startup-handle offset/count,
+/// and five reserved u32 values. The argv table contains one u32 offset per
+/// NUL-terminated argument, and the handle table contains child-local u32 values.
+/// Sections and the total block are 8-byte aligned; the block address and initial
+/// RSP are 16-byte aligned. RDI is the block address, RSI its byte length, and RDX
+/// and RCX are zero.
+pub const DIRECT_STARTUP_MAGIC: u32 = u32::from_le_bytes(*b"GKSP");
+pub const DIRECT_STARTUP_VERSION: u16 = 1;
+const DIRECT_STARTUP_HEADER_SIZE: usize = 64;
+const DIRECT_STARTUP_ALIGNMENT: usize = 16;
 const STACK_ASLR_ALIGNMENT: u64 = 2 * 1024 * 1024;
 const STACK_ASLR_SLOTS: u64 = 1024;
 const MAPPING_ASLR_SLOTS: u64 = 16_384;
@@ -113,6 +132,7 @@ pub enum ProcessState {
     Blocked,
     Exited(i32),
     Faulted(ProcessFault),
+    Terminated,
 }
 
 impl ProcessState {
@@ -125,7 +145,7 @@ impl ProcessState {
     }
 
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Exited(_) | Self::Faulted(_))
+        matches!(self, Self::Exited(_) | Self::Faulted(_) | Self::Terminated)
     }
 }
 
@@ -162,6 +182,134 @@ pub(crate) struct PendingWaitMany {
 
 pub(crate) enum BlockedSyscall {
     WaitMany(PendingWaitMany),
+}
+
+/// Fully allocated direct-process startup bytes awaiting child-local handles.
+pub(crate) struct DirectStartupBlock {
+    bytes: Vec<u8>,
+    handles_offset: usize,
+    handle_count: usize,
+}
+
+impl DirectStartupBlock {
+    pub(crate) fn new(args: &[u8], config: &[u8], handle_count: usize) -> Result<Self, Status> {
+        let argument_offsets = parse_argument_offsets(args)?;
+        if argument_offsets.len() > PROCESS_MAX_ARGS
+            || handle_count > PROCESS_MAX_STARTUP_HANDLES
+            || args
+                .len()
+                .checked_add(config.len())
+                .is_none_or(|length| length > PROCESS_MAX_STARTUP_BYTES)
+        {
+            return Err(Status::ResourceLimit);
+        }
+
+        let argv_offset = DIRECT_STARTUP_HEADER_SIZE;
+        let args_offset = align_up_usize(
+            argv_offset
+                .checked_add(argument_offsets.len() * size_of::<u32>())
+                .ok_or(Status::ResourceLimit)?,
+            8,
+        )
+        .ok_or(Status::ResourceLimit)?;
+        let config_offset = align_up_usize(
+            args_offset
+                .checked_add(args.len())
+                .ok_or(Status::ResourceLimit)?,
+            8,
+        )
+        .ok_or(Status::ResourceLimit)?;
+        let handles_offset = align_up_usize(
+            config_offset
+                .checked_add(config.len())
+                .ok_or(Status::ResourceLimit)?,
+            8,
+        )
+        .ok_or(Status::ResourceLimit)?;
+        let total_size = align_up_usize(
+            handles_offset
+                .checked_add(handle_count * size_of::<u32>())
+                .ok_or(Status::ResourceLimit)?,
+            DIRECT_STARTUP_ALIGNMENT,
+        )
+        .ok_or(Status::ResourceLimit)?;
+        if total_size > USER_STACK_SIZE as usize {
+            return Err(Status::ResourceLimit);
+        }
+
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(total_size)
+            .map_err(|_| Status::OutOfMemory)?;
+        bytes.resize(total_size, 0);
+        put_startup_u32(&mut bytes, 0, DIRECT_STARTUP_MAGIC);
+        bytes[4..6].copy_from_slice(&DIRECT_STARTUP_VERSION.to_le_bytes());
+        bytes[6..8].copy_from_slice(&(DIRECT_STARTUP_HEADER_SIZE as u16).to_le_bytes());
+        put_startup_u32(&mut bytes, 8, total_size as u32);
+        put_startup_u32(&mut bytes, 12, argument_offsets.len() as u32);
+        put_startup_u32(&mut bytes, 16, argv_offset as u32);
+        put_startup_u32(&mut bytes, 20, args_offset as u32);
+        put_startup_u32(&mut bytes, 24, args.len() as u32);
+        put_startup_u32(&mut bytes, 28, config_offset as u32);
+        put_startup_u32(&mut bytes, 32, config.len() as u32);
+        put_startup_u32(&mut bytes, 36, handles_offset as u32);
+        put_startup_u32(&mut bytes, 40, handle_count as u32);
+        for (index, offset) in argument_offsets.into_iter().enumerate() {
+            put_startup_u32(
+                &mut bytes,
+                argv_offset + index * size_of::<u32>(),
+                (args_offset + offset) as u32,
+            );
+        }
+        bytes[args_offset..args_offset + args.len()].copy_from_slice(args);
+        bytes[config_offset..config_offset + config.len()].copy_from_slice(config);
+        Ok(Self {
+            bytes,
+            handles_offset,
+            handle_count,
+        })
+    }
+
+    pub(crate) fn set_handles(&mut self, handles: &[Handle]) {
+        assert_eq!(handles.len(), self.handle_count);
+        for (index, handle) in handles.iter().copied().enumerate() {
+            put_startup_u32(
+                &mut self.bytes,
+                self.handles_offset + index * size_of::<u32>(),
+                handle.raw(),
+            );
+        }
+    }
+}
+
+fn parse_argument_offsets(args: &[u8]) -> Result<Vec<usize>, Status> {
+    if (!args.is_empty() && args.last() != Some(&0)) || core::str::from_utf8(args).is_err() {
+        return Err(Status::InvalidArgument);
+    }
+    let mut offsets = Vec::new();
+    offsets
+        .try_reserve_exact(args.iter().filter(|byte| **byte == 0).count())
+        .map_err(|_| Status::OutOfMemory)?;
+    let mut offset = 0;
+    while offset < args.len() {
+        offsets.push(offset);
+        offset += args[offset..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .expect("validated argument blob ends in NUL")
+            + 1;
+    }
+    Ok(offsets)
+}
+
+fn align_up_usize(value: usize, alignment: usize) -> Option<usize> {
+    value
+        .checked_add(alignment - 1)
+        .map(|rounded| rounded & !(alignment - 1))
+}
+
+fn put_startup_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
 }
 
 /// Fixed initial userspace stack layout.
@@ -488,6 +636,7 @@ pub struct Process {
     context: UserContext,
     layout: ProcessLayout,
     handles: Option<HandleTable>,
+    control: Option<ProcessControl>,
     state: ProcessState,
     preemption_count: u64,
     blocked_syscall: Option<BlockedSyscall>,
@@ -647,6 +796,7 @@ impl Process {
             context,
             layout,
             handles: Some(HandleTable::new()),
+            control: None,
             state: ProcessState::Ready,
             preemption_count: 0,
             blocked_syscall: None,
@@ -668,6 +818,50 @@ impl Process {
 
     pub const fn state(&self) -> ProcessState {
         self.state
+    }
+
+    pub fn attach_control(&mut self, control: ProcessControl) {
+        assert!(
+            self.control.is_none(),
+            "process control was already attached"
+        );
+        self.control = Some(control);
+    }
+
+    pub fn termination_requested(&self) -> bool {
+        self.control
+            .as_ref()
+            .is_some_and(ProcessControl::terminate_requested)
+    }
+
+    pub fn mark_terminated(&mut self) {
+        self.blocked_syscall = None;
+        self.state = ProcessState::Terminated;
+        if let Some(control) = &self.control {
+            control.mark_terminated();
+        }
+    }
+
+    pub fn publish_terminal_status(&self) {
+        let Some(control) = &self.control else {
+            return;
+        };
+        match self.state {
+            ProcessState::Exited(code) => {
+                control.mark_exited(code);
+            }
+            ProcessState::Faulted(fault) => {
+                control.mark_faulted(
+                    public_fault(fault.reason),
+                    fault.code,
+                    fault.address.unwrap_or(0),
+                );
+            }
+            ProcessState::Terminated => {
+                control.mark_terminated();
+            }
+            ProcessState::Ready | ProcessState::Blocked => {}
+        }
     }
 
     pub const fn is_runnable(&self) -> bool {
@@ -778,11 +972,13 @@ impl Process {
     pub fn mark_exited(&mut self, code: i32) {
         self.blocked_syscall = None;
         self.state = ProcessState::Exited(code);
+        self.publish_terminal_status();
     }
 
     pub fn mark_faulted(&mut self, reason: ProcessFault) {
         self.blocked_syscall = None;
         self.state = ProcessState::Faulted(reason);
+        self.publish_terminal_status();
     }
 
     pub fn address_space(&self) -> &AddressSpace {
@@ -799,6 +995,29 @@ impl Process {
 
     pub const fn context(&self) -> &UserContext {
         &self.context
+    }
+
+    /// Installs a prepared direct-process startup block in the active child stack.
+    pub(crate) fn install_direct_startup(
+        &mut self,
+        startup: &DirectStartupBlock,
+    ) -> Result<(), AddressSpaceError> {
+        let block_address = self
+            .layout
+            .stack_top
+            .checked_sub(startup.bytes.len() as u64)
+            .ok_or(AddressSpaceError::AddressOverflow)?
+            & !((DIRECT_STARTUP_ALIGNMENT as u64) - 1);
+        self.address_space().validate_user_range(
+            block_address,
+            startup.bytes.len(),
+            UserAccess::Write,
+        )?;
+        self.address_space()
+            .copy_to_user(block_address, &startup.bytes)?;
+        self.context.rsp = block_address;
+        self.set_start_arguments([block_address, startup.bytes.len() as u64, 0, 0]);
+        Ok(())
     }
 
     /// Sets the first four System V AMD64 arguments for the initial user entry.
@@ -1075,6 +1294,17 @@ fn reclaim_failed_construction(
         panic!("failed to reclaim partial process construction");
     }
     Err(original_error)
+}
+
+const fn public_fault(reason: ProcessFaultReason) -> PublicProcessFault {
+    match reason {
+        ProcessFaultReason::PageFault => PublicProcessFault::PageFault,
+        ProcessFaultReason::GeneralProtection => PublicProcessFault::GeneralProtection,
+        ProcessFaultReason::InvalidOpcode => PublicProcessFault::InvalidOpcode,
+        ProcessFaultReason::InvalidUserContext => PublicProcessFault::InvalidUserContext,
+        ProcessFaultReason::ResourceLimit => PublicProcessFault::ResourceLimit,
+        ProcessFaultReason::Other(_) => PublicProcessFault::Other,
+    }
 }
 
 fn user_permissions(permissions: SegmentPermissions) -> UserPagePermissions {
@@ -1552,7 +1782,10 @@ impl Default for ProcessTable {
 
 #[cfg(test)]
 mod tests {
-    use alloc::alloc::{alloc_zeroed, dealloc, Layout};
+    use alloc::{
+        alloc::{alloc_zeroed, dealloc, Layout},
+        vec,
+    };
     use core::{
         ptr::NonNull,
         sync::atomic::{AtomicUsize, Ordering},
@@ -1625,6 +1858,7 @@ mod tests {
             context: UserContext::new(0x1000, USER_STACK_TOP),
             layout: ProcessLayout::STANDARD,
             handles: None,
+            control: None,
             state,
             preemption_count: 0,
             blocked_syscall: None,
@@ -1907,12 +2141,112 @@ mod tests {
     }
 
     #[test]
+    fn direct_startup_block_has_versioned_offsets_and_child_handles() {
+        let mut startup = DirectStartupBlock::new(b"first\0second\0", b"cfg", 2).unwrap();
+        startup.set_handles(&[Handle::from_raw(7), Handle::from_raw(9)]);
+        let read =
+            |offset| u32::from_le_bytes(startup.bytes[offset..offset + 4].try_into().unwrap());
+
+        assert_eq!(read(0), DIRECT_STARTUP_MAGIC);
+        assert_eq!(
+            u16::from_le_bytes(startup.bytes[4..6].try_into().unwrap()),
+            1
+        );
+        assert_eq!(read(12), 2);
+        let argv = read(16) as usize;
+        let args = read(20) as usize;
+        let config = read(28) as usize;
+        let handles = read(36) as usize;
+        assert_eq!(read(argv) as usize, args);
+        assert_eq!(read(argv + 4) as usize, args + 6);
+        assert_eq!(&startup.bytes[args..args + 13], b"first\0second\0");
+        assert_eq!(&startup.bytes[config..config + 3], b"cfg");
+        assert_eq!(read(handles), 7);
+        assert_eq!(read(handles + 4), 9);
+        assert_eq!(startup.bytes.len() % DIRECT_STARTUP_ALIGNMENT, 0);
+    }
+
+    #[test]
+    fn direct_startup_rejects_malformed_and_excessive_arguments() {
+        assert!(matches!(
+            DirectStartupBlock::new(b"not-terminated", &[], 0),
+            Err(Status::InvalidArgument)
+        ));
+        assert!(matches!(
+            DirectStartupBlock::new(&[0xff, 0], &[], 0),
+            Err(Status::InvalidArgument)
+        ));
+        let too_many = vec![0; PROCESS_MAX_ARGS + 1];
+        assert!(matches!(
+            DirectStartupBlock::new(&too_many, &[], 0),
+            Err(Status::ResourceLimit)
+        ));
+    }
+
+    #[test]
+    fn process_control_handles_enforce_inspect_and_terminate_rights() {
+        let mut table = HandleTable::new();
+        let (handle, _) = table.process_create().unwrap();
+        let inspect = table.handle_duplicate(handle, Rights::INSPECT).unwrap();
+        let terminate = table.handle_duplicate(handle, Rights::TERMINATE).unwrap();
+
+        assert!(table.process_info(inspect).is_ok());
+        assert_eq!(
+            table.process_terminate(inspect),
+            Err(IpcError::AccessDenied)
+        );
+        assert_eq!(table.process_info(terminate), Err(IpcError::AccessDenied));
+        assert!(table.process_terminate(terminate).is_ok());
+    }
+
+    #[test]
+    fn attached_control_publishes_exit_fault_and_external_termination() {
+        let mut table = HandleTable::new();
+        let (handle, control) = table.process_create().unwrap();
+        let mut terminated = test_process(ProcessState::Ready);
+        terminated.attach_control(control);
+        table.process_terminate(handle).unwrap();
+        assert!(terminated.termination_requested());
+        terminated.mark_terminated();
+        let info = table.process_info(handle).unwrap();
+        assert_eq!(
+            info.termination_cause(),
+            Some(ginkgo_sysapi::ProcessTerminationCause::Terminated)
+        );
+
+        let (handle, control) = table.process_create().unwrap();
+        let mut exited = test_process(ProcessState::Ready);
+        exited.attach_control(control);
+        exited.mark_exited(-3);
+        let info = table.process_info(handle).unwrap();
+        assert_eq!(info.exit_code, -3);
+        assert_eq!(
+            info.termination_cause(),
+            Some(ginkgo_sysapi::ProcessTerminationCause::Exited)
+        );
+
+        let (handle, control) = table.process_create().unwrap();
+        let mut faulted = test_process(ProcessState::Ready);
+        faulted.attach_control(control);
+        faulted.mark_faulted(ProcessFault::at_address(
+            ProcessFaultReason::PageFault,
+            5,
+            0xdead_beef,
+        ));
+        let info = table.process_info(handle).unwrap();
+        assert_eq!(info.process_fault(), Some(PublicProcessFault::PageFault));
+        assert_eq!(info.fault_code, 5);
+        assert_eq!(info.fault_address, 0xdead_beef);
+    }
+
+    #[test]
     fn process_states_retain_completion_details_and_classify_lifecycle() {
         let fault = ProcessFault::at_address(ProcessFaultReason::PageFault, 0b101, 0xdead_beef);
         let ready = ProcessState::Ready;
         let blocked = ProcessState::Blocked;
         let exited = ProcessState::Exited(-17);
         let faulted = ProcessState::Faulted(fault);
+        let terminated = ProcessState::Terminated;
 
         assert!(ready.is_runnable());
         assert!(!ready.is_blocked());
@@ -1924,6 +2258,8 @@ mod tests {
         assert!(exited.is_terminal());
         assert!(!faulted.is_runnable());
         assert!(faulted.is_terminal());
+        assert!(!terminated.is_runnable());
+        assert!(terminated.is_terminal());
         assert_eq!(exited, ProcessState::Exited(-17));
         assert_eq!(fault.reason, ProcessFaultReason::PageFault);
         assert_eq!(fault.code, 0b101);

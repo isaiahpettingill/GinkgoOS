@@ -82,10 +82,12 @@ extern "C" fn process_main(
                 }
                 Event::CloseRequested { .. } => {
                     destroy_window(&mut client);
+                    let state = host.borrow();
                     close_runtime_handles(
                         terminal_endpoint,
                         shell_endpoint,
-                        &host.borrow().children,
+                        &state.children,
+                        &state.jobs,
                     );
                     ginkgo_runtime::exit(0);
                 }
@@ -374,9 +376,13 @@ fn close_runtime_handles(
     terminal_endpoint: Handle,
     shell_endpoint: Handle,
     children: &[shell::ChildStream],
+    jobs: &[shell::HeadlessJob],
 ) {
     for child in children {
         let _ = handle_close(child.endpoint);
+    }
+    for job in jobs {
+        let _ = handle_close(job.process);
     }
     let _ = handle_close(terminal_endpoint);
     let _ = handle_close(shell_endpoint);

@@ -3,6 +3,7 @@ members = [
     "crates/ginkgo-kernel",
     "crates/ginkgo-userspace",
     "crates/ginkgo-ipc",
+    "crates/ginkgo-app-package",
     "crates/ginkgo-program-registry",
     "crates/ginkgo-hid",
     "crates/ginkgo-filesystem",

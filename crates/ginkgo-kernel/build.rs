@@ -58,6 +58,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GINKGO_TERMINAL_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_PREEMPTION_SMOKE");
     println!("cargo:rerun-if-env-changed=GINKGO_FRAME_RECLAIM_STRESS");
+    println!("cargo:rerun-if-env-changed=GINKGO_FILESYSTEM_HIERARCHY_SMOKE");
     println!("cargo:rerun-if-env-changed=GINKGO_TRUST_SIGNING_KEY_HEX");
     println!("cargo:rustc-link-arg-bin=ginkgo-os=-T{}", linker.display());
 

@@ -114,6 +114,99 @@ pub fn random_fill(source: Handle, output: &mut [u8]) -> SyscallResult<()> {
     })
 }
 
+/// Creates a process from an executable file capability.
+///
+/// `args_blob` contains zero or more NUL-terminated UTF-8 arguments. Creation
+/// transfers or duplicates `startup_handles` atomically according to each
+/// disposition. The combined arguments and opaque configuration data are
+/// bounded by [`PROCESS_MAX_STARTUP_BYTES`].
+pub fn process_create(
+    executable: Handle,
+    args_blob: &[u8],
+    startup_handles: &[HandleDisposition],
+    config: &[u8],
+) -> SyscallResult<Handle> {
+    let mut output = HandleOutput::default();
+    let args = process_create_args(executable, args_blob, startup_handles, config, &mut output)?;
+
+    // SAFETY: args and output remain valid, and all three borrowed input slices
+    // remain readable until the syscall returns. Empty slices use address zero.
+    let raw = unsafe {
+        raw_syscall6(
+            SyscallNumber::ProcessCreate,
+            pointer_address(&args),
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    status_result(raw)?;
+    Ok(output.handle)
+}
+
+/// Reads stable state, termination, and fault information for a process.
+pub fn process_get_info(process: Handle) -> SyscallResult<ProcessInfo> {
+    let mut output = ProcessInfo::default();
+    // SAFETY: output is writable and remains alive until the syscall returns.
+    let raw = unsafe {
+        raw_syscall6(
+            SyscallNumber::ProcessGetInfo,
+            u64::from(process.raw()),
+            mut_pointer_address(&mut output),
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    status_result(raw)?;
+    Ok(output)
+}
+
+/// Requests termination of a process through a capability with `TERMINATE` rights.
+pub fn process_terminate(process: Handle) -> SyscallResult<()> {
+    // SAFETY: ProcessTerminate receives only an integer handle value.
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::ProcessTerminate,
+            u64::from(process.raw()),
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    })
+}
+
+/// Waits for a process to terminate and returns its final information.
+pub fn process_wait(process: Handle, deadline_ns: i64) -> SyscallResult<ProcessInfo> {
+    let mut item = [WaitItem::new(process, Signals::TERMINATED)];
+    wait_many(&mut item, deadline_ns)?;
+    process_get_info(process)
+}
+
+/// Returns the calling application's private data-directory capability.
+pub fn application_get_data_directory() -> SyscallResult<Handle> {
+    let mut output = HandleOutput::default();
+    // SAFETY: output is writable and remains alive until the syscall returns.
+    let raw = unsafe {
+        raw_syscall6(
+            SyscallNumber::ApplicationGetDataDirectory,
+            mut_pointer_address(&mut output),
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    status_result(raw)?;
+    Ok(output.handle)
+}
+
 /// Terminates the current process with `exit_code`.
 ///
 /// This function returns only if the kernel rejects the request. The returned
@@ -160,23 +253,18 @@ pub fn audio_write(pcm: &[u8]) -> SyscallResult<()> {
     status_result(unsafe { raw_syscall6(SyscallNumber::AudioWrite, address, length, 0, 0, 0, 0) })
 }
 
-/// Opens or creates one file relative to an authorized filesystem-root capability.
+/// Opens or creates one file relative to a filesystem root or directory capability.
 pub fn filesystem_open(
-    root: Handle,
+    anchor: Handle,
     name: &str,
     flags: FilesystemOpenFlags,
 ) -> SyscallResult<Handle> {
-    let args = FilesystemOpenArgs {
-        name_address: slice_address(name.as_bytes()),
-        name_length: name.len() as u64,
-        flags,
-        reserved: 0,
-    };
+    let args = filesystem_open_args(name, flags);
     let mut output = HandleOutput::default();
     let raw = unsafe {
         raw_syscall6(
             SyscallNumber::FilesystemOpen,
-            u64::from(root.raw()),
+            u64::from(anchor.raw()),
             pointer_address(&args),
             mut_pointer_address(&mut output),
             0,
@@ -288,6 +376,161 @@ pub fn filesystem_unlink(root: Handle, name: &str) -> SyscallResult<()> {
             0,
         )
     })
+}
+
+/// Opens a directory relative to a filesystem root or directory capability.
+pub fn filesystem_open_directory(anchor: Handle, path: &str) -> SyscallResult<Handle> {
+    let mut output = HandleOutput::default();
+    let args = filesystem_open_directory_args(anchor, path, &mut output);
+    let raw = unsafe {
+        raw_syscall6(
+            SyscallNumber::FilesystemOpenDirectory,
+            pointer_address(&args),
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    status_result(raw)?;
+    Ok(output.handle)
+}
+
+/// Creates a directory at a relative UTF-8 path beneath `anchor`.
+pub fn filesystem_create_directory(anchor: Handle, path: &str) -> SyscallResult<()> {
+    let args = filesystem_create_directory_args(anchor, path);
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::FilesystemCreateDirectory,
+            pointer_address(&args),
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    })
+}
+
+/// Removes an empty directory at a relative UTF-8 path beneath `anchor`.
+pub fn filesystem_remove_directory(anchor: Handle, path: &str) -> SyscallResult<()> {
+    let args = filesystem_remove_directory_args(anchor, path);
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::FilesystemRemoveDirectory,
+            pointer_address(&args),
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    })
+}
+
+/// Renames or moves one relative path, optionally replacing the destination atomically.
+pub fn filesystem_rename(
+    source_anchor: Handle,
+    source_path: &str,
+    destination_anchor: Handle,
+    destination_path: &str,
+    flags: FilesystemRenameFlags,
+) -> SyscallResult<()> {
+    let args = filesystem_rename_args(
+        source_anchor,
+        source_path,
+        destination_anchor,
+        destination_path,
+        flags,
+    );
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::FilesystemRename,
+            pointer_address(&args),
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    })
+}
+
+/// Flushes pending data and metadata for a file, directory, or filesystem-root capability.
+pub fn filesystem_sync(handle: Handle) -> SyscallResult<()> {
+    let args = filesystem_sync_args(handle);
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::FilesystemSync,
+            pointer_address(&args),
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    })
+}
+
+/// Returns capacity and stable limit information for the filesystem containing `anchor`.
+pub fn filesystem_get_info(anchor: Handle) -> SyscallResult<FilesystemInfo> {
+    let mut output = FilesystemInfo::default();
+    let args = filesystem_get_info_args(anchor, &mut output);
+    let raw = unsafe {
+        raw_syscall6(
+            SyscallNumber::FilesystemGetInfo,
+            pointer_address(&args),
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    status_result(raw)?;
+    Ok(output)
+}
+
+/// Returns rich metadata for a relative UTF-8 path beneath `anchor`.
+pub fn filesystem_get_metadata(anchor: Handle, path: &str) -> SyscallResult<FilesystemMetadata> {
+    let mut output = FilesystemMetadata::default();
+    let args = filesystem_get_metadata_args(anchor, path, &mut output);
+    let raw = unsafe {
+        raw_syscall6(
+            SyscallNumber::FilesystemGetMetadata,
+            pointer_address(&args),
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    status_result(raw)?;
+    Ok(output)
+}
+
+/// Reads one rich entry from a directory capability. `EndOfDirectory` ends iteration.
+pub fn filesystem_read_directory2(
+    directory: Handle,
+    cookie: u64,
+) -> SyscallResult<FilesystemDirectoryEntry2> {
+    let mut output = FilesystemDirectoryEntry2::default();
+    let args = filesystem_read_directory2_args(directory, cookie, &mut output);
+    let raw = unsafe {
+        raw_syscall6(
+            SyscallNumber::FilesystemReadDirectory2,
+            pointer_address(&args),
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    status_result(raw)?;
+    Ok(output)
 }
 
 /// Closes a process-local handle.
@@ -604,6 +847,108 @@ fn debug_write_args(bytes: &[u8]) -> (u64, u64) {
     (slice_address(bytes), bytes.len() as u64)
 }
 
+fn filesystem_open_args(name: &str, flags: FilesystemOpenFlags) -> FilesystemOpenArgs {
+    FilesystemOpenArgs {
+        name_address: slice_address(name.as_bytes()),
+        name_length: name.len() as u64,
+        flags,
+        reserved: 0,
+    }
+}
+
+fn filesystem_open_directory_args(
+    anchor: Handle,
+    path: &str,
+    output: &mut HandleOutput,
+) -> FilesystemOpenDirectoryArgs {
+    FilesystemOpenDirectoryArgs {
+        anchor,
+        reserved: 0,
+        path_address: slice_address(path.as_bytes()),
+        path_length: path.len() as u64,
+        output_address: mut_pointer_address(output),
+    }
+}
+
+fn filesystem_create_directory_args(anchor: Handle, path: &str) -> FilesystemCreateDirectoryArgs {
+    FilesystemCreateDirectoryArgs {
+        anchor,
+        reserved: 0,
+        path_address: slice_address(path.as_bytes()),
+        path_length: path.len() as u64,
+    }
+}
+
+fn filesystem_remove_directory_args(anchor: Handle, path: &str) -> FilesystemRemoveDirectoryArgs {
+    FilesystemRemoveDirectoryArgs {
+        anchor,
+        reserved: 0,
+        path_address: slice_address(path.as_bytes()),
+        path_length: path.len() as u64,
+    }
+}
+
+fn filesystem_rename_args(
+    source_anchor: Handle,
+    source_path: &str,
+    destination_anchor: Handle,
+    destination_path: &str,
+    flags: FilesystemRenameFlags,
+) -> FilesystemRenameArgs {
+    FilesystemRenameArgs {
+        source_anchor,
+        destination_anchor,
+        source_path_address: slice_address(source_path.as_bytes()),
+        source_path_length: source_path.len() as u64,
+        destination_path_address: slice_address(destination_path.as_bytes()),
+        destination_path_length: destination_path.len() as u64,
+        flags,
+        reserved: 0,
+    }
+}
+
+fn filesystem_sync_args(handle: Handle) -> FilesystemSyncArgs {
+    FilesystemSyncArgs {
+        handle,
+        reserved: 0,
+    }
+}
+
+fn filesystem_get_info_args(anchor: Handle, output: &mut FilesystemInfo) -> FilesystemGetInfoArgs {
+    FilesystemGetInfoArgs {
+        anchor,
+        reserved: 0,
+        output_address: mut_pointer_address(output),
+    }
+}
+
+fn filesystem_get_metadata_args(
+    anchor: Handle,
+    path: &str,
+    output: &mut FilesystemMetadata,
+) -> FilesystemGetMetadataArgs {
+    FilesystemGetMetadataArgs {
+        anchor,
+        reserved: 0,
+        path_address: slice_address(path.as_bytes()),
+        path_length: path.len() as u64,
+        output_address: mut_pointer_address(output),
+    }
+}
+
+fn filesystem_read_directory2_args(
+    directory: Handle,
+    cookie: u64,
+    output: &mut FilesystemDirectoryEntry2,
+) -> FilesystemReadDirectory2Args {
+    FilesystemReadDirectory2Args {
+        directory,
+        reserved: 0,
+        cookie,
+        output_address: mut_pointer_address(output),
+    }
+}
+
 fn channel_write_args(bytes: &[u8], dispositions: &[HandleDisposition]) -> ChannelWriteArgs {
     ChannelWriteArgs {
         bytes_address: slice_address(bytes),
@@ -613,6 +958,42 @@ fn channel_write_args(bytes: &[u8], dispositions: &[HandleDisposition]) -> Chann
         flags: 0,
         reserved: 0,
     }
+}
+
+fn process_create_args(
+    executable: Handle,
+    args_blob: &[u8],
+    startup_handles: &[HandleDisposition],
+    config: &[u8],
+    output: &mut HandleOutput,
+) -> SyscallResult<ProcessCreateArgs> {
+    let argument_count = args_blob.iter().filter(|byte| **byte == 0).count();
+    if (!args_blob.is_empty() && args_blob.last() != Some(&0))
+        || core::str::from_utf8(args_blob).is_err()
+    {
+        return Err(Status::InvalidArgument);
+    }
+    if argument_count > PROCESS_MAX_ARGS
+        || startup_handles.len() > PROCESS_MAX_STARTUP_HANDLES
+        || args_blob
+            .len()
+            .checked_add(config.len())
+            .is_none_or(|length| length > PROCESS_MAX_STARTUP_BYTES)
+    {
+        return Err(Status::ResourceLimit);
+    }
+
+    Ok(ProcessCreateArgs {
+        executable,
+        reserved: 0,
+        args_address: slice_address(args_blob),
+        args_length: args_blob.len() as u64,
+        startup_handles_address: slice_address(startup_handles),
+        startup_handle_count: startup_handles.len() as u64,
+        config_address: slice_address(config),
+        config_length: config.len() as u64,
+        output_address: mut_pointer_address(output),
+    })
 }
 
 fn channel_read_args(
@@ -661,6 +1042,12 @@ mod tests {
             Status::EndOfDirectory,
             Status::Io,
             Status::TimedOut,
+            Status::ResourceLimit,
+            Status::NotDirectory,
+            Status::IsDirectory,
+            Status::DirectoryNotEmpty,
+            Status::AlreadyExists,
+            Status::CrossDevice,
         ] {
             assert_eq!(status_result(status.raw().into()), Err(status));
         }
@@ -709,6 +1096,216 @@ mod tests {
         assert_eq!(args.disposition_count, 1);
         assert_eq!(args.flags, 0);
         assert_eq!(args.reserved, 0);
+    }
+
+    #[test]
+    fn filesystem_path_arguments_retain_anchors_paths_flags_and_outputs() {
+        let anchor = Handle::from_raw(41);
+        let destination_anchor = Handle::from_raw(42);
+        let path = "parent/child";
+        let destination = "archive/child";
+
+        let open = filesystem_open_args(path, FilesystemOpenFlags::READ);
+        assert_eq!(open.name_address, pointer_address(path.as_ptr()));
+        assert_eq!(open.name_length, path.len() as u64);
+        assert_eq!(open.flags, FilesystemOpenFlags::READ);
+        assert_eq!(open.reserved, 0);
+
+        let mut handle_output = HandleOutput::default();
+        let handle_output_address = mut_pointer_address(&mut handle_output);
+        let open_directory = filesystem_open_directory_args(anchor, path, &mut handle_output);
+        assert_eq!(open_directory.anchor, anchor);
+        assert_eq!(open_directory.reserved, 0);
+        assert_eq!(open_directory.path_address, pointer_address(path.as_ptr()));
+        assert_eq!(open_directory.path_length, path.len() as u64);
+        assert_eq!(open_directory.output_address, handle_output_address);
+
+        let create = filesystem_create_directory_args(anchor, path);
+        assert_eq!(create.anchor, anchor);
+        assert_eq!(create.reserved, 0);
+        assert_eq!(create.path_address, pointer_address(path.as_ptr()));
+        assert_eq!(create.path_length, path.len() as u64);
+
+        let remove = filesystem_remove_directory_args(anchor, path);
+        assert_eq!(remove.anchor, anchor);
+        assert_eq!(remove.reserved, 0);
+        assert_eq!(remove.path_address, pointer_address(path.as_ptr()));
+        assert_eq!(remove.path_length, path.len() as u64);
+
+        let rename = filesystem_rename_args(
+            anchor,
+            path,
+            destination_anchor,
+            destination,
+            FilesystemRenameFlags::REPLACE,
+        );
+        assert_eq!(rename.source_anchor, anchor);
+        assert_eq!(rename.destination_anchor, destination_anchor);
+        assert_eq!(rename.source_path_address, pointer_address(path.as_ptr()));
+        assert_eq!(rename.source_path_length, path.len() as u64);
+        assert_eq!(
+            rename.destination_path_address,
+            pointer_address(destination.as_ptr())
+        );
+        assert_eq!(rename.destination_path_length, destination.len() as u64);
+        assert_eq!(rename.flags, FilesystemRenameFlags::REPLACE);
+        assert_eq!(rename.reserved, 0);
+
+        let no_replace = filesystem_rename_args(
+            anchor,
+            path,
+            destination_anchor,
+            destination,
+            FilesystemRenameFlags::empty(),
+        );
+        assert!(no_replace.flags.is_empty());
+    }
+
+    #[test]
+    fn filesystem_non_path_arguments_retain_handles_cookies_and_outputs() {
+        let anchor = Handle::from_raw(51);
+        let sync = filesystem_sync_args(anchor);
+        assert_eq!(sync.handle, anchor);
+        assert_eq!(sync.reserved, 0);
+
+        let mut info = FilesystemInfo::default();
+        let info_address = mut_pointer_address(&mut info);
+        let get_info = filesystem_get_info_args(anchor, &mut info);
+        assert_eq!(get_info.anchor, anchor);
+        assert_eq!(get_info.reserved, 0);
+        assert_eq!(get_info.output_address, info_address);
+
+        let path = "nested/file";
+        let mut metadata = FilesystemMetadata::default();
+        let metadata_address = mut_pointer_address(&mut metadata);
+        let get_metadata = filesystem_get_metadata_args(anchor, path, &mut metadata);
+        assert_eq!(get_metadata.anchor, anchor);
+        assert_eq!(get_metadata.reserved, 0);
+        assert_eq!(get_metadata.path_address, pointer_address(path.as_ptr()));
+        assert_eq!(get_metadata.path_length, path.len() as u64);
+        assert_eq!(get_metadata.output_address, metadata_address);
+
+        let mut entry = FilesystemDirectoryEntry2::default();
+        let entry_address = mut_pointer_address(&mut entry);
+        let read_directory = filesystem_read_directory2_args(anchor, 99, &mut entry);
+        assert_eq!(read_directory.directory, anchor);
+        assert_eq!(read_directory.reserved, 0);
+        assert_eq!(read_directory.cookie, 99);
+        assert_eq!(read_directory.output_address, entry_address);
+    }
+
+    #[test]
+    fn empty_filesystem_paths_use_null_addresses() {
+        let anchor = Handle::from_raw(61);
+        let mut output = HandleOutput::default();
+        let open = filesystem_open_args("", FilesystemOpenFlags::empty());
+        let open_directory = filesystem_open_directory_args(anchor, "", &mut output);
+        let create = filesystem_create_directory_args(anchor, "");
+        let remove = filesystem_remove_directory_args(anchor, "");
+        let rename = filesystem_rename_args(anchor, "", anchor, "", FilesystemRenameFlags::empty());
+
+        assert_eq!(open.name_address, 0);
+        assert_eq!(open.name_length, 0);
+        assert_eq!(open_directory.path_address, 0);
+        assert_eq!(open_directory.path_length, 0);
+        assert_eq!(create.path_address, 0);
+        assert_eq!(create.path_length, 0);
+        assert_eq!(remove.path_address, 0);
+        assert_eq!(remove.path_length, 0);
+        assert_eq!(rename.source_path_address, 0);
+        assert_eq!(rename.source_path_length, 0);
+        assert_eq!(rename.destination_path_address, 0);
+        assert_eq!(rename.destination_path_length, 0);
+    }
+
+    #[test]
+    fn process_create_arguments_retain_all_borrowed_inputs() {
+        let arguments = b"program\0--flag\0";
+        let handles = [HandleDisposition::duplicate(
+            Handle::from_raw(9),
+            Rights::READ,
+        )];
+        let config = b"mode=test";
+        let mut output = HandleOutput::default();
+        let output_address = mut_pointer_address(&mut output);
+
+        let args = process_create_args(
+            Handle::from_raw(7),
+            arguments,
+            &handles,
+            config,
+            &mut output,
+        )
+        .unwrap();
+
+        assert_eq!(args.executable, Handle::from_raw(7));
+        assert_eq!(args.reserved, 0);
+        assert_eq!(args.args_address, pointer_address(arguments.as_ptr()));
+        assert_eq!(args.args_length, arguments.len() as u64);
+        assert_eq!(
+            args.startup_handles_address,
+            pointer_address(handles.as_ptr())
+        );
+        assert_eq!(args.startup_handle_count, 1);
+        assert_eq!(args.config_address, pointer_address(config.as_ptr()));
+        assert_eq!(args.config_length, config.len() as u64);
+        assert_eq!(args.output_address, output_address);
+    }
+
+    #[test]
+    fn process_create_rejects_invalid_or_unbounded_startup_data() {
+        let mut output = HandleOutput::default();
+        assert_eq!(
+            process_create_args(Handle::from_raw(1), b"unterminated", &[], &[], &mut output),
+            Err(Status::InvalidArgument)
+        );
+        assert_eq!(
+            process_create_args(Handle::from_raw(1), &[0xff, 0], &[], &[], &mut output),
+            Err(Status::InvalidArgument)
+        );
+
+        let too_many_arguments = [0_u8; PROCESS_MAX_ARGS + 1];
+        assert_eq!(
+            process_create_args(
+                Handle::from_raw(1),
+                &too_many_arguments,
+                &[],
+                &[],
+                &mut output,
+            ),
+            Err(Status::ResourceLimit)
+        );
+
+        let too_many_handles =
+            [HandleDisposition::move_handle(Handle::from_raw(2), Rights::TRANSFER);
+                PROCESS_MAX_STARTUP_HANDLES + 1];
+        assert_eq!(
+            process_create_args(
+                Handle::from_raw(1),
+                &[],
+                &too_many_handles,
+                &[],
+                &mut output,
+            ),
+            Err(Status::ResourceLimit)
+        );
+
+        let oversized = [0_u8; PROCESS_MAX_STARTUP_BYTES + 1];
+        assert_eq!(
+            process_create_args(Handle::from_raw(1), &[], &[], &oversized, &mut output),
+            Err(Status::ResourceLimit)
+        );
+    }
+
+    #[test]
+    fn empty_process_create_inputs_use_null_addresses() {
+        let mut output = HandleOutput::default();
+        let args = process_create_args(Handle::from_raw(1), &[], &[], &[], &mut output).unwrap();
+
+        assert_eq!(args.args_address, 0);
+        assert_eq!(args.startup_handles_address, 0);
+        assert_eq!(args.config_address, 0);
+        assert_ne!(args.output_address, 0);
     }
 
     #[test]

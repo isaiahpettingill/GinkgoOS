@@ -10,6 +10,7 @@
 use alloc::{
     alloc::{alloc_zeroed, dealloc, Layout},
     collections::VecDeque,
+    string::String,
     sync::Arc,
     vec::Vec,
 };
@@ -20,9 +21,10 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use ginkgo_filesystem::FileHandle;
+use ginkgo_filesystem::{DirectoryHandle, FileHandle};
 use ginkgo_sysapi::{
-    Handle, MessageInfo, ObjectType, Rights, Signals, Status, WaitItem, CHANNEL_MAX_BYTES,
+    Handle, MessageInfo, ObjectType, ProcessFault, ProcessInfo, ProcessState,
+    ProcessTerminationCause, Rights, Signals, Status, WaitItem, CHANNEL_MAX_BYTES,
     CHANNEL_MAX_HANDLES,
 };
 use spinning_top::Spinlock;
@@ -35,6 +37,8 @@ pub const HANDLE_TABLE_CAPACITY: usize = 256;
 pub const SHARED_MEMORY_PAGE_SIZE: usize = 4096;
 /// Default number of equal shared-memory slots owned by [`HandleTable::window_create`].
 pub const WINDOW_BUFFER_COUNT: usize = 2;
+/// Maximum UTF-8 byte length of an application-data scope identifier.
+pub const APPLICATION_DATA_MAX_APP_ID_LEN: usize = 127;
 
 const HANDLE_INDEX_BITS: u32 = 12;
 const HANDLE_INDEX_MASK: u32 = (1 << HANDLE_INDEX_BITS) - 1;
@@ -103,6 +107,13 @@ const WINDOW_MANAGER_RIGHTS: Rights = Rights::from_bits_retain(
         | Rights::DUPLICATE.bits()
         | Rights::TRANSFER.bits()
         | Rights::MANAGE.bits(),
+);
+const PROCESS_DEFAULT_RIGHTS: Rights = Rights::from_bits_retain(
+    Rights::WAIT.bits()
+        | Rights::INSPECT.bits()
+        | Rights::TERMINATE.bits()
+        | Rights::DUPLICATE.bits()
+        | Rights::TRANSFER.bits(),
 );
 
 fn handle_from_parts(index: usize, generation: u32) -> Handle {
@@ -193,9 +204,148 @@ enum KernelObject {
     Channel(ChannelEndpoint),
     SharedMemory(SharedMemoryObject),
     Window(WindowEndpoint),
+    Process(ProcessControl),
+    ApplicationData(ApplicationDataScope),
     FilesystemRoot,
+    Directory(DirectoryHandle),
     File(FileHandle),
     RandomSource,
+}
+
+/// An owned, cloneable application-data namespace scope.
+///
+/// Clones share immutable validated identifier storage and remain valid after the
+/// originating handle is closed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApplicationDataScope {
+    app_id: Arc<String>,
+}
+
+impl ApplicationDataScope {
+    pub fn app_id(&self) -> &str {
+        self.app_id.as_str()
+    }
+}
+
+impl AsRef<str> for ApplicationDataScope {
+    fn as_ref(&self) -> &str {
+        self.app_id()
+    }
+}
+
+/// Scheduler-facing ownership of a waitable process object's persistent state.
+///
+/// This control is independent of the scheduler's process representation. The
+/// scheduler retains a clone while a process is live, records exactly one terminal
+/// outcome, and may then drop its clone; handle-owned clones continue to provide
+/// inspection and terminal signals until the final handle is closed.
+#[derive(Clone)]
+pub struct ProcessControl {
+    state: Arc<Spinlock<ProcessControlState>>,
+}
+
+#[derive(Clone, Copy)]
+struct ProcessControlState {
+    info: ProcessInfo,
+    terminate_requested: bool,
+}
+
+impl ProcessControl {
+    /// Creates running process state without installing a handle.
+    pub fn new() -> Result<Self, IpcError> {
+        let info = ProcessInfo {
+            state: ProcessState::Running as u32,
+            cause: ProcessTerminationCause::None as u32,
+            exit_code: 0,
+            fault: ProcessFault::None as u32,
+            fault_code: 0,
+            fault_address: 0,
+        };
+        let state = Arc::try_new(Spinlock::new(ProcessControlState {
+            info,
+            terminate_requested: false,
+        }))
+        .map_err(|_| IpcError::OutOfMemory)?;
+        Ok(Self { state })
+    }
+
+    /// Returns the stable public process snapshot without requiring a handle.
+    pub fn info(&self) -> ProcessInfo {
+        self.state.lock().info
+    }
+
+    /// Reports whether a holder of `TERMINATE` has requested scheduler teardown.
+    pub fn terminate_requested(&self) -> bool {
+        self.state.lock().terminate_requested
+    }
+
+    /// Records normal process exit unless another terminal outcome won the race.
+    pub fn mark_exited(&self, exit_code: i32) -> bool {
+        self.mark_terminal(ProcessInfo {
+            state: ProcessState::Terminated as u32,
+            cause: ProcessTerminationCause::Exited as u32,
+            exit_code,
+            fault: ProcessFault::None as u32,
+            fault_code: 0,
+            fault_address: 0,
+        })
+    }
+
+    /// Records a structured userspace fault unless the process is already terminal.
+    ///
+    /// `ProcessFault::None` is not a fault and is rejected without changing state.
+    /// A zero `fault_address` represents an unavailable or inapplicable address.
+    pub fn mark_faulted(&self, fault: ProcessFault, fault_code: u64, fault_address: u64) -> bool {
+        if fault == ProcessFault::None {
+            return false;
+        }
+        self.mark_terminal(ProcessInfo {
+            state: ProcessState::Terminated as u32,
+            cause: ProcessTerminationCause::Faulted as u32,
+            exit_code: 0,
+            fault: fault as u32,
+            fault_code,
+            fault_address,
+        })
+    }
+
+    /// Records scheduler acknowledgement of external termination.
+    pub fn mark_terminated(&self) -> bool {
+        self.mark_terminal(ProcessInfo {
+            state: ProcessState::Terminated as u32,
+            cause: ProcessTerminationCause::Terminated as u32,
+            exit_code: 0,
+            fault: ProcessFault::None as u32,
+            fault_code: 0,
+            fault_address: 0,
+        })
+    }
+
+    fn request_terminate(&self) -> bool {
+        let mut state = self.state.lock();
+        if state.info.state == ProcessState::Terminated as u32 {
+            return false;
+        }
+        state.terminate_requested = true;
+        true
+    }
+
+    fn signals(&self) -> Signals {
+        if self.state.lock().info.state == ProcessState::Terminated as u32 {
+            Signals::TERMINATED
+        } else {
+            Signals::empty()
+        }
+    }
+
+    fn mark_terminal(&self, info: ProcessInfo) -> bool {
+        let mut state = self.state.lock();
+        if state.info.state == ProcessState::Terminated as u32 {
+            return false;
+        }
+        state.info = info;
+        true
+    }
 }
 
 struct SharedMemoryObject {
@@ -524,6 +674,41 @@ impl HandleTable {
         self.len() == 0
     }
 
+    /// Creates running process control state and installs its default capability.
+    ///
+    /// The returned [`ProcessControl`] is retained by the scheduler independently
+    /// of the handle. Closing the handle does not request or cause termination.
+    pub fn process_create(&mut self) -> Result<(Handle, ProcessControl), IpcError> {
+        let process = ProcessControl::new()?;
+        let handle = self.process_install(&process)?;
+        Ok((handle, process))
+    }
+
+    /// Installs a default-rights handle for existing process control state.
+    pub fn process_install(&mut self, process: &ProcessControl) -> Result<Handle, IpcError> {
+        let object = Arc::try_new(KernelObject::Process(process.clone()))
+            .map_err(|_| IpcError::OutOfMemory)?;
+        let slot = self.reserve_slots(1)?[0];
+        Ok(self.insert_reserved(slot, object, PROCESS_DEFAULT_RIGHTS))
+    }
+
+    /// Returns persistent process status. The handle must carry [`Rights::INSPECT`].
+    pub fn process_info(&self, handle: Handle) -> Result<ProcessInfo, IpcError> {
+        let object = self.object_with_rights(handle, Rights::INSPECT)?;
+        Ok(process_control(&object)?.info())
+    }
+
+    /// Requests external process termination through a [`Rights::TERMINATE`] handle.
+    ///
+    /// This only records a request. The scheduler remains responsible for stopping
+    /// the process and calling [`ProcessControl::mark_terminated`]. Requests made
+    /// after a terminal outcome are harmless no-ops.
+    pub fn process_terminate(&self, handle: Handle) -> Result<(), IpcError> {
+        let object = self.object_with_rights(handle, Rights::TERMINATE)?;
+        process_control(&object)?.request_terminate();
+        Ok(())
+    }
+
     /// Creates a non-transferable capability authorizing kernel random bytes.
     pub fn random_source_create(&mut self) -> Result<Handle, IpcError> {
         let object = Arc::try_new(KernelObject::RandomSource).map_err(|_| IpcError::OutOfMemory)?;
@@ -539,21 +724,113 @@ impl HandleTable {
         }
     }
 
-    /// Creates a non-transferable capability for the filesystem root namespace.
-    pub fn filesystem_root_create(&mut self) -> Result<Handle, IpcError> {
-        let object =
-            Arc::try_new(KernelObject::FilesystemRoot).map_err(|_| IpcError::OutOfMemory)?;
+    /// Creates a non-transferable application-private data namespace capability.
+    ///
+    /// The identifier is independently validated against the lowercase registry
+    /// grammar and copied into bounded immutable storage.
+    pub fn application_data_create(&mut self, app_id: &str) -> Result<Handle, IpcError> {
+        if !valid_application_data_app_id(app_id) {
+            return Err(IpcError::InvalidMessage);
+        }
+        let mut owned_app_id = String::new();
+        owned_app_id
+            .try_reserve_exact(app_id.len())
+            .map_err(|_| IpcError::OutOfMemory)?;
+        owned_app_id.push_str(app_id);
+        let app_id = Arc::try_new(owned_app_id).map_err(|_| IpcError::OutOfMemory)?;
+        let object = Arc::try_new(KernelObject::ApplicationData(ApplicationDataScope {
+            app_id,
+        }))
+        .map_err(|_| IpcError::OutOfMemory)?;
         let slot = self.reserve_slots(1)?[0];
         Ok(self.insert_reserved(slot, object, Rights::READ | Rights::WRITE))
     }
 
-    /// Creates a process-local file capability with the requested read/write access.
+    /// Returns an owned clone of an application-data scope after checking rights.
+    pub fn application_data_scope(
+        &self,
+        handle: Handle,
+        required_rights: Rights,
+    ) -> Result<ApplicationDataScope, IpcError> {
+        let object = self.object_with_rights(handle, required_rights)?;
+        match object.as_ref() {
+            KernelObject::ApplicationData(scope) => Ok(scope.clone()),
+            _ => Err(IpcError::WrongObjectType),
+        }
+    }
+
+    /// Creates a non-transferable read/write capability for the filesystem root namespace.
+    pub fn filesystem_root_create(&mut self) -> Result<Handle, IpcError> {
+        self.filesystem_root_create_with_rights(Rights::READ | Rights::WRITE)
+    }
+
+    /// Creates a filesystem-root capability with explicitly bounded namespace access.
+    ///
+    /// `rights` must be a nonempty subset of `READ | WRITE | EXECUTE`. Root handles
+    /// intentionally carry neither `DUPLICATE` nor `TRANSFER` authority.
+    pub fn filesystem_root_create_with_rights(
+        &mut self,
+        rights: Rights,
+    ) -> Result<Handle, IpcError> {
+        let allowed = Rights::READ | Rights::WRITE | Rights::EXECUTE;
+        if rights.is_empty() || !allowed.contains(rights) {
+            return Err(IpcError::InvalidRights);
+        }
+        let object =
+            Arc::try_new(KernelObject::FilesystemRoot).map_err(|_| IpcError::OutOfMemory)?;
+        let slot = self.reserve_slots(1)?[0];
+        Ok(self.insert_reserved(slot, object, rights))
+    }
+
+    /// Creates a scoped directory capability with explicitly bounded authority.
+    ///
+    /// `rights` must be a nonempty subset of `READ | WRITE | DUPLICATE | TRANSFER`.
+    /// Read and write authorize directory operations; duplicate and transfer authorize
+    /// delegation and may be attenuated independently.
+    pub fn filesystem_directory_create(
+        &mut self,
+        directory: DirectoryHandle,
+        rights: Rights,
+    ) -> Result<Handle, IpcError> {
+        let allowed = Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER;
+        if rights.is_empty() || !allowed.contains(rights) {
+            return Err(IpcError::InvalidRights);
+        }
+        let object =
+            Arc::try_new(KernelObject::Directory(directory)).map_err(|_| IpcError::OutOfMemory)?;
+        let slot = self.reserve_slots(1)?[0];
+        Ok(self.insert_reserved(slot, object, rights))
+    }
+
+    /// Returns a scoped filesystem directory after checking all requested rights.
+    pub fn filesystem_directory(
+        &self,
+        handle: Handle,
+        required_rights: Rights,
+    ) -> Result<DirectoryHandle, IpcError> {
+        let object = self.object_with_rights(handle, required_rights)?;
+        match object.as_ref() {
+            KernelObject::Directory(directory) => Ok(*directory),
+            _ => Err(IpcError::WrongObjectType),
+        }
+    }
+
+    /// Creates a process-local file capability with bounded data or execution access.
+    ///
+    /// `DUPLICATE` and `TRANSFER` may accompany ordinary read/write access. Execution
+    /// requires read access and is mutually exclusive with write access, preventing a
+    /// writable executable capability from being created.
     pub fn filesystem_file_create(
         &mut self,
         file: FileHandle,
         rights: Rights,
     ) -> Result<Handle, IpcError> {
-        if rights.is_empty() || !(Rights::READ | Rights::WRITE).contains(rights) {
+        let allowed =
+            Rights::READ | Rights::WRITE | Rights::EXECUTE | Rights::DUPLICATE | Rights::TRANSFER;
+        let has_data_access = rights.intersects(Rights::READ | Rights::WRITE);
+        let invalid_execute = rights.contains(Rights::EXECUTE)
+            && (!rights.contains(Rights::READ) || rights.contains(Rights::WRITE));
+        if rights.is_empty() || !allowed.contains(rights) || !has_data_access || invalid_execute {
             return Err(IpcError::InvalidRights);
         }
         let object = Arc::try_new(KernelObject::File(file)).map_err(|_| IpcError::OutOfMemory)?;
@@ -1253,7 +1530,10 @@ impl HandleTable {
             KernelObject::SharedMemory(_) => Ok(ObjectType::SharedMemory),
             KernelObject::RandomSource => Ok(ObjectType::RandomSource),
             KernelObject::Window(_) => Ok(ObjectType::Window),
+            KernelObject::Process(_) => Ok(ObjectType::Process),
+            KernelObject::ApplicationData(_) => Ok(ObjectType::ApplicationData),
             KernelObject::FilesystemRoot => Ok(ObjectType::FilesystemRoot),
+            KernelObject::Directory(_) => Ok(ObjectType::Directory),
             KernelObject::File(_) => Ok(ObjectType::File),
         }
     }
@@ -1265,7 +1545,11 @@ impl HandleTable {
             KernelObject::Channel(endpoint) => Ok(endpoint.signals()),
             KernelObject::SharedMemory(_) | KernelObject::RandomSource => Ok(Signals::empty()),
             KernelObject::Window(endpoint) => Ok(endpoint.signals()),
-            KernelObject::FilesystemRoot | KernelObject::File(_) => Ok(Signals::empty()),
+            KernelObject::Process(process) => Ok(process.signals()),
+            KernelObject::ApplicationData(_)
+            | KernelObject::FilesystemRoot
+            | KernelObject::Directory(_)
+            | KernelObject::File(_) => Ok(Signals::empty()),
         }
     }
 
@@ -1369,41 +1653,109 @@ impl Default for HandleTable {
     }
 }
 
+/// Atomically applies an ordered batch of moves and duplicates between handle tables.
+///
+/// Every source handle must occur at most once. Moves require [`Rights::TRANSFER`],
+/// duplicates require [`Rights::DUPLICATE`], and destination rights must be subsets
+/// of the source rights. All validation and allocation, including reservation of
+/// every destination slot, completes before any source or destination entry changes.
+/// On error both tables are unchanged. Returned destination-local handles correspond
+/// one-for-one with `dispositions` in the same order.
+pub fn handle_transfer_batch_between(
+    source_table: &mut HandleTable,
+    destination_table: &mut HandleTable,
+    dispositions: &[HandleOperationDisposition],
+) -> Result<Vec<Handle>, IpcError> {
+    enum PreparedHandle {
+        Move { index: usize, rights: Rights },
+        Duplicate(HandleEntry),
+    }
+
+    let mut prepared = try_vec_with_capacity(dispositions.len())?;
+    for (position, disposition) in dispositions.iter().copied().enumerate() {
+        if dispositions[..position]
+            .iter()
+            .any(|prior| prior.handle == disposition.handle)
+        {
+            return Err(IpcError::DuplicateHandle);
+        }
+
+        let (index, _) = source_table.validated_slot(disposition.handle)?;
+        let entry = source_table.slots[index]
+            .entry
+            .as_ref()
+            .ok_or(IpcError::InvalidHandle)?;
+        let required = match disposition.operation {
+            HandleOperation::Move => Rights::TRANSFER,
+            HandleOperation::Duplicate => Rights::DUPLICATE,
+        };
+        if !entry.rights.contains(required) {
+            return Err(IpcError::AccessDenied);
+        }
+        if !entry.rights.contains(disposition.rights) {
+            return Err(IpcError::InvalidRights);
+        }
+
+        match disposition.operation {
+            HandleOperation::Move => prepared.push(PreparedHandle::Move {
+                index,
+                rights: disposition.rights,
+            }),
+            HandleOperation::Duplicate => prepared.push(PreparedHandle::Duplicate(HandleEntry {
+                object: Arc::clone(&entry.object),
+                rights: disposition.rights,
+            })),
+        }
+    }
+
+    // Allocate the result before reserving destination slots. Once reservation
+    // succeeds, the commit below only moves values into known-vacant entries.
+    let mut destination_handles = try_vec_with_capacity(dispositions.len())?;
+    let destination_slots = destination_table.reserve_slots(dispositions.len())?;
+    for (prepared, destination_index) in prepared.into_iter().zip(destination_slots) {
+        let entry = match prepared {
+            PreparedHandle::Move { index, rights } => {
+                let mut entry = source_table.slots[index]
+                    .entry
+                    .take()
+                    .expect("validated cross-table move slot became vacant");
+                source_table.slots[index].advance_generation();
+                entry.rights = rights;
+                entry
+            }
+            PreparedHandle::Duplicate(entry) => entry,
+        };
+        destination_table.slots[destination_index].entry = Some(entry);
+        destination_handles.push(handle_from_parts(
+            destination_index,
+            destination_table.slots[destination_index].generation,
+        ));
+    }
+    Ok(destination_handles)
+}
+
 /// Atomically moves one capability between process-local handle tables.
 ///
 /// The source must carry `TRANSFER`, and `rights` must be a subset of its current
 /// rights. Destination capacity is reserved before the source is consumed, so any
-/// reported error leaves the source handle unchanged.
+/// reported error leaves both tables unchanged.
 pub fn handle_move_between(
     source_table: &mut HandleTable,
     destination_table: &mut HandleTable,
     source_handle: Handle,
     rights: Rights,
 ) -> Result<Handle, IpcError> {
-    let (source_index, _) = source_table.validated_slot(source_handle)?;
-    let source_entry = source_table.slots[source_index]
-        .entry
-        .as_ref()
-        .ok_or(IpcError::InvalidHandle)?;
-    if !source_entry.rights.contains(Rights::TRANSFER) {
-        return Err(IpcError::AccessDenied);
-    }
-    if !source_entry.rights.contains(rights) {
-        return Err(IpcError::InvalidRights);
-    }
-
-    let destination_index = destination_table.reserve_slots(1)?[0];
-    let mut entry = source_table.slots[source_index]
-        .entry
-        .take()
-        .expect("validated move slot became vacant");
-    source_table.slots[source_index].advance_generation();
-    entry.rights = rights;
-    destination_table.slots[destination_index].entry = Some(entry);
-    Ok(handle_from_parts(
-        destination_index,
-        destination_table.slots[destination_index].generation,
-    ))
+    let mut handles = handle_transfer_batch_between(
+        source_table,
+        destination_table,
+        &[HandleOperationDisposition::move_handle(
+            source_handle,
+            rights,
+        )],
+    )?;
+    Ok(handles
+        .pop()
+        .expect("one successful cross-table disposition returned no handle"))
 }
 
 /// Creates one channel endpoint in each of two process-local handle tables.
@@ -1449,7 +1801,10 @@ fn channel_endpoint(object: &Arc<KernelObject>) -> Result<&ChannelEndpoint, IpcE
         KernelObject::SharedMemory(_)
         | KernelObject::RandomSource
         | KernelObject::Window(_)
+        | KernelObject::Process(_)
+        | KernelObject::ApplicationData(_)
         | KernelObject::FilesystemRoot
+        | KernelObject::Directory(_)
         | KernelObject::File(_) => Err(IpcError::WrongObjectType),
     }
 }
@@ -1460,7 +1815,10 @@ fn shared_memory_object(object: &Arc<KernelObject>) -> Result<&SharedMemoryObjec
         KernelObject::Channel(_)
         | KernelObject::RandomSource
         | KernelObject::Window(_)
+        | KernelObject::Process(_)
+        | KernelObject::ApplicationData(_)
         | KernelObject::FilesystemRoot
+        | KernelObject::Directory(_)
         | KernelObject::File(_) => Err(IpcError::WrongObjectType),
     }
 }
@@ -1471,7 +1829,24 @@ fn window_endpoint(object: &Arc<KernelObject>) -> Result<&WindowEndpoint, IpcErr
         KernelObject::Channel(_)
         | KernelObject::SharedMemory(_)
         | KernelObject::RandomSource
+        | KernelObject::Process(_)
+        | KernelObject::ApplicationData(_)
         | KernelObject::FilesystemRoot
+        | KernelObject::Directory(_)
+        | KernelObject::File(_) => Err(IpcError::WrongObjectType),
+    }
+}
+
+fn process_control(object: &Arc<KernelObject>) -> Result<&ProcessControl, IpcError> {
+    match object.as_ref() {
+        KernelObject::Process(process) => Ok(process),
+        KernelObject::Channel(_)
+        | KernelObject::SharedMemory(_)
+        | KernelObject::RandomSource
+        | KernelObject::Window(_)
+        | KernelObject::ApplicationData(_)
+        | KernelObject::FilesystemRoot
+        | KernelObject::Directory(_)
         | KernelObject::File(_) => Err(IpcError::WrongObjectType),
     }
 }
@@ -1485,6 +1860,19 @@ fn window_endpoint_for_role(
         return Err(IpcError::AccessDenied);
     }
     Ok(endpoint)
+}
+
+fn valid_application_data_app_id(app_id: &str) -> bool {
+    !app_id.is_empty()
+        && app_id.len() <= APPLICATION_DATA_MAX_APP_ID_LEN
+        && app_id.split('.').all(|component| {
+            !component.is_empty()
+                && component.as_bytes()[0].is_ascii_lowercase()
+                && component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                && !component.ends_with('-')
+        })
 }
 
 fn try_vec_with_capacity<T>(capacity: usize) -> Result<Vec<T>, IpcError> {
@@ -1604,6 +1992,197 @@ mod tests {
     use super::*;
 
     static SHARED_MEMORY_TEST_LOCK: Spinlock<()> = Spinlock::new(());
+
+    #[test]
+    fn process_default_rights_and_operations_are_independently_gated() {
+        let mut table = HandleTable::new();
+        let (process, control) = table.process_create().unwrap();
+        assert_eq!(table.object_type(process), Ok(ObjectType::Process));
+        assert_eq!(table.handle_rights(process), Ok(PROCESS_DEFAULT_RIGHTS));
+        assert_eq!(
+            PROCESS_DEFAULT_RIGHTS,
+            Rights::WAIT
+                | Rights::INSPECT
+                | Rights::TERMINATE
+                | Rights::DUPLICATE
+                | Rights::TRANSFER
+        );
+        assert_eq!(control.info().process_state(), Some(ProcessState::Running));
+        assert_eq!(
+            control.info().termination_cause(),
+            Some(ProcessTerminationCause::None)
+        );
+
+        let inspect = table.handle_duplicate(process, Rights::INSPECT).unwrap();
+        assert_eq!(table.process_info(inspect), Ok(control.info()));
+        assert_eq!(table.object_signals(inspect), Err(IpcError::AccessDenied));
+        assert_eq!(
+            table.process_terminate(inspect),
+            Err(IpcError::AccessDenied)
+        );
+
+        let wait = table.handle_duplicate(process, Rights::WAIT).unwrap();
+        assert_eq!(table.object_signals(wait), Ok(Signals::empty()));
+        assert_eq!(table.process_info(wait), Err(IpcError::AccessDenied));
+        assert_eq!(table.process_terminate(wait), Err(IpcError::AccessDenied));
+
+        let terminate = table.handle_duplicate(process, Rights::TERMINATE).unwrap();
+        assert_eq!(table.process_info(terminate), Err(IpcError::AccessDenied));
+        assert_eq!(table.object_signals(terminate), Err(IpcError::AccessDenied));
+        table.process_terminate(terminate).unwrap();
+        assert!(control.terminate_requested());
+        assert_eq!(control.info().process_state(), Some(ProcessState::Running));
+        assert_eq!(table.object_signals(process), Ok(Signals::empty()));
+
+        let (channel, _) = table.channel_create().unwrap();
+        assert_eq!(table.process_info(channel), Err(IpcError::AccessDenied));
+        assert_eq!(
+            table.process_terminate(channel),
+            Err(IpcError::AccessDenied)
+        );
+        let channel_with_process_rights = table
+            .handle_duplicate(channel, Rights::WAIT | Rights::INSPECT | Rights::TERMINATE)
+            .unwrap_err();
+        assert_eq!(channel_with_process_rights, IpcError::InvalidRights);
+    }
+
+    #[test]
+    fn process_terminal_outcomes_publish_structured_info_and_signal_once() {
+        let mut table = HandleTable::new();
+
+        let (exited, exited_control) = table.process_create().unwrap();
+        assert!(exited_control.mark_exited(-17));
+        assert_eq!(
+            table.process_info(exited).unwrap(),
+            ProcessInfo {
+                state: ProcessState::Terminated as u32,
+                cause: ProcessTerminationCause::Exited as u32,
+                exit_code: -17,
+                fault: ProcessFault::None as u32,
+                fault_code: 0,
+                fault_address: 0,
+            }
+        );
+        assert_eq!(table.object_signals(exited), Ok(Signals::TERMINATED));
+        assert!(!exited_control.mark_terminated());
+
+        let (faulted, faulted_control) = table.process_create().unwrap();
+        assert!(!faulted_control.mark_faulted(ProcessFault::None, 1, 2));
+        assert!(faulted_control.mark_faulted(ProcessFault::PageFault, 0b101, 0xdead_beef));
+        let fault = table.process_info(faulted).unwrap();
+        assert_eq!(fault.process_state(), Some(ProcessState::Terminated));
+        assert_eq!(
+            fault.termination_cause(),
+            Some(ProcessTerminationCause::Faulted)
+        );
+        assert_eq!(fault.process_fault(), Some(ProcessFault::PageFault));
+        assert_eq!(fault.exit_code, 0);
+        assert_eq!(fault.fault_code, 0b101);
+        assert_eq!(fault.fault_address, 0xdead_beef);
+        assert_eq!(table.object_signals(faulted), Ok(Signals::TERMINATED));
+
+        let (terminated, terminated_control) = table.process_create().unwrap();
+        table.process_terminate(terminated).unwrap();
+        assert!(terminated_control.terminate_requested());
+        assert_eq!(table.object_signals(terminated), Ok(Signals::empty()));
+        assert!(terminated_control.mark_terminated());
+        let info = table.process_info(terminated).unwrap();
+        assert_eq!(info.process_state(), Some(ProcessState::Terminated));
+        assert_eq!(
+            info.termination_cause(),
+            Some(ProcessTerminationCause::Terminated)
+        );
+        assert_eq!(info.process_fault(), Some(ProcessFault::None));
+        assert_eq!(table.object_signals(terminated), Ok(Signals::TERMINATED));
+        table.process_terminate(terminated).unwrap();
+        assert!(terminated_control.terminate_requested());
+    }
+
+    #[test]
+    fn process_aliases_and_channel_operations_share_one_lifecycle() {
+        let mut sender = HandleTable::new();
+        let mut receiver = HandleTable::new();
+        let (process, control) = sender.process_create().unwrap();
+        let moved = sender
+            .handle_duplicate(process, PROCESS_DEFAULT_RIGHTS)
+            .unwrap();
+        let (send, receive) = channel_create_between(&mut sender, &mut receiver).unwrap();
+        let received_rights = Rights::WAIT | Rights::INSPECT;
+        sender
+            .channel_write_with_handle_operations(
+                send,
+                b"processes",
+                &[
+                    HandleOperationDisposition::duplicate(process, received_rights),
+                    HandleOperationDisposition::move_handle(moved, received_rights),
+                ],
+            )
+            .unwrap();
+        assert_eq!(sender.object_type(process), Ok(ObjectType::Process));
+        assert_eq!(sender.object_type(moved), Err(IpcError::InvalidHandle));
+
+        let mut bytes = [0; 9];
+        let mut handles = [Handle::INVALID; 2];
+        receiver
+            .channel_read(receive, &mut bytes, &mut handles)
+            .unwrap();
+        assert_eq!(&bytes, b"processes");
+        for handle in handles {
+            assert_eq!(receiver.object_type(handle), Ok(ObjectType::Process));
+            assert_eq!(receiver.handle_rights(handle), Ok(received_rights));
+            assert_eq!(receiver.process_info(handle), Ok(control.info()));
+        }
+
+        assert!(control.mark_exited(23));
+        assert_eq!(sender.process_info(process).unwrap().exit_code, 23);
+        for handle in handles {
+            assert_eq!(receiver.process_info(handle).unwrap().exit_code, 23);
+            assert_eq!(receiver.object_signals(handle), Ok(Signals::TERMINATED));
+        }
+    }
+
+    #[test]
+    fn process_info_persists_after_scheduler_control_is_retired() {
+        let mut table = HandleTable::new();
+        let (process, control) = table.process_create().unwrap();
+        assert!(control.mark_faulted(ProcessFault::InvalidOpcode, 6, 0));
+        drop(control);
+
+        let info = table.process_info(process).unwrap();
+        assert_eq!(info.process_state(), Some(ProcessState::Terminated));
+        assert_eq!(
+            info.termination_cause(),
+            Some(ProcessTerminationCause::Faulted)
+        );
+        assert_eq!(info.process_fault(), Some(ProcessFault::InvalidOpcode));
+        assert_eq!(info.fault_code, 6);
+        assert_eq!(table.object_signals(process), Ok(Signals::TERMINATED));
+    }
+
+    #[test]
+    fn closing_the_last_process_handle_does_not_request_or_cause_termination() {
+        let control = ProcessControl::new().unwrap();
+        {
+            let mut table = HandleTable::new();
+            let first = table.process_install(&control).unwrap();
+            let second = table.process_install(&control).unwrap();
+            table.handle_close(first).unwrap();
+            table.handle_close(second).unwrap();
+            assert!(table.is_empty());
+        }
+
+        assert!(!control.terminate_requested());
+        assert_eq!(control.info().process_state(), Some(ProcessState::Running));
+        assert_eq!(
+            control.info().termination_cause(),
+            Some(ProcessTerminationCause::None)
+        );
+        assert!(control.mark_exited(0));
+        assert_eq!(
+            control.info().process_state(),
+            Some(ProcessState::Terminated)
+        );
+    }
 
     #[test]
     fn shared_memory_backing_is_page_aligned_rounded_zeroed_and_map_gated() {
@@ -1812,6 +2391,414 @@ mod tests {
             Err(IpcError::WrongObjectType)
         );
         assert_eq!(IpcError::OutOfMemory.status(), Status::OutOfMemory);
+    }
+
+    #[test]
+    fn application_data_capabilities_own_validated_scopes_with_exact_rights() {
+        let mut table = HandleTable::new();
+        let mut supplied_id = String::from("tools.paint-2");
+        let application_data = table.application_data_create(&supplied_id).unwrap();
+        supplied_id.clear();
+
+        assert_eq!(
+            table.object_type(application_data),
+            Ok(ObjectType::ApplicationData)
+        );
+        assert_eq!(
+            table.handle_rights(application_data),
+            Ok(Rights::READ | Rights::WRITE)
+        );
+        for rights in [Rights::READ, Rights::WRITE, Rights::READ | Rights::WRITE] {
+            let scope = table
+                .application_data_scope(application_data, rights)
+                .unwrap();
+            assert_eq!(scope.app_id(), "tools.paint-2");
+            assert_eq!(scope.as_ref(), "tools.paint-2");
+        }
+        assert_eq!(
+            table.application_data_scope(application_data, Rights::EXECUTE),
+            Err(IpcError::AccessDenied)
+        );
+
+        let retained = table
+            .application_data_scope(application_data, Rights::READ)
+            .unwrap();
+        table.handle_close(application_data).unwrap();
+        assert_eq!(retained.app_id(), "tools.paint-2");
+    }
+
+    #[test]
+    fn application_data_scopes_are_independent_and_nontransferable() {
+        let mut source = HandleTable::new();
+        let mut destination = HandleTable::new();
+        let alpha = source.application_data_create("alpha.editor").unwrap();
+        let beta = source.application_data_create("beta.editor").unwrap();
+        let alpha_scope = source.application_data_scope(alpha, Rights::READ).unwrap();
+        let beta_scope = source.application_data_scope(beta, Rights::READ).unwrap();
+        assert_ne!(alpha_scope, beta_scope);
+        assert_eq!(alpha_scope.app_id(), "alpha.editor");
+        assert_eq!(beta_scope.app_id(), "beta.editor");
+
+        assert_eq!(
+            source.handle_duplicate(alpha, Rights::READ),
+            Err(IpcError::AccessDenied)
+        );
+        assert_eq!(
+            handle_move_between(&mut source, &mut destination, alpha, Rights::READ),
+            Err(IpcError::AccessDenied)
+        );
+        assert!(destination.is_empty());
+        assert_eq!(source.object_type(alpha), Ok(ObjectType::ApplicationData));
+
+        let (send, receive) = source.channel_create().unwrap();
+        assert_eq!(
+            source.channel_write(send, b"scope", &[beta]),
+            Err(IpcError::AccessDenied)
+        );
+        assert_eq!(source.object_type(beta), Ok(ObjectType::ApplicationData));
+        assert_eq!(
+            source.channel_read(receive, &mut [], &mut []),
+            Err(IpcError::ShouldWait)
+        );
+
+        let root = source.filesystem_root_create().unwrap();
+        assert_eq!(
+            source.application_data_scope(root, Rights::READ),
+            Err(IpcError::WrongObjectType)
+        );
+    }
+
+    #[test]
+    fn application_data_creation_rejects_invalid_or_unbounded_app_ids() {
+        let mut table = HandleTable::new();
+        let maximum = "a".repeat(APPLICATION_DATA_MAX_APP_ID_LEN);
+        let maximum_handle = table.application_data_create(&maximum).unwrap();
+        assert_eq!(
+            table
+                .application_data_scope(maximum_handle, Rights::READ)
+                .unwrap()
+                .app_id(),
+            maximum
+        );
+
+        let oversized = "a".repeat(APPLICATION_DATA_MAX_APP_ID_LEN + 1);
+        for app_id in [
+            "",
+            ".alpha",
+            "alpha.",
+            "alpha..beta",
+            "Alpha",
+            "alpha_Beta",
+            "alpha-beta-",
+            "-alpha",
+            "alpha/beta",
+            "alpha\\beta",
+            "alpha:beta",
+            "alpha beta",
+            "alpha\0beta",
+            "álpha",
+            oversized.as_str(),
+        ] {
+            assert_eq!(
+                table.application_data_create(app_id),
+                Err(IpcError::InvalidMessage),
+                "accepted invalid application ID {app_id:?}"
+            );
+        }
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn filesystem_directory_creation_reports_type_and_enforces_bounded_rights() {
+        let mut filesystem = ginkgo_filesystem::RedoxFs::new().unwrap();
+        let root = filesystem.root_directory().unwrap();
+        let directory = filesystem.create_directory_at(root, "scoped").unwrap();
+        let mut table = HandleTable::new();
+
+        for rights in [
+            Rights::READ,
+            Rights::WRITE,
+            Rights::DUPLICATE,
+            Rights::TRANSFER,
+            Rights::READ | Rights::WRITE,
+            Rights::READ | Rights::DUPLICATE | Rights::TRANSFER,
+            Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER,
+        ] {
+            let handle = table
+                .filesystem_directory_create(directory, rights)
+                .unwrap();
+            assert_eq!(table.object_type(handle), Ok(ObjectType::Directory));
+            assert_eq!(table.handle_rights(handle), Ok(rights));
+            assert_eq!(table.filesystem_directory(handle, rights), Ok(directory));
+        }
+
+        let read_only = table
+            .filesystem_directory_create(directory, Rights::READ)
+            .unwrap();
+        assert_eq!(
+            table.filesystem_directory(read_only, Rights::WRITE),
+            Err(IpcError::AccessDenied)
+        );
+        for rights in [
+            Rights::empty(),
+            Rights::WAIT,
+            Rights::EXECUTE,
+            Rights::READ | Rights::WAIT,
+            Rights::WRITE | Rights::MANAGE,
+        ] {
+            assert_eq!(
+                table.filesystem_directory_create(directory, rights),
+                Err(IpcError::InvalidRights)
+            );
+        }
+    }
+
+    #[test]
+    fn filesystem_directory_delegation_attenuates_and_transfers_as_a_graph_leaf() {
+        let mut filesystem = ginkgo_filesystem::RedoxFs::new().unwrap();
+        let root = filesystem.root_directory().unwrap();
+        let directory = filesystem.create_directory_at(root, "delegated").unwrap();
+        let mut source = HandleTable::new();
+        let mut destination = HandleTable::new();
+        let full_rights = Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER;
+        let parent = source
+            .filesystem_directory_create(directory, full_rights)
+            .unwrap();
+        let delegated = source
+            .handle_duplicate(parent, Rights::READ | Rights::TRANSFER)
+            .unwrap();
+        assert_eq!(source.handle_rights(parent), Ok(full_rights));
+        assert_eq!(
+            source.handle_rights(delegated),
+            Ok(Rights::READ | Rights::TRANSFER)
+        );
+
+        let (send, receive) = channel_create_between(&mut source, &mut destination).unwrap();
+        source
+            .channel_write_with_dispositions(
+                send,
+                b"directory",
+                &[HandleDisposition::new(delegated, Rights::READ)],
+            )
+            .unwrap();
+        assert_eq!(source.object_type(delegated), Err(IpcError::InvalidHandle));
+        assert_eq!(source.object_type(parent), Ok(ObjectType::Directory));
+
+        let mut bytes = [0; 9];
+        let mut handles = [Handle::INVALID; 1];
+        destination
+            .channel_read(receive, &mut bytes, &mut handles)
+            .unwrap();
+        assert_eq!(&bytes, b"directory");
+        let received = handles[0];
+        assert_eq!(destination.object_type(received), Ok(ObjectType::Directory));
+        assert_eq!(destination.handle_rights(received), Ok(Rights::READ));
+        let received_directory = destination
+            .filesystem_directory(received, Rights::READ)
+            .unwrap();
+        assert_eq!(received_directory, directory);
+        assert!(filesystem
+            .list_directory(received_directory)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            destination.handle_duplicate(received, Rights::READ),
+            Err(IpcError::AccessDenied)
+        );
+    }
+
+    #[test]
+    fn filesystem_directory_access_rejects_other_object_kinds() {
+        let mut filesystem = ginkgo_filesystem::RedoxFs::new().unwrap();
+        let directory = filesystem.root_directory().unwrap();
+        let file = filesystem.create_file_at(directory, "file").unwrap();
+        let mut table = HandleTable::new();
+        let directory_handle = table
+            .filesystem_directory_create(directory, Rights::READ)
+            .unwrap();
+        let root_handle = table.filesystem_root_create().unwrap();
+        let file_handle = table.filesystem_file_create(file, Rights::READ).unwrap();
+        let application_data = table.application_data_create("directory.test").unwrap();
+
+        assert_eq!(
+            table.filesystem_directory(root_handle, Rights::READ),
+            Err(IpcError::WrongObjectType)
+        );
+        assert_eq!(
+            table.filesystem_directory(file_handle, Rights::READ),
+            Err(IpcError::WrongObjectType)
+        );
+        assert_eq!(
+            table.filesystem_directory(application_data, Rights::READ),
+            Err(IpcError::WrongObjectType)
+        );
+        assert_eq!(
+            table.filesystem_root(directory_handle, Rights::READ),
+            Err(IpcError::WrongObjectType)
+        );
+        assert_eq!(
+            table.filesystem_file(directory_handle, Rights::READ),
+            Err(IpcError::WrongObjectType)
+        );
+        assert_eq!(
+            table.object_type(root_handle),
+            Ok(ObjectType::FilesystemRoot)
+        );
+        assert_eq!(
+            table.object_type(application_data),
+            Ok(ObjectType::ApplicationData)
+        );
+    }
+
+    #[test]
+    fn filesystem_root_creation_bounds_explicit_rights_and_preserves_default() {
+        let mut table = HandleTable::new();
+        let default_root = table.filesystem_root_create().unwrap();
+        assert_eq!(
+            table.handle_rights(default_root),
+            Ok(Rights::READ | Rights::WRITE)
+        );
+        assert_eq!(
+            table.object_type(default_root),
+            Ok(ObjectType::FilesystemRoot)
+        );
+        assert_eq!(
+            table.filesystem_root(default_root, Rights::READ | Rights::WRITE),
+            Ok(())
+        );
+        assert_eq!(
+            table.filesystem_root(default_root, Rights::EXECUTE),
+            Err(IpcError::AccessDenied)
+        );
+        let mut destination = HandleTable::new();
+        assert_eq!(
+            handle_move_between(&mut table, &mut destination, default_root, Rights::READ,),
+            Err(IpcError::AccessDenied)
+        );
+        assert_eq!(
+            table.object_type(default_root),
+            Ok(ObjectType::FilesystemRoot)
+        );
+        assert!(destination.is_empty());
+
+        for rights in [
+            Rights::READ,
+            Rights::WRITE,
+            Rights::EXECUTE,
+            Rights::READ | Rights::EXECUTE,
+            Rights::READ | Rights::WRITE | Rights::EXECUTE,
+        ] {
+            let root = table.filesystem_root_create_with_rights(rights).unwrap();
+            assert_eq!(table.handle_rights(root), Ok(rights));
+            assert_eq!(table.filesystem_root(root, rights), Ok(()));
+            assert_eq!(
+                table.handle_duplicate(root, rights),
+                Err(IpcError::AccessDenied)
+            );
+        }
+
+        for rights in [
+            Rights::empty(),
+            Rights::DUPLICATE,
+            Rights::TRANSFER,
+            Rights::READ | Rights::DUPLICATE,
+            Rights::EXECUTE | Rights::TRANSFER,
+            Rights::READ | Rights::WRITE | Rights::EXECUTE | Rights::WAIT,
+        ] {
+            assert_eq!(
+                table.filesystem_root_create_with_rights(rights),
+                Err(IpcError::InvalidRights)
+            );
+        }
+    }
+
+    #[test]
+    fn filesystem_file_creation_supports_read_only_executable_transfer() {
+        let mut filesystem = ginkgo_filesystem::RedoxFs::new().unwrap();
+        let file = filesystem.create("/ipc-executable-rights").unwrap();
+        let mut source = HandleTable::new();
+        let mut destination = HandleTable::new();
+
+        for rights in [
+            Rights::READ,
+            Rights::WRITE,
+            Rights::READ | Rights::WRITE,
+            Rights::READ | Rights::DUPLICATE,
+            Rights::WRITE | Rights::TRANSFER,
+        ] {
+            let handle = source.filesystem_file_create(file, rights).unwrap();
+            assert_eq!(source.handle_rights(handle), Ok(rights));
+            assert_eq!(source.filesystem_file(handle, rights), Ok(file));
+            assert_eq!(source.object_type(handle), Ok(ObjectType::File));
+        }
+
+        let executable_rights =
+            Rights::READ | Rights::EXECUTE | Rights::DUPLICATE | Rights::TRANSFER;
+        let executable = source
+            .filesystem_file_create(file, executable_rights)
+            .unwrap();
+        assert_eq!(source.handle_rights(executable), Ok(executable_rights));
+        assert_eq!(
+            source.filesystem_file(executable, Rights::READ | Rights::EXECUTE),
+            Ok(file)
+        );
+        assert_eq!(
+            source.filesystem_file(executable, Rights::WRITE),
+            Err(IpcError::AccessDenied)
+        );
+
+        let transferred_source = source
+            .handle_duplicate(
+                executable,
+                Rights::READ | Rights::EXECUTE | Rights::TRANSFER,
+            )
+            .unwrap();
+        let transferred = handle_move_between(
+            &mut source,
+            &mut destination,
+            transferred_source,
+            Rights::READ | Rights::EXECUTE,
+        )
+        .unwrap();
+        assert_eq!(
+            source.object_type(transferred_source),
+            Err(IpcError::InvalidHandle)
+        );
+        assert_eq!(destination.object_type(transferred), Ok(ObjectType::File));
+        assert_eq!(
+            destination.handle_rights(transferred),
+            Ok(Rights::READ | Rights::EXECUTE)
+        );
+        assert_eq!(
+            destination.filesystem_file(transferred, Rights::EXECUTE),
+            Ok(file)
+        );
+        assert_eq!(source.object_type(executable), Ok(ObjectType::File));
+    }
+
+    #[test]
+    fn filesystem_file_creation_rejects_invalid_and_writable_execute_rights() {
+        let mut filesystem = ginkgo_filesystem::RedoxFs::new().unwrap();
+        let file = filesystem.create("/ipc-invalid-execute-rights").unwrap();
+        let mut table = HandleTable::new();
+
+        for rights in [
+            Rights::empty(),
+            Rights::DUPLICATE,
+            Rights::TRANSFER,
+            Rights::DUPLICATE | Rights::TRANSFER,
+            Rights::EXECUTE,
+            Rights::EXECUTE | Rights::DUPLICATE | Rights::TRANSFER,
+            Rights::WRITE | Rights::EXECUTE,
+            Rights::READ | Rights::WRITE | Rights::EXECUTE,
+            Rights::READ | Rights::EXECUTE | Rights::WAIT,
+        ] {
+            assert_eq!(
+                table.filesystem_file_create(file, rights),
+                Err(IpcError::InvalidRights)
+            );
+        }
+        assert!(table.is_empty());
     }
 
     #[test]
@@ -2703,6 +3690,232 @@ mod tests {
         assert_eq!(
             source.handle_rights(without_transfer),
             Ok(Rights::READ | Rights::WRITE | Rights::WAIT)
+        );
+    }
+
+    #[test]
+    fn cross_table_batch_mixes_moves_and_duplicates_in_disposition_order() {
+        let mut source = HandleTable::new();
+        let mut destination = HandleTable::new();
+        let (process, control) = source.process_create().unwrap();
+        let memory = source.shared_memory_create(8).unwrap();
+        source.shared_memory_write(memory, 0, b"retained").unwrap();
+        let (channel, peer) = source.channel_create().unwrap();
+        let process_rights = Rights::WAIT | Rights::INSPECT;
+        let memory_rights = Rights::READ;
+        let channel_rights = Rights::READ | Rights::WAIT;
+
+        let handles = handle_transfer_batch_between(
+            &mut source,
+            &mut destination,
+            &[
+                HandleOperationDisposition::duplicate(process, process_rights),
+                HandleOperationDisposition::move_handle(memory, memory_rights),
+                HandleOperationDisposition::duplicate(channel, channel_rights),
+            ],
+        )
+        .unwrap();
+        assert_eq!(handles.len(), 3);
+        assert_eq!(destination.object_type(handles[0]), Ok(ObjectType::Process));
+        assert_eq!(
+            destination.object_type(handles[1]),
+            Ok(ObjectType::SharedMemory)
+        );
+        assert_eq!(destination.object_type(handles[2]), Ok(ObjectType::Channel));
+        assert_eq!(destination.handle_rights(handles[0]), Ok(process_rights));
+        assert_eq!(destination.handle_rights(handles[1]), Ok(memory_rights));
+        assert_eq!(destination.handle_rights(handles[2]), Ok(channel_rights));
+
+        assert_eq!(source.object_type(process), Ok(ObjectType::Process));
+        assert_eq!(source.object_type(memory), Err(IpcError::InvalidHandle));
+        assert_eq!(source.object_type(channel), Ok(ObjectType::Channel));
+        assert!(control.mark_exited(31));
+        assert_eq!(destination.process_info(handles[0]).unwrap().exit_code, 31);
+        assert_eq!(
+            destination.object_signals(handles[0]),
+            Ok(Signals::TERMINATED)
+        );
+
+        let mut stored = [0; 8];
+        destination
+            .shared_memory_read(handles[1], 0, &mut stored)
+            .unwrap();
+        assert_eq!(&stored, b"retained");
+        source.channel_write(peer, b"alias", &[]).unwrap();
+        let mut message = [0; 5];
+        destination
+            .channel_read(handles[2], &mut message, &mut [])
+            .unwrap();
+        assert_eq!(&message, b"alias");
+    }
+
+    #[test]
+    fn cross_table_batch_validation_errors_leave_both_tables_unchanged() {
+        {
+            let mut source = HandleTable::new();
+            let mut destination = HandleTable::new();
+            let (process, _) = source.process_create().unwrap();
+            let sentinel = destination.random_source_create().unwrap();
+            let source_len = source.len();
+            let destination_len = destination.len();
+            assert_eq!(
+                handle_transfer_batch_between(
+                    &mut source,
+                    &mut destination,
+                    &[
+                        HandleOperationDisposition::move_handle(process, Rights::INSPECT),
+                        HandleOperationDisposition::duplicate(
+                            Handle::from_raw(u32::MAX),
+                            Rights::empty(),
+                        ),
+                    ],
+                ),
+                Err(IpcError::InvalidHandle)
+            );
+            assert_eq!(source.len(), source_len);
+            assert_eq!(destination.len(), destination_len);
+            assert_eq!(source.handle_rights(process), Ok(PROCESS_DEFAULT_RIGHTS));
+            assert_eq!(
+                destination.object_type(sentinel),
+                Ok(ObjectType::RandomSource)
+            );
+        }
+
+        {
+            let mut source = HandleTable::new();
+            let mut destination = HandleTable::new();
+            let (process, _) = source.process_create().unwrap();
+            let sentinel = destination.random_source_create().unwrap();
+            assert_eq!(
+                handle_transfer_batch_between(
+                    &mut source,
+                    &mut destination,
+                    &[
+                        HandleOperationDisposition::move_handle(process, Rights::INSPECT),
+                        HandleOperationDisposition::duplicate(process, Rights::WAIT),
+                    ],
+                ),
+                Err(IpcError::DuplicateHandle)
+            );
+            assert_eq!(source.handle_rights(process), Ok(PROCESS_DEFAULT_RIGHTS));
+            assert_eq!(source.len(), 1);
+            assert_eq!(destination.len(), 1);
+            assert_eq!(
+                destination.object_type(sentinel),
+                Ok(ObjectType::RandomSource)
+            );
+        }
+
+        {
+            let mut source = HandleTable::new();
+            let mut destination = HandleTable::new();
+            let (process, _) = source.process_create().unwrap();
+            let sentinel = destination.random_source_create().unwrap();
+            assert_eq!(
+                handle_transfer_batch_between(
+                    &mut source,
+                    &mut destination,
+                    &[HandleOperationDisposition::duplicate(
+                        process,
+                        PROCESS_DEFAULT_RIGHTS | Rights::READ,
+                    )],
+                ),
+                Err(IpcError::InvalidRights)
+            );
+            assert_eq!(source.handle_rights(process), Ok(PROCESS_DEFAULT_RIGHTS));
+            assert_eq!(source.len(), 1);
+            assert_eq!(destination.len(), 1);
+            assert_eq!(
+                destination.object_type(sentinel),
+                Ok(ObjectType::RandomSource)
+            );
+        }
+
+        {
+            let mut source = HandleTable::new();
+            let mut destination = HandleTable::new();
+            let (process, _) = source.process_create().unwrap();
+            let no_transfer = source
+                .handle_duplicate(process, Rights::WAIT | Rights::INSPECT | Rights::DUPLICATE)
+                .unwrap();
+            let no_duplicate = source
+                .handle_duplicate(process, Rights::WAIT | Rights::INSPECT | Rights::TRANSFER)
+                .unwrap();
+            let sentinel = destination.random_source_create().unwrap();
+            assert_eq!(
+                handle_transfer_batch_between(
+                    &mut source,
+                    &mut destination,
+                    &[HandleOperationDisposition::move_handle(
+                        no_transfer,
+                        Rights::INSPECT,
+                    )],
+                ),
+                Err(IpcError::AccessDenied)
+            );
+            assert_eq!(
+                handle_transfer_batch_between(
+                    &mut source,
+                    &mut destination,
+                    &[HandleOperationDisposition::duplicate(
+                        no_duplicate,
+                        Rights::INSPECT,
+                    )],
+                ),
+                Err(IpcError::AccessDenied)
+            );
+            assert_eq!(
+                source.handle_rights(no_transfer),
+                Ok(Rights::WAIT | Rights::INSPECT | Rights::DUPLICATE)
+            );
+            assert_eq!(
+                source.handle_rights(no_duplicate),
+                Ok(Rights::WAIT | Rights::INSPECT | Rights::TRANSFER)
+            );
+            assert_eq!(source.len(), 3);
+            assert_eq!(destination.len(), 1);
+            assert_eq!(
+                destination.object_type(sentinel),
+                Ok(ObjectType::RandomSource)
+            );
+        }
+    }
+
+    #[test]
+    fn cross_table_batch_destination_exhaustion_rolls_back_every_operation() {
+        let mut source = HandleTable::new();
+        let mut destination = HandleTable::new();
+        let (process, _) = source.process_create().unwrap();
+        let memory = source.shared_memory_create(4).unwrap();
+        let process_rights = source.handle_rights(process).unwrap();
+        let memory_rights = source.handle_rights(memory).unwrap();
+        let mut first_destination = Handle::INVALID;
+        for index in 0..(HANDLE_TABLE_CAPACITY - 1) {
+            let handle = destination.random_source_create().unwrap();
+            if index == 0 {
+                first_destination = handle;
+            }
+        }
+        assert_eq!(destination.len(), HANDLE_TABLE_CAPACITY - 1);
+
+        assert_eq!(
+            handle_transfer_batch_between(
+                &mut source,
+                &mut destination,
+                &[
+                    HandleOperationDisposition::move_handle(process, Rights::INSPECT),
+                    HandleOperationDisposition::duplicate(memory, Rights::READ),
+                ],
+            ),
+            Err(IpcError::HandleTableFull)
+        );
+        assert_eq!(source.handle_rights(process), Ok(process_rights));
+        assert_eq!(source.handle_rights(memory), Ok(memory_rights));
+        assert_eq!(source.len(), 2);
+        assert_eq!(destination.len(), HANDLE_TABLE_CAPACITY - 1);
+        assert_eq!(
+            destination.object_type(first_destination),
+            Ok(ObjectType::RandomSource)
         );
     }
 

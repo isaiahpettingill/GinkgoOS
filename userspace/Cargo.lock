@@ -199,6 +199,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ginkgo-app-package"
+version = "0.1.0"
+dependencies = [
+ "hmac-sha256",
+]
+
+[[package]]
 name = "ginkgo-desktop"
 version = "0.1.0"
 dependencies = [
@@ -283,6 +290,7 @@ dependencies = [
 name = "ginkgo-terminal"
 version = "0.1.0"
 dependencies = [
+ "ginkgo-app-package",
  "ginkgo-graphics",
  "ginkgo-runtime",
  "ginkgo-terminal-protocol",
@@ -328,6 +336,12 @@ dependencies = [
  "equivalent",
  "foldhash",
 ]
+
+[[package]]
+name = "hmac-sha256"
+version = "1.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec9d92d097f4749b64e8cc33d924d9f40a2d4eb91402b458014b781f5733d60f"
 
 [[package]]
 name = "js-sys"
