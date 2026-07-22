@@ -28,9 +28,10 @@ use ginkgo_filesystem::RedoxFs;
 use ginkgo_hid::{ApplicationKind, Axis, InputEvent, AXIS_MAX, AXIS_MIN};
 use ginkgo_ipc::IpcError;
 use ginkgo_kernel::{
+    ahci::{AhciDisk, AhciError},
     arch::{self, CpuPrivilegeState, ExternalInterruptState, KernelExit, PrivilegeStackTops},
-    ata::AtaPioDisk,
     audio::AudioDevice,
+    block::{BlockDevice, Volume, SECTOR_SIZE},
     desktop_runtime::{DesktopBroker, DesktopBrokerError, DesktopRuntimeEvent},
     entropy::EntropyPool,
     input::{DeviceInputEvent, InputManager},
@@ -47,6 +48,7 @@ use ginkgo_kernel::{
     task::{Scheduler, TaskPoll, TaskState},
     trust::TrustedManifest,
     usb::{self, UsbError},
+    virtio_blk::{VirtioBlk, VirtioBlkError},
 };
 use ginkgo_program_registry::{EntryFlags, Registry};
 use ginkgo_window::{
@@ -115,6 +117,64 @@ const TERMINAL_PATH: &str = "/terminal.elf";
 const PROGRAM_REGISTRY_PATH: &str = "/programs.gkr";
 const MAX_EXECUTABLE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LAUNCHER_PROGRAMS: usize = 6;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StorageError {
+    Virtio(VirtioBlkError),
+    Ahci(AhciError),
+}
+
+enum StorageDisk {
+    Virtio(VirtioBlk),
+    Ahci(AhciDisk),
+}
+
+impl BlockDevice for StorageDisk {
+    type Error = StorageError;
+
+    fn capacity_sectors(&self) -> u64 {
+        match self {
+            Self::Virtio(disk) => disk.capacity_sectors(),
+            Self::Ahci(disk) => disk.capacity_sectors(),
+        }
+    }
+
+    fn read_sectors(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), Self::Error> {
+        match self {
+            Self::Virtio(disk) => disk.read_sectors(lba, buffer).map_err(StorageError::Virtio),
+            Self::Ahci(disk) => disk.read_sectors(lba, buffer).map_err(StorageError::Ahci),
+        }
+    }
+
+    fn write_sectors(&mut self, lba: u64, buffer: &[u8]) -> Result<(), Self::Error> {
+        match self {
+            Self::Virtio(disk) => disk
+                .write_sectors(lba, buffer)
+                .map_err(StorageError::Virtio),
+            Self::Ahci(disk) => disk.write_sectors(lba, buffer).map_err(StorageError::Ahci),
+        }
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        match self {
+            Self::Virtio(disk) => disk.flush().map_err(StorageError::Virtio),
+            Self::Ahci(disk) => disk.flush().map_err(StorageError::Ahci),
+        }
+    }
+}
+
+fn volume_is_blank<D: BlockDevice>(volume: &mut Volume<D>) -> bool {
+    let mut sector = [0_u8; SECTOR_SIZE];
+    let sectors = redoxfs::BLOCK_SIZE as usize / SECTOR_SIZE;
+    for lba in 0..sectors {
+        if volume.read_sectors(lba as u64, &mut sector).is_err()
+            || sector.iter().any(|byte| *byte != 0)
+        {
+            return false;
+        }
+    }
+    true
+}
 
 #[derive(Clone, Copy)]
 struct ProgramSummary {
@@ -331,18 +391,31 @@ pub extern "C" fn _start() -> ! {
             }
         };
     usb::configure_timestamp_frequency(Some(tsc_frequency));
-    let Ok(mut disk) = (unsafe { AtaPioDisk::primary_master() }) else {
-        ui.render_boot_log(&mut screen, "ata: persistent disk unavailable");
+    let storage = match unsafe { VirtioBlk::initialize(&mut frames, hhdm.offset) } {
+        Ok(disk) => {
+            ui.render_boot_log(&mut screen, "storage: virtio-blk online");
+            StorageDisk::Virtio(disk)
+        }
+        Err(_) => match unsafe { AhciDisk::initialize(&mut page_table, &mut frames) } {
+            Ok(disk) => {
+                ui.render_boot_log(&mut screen, "storage: AHCI/SATA online");
+                StorageDisk::Ahci(disk)
+            }
+            Err(_) => {
+                ui.render_boot_log(&mut screen, "storage: no virtio-blk or AHCI disk");
+                halt_forever();
+            }
+        },
+    };
+    let Ok(mut volume) = Volume::discover(storage) else {
+        ui.render_boot_log(&mut screen, "storage: invalid partition table");
         halt_forever();
     };
-    let Ok(blank_disk) = disk.is_blank() else {
-        ui.render_boot_log(&mut screen, "ata: persistent disk read failed");
-        halt_forever();
-    };
+    let blank_disk = volume_is_blank(&mut volume);
     let fs_result = if blank_disk {
-        RedoxFs::format_disk(disk)
+        RedoxFs::format_disk(volume)
     } else {
-        RedoxFs::open_disk(disk)
+        RedoxFs::open_disk(volume)
     };
     let Ok(mut fs) = fs_result else {
         ui.render_boot_log(&mut screen, "redoxfs: persistent disk mount failed");
@@ -638,7 +711,7 @@ struct KernelContext {
     frames: UsableFrameAllocator<'static>,
     page_table: ActivePageTable,
     hhdm_offset: u64,
-    fs: RedoxFs<AtaPioDisk>,
+    fs: RedoxFs<Volume<StorageDisk>>,
     serial: Option<SerialPort>,
     input: Option<InputManager>,
     audio: Option<AudioDevice>,

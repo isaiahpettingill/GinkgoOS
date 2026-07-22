@@ -2,9 +2,11 @@
 
 extern crate alloc;
 
+pub mod ahci;
 pub mod arch;
 pub mod ata;
 pub mod audio;
+pub mod block;
 pub mod compositor;
 pub mod desktop_runtime;
 pub mod elf;
@@ -21,3 +23,4 @@ pub mod syscall;
 pub mod task;
 pub mod trust;
 pub mod usb;
+pub mod virtio_blk;

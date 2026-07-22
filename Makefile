@@ -26,6 +26,7 @@ OVMF_URL := https://github.com/osdev0/edk2-ovmf-stable-bins/releases/latest/down
 OVMF_CODE := $(OVMF_DIR)/ovmf-code-x86_64.fd
 
 XORRISO ?= xorriso
+PYTHON ?= python3
 ifeq ($(OS),Windows_NT)
 WINDOWS_USERPROFILE := $(subst \,/,$(USERPROFILE))
 SCOOP_ROOT ?= $(if $(SCOOP),$(subst \,/,$(SCOOP)),$(WINDOWS_USERPROFILE)/scoop)
@@ -73,16 +74,16 @@ $(ISO): kernel $(LIMINE_DIR)/BOOTX64.EFI limine.conf
 		-efi-boot-part --efi-boot-image --protective-msdos-label \
 		$(ISO_ROOT) -o $(ISO)
 
-$(FS_IMAGE):
+$(FS_IMAGE): tools/create_gpt_disk.py
 	mkdir -p $(BUILD_DIR)
-	dd if=/dev/zero of=$(FS_IMAGE) bs=1M count=$(FS_IMAGE_SIZE_MB)
+	$(PYTHON) tools/create_gpt_disk.py $(FS_IMAGE) --size-mb $(FS_IMAGE_SIZE_MB)
 
 qemu: $(OVMF_CODE) $(FS_IMAGE)
 	@test -f $(ISO) || { echo "Missing $(ISO); create it first with 'make iso' (WSL is supported)."; exit 1; }
 	"$(QEMU)" $(QEMU_FLAGS) \
 		-drive if=pflash,unit=0,format=raw,file=$(OVMF_CODE),readonly=on \
 		-drive if=none,id=ginkgo-fs,format=raw,cache=writethrough,file=$(FS_IMAGE) \
-		-device ide-hd,drive=ginkgo-fs,bus=ide.0,unit=0 \
+		-device virtio-blk-pci,disable-modern=on,drive=ginkgo-fs \
 		-cdrom $(ISO) -boot d
 
 no-iso: kernel $(LIMINE_DIR)/BOOTX64.EFI $(OVMF_CODE) $(FS_IMAGE) limine.conf
@@ -94,7 +95,7 @@ no-iso: kernel $(LIMINE_DIR)/BOOTX64.EFI $(OVMF_CODE) $(FS_IMAGE) limine.conf
 	"$(QEMU)" $(QEMU_FLAGS) \
 		-drive if=pflash,unit=0,format=raw,file=$(OVMF_CODE),readonly=on \
 		-drive if=none,id=ginkgo-fs,format=raw,cache=writethrough,file=$(FS_IMAGE) \
-		-device ide-hd,drive=ginkgo-fs,bus=ide.0,unit=0 \
+		-device virtio-blk-pci,disable-modern=on,drive=ginkgo-fs \
 		-drive if=none,id=ginkgo-boot,format=raw,file=fat:rw:$(NO_ISO_ROOT) \
 		-device ide-hd,drive=ginkgo-boot,bus=ide.1,unit=0 -boot c
 
@@ -102,7 +103,7 @@ run: $(OVMF_CODE) $(ISO) $(FS_IMAGE)
 	"$(QEMU)" $(QEMU_FLAGS) \
 		-drive if=pflash,unit=0,format=raw,file=$(OVMF_CODE),readonly=on \
 		-drive if=none,id=ginkgo-fs,format=raw,cache=writethrough,file=$(FS_IMAGE) \
-		-device ide-hd,drive=ginkgo-fs,bus=ide.0,unit=0 \
+		-device virtio-blk-pci,disable-modern=on,drive=ginkgo-fs \
 		-cdrom $(ISO) -boot d
 
 check: userspace

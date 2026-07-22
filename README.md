@@ -25,7 +25,7 @@ A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. Gi
 - A strictly validated, versioned `.gkr` executable registry with hidden system entries
 - A transport-independent scrolling desktop policy and application window protocol
 - Packed bitmap-font rendering and a validated, versioned `.gkf` format
-- Persistent RedoxFS transactions over a bounded-polling legacy ATA PIO disk backend
+- Persistent RedoxFS transactions on GPT/MBR volumes over bounded-polling virtio-blk or AHCI/SATA
 - Talc-backed dynamic allocation for RedoxFS and future kernel services
 - Single-core round-robin userspace scheduling with local-APIC timer preemption
 - Hardware-seeded kernel CSPRNG with process-local random capabilities
@@ -107,9 +107,11 @@ The default QEMU flags attach `ich9-intel-hda` and `hda-output` to an explicit `
 
 ### Filesystem architecture
 
-The kernel uses the RedoxFS 0.9.1 transaction engine and filesystem format, adapted from upstream commit `99bc185bf8ad8bd6f4d2562c424d800c2a3d310b`. The filesystem adapter is generic over its `Disk` implementation. Host tests retain an in-memory backend, while the boot kernel claims the legacy primary-master ATA device, validates its LBA28 capacity, and performs bounded polling PIO transfers in 512-byte sectors. A blank disk is formatted once; later boots reopen the existing unencrypted image. Trusted embedded executables and the registry are refreshed on every boot without deleting ordinary files.
+The kernel uses the RedoxFS 0.9.1 transaction engine and filesystem format, adapted from upstream commit `99bc185bf8ad8bd6f4d2562c424d800c2a3d310b`. A common 512-byte-sector block interface provides bounded reads, writes, capacity reporting, and explicit flushes. Boot prefers PCI-discovered transitional `virtio-blk` and falls back to PCI AHCI/SATA. Both drivers use bounded polling, validate transfer ranges, and propagate controller and device errors rather than waiting indefinitely.
 
-The default QEMU targets attach `build/ginkgo-redoxfs.img` with writethrough caching. `make clean` preserves this image, `make reset-fs` deletes it, and the deliberately destructive `make distclean` removes the entire build directory. The current hardware driver supports only a legacy primary-master ATA disk; AHCI, NVMe, virtio-blk, partitions, and encrypted RedoxFS images are not yet supported.
+Storage discovery validates GPT header and partition-array CRCs and bounds, understands protective and legacy MBRs, and mounts the first usable partition. Media with no partition table remains supported as a whole-disk volume. RedoxFS writes explicitly flush the selected block device before completion. A blank selected volume is formatted once; later boots reopen it, while trusted embedded programs are refreshed without deleting ordinary files.
+
+The default QEMU targets attach the persistent GPT image `build/ginkgo-redoxfs.img` through `virtio-blk` with writethrough caching. `make clean` preserves this image, `make reset-fs` deletes it, and the deliberately destructive `make distclean` removes the entire build directory. AHCI provides the modern physical SATA path; NVMe and USB mass storage remain separate future phases.
 
 ## Dependencies
 
@@ -136,7 +138,7 @@ Install Rust through rustup, then ensure `cargo` is in `PATH`.
 make run
 ```
 
-The first run downloads Limine and OVMF, builds the kernel, creates `build/ginkgo-os.iso`, creates a persistent 16 MiB `build/ginkgo-redoxfs.img` if needed, and starts QEMU. The default `pc` machine attaches that image as the primary ATA disk plus an xHCI USB keyboard and tablet. Subsequent runs reuse the same filesystem image.
+The first run downloads Limine and OVMF, builds the kernel, creates `build/ginkgo-os.iso`, creates a persistent 16 MiB GPT `build/ginkgo-redoxfs.img` if needed, and starts QEMU. The default `pc` machine attaches that image through transitional `virtio-blk` plus an xHCI USB keyboard and tablet. Subsequent runs reuse the same filesystem image.
 
 To boot directly from a QEMU virtual FAT disk without creating an ISO or requiring `xorriso`:
 
