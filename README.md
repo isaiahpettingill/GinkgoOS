@@ -1,6 +1,6 @@
 # GinkgoOS
 
-A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. GinkgoOS boots through an on-screen kernel log and splash into a persistent protected ring-3 desktop service with a program-registry-backed launcher. The kernel also includes framebuffer output, physical frame allocation, isolated userspace address spaces, syscalls and capability IPC, shared-memory mappings, checked device-I/O capabilities, polling xHCI USB HID input, a kernel-adapted RedoxFS filesystem, and cooperative task/process scheduling.
+A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. GinkgoOS boots through an on-screen kernel log and splash into a persistent protected ring-3 desktop service with a program-registry-backed launcher. The kernel also includes framebuffer output, physical frame allocation, isolated userspace address spaces, syscalls and capability IPC, shared-memory mappings, checked device-I/O capabilities, polling xHCI USB HID input, polling Intel HDA audio, a kernel-adapted RedoxFS filesystem, and cooperative task/process scheduling.
 
 ## What is included
 
@@ -14,7 +14,7 @@ A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. Gi
 - Rights-checked shared-memory map/unmap with mapping leases that survive source-handle closure
 - `x86_64` port I/O plus `volatile`-backed checked MMIO capabilities
 - A nonblocking serial device built on `uart_16550`
-- PCI discovery and a polling xHCI USB host controller
+- General PCI class discovery, a polling xHCI USB host controller, and polling Intel HDA output
 - USB HID keyboards, mice, joysticks, and gamepads, including DragonRise Generic USB Joystick reports
 - Descriptor-driven keyboard, button, axis, wheel, and hat-switch events in a bounded kernel input queue
 - Process-local capability handles and bounded bidirectional datagram channels with atomic, rights-attenuating handle transfer
@@ -32,7 +32,7 @@ A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. Gi
 - Embedded-graphics draw targets for volatile hardware framebuffers and ordinary XRGB/ARGB window RAM
 - UEFI ISO and no-ISO QEMU boot targets
 
-The scheduler is deliberately stackless and cooperative: each kernel task performs one bounded step, stores its continuation in `TaskState`, and returns to yield. A process task enters ring 3 until the application makes one syscall or faults, dispatches that syscall while the process CR3 remains active, restores the kernel CR3, and then yields to the next scheduler turn. USB input follows the same model and polls xHCI without interrupts. The kernel does not yet provide independent kernel-task stacks, timer preemption, external interrupt delivery, SMP, or blocking waits.
+The scheduler is deliberately stackless and cooperative: each kernel task performs one bounded step, stores its continuation in `TaskState`, and returns to yield. A process task enters ring 3 until the application makes one syscall or faults, dispatches that syscall while the process CR3 remains active, restores the kernel CR3, and then yields to the next scheduler turn. USB input and Intel HDA audio follow the same model and poll their DMA rings without interrupts. The kernel does not yet provide independent kernel-task stacks, timer preemption, external interrupt delivery, SMP, or blocking waits.
 
 ### IPC groundwork
 
@@ -88,6 +88,14 @@ Currently integrated pane bindings are `META+Left/Right` for focus, `META+Q` to 
 At boot, GinkgoOS discovers the first PCI xHCI controller, enumerates directly attached root-port devices, configures each HID interrupt-IN endpoint, and parses its report descriptor. `InputManager` normalizes reports into device-tagged `InputEvent` values for keyboard keys, mouse buttons and relative axes, joystick/gamepad buttons, absolute axes, wheels, and hat switches. The desktop tracks relative mice and absolute USB tablets, displays mouse-button state through the cursor color, tracks left/right Shift and Logo keys, and routes `META+N` to the protected desktop service. Launcher text input supports Shift, Caps Lock, Enter, Tab, and Backspace. Every normalized event is recorded in `/input`; filesystem streams are flushed in batches so RedoxFS transactions do not stall USB polling. Report IDs and packed, signed, or non-byte-aligned fields are supported.
 
 Input is currently limited to devices attached directly to xHCI root ports at boot. USB hubs and hotplug re-enumeration are not implemented yet. Enumeration failures are isolated per port so one malformed or unsupported device does not disable other input devices.
+
+### Intel HDA audio
+
+At boot, GinkgoOS discovers the first PCI class `04:03:00` High Definition Audio controller, maps BAR0 uncached, enumerates all reported codecs and audio function groups, searches each analog pin's connection graph, powers and configures the selected route, and starts a 32-period DMA output stream. Connected headphones, fixed speakers, and desktop line-out are preferred in that order. The driver uses bounded polling rather than external interrupts and rejects DMA addresses above 4 GiB when a controller lacks 64-bit addressing.
+
+The fixed initial PCM contract is 44,100 Hz, signed 16-bit little-endian, stereo interleaved. Userspace submits frame-aligned chunks of at most 16 KiB with `ginkgo_userspace::audio_write`; `Status::ShouldWait` means the 128 KiB queue is full and the complete chunk should be retried after yielding. QEMU's `8086:293e` controller receives a short boot-time test tone, while physical hardware starts silently.
+
+The default QEMU flags attach `ich9-intel-hda` and `hda-output` to an explicit `dsound` backend on Windows or `sdl` elsewhere. Override `QEMU_AUDIO_FLAGS`, for example with `-audiodev wav,id=ginkgo-audio,path=build/ginkgo-audio.wav`, for deterministic capture. The current implementation uses the HDA immediate-command interface and one output stream; CORB/RIRB transport, format negotiation, resampling, input, jack-change notifications, and multiple-card selection remain future work.
 
 ### Filesystem architecture
 

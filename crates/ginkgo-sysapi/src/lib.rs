@@ -44,6 +44,8 @@ pub enum SyscallNumber {
     FilesystemReadDirectory = 17,
     FilesystemTruncate = 18,
     FilesystemUnlink = 19,
+    /// Queues interleaved 44.1 kHz signed 16-bit little-endian stereo PCM.
+    AudioWrite = 20,
 }
 
 /// An opaque process-local reference to a kernel object.
@@ -568,6 +570,7 @@ mod tests {
         assert_eq!(SyscallNumber::ChannelCreate as u64, 5);
         assert_eq!(SyscallNumber::ChannelWrite as u64, 6);
         assert_eq!(SyscallNumber::ChannelRead as u64, 7);
+        assert_eq!(SyscallNumber::AudioWrite as u64, 20);
         assert_eq!(SyscallNumber::SharedMemoryCreate as u64, 8);
         assert_eq!(SyscallNumber::SharedMemoryGetSize as u64, 9);
         assert_eq!(SyscallNumber::SharedMemoryMap as u64, 10);

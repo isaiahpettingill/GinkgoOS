@@ -111,6 +111,18 @@ pub fn debug_write(bytes: &[u8]) -> SyscallResult<()> {
     status_result(unsafe { raw_syscall6(SyscallNumber::DebugWrite, address, length, 0, 0, 0, 0) })
 }
 
+/// Queues interleaved 44.1 kHz signed 16-bit little-endian stereo PCM.
+///
+/// The kernel accepts frame-aligned writes up to 16 KiB. `ShouldWait` means the
+/// bounded hardware queue is full; yield and retry the complete slice.
+#[inline]
+pub fn audio_write(pcm: &[u8]) -> SyscallResult<()> {
+    let address = slice_address(pcm);
+    let length = pcm.len() as u64;
+    // SAFETY: pcm remains readable for the duration of the syscall.
+    status_result(unsafe { raw_syscall6(SyscallNumber::AudioWrite, address, length, 0, 0, 0, 0) })
+}
+
 /// Opens or creates one file relative to an authorized filesystem-root capability.
 pub fn filesystem_open(
     root: Handle,

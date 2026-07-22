@@ -30,6 +30,7 @@ use ginkgo_ipc::IpcError;
 use ginkgo_kernel::{
     arch::{self, CpuPrivilegeState, KernelExit, PrivilegeStackTops},
     ata::AtaPioDisk,
+    audio::AudioDevice,
     desktop_runtime::{DesktopBroker, DesktopBrokerError, DesktopRuntimeEvent},
     input::{DeviceInputEvent, InputManager},
     io::SerialPort,
@@ -278,6 +279,7 @@ pub extern "C" fn _start() -> ! {
         fs,
         serial,
         input: None,
+        audio: None,
         screen,
         ui,
         paging_verified: false,
@@ -340,6 +342,36 @@ pub extern "C" fn _start() -> ! {
     context
         .ui
         .render_boot_log(&mut context.screen, input_status);
+
+    {
+        let mut sink = SerialDebugSink::new(&mut context.serial);
+        let _ = writeln!(sink, "audio: probing Intel HDA\r");
+    }
+    match unsafe { AudioDevice::initialize(&mut context.page_table, &mut context.frames) } {
+        Ok(mut audio) => {
+            let tone_result = if audio.is_qemu_ich9() {
+                audio.queue_test_tone()
+            } else {
+                Ok(())
+            };
+            let mut sink = SerialDebugSink::new(&mut context.serial);
+            if let Err(error) = tone_result {
+                let _ = writeln!(sink, "audio: test tone queue failed: {error:?}\r");
+            }
+            let _ = writeln!(sink, "audio: Intel HDA ready (44.1 kHz S16LE stereo)\r");
+            context.audio = Some(audio);
+            context
+                .ui
+                .render_boot_log(&mut context.screen, "audio: Intel HDA ready");
+        }
+        Err(error) => {
+            let mut sink = SerialDebugSink::new(&mut context.serial);
+            let _ = writeln!(sink, "audio: Intel HDA unavailable: {error:?}\r");
+            context
+                .ui
+                .render_boot_log(&mut context.screen, "audio: Intel HDA unavailable");
+        }
+    }
 
     let cpu_state: &'static mut CpuPrivilegeState =
         unsafe { &mut *ptr::addr_of_mut!(CPU_PRIVILEGE_STATE) };
@@ -413,12 +445,13 @@ pub extern "C" fn _start() -> ! {
         );
     }
 
-    let mut scheduler = Scheduler::<KernelContext, 7>::new();
+    let mut scheduler = Scheduler::<KernelContext, 8>::new();
     if scheduler.spawn(filesystem_task).is_err()
         || scheduler.spawn(console_task).is_err()
         || scheduler.spawn(accounting_task).is_err()
         || scheduler.spawn(log_flush_task).is_err()
         || scheduler.spawn(input_task).is_err()
+        || scheduler.spawn(audio_task).is_err()
         || scheduler.spawn(desktop_task).is_err()
     {
         halt_forever();
@@ -440,6 +473,7 @@ struct KernelContext {
     fs: RedoxFs<AtaPioDisk>,
     serial: Option<SerialPort>,
     input: Option<InputManager>,
+    audio: Option<AudioDevice>,
     screen: FramebufferWriter<'static>,
     ui: ValidationUi,
     paging_verified: bool,
@@ -1071,6 +1105,7 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                     &context.page_table,
                     &mut context.frames,
                     &mut context.fs,
+                    &mut context.audio,
                     &mut sink,
                 );
                 debug_assert!(
@@ -1352,6 +1387,19 @@ fn request_launcher_toggle(context: &mut KernelContext) {
     if matches!(result, Err(DesktopBrokerError::Ipc(IpcError::ShouldWait))) {
         context.launcher_toggle_pending = true;
     }
+}
+
+fn audio_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll {
+    let result = match context.audio.as_mut() {
+        Some(audio) => audio.poll(),
+        None => return TaskPoll::Pending,
+    };
+    if let Err(error) = result {
+        let mut sink = SerialDebugSink::new(&mut context.serial);
+        let _ = writeln!(sink, "audio: playback stopped: {error:?}\r");
+        context.audio = None;
+    }
+    TaskPoll::Pending
 }
 
 fn input_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {

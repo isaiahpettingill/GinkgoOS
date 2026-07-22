@@ -26,6 +26,7 @@ use redoxfs::Disk;
 
 use crate::{
     arch::UserContext,
+    audio::AudioDevice,
     memory::UsableFrameAllocator,
     paging::{
         address_space::{AddressSpaceError, UserAccess},
@@ -36,6 +37,8 @@ use crate::{
 
 /// Maximum bytes accepted by one [`SyscallNumber::DebugWrite`] call.
 pub const DEBUG_WRITE_MAX_BYTES: usize = 4096;
+/// Maximum frame-aligned PCM bytes accepted by one audio write.
+pub const AUDIO_WRITE_MAX_BYTES: usize = 16 * 1024;
 /// Maximum objects inspected by one nonblocking wait-many poll.
 ///
 /// The current scheduler never blocks inside WaitMany. It validates the supplied
@@ -87,6 +90,7 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
     kernel_page_table: &ActivePageTable,
     frame_allocator: &mut UsableFrameAllocator<'_>,
     filesystem: &mut RedoxFs<B>,
+    audio: &mut Option<AudioDevice>,
     debug_sink: &mut D,
 ) -> SyscallOutcome {
     let Some(number) = decode_syscall_number(context.rax) else {
@@ -120,6 +124,7 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
             kernel_page_table,
             frame_allocator,
             filesystem,
+            audio,
             debug_sink,
         )
     };
@@ -134,6 +139,7 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
     kernel_page_table: &ActivePageTable,
     frame_allocator: &mut UsableFrameAllocator<'_>,
     filesystem: &mut RedoxFs<B>,
+    audio: &mut Option<AudioDevice>,
     debug_sink: &mut D,
 ) -> Status {
     let result = match number {
@@ -196,6 +202,7 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
         SyscallNumber::FilesystemUnlink => {
             filesystem_unlink(process, filesystem, context.rdi, context.rsi, context.rdx)
         }
+        SyscallNumber::AudioWrite => audio_write(process, audio, context.rdi, context.rsi),
     };
     match result {
         Ok(()) => Status::Ok,
@@ -225,6 +232,7 @@ const fn decode_syscall_number(raw: u64) -> Option<SyscallNumber> {
         17 => SyscallNumber::FilesystemReadDirectory,
         18 => SyscallNumber::FilesystemTruncate,
         19 => SyscallNumber::FilesystemUnlink,
+        20 => SyscallNumber::AudioWrite,
         _ => return None,
     })
 }
@@ -796,6 +804,33 @@ const fn map_fs_error(error: FsError) -> Status {
     }
 }
 
+fn audio_write(
+    process: &Process,
+    audio: &mut Option<AudioDevice>,
+    address: u64,
+    raw_length: u64,
+) -> Result<(), Status> {
+    let length = checked_array_bytes(
+        raw_length,
+        1,
+        AUDIO_WRITE_MAX_BYTES as u64,
+        Status::OutOfRange,
+    )?;
+    if length == 0 || length % 4 != 0 {
+        return Err(Status::InvalidArgument);
+    }
+    let device = audio.as_mut().ok_or(Status::NotFound)?;
+    if device.available_bytes() < length {
+        return Err(Status::ShouldWait);
+    }
+    let bytes = copy_vec_from_user(process, address, length)?;
+    match device.write_pcm(&bytes) {
+        Ok(accepted) if accepted == length => Ok(()),
+        Ok(_) => Err(Status::ShouldWait),
+        Err(_) => Err(Status::Io),
+    }
+}
+
 fn copy_block_from_user<const N: usize>(
     process: &Process,
     address: u64,
@@ -1161,7 +1196,8 @@ mod tests {
         for number in expected {
             assert_eq!(decode_syscall_number(number as u64), Some(number));
         }
-        assert_eq!(decode_syscall_number(20), None);
+        assert_eq!(decode_syscall_number(20), Some(SyscallNumber::AudioWrite));
+        assert_eq!(decode_syscall_number(21), None);
         assert_eq!(decode_syscall_number(u64::MAX), None);
     }
 

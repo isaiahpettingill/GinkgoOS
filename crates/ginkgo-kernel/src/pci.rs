@@ -1,8 +1,7 @@
 //! Legacy PCI configuration-space discovery for x86_64.
 //!
-//! This module uses PCI configuration mechanism #1 (`0xcf8`/`0xcfc`).  It is
-//! intentionally small: GinkgoOS currently needs it only to claim an xHCI
-//! controller before a more general PCI subsystem exists.
+//! This module uses PCI configuration mechanism #1 (`0xcf8`/`0xcfc`) to find
+//! devices by class and to configure their memory BARs.
 
 use crate::io::{IoError, PortRegion};
 
@@ -163,10 +162,17 @@ impl PciConfig {
         }))
     }
 
-    /// Finds the first xHCI controller, correctly limiting single-function
-    /// devices to function zero while scanning all functions of multifunction
-    /// devices.
-    pub fn find_xhci(&mut self) -> Result<Option<PciDevice>, PciError> {
+    /// Finds the first device matching a class tuple in deterministic
+    /// bus/device/function order.
+    ///
+    /// Function zero determines whether functions 1 through 7 are scanned, as
+    /// required for PCI multifunction devices.
+    pub fn find_first(
+        &mut self,
+        class: u8,
+        subclass: u8,
+        programming_interface: Option<u8>,
+    ) -> Result<Option<PciDevice>, PciError> {
         for bus in 0_u16..=255 {
             for device in 0_u8..32 {
                 let function_zero = PciAddress {
@@ -177,17 +183,11 @@ impl PciConfig {
                 let Some(first) = self.device(function_zero)? else {
                     continue;
                 };
-                if first.class == 0x0c
-                    && first.subclass == 0x03
-                    && first.programming_interface == 0x30
-                {
+                if device_matches(first, class, subclass, programming_interface) {
                     return Ok(Some(first));
                 }
 
-                if first.header_type & 0x80 == 0 {
-                    continue;
-                }
-                for function in 1_u8..8 {
+                for function in 1..function_count(first.header_type) {
                     let address = PciAddress {
                         bus: bus as u8,
                         device,
@@ -196,10 +196,7 @@ impl PciConfig {
                     let Some(candidate) = self.device(address)? else {
                         continue;
                     };
-                    if candidate.class == 0x0c
-                        && candidate.subclass == 0x03
-                        && candidate.programming_interface == 0x30
-                    {
+                    if device_matches(candidate, class, subclass, programming_interface) {
                         return Ok(Some(candidate));
                     }
                 }
@@ -208,17 +205,30 @@ impl PciConfig {
         Ok(None)
     }
 
-    /// Probes BAR0 and restores every configuration register it changes.
-    /// Memory decoding is temporarily disabled while the BAR size mask is read.
-    pub fn probe_bar0(&mut self, device: PciDevice) -> Result<PciBar, PciError> {
-        if device.header_type & 0x7f != 0 {
-            return Err(PciError::InvalidBar);
+    /// Finds the first xHCI controller.
+    pub fn find_xhci(&mut self) -> Result<Option<PciDevice>, PciError> {
+        self.find_first(0x0c, 0x03, Some(0x30))
+    }
+
+    /// Probes a memory BAR and restores every configuration register it changes.
+    ///
+    /// BAR indices are validated against the device's PCI header type. Memory
+    /// decoding is temporarily disabled while the BAR size mask is read.
+    pub fn probe_bar(&mut self, device: PciDevice, index: u8) -> Result<PciBar, PciError> {
+        let (register, has_upper_register) = memory_bar_register(device.header_type, index)?;
+
+        // An upper half is not independently probeable as a BAR.
+        if index > 0 {
+            let previous = self.read_u32(device.address, register - 4)?;
+            if is_64_bit_memory_bar(previous) {
+                return Err(PciError::InvalidBar);
+            }
         }
 
         let command = self.read_u16(device.address, 0x04)?;
         self.write_u16(device.address, 0x04, command & !COMMAND_MEMORY_SPACE)?;
 
-        let result = self.probe_bar0_inner(device.address);
+        let result = self.probe_bar_inner(device.address, register, has_upper_register);
 
         // Restore decode state even when probing found an invalid BAR.
         let restore = self.write_u16(device.address, 0x04, command);
@@ -229,11 +239,18 @@ impl PciConfig {
         }
     }
 
-    fn probe_bar0_inner(&mut self, address: PciAddress) -> Result<PciBar, PciError> {
-        let low = self.read_u32(address, 0x10)?;
-        if low == 0 || low == u32::MAX {
-            return Err(PciError::InvalidBar);
-        }
+    /// Compatibility wrapper for probing BAR0.
+    pub fn probe_bar0(&mut self, device: PciDevice) -> Result<PciBar, PciError> {
+        self.probe_bar(device, 0)
+    }
+
+    fn probe_bar_inner(
+        &mut self,
+        address: PciAddress,
+        register: u8,
+        has_upper_register: bool,
+    ) -> Result<PciBar, PciError> {
+        let low = self.read_u32(address, register)?;
         if low & 1 != 0 {
             return Err(PciError::UnsupportedIoBar);
         }
@@ -243,39 +260,43 @@ impl PciConfig {
             return Err(PciError::InvalidBar);
         }
         let is_64_bit = kind == 2;
+        if is_64_bit && !has_upper_register {
+            return Err(PciError::InvalidBar);
+        }
         let high = if is_64_bit {
-            self.read_u32(address, 0x14)?
+            self.read_u32(address, register + 4)?
         } else {
             0
         };
 
-        self.write_u32(address, 0x10, u32::MAX)?;
+        self.write_u32(address, register, u32::MAX)?;
         if is_64_bit {
-            if let Err(error) = self.write_u32(address, 0x14, u32::MAX) {
-                if let Err(restore_error) = self.write_u32(address, 0x10, low) {
-                    return Err(restore_error);
-                }
+            if let Err(error) = self.write_u32(address, register + 4, u32::MAX) {
+                let restore_high = self.write_u32(address, register + 4, high);
+                let restore_low = self.write_u32(address, register, low);
+                restore_high?;
+                restore_low?;
                 return Err(error);
             }
         }
-        let mask_low_result = self.read_u32(address, 0x10);
+        let mask_low_result = self.read_u32(address, register);
         let mask_high_result = if is_64_bit {
-            self.read_u32(address, 0x14)
+            self.read_u32(address, register + 4)
         } else {
             Ok(0)
         };
 
         // BAR contents must be restored before interpreting a failed read.
-        let restore_low = self.write_u32(address, 0x10, low);
         let restore_high = if is_64_bit {
-            self.write_u32(address, 0x14, high)
+            self.write_u32(address, register + 4, high)
         } else {
             Ok(())
         };
+        let restore_low = self.write_u32(address, register, low);
         let mask_low = mask_low_result?;
         let mask_high = mask_high_result?;
-        restore_low?;
         restore_high?;
+        restore_low?;
 
         let physical_address = if is_64_bit {
             (u64::from(high) << 32) | u64::from(low & 0xffff_fff0)
@@ -303,6 +324,42 @@ impl PciConfig {
             command | COMMAND_MEMORY_SPACE | COMMAND_BUS_MASTER,
         )
     }
+}
+
+fn device_matches(
+    device: PciDevice,
+    class: u8,
+    subclass: u8,
+    programming_interface: Option<u8>,
+) -> bool {
+    device.class == class
+        && device.subclass == subclass
+        && programming_interface.is_none_or(|interface| device.programming_interface == interface)
+}
+
+fn function_count(header_type: u8) -> u8 {
+    if header_type & 0x80 != 0 {
+        8
+    } else {
+        1
+    }
+}
+
+fn memory_bar_register(header_type: u8, index: u8) -> Result<(u8, bool), PciError> {
+    let count = match header_type & 0x7f {
+        0 => 6,
+        1 => 2,
+        _ => return Err(PciError::InvalidBar),
+    };
+    if index >= count {
+        return Err(PciError::InvalidBar);
+    }
+
+    Ok((0x10 + index * 4, index + 1 < count))
+}
+
+fn is_64_bit_memory_bar(value: u32) -> bool {
+    value & 1 == 0 && (value >> 1) & 3 == 2
 }
 
 fn memory_bar_size(mask_low: u32, mask_high: u32, is_64_bit: bool) -> Result<u64, PciError> {
@@ -356,6 +413,53 @@ mod tests {
         assert!(PciAddress::new(0, 0, 8).is_none());
     }
 
+    fn test_device(header_type: u8, class: u8, subclass: u8, interface: u8) -> PciDevice {
+        PciDevice {
+            address: PciAddress::new(0, 0, 0).unwrap(),
+            vendor_id: 0x1234,
+            device_id: 0x5678,
+            revision: 0,
+            class,
+            subclass,
+            programming_interface: interface,
+            header_type,
+        }
+    }
+
+    #[test]
+    fn class_matching_can_ignore_or_require_programming_interface() {
+        let audio = test_device(0, 0x04, 0x03, 0x80);
+        assert!(device_matches(audio, 0x04, 0x03, None));
+        assert!(device_matches(audio, 0x04, 0x03, Some(0x80)));
+        assert!(!device_matches(audio, 0x04, 0x03, Some(0x00)));
+        assert!(!device_matches(audio, 0x04, 0x01, None));
+    }
+
+    #[test]
+    fn multifunction_bit_controls_function_scan_count() {
+        assert_eq!(function_count(0x00), 1);
+        assert_eq!(function_count(0x01), 1);
+        assert_eq!(function_count(0x80), 8);
+        assert_eq!(function_count(0x81), 8);
+    }
+
+    #[test]
+    fn bar_registers_follow_header_layout() {
+        assert_eq!(memory_bar_register(0x00, 0), Ok((0x10, true)));
+        assert_eq!(memory_bar_register(0x80, 5), Ok((0x24, false)));
+        assert_eq!(memory_bar_register(0x01, 1), Ok((0x14, false)));
+        assert_eq!(memory_bar_register(0x01, 2), Err(PciError::InvalidBar));
+        assert_eq!(memory_bar_register(0x02, 0), Err(PciError::InvalidBar));
+    }
+
+    #[test]
+    fn memory_bar_type_recognizes_only_64_bit_memory_bars() {
+        assert!(is_64_bit_memory_bar(0x0000_0004));
+        assert!(is_64_bit_memory_bar(0x1234_500c));
+        assert!(!is_64_bit_memory_bar(0x0000_0000));
+        assert!(!is_64_bit_memory_bar(0x0000_0001));
+    }
+
     #[test]
     fn bar_size_masks_use_the_correct_address_width() {
         assert_eq!(memory_bar_size(0xffff_c000, 0, false), Ok(0x4000));
@@ -363,5 +467,7 @@ mod tests {
             memory_bar_size(0xff00_0000, 0xffff_ffff, true),
             Ok(0x0100_0000)
         );
+        assert_eq!(memory_bar_size(0, 0, false), Err(PciError::InvalidBar));
+        assert_eq!(memory_bar_size(0, 0, true), Err(PciError::InvalidBar));
     }
 }
