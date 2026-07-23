@@ -82,12 +82,18 @@ pub enum SyscallNumber {
     SystemPowerCancel = 37,
     /// Reads progress and failure information through a system-power capability.
     SystemPowerGetInfo = 38,
-    /// Maps zero-filled private anonymous memory into the calling process.
+    /// Maps eager zero-filled private memory; length is rounded up to whole pages.
     AnonymousMap = 39,
-    /// Unmaps one exact anonymous mapping and releases its resident frames.
+    /// Removes an aligned anonymous range; length is rounded up to whole pages.
     AnonymousUnmap = 40,
-    /// Changes one exact anonymous mapping's permissions with W^X enforcement.
+    /// Protects an aligned anonymous range, rounding length up and enforcing W^X.
     AnonymousProtect = 41,
+    /// Reserves page-rounded anonymous space without allocating frames or quota.
+    AnonymousReserve = 42,
+    /// Commits zero-filled pages at an aligned address, rounding length up.
+    AnonymousCommit = 43,
+    /// Decommits an aligned page-rounded range while preserving its reservation.
+    AnonymousDecommit = 44,
 }
 
 /// An opaque process-local reference to a kernel object.
@@ -742,6 +748,8 @@ pub struct SharedMemoryMapOutput {
 
 /// Output block for [`SyscallNumber::AnonymousMap`].
 pub type AnonymousMapOutput = SharedMemoryMapOutput;
+/// Output block for [`SyscallNumber::AnonymousReserve`].
+pub type AnonymousReserveOutput = SharedMemoryMapOutput;
 
 /// Maximum UTF-8 bytes in one filesystem path component.
 pub const FILESYSTEM_NAME_MAX: usize = 252;
@@ -1115,6 +1123,12 @@ mod tests {
         assert_eq!(SyscallNumber::SystemPowerRequest as u64, 36);
         assert_eq!(SyscallNumber::SystemPowerCancel as u64, 37);
         assert_eq!(SyscallNumber::SystemPowerGetInfo as u64, 38);
+        assert_eq!(SyscallNumber::AnonymousMap as u64, 39);
+        assert_eq!(SyscallNumber::AnonymousUnmap as u64, 40);
+        assert_eq!(SyscallNumber::AnonymousProtect as u64, 41);
+        assert_eq!(SyscallNumber::AnonymousReserve as u64, 42);
+        assert_eq!(SyscallNumber::AnonymousCommit as u64, 43);
+        assert_eq!(SyscallNumber::AnonymousDecommit as u64, 44);
     }
 
     #[test]

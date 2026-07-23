@@ -338,6 +338,15 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
         SyscallNumber::AnonymousProtect => {
             anonymous_protect(process, context.rdi, context.rsi, context.rdx)
         }
+        SyscallNumber::AnonymousReserve => {
+            anonymous_reserve(process, context.rdi, context.rsi, context.rdx)
+        }
+        SyscallNumber::AnonymousCommit => {
+            anonymous_commit(process, context.rdi, context.rsi, frame_allocator)
+        }
+        SyscallNumber::AnonymousDecommit => {
+            anonymous_decommit(process, context.rdi, context.rsi, frame_allocator)
+        }
     };
     DispatchResult::Complete(match result {
         Ok(()) => Status::Ok,
@@ -389,6 +398,9 @@ const fn decode_syscall_number(raw: u64) -> Option<SyscallNumber> {
         39 => SyscallNumber::AnonymousMap,
         40 => SyscallNumber::AnonymousUnmap,
         41 => SyscallNumber::AnonymousProtect,
+        42 => SyscallNumber::AnonymousReserve,
+        43 => SyscallNumber::AnonymousCommit,
+        44 => SyscallNumber::AnonymousDecommit,
         _ => return None,
     })
 }
@@ -846,6 +858,47 @@ fn anonymous_map(
         return Err(status);
     }
     Ok(())
+}
+
+fn anonymous_reserve(
+    process: &mut Process,
+    length: u64,
+    raw_protection: u64,
+    output_address: u64,
+) -> Result<(), Status> {
+    let protection_bits = u32::try_from(raw_protection).map_err(|_| Status::InvalidArgument)?;
+    let protection = MapProtection::from_bits(protection_bits).ok_or(Status::InvalidArgument)?;
+    validate_user_output(process, output_address, SHARED_MEMORY_MAP_OUTPUT_SIZE)?;
+    let (address, rollback) = process
+        .reserve_anonymous_with_rollback(length, protection)
+        .map_err(map_shared_mapping_error)?;
+    if let Err(status) = copy_to_user(process, output_address, &address.to_le_bytes()) {
+        process.rollback_anonymous_reservation(rollback);
+        return Err(status);
+    }
+    Ok(())
+}
+
+fn anonymous_commit(
+    process: &mut Process,
+    address: u64,
+    length: u64,
+    frame_allocator: &mut UsableFrameAllocator<'_>,
+) -> Result<(), Status> {
+    process
+        .commit_anonymous(address, length, frame_allocator)
+        .map_err(map_shared_mapping_error)
+}
+
+fn anonymous_decommit(
+    process: &mut Process,
+    address: u64,
+    length: u64,
+    frame_allocator: &mut UsableFrameAllocator<'_>,
+) -> Result<(), Status> {
+    process
+        .decommit_anonymous(address, length, frame_allocator)
+        .map_err(map_shared_mapping_error)
 }
 
 fn anonymous_unmap(
@@ -2400,6 +2453,9 @@ mod tests {
             SyscallNumber::AnonymousMap,
             SyscallNumber::AnonymousUnmap,
             SyscallNumber::AnonymousProtect,
+            SyscallNumber::AnonymousReserve,
+            SyscallNumber::AnonymousCommit,
+            SyscallNumber::AnonymousDecommit,
         ];
         for number in expected {
             assert_eq!(decode_syscall_number(number as u64), Some(number));
@@ -2442,7 +2498,19 @@ mod tests {
             decode_syscall_number(41),
             Some(SyscallNumber::AnonymousProtect)
         );
-        assert_eq!(decode_syscall_number(42), None);
+        assert_eq!(
+            decode_syscall_number(42),
+            Some(SyscallNumber::AnonymousReserve)
+        );
+        assert_eq!(
+            decode_syscall_number(43),
+            Some(SyscallNumber::AnonymousCommit)
+        );
+        assert_eq!(
+            decode_syscall_number(44),
+            Some(SyscallNumber::AnonymousDecommit)
+        );
+        assert_eq!(decode_syscall_number(45), None);
         assert_eq!(decode_syscall_number(u64::MAX), None);
     }
 

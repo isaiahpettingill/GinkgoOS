@@ -858,6 +858,8 @@ pub unsafe fn shared_memory_map(
 
 /// Maps eager, zero-filled private memory into the current process.
 ///
+/// `length` must be nonzero and is rounded up to a whole-page mapping.
+///
 /// # Safety
 ///
 /// The caller must uphold Rust aliasing rules for the returned memory.
@@ -882,7 +884,86 @@ pub unsafe fn anonymous_map(
     NonNull::new(output.address as usize as *mut u8).ok_or(Status::InvalidAddress)
 }
 
-/// Changes permissions on one exact private anonymous mapping.
+/// Reserves private anonymous address space without allocating physical frames.
+///
+/// `length` must be nonzero and is rounded up to a whole-page reservation. The
+/// reservation's protection is applied when pages are committed and may be
+/// changed with [`anonymous_protect`] before or after commitment.
+///
+/// # Safety
+///
+/// The caller must uphold Rust aliasing rules for any subsequently committed memory.
+#[inline]
+pub unsafe fn anonymous_reserve(
+    length: usize,
+    protection: MapProtection,
+) -> SyscallResult<NonNull<u8>> {
+    let mut output = AnonymousReserveOutput::default();
+    let raw = unsafe {
+        raw_syscall6(
+            SyscallNumber::AnonymousReserve,
+            length as u64,
+            u64::from(protection.bits()),
+            mut_pointer_address(&mut output),
+            0,
+            0,
+            0,
+        )
+    };
+    status_result(raw)?;
+    NonNull::new(output.address as usize as *mut u8).ok_or(Status::InvalidAddress)
+}
+
+/// Eagerly commits zero-filled physical pages into an anonymous reservation.
+///
+/// `address` must be page aligned. `length` must be nonzero and is rounded up;
+/// every intersecting page must currently be reserved and uncommitted.
+///
+/// # Safety
+///
+/// The caller must uphold Rust aliasing rules for the newly accessible memory.
+#[inline]
+pub unsafe fn anonymous_commit(address: NonNull<u8>, length: usize) -> SyscallResult<()> {
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::AnonymousCommit,
+            pointer_address(address.as_ptr()),
+            length as u64,
+            0,
+            0,
+            0,
+            0,
+        )
+    })
+}
+
+/// Releases committed pages while preserving their anonymous reservation.
+///
+/// `address` must be page aligned and `length` is rounded up. Already-decommitted
+/// pages in the range are accepted, making this operation idempotent.
+///
+/// # Safety
+///
+/// No pointer or reference into the range may be used unless it is committed again.
+#[inline]
+pub unsafe fn anonymous_decommit(address: NonNull<u8>, length: usize) -> SyscallResult<()> {
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::AnonymousDecommit,
+            pointer_address(address.as_ptr()),
+            length as u64,
+            0,
+            0,
+            0,
+            0,
+        )
+    })
+}
+
+/// Changes permissions on a page-granular private anonymous subrange.
+///
+/// `address` must be page aligned and nonzero `length` is rounded up, so every
+/// page intersecting the requested byte range receives the new protection.
 ///
 /// # Safety
 ///
@@ -906,7 +987,10 @@ pub unsafe fn anonymous_protect(
     })
 }
 
-/// Releases one exact private anonymous mapping.
+/// Removes a page-granular private anonymous subrange and its reservation.
+///
+/// `address` must be page aligned and nonzero `length` is rounded up, so every
+/// page intersecting the requested byte range is removed.
 ///
 /// # Safety
 ///

@@ -36,6 +36,12 @@ pub const USER_STACK_TOP: u64 = 0x0000_7fff_ffff_f000;
 pub const USER_STACK_BOTTOM: u64 = USER_STACK_TOP - USER_STACK_SIZE;
 pub const USER_STACK_GUARD_START: u64 = USER_STACK_BOTTOM - PAGE_SIZE;
 pub const SHARED_MAPPING_BASE: u64 = 0x0000_0001_0000_0000;
+/// Hard ceiling for one process's sorted semantic virtual-memory areas.
+pub const MAX_VMAS: usize = 256;
+/// Stable internal fault reason/code used when page-table rollback cannot restore
+/// a process to a coherent mapping state. Such a process is quarantined terminally.
+const VM_ROLLBACK_FAILURE_REASON: u16 = 1;
+const VM_ROLLBACK_FAILURE_CODE: u64 = 0x564d_0001;
 
 /// Magic (`GKSP`) and version for the direct-process startup block passed in RDI.
 ///
@@ -402,16 +408,40 @@ pub enum ProcessCreateError {
     ResourceLimit,
 }
 
-/// One exact application-visible shared-memory mapping.
-///
-/// `length` is the logical byte length supplied by the application, while
-/// `mapped_len` is the page-rounded span installed in the address space.
+/// Semantic ownership of one virtual-memory area.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AnonymousMapping {
-    pub address: u64,
-    pub length: u64,
-    pub mapped_len: usize,
+pub enum VmAreaKind {
+    Image,
+    Anonymous {
+        reservation_id: u64,
+        committed: bool,
+    },
+    Stack,
+    StackGuard,
+    Shared,
+}
+
+/// One page-aligned, nonempty entry in a process's bounded sorted VMA table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmArea {
+    pub start: u64,
+    pub end: u64,
+    pub kind: VmAreaKind,
     pub protection: MapProtection,
+}
+
+impl VmArea {
+    pub const fn length(self) -> u64 {
+        self.end - self.start
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AnonymousReservationRollback {
+    start: u64,
+    end: u64,
+    reservation_id: u64,
+    previous_cursor: u64,
 }
 
 pub struct SharedMemoryMapping {
@@ -652,11 +682,12 @@ pub struct Process {
     preemption_count: u64,
     blocked_syscall: Option<BlockedSyscall>,
     shared_mappings: Option<Vec<SharedMemoryMapping>>,
-    anonymous_mappings: Option<Vec<AnonymousMapping>>,
+    vmas: Option<Vec<VmArea>>,
     // If a corrupt page table prevents rollback, retaining the lease is safer
     // than releasing backing which may still have a live userspace alias.
     retained_failed_mapping_leases: Option<Vec<SharedMemoryMappingLease>>,
     next_mapping_cursor: u64,
+    next_anonymous_reservation_id: u64,
     limits: ProcessLimits,
     usage: ProcessUsage,
 }
@@ -800,6 +831,12 @@ impl Process {
             );
         }
 
+        let vmas = match initial_vmas(&image, layout) {
+            Ok(vmas) => vmas,
+            Err(error) => {
+                return reclaim_failed_construction(address_space, allocator, error);
+            }
+        };
         let private_pages = image
             .segments
             .iter()
@@ -820,13 +857,14 @@ impl Process {
             preemption_count: 0,
             blocked_syscall: None,
             shared_mappings: Some(Vec::new()),
-            anonymous_mappings: Some(Vec::new()),
+            vmas: Some(vmas),
             retained_failed_mapping_leases: Some(Vec::new()),
             next_mapping_cursor: SHARED_MAPPING_BASE
                 + randomness
                     .map(|values| values[2] % MAPPING_ASLR_SLOTS)
                     .unwrap_or(0)
                     * PAGE_SIZE,
+            next_anonymous_reservation_id: 1,
             limits,
             usage: ProcessUsage {
                 private_pages,
@@ -1094,10 +1132,104 @@ impl Process {
         self.next_mapping_cursor
     }
 
-    pub fn anonymous_mappings(&self) -> &[AnonymousMapping] {
-        self.anonymous_mappings
+    pub fn vmas(&self) -> &[VmArea] {
+        self.vmas
             .as_ref()
-            .expect("live process lost its anonymous mapping records")
+            .expect("live process lost its semantic VMA table")
+    }
+
+    /// Reserves page-rounded anonymous address space without frames or private-page quota.
+    pub fn reserve_anonymous(
+        &mut self,
+        length: u64,
+        protection: MapProtection,
+    ) -> Result<u64, SharedMappingError> {
+        self.reserve_anonymous_with_rollback(length, protection)
+            .map(|(address, _)| address)
+    }
+
+    pub(crate) fn reserve_anonymous_with_rollback(
+        &mut self,
+        length: u64,
+        protection: MapProtection,
+    ) -> Result<(u64, AnonymousReservationRollback), SharedMappingError> {
+        let protection = anonymous_permissions(protection)?.0;
+        let (_, mapped_len) = normalize_anonymous_range(PAGE_SIZE, length)?;
+        let reservation_id = self.next_anonymous_reservation_id;
+        let next_reservation_id = reservation_id
+            .checked_add(1)
+            .ok_or(SharedMappingError::ResourceLimit)?;
+        let previous_cursor = self.next_mapping_cursor;
+        let occupied = self.occupied_ranges()?;
+        let address = select_mapping_address(0, false, mapped_len, previous_cursor, &occupied)?;
+        let end = address
+            .checked_add(mapped_len as u64)
+            .ok_or(SharedMappingError::RangeOverflow)?;
+        let planned = plan_vma_insert(
+            self.vmas(),
+            VmArea {
+                start: address,
+                end,
+                kind: VmAreaKind::Anonymous {
+                    reservation_id,
+                    committed: false,
+                },
+                protection,
+            },
+        )?;
+        *self.vmas.as_mut().expect("live process lost its VMA table") = planned;
+        self.next_mapping_cursor = if end < self.layout.stack_guard_start {
+            end
+        } else {
+            SHARED_MAPPING_BASE
+        };
+        self.next_anonymous_reservation_id = next_reservation_id;
+        Ok((
+            address,
+            AnonymousReservationRollback {
+                start: address,
+                end,
+                reservation_id,
+                previous_cursor,
+            },
+        ))
+    }
+
+    /// Removes a fresh reservation and restores placement state without allocating.
+    pub(crate) fn rollback_anonymous_reservation(
+        &mut self,
+        rollback: AnonymousReservationRollback,
+    ) {
+        let index = self
+            .vmas()
+            .iter()
+            .position(|vma| {
+                vma.start == rollback.start
+                    && vma.end == rollback.end
+                    && vma.kind
+                        == (VmAreaKind::Anonymous {
+                            reservation_id: rollback.reservation_id,
+                            committed: false,
+                        })
+            })
+            .expect("fresh anonymous reservation rollback lost its exact VMA");
+        self.vmas
+            .as_mut()
+            .expect("live process lost its VMA table")
+            .remove(index);
+        self.next_mapping_cursor = rollback.previous_cursor;
+    }
+
+    fn restore_mapping_cursor(&mut self, rollback: AnonymousReservationRollback) {
+        self.next_mapping_cursor = rollback.previous_cursor;
+    }
+
+    fn fail_stop_vm_rollback(&mut self, address: u64) {
+        self.mark_faulted(ProcessFault::at_address(
+            ProcessFaultReason::Other(VM_ROLLBACK_FAILURE_REASON),
+            VM_ROLLBACK_FAILURE_CODE,
+            address,
+        ));
     }
 
     /// Maps eager, zero-filled private pages at a kernel-selected address.
@@ -1107,49 +1239,46 @@ impl Process {
         protection: MapProtection,
         allocator: &mut UsableFrameAllocator<'_>,
     ) -> Result<u64, SharedMappingError> {
-        if length == 0 {
-            return Err(SharedMappingError::ZeroLength);
+        let (address, rollback) = self.reserve_anonymous_with_rollback(length, protection)?;
+        if let Err(error) = self.commit_anonymous(address, length, allocator) {
+            if matches!(error, SharedMappingError::RollbackFailed { .. }) {
+                // The VMA quarantines any aliases that rollback could not remove.
+                self.restore_mapping_cursor(rollback);
+            } else {
+                self.rollback_anonymous_reservation(rollback);
+            }
+            return Err(error);
         }
-        if !protection.contains(MapProtection::READ)
-            || (protection.contains(MapProtection::WRITE)
-                && protection.contains(MapProtection::EXECUTE))
-        {
-            return Err(SharedMappingError::InvalidProtection(protection));
-        }
-        let permissions = if protection.contains(MapProtection::WRITE) {
-            UserPagePermissions::READ_WRITE
-        } else if protection.contains(MapProtection::EXECUTE) {
-            UserPagePermissions::READ_EXECUTE
-        } else {
-            UserPagePermissions::READ_ONLY
-        };
-        let mapped_len_u64 = length
-            .checked_add(PAGE_SIZE - 1)
-            .map(|rounded| rounded & !(PAGE_SIZE - 1))
-            .ok_or(SharedMappingError::RangeOverflow)?;
-        let mapped_len =
-            usize::try_from(mapped_len_u64).map_err(|_| SharedMappingError::RangeOverflow)?;
-        let pages = mapped_len_u64 / PAGE_SIZE;
+        Ok(address)
+    }
+
+    /// Eagerly commits a reserved anonymous subrange with transactional rollback.
+    pub fn commit_anonymous(
+        &mut self,
+        address: u64,
+        length: u64,
+        allocator: &mut UsableFrameAllocator<'_>,
+    ) -> Result<(), SharedMappingError> {
+        let (end, mapped_len) = normalize_anonymous_range(address, length)?;
+        let planned = plan_anonymous_change(self.vmas(), address, end, AnonymousChange::Commit)?;
+        let pages = mapped_len as u64 / PAGE_SIZE;
         let new_private_pages = self
             .usage
             .private_pages
             .checked_add(pages)
             .filter(|total| *total <= self.limits.private_pages)
             .ok_or(SharedMappingError::ResourceLimit)?;
-        let occupied = self.occupied_ranges()?;
-        let address =
-            select_mapping_address(0, false, mapped_len, self.next_mapping_cursor, &occupied)?;
-        self.anonymous_mappings
-            .as_mut()
-            .expect("live process lost its anonymous mapping records")
-            .try_reserve(1)
-            .map_err(|_| SharedMappingError::OutOfMemory)?;
 
-        let mut mapped = 0_usize;
+        let mut mapped = 0usize;
         while mapped < mapped_len {
-            let page_address = address
-                .checked_add(mapped as u64)
-                .ok_or(SharedMappingError::RangeOverflow)?;
+            let page_address = address + mapped as u64;
+            let protection = self
+                .vmas()
+                .iter()
+                .find(|vma| vma.start <= page_address && page_address < vma.end)
+                .expect("committed range was completely covered")
+                .protection;
+            let (_, permissions) = anonymous_permissions(protection)?;
             if let Err(mapping_error) =
                 self.address_space_mut()
                     .map_zeroed_user_4k(page_address, permissions, allocator)
@@ -1158,10 +1287,12 @@ impl Process {
                     if let Err(rollback_error) =
                         self.address_space_mut().unmap_user_range(address, mapped)
                     {
-                        return Err(SharedMappingError::RollbackFailed {
+                        let error = SharedMappingError::RollbackFailed {
                             mapping_error,
                             rollback_error,
-                        });
+                        };
+                        self.fail_stop_vm_rollback(page_address);
+                        return Err(error);
                     }
                 }
                 self.address_space_mut()
@@ -1174,21 +1305,9 @@ impl Process {
             mapped += PAGE_SIZE as usize;
         }
 
-        self.anonymous_mappings
-            .as_mut()
-            .expect("live process lost its anonymous mapping records")
-            .push(AnonymousMapping {
-                address,
-                length,
-                mapped_len,
-                protection,
-            });
+        *self.vmas.as_mut().expect("live process lost its VMA table") = planned;
         self.usage.private_pages = new_private_pages;
-        self.next_mapping_cursor = address
-            .checked_add(mapped_len as u64)
-            .filter(|next| *next < self.layout.stack_guard_start)
-            .unwrap_or(SHARED_MAPPING_BASE);
-        Ok(address)
+        Ok(())
     }
 
     pub fn protect_anonymous(
@@ -1197,64 +1316,73 @@ impl Process {
         length: u64,
         protection: MapProtection,
     ) -> Result<(), SharedMappingError> {
-        let index = self
-            .anonymous_mappings()
-            .iter()
-            .position(|mapping| mapping.address == address && mapping.length == length)
-            .ok_or(SharedMappingError::ExactMappingNotFound { address, length })?;
-        if !protection.contains(MapProtection::READ)
-            || (protection.contains(MapProtection::WRITE)
-                && protection.contains(MapProtection::EXECUTE))
-        {
-            return Err(SharedMappingError::InvalidProtection(protection));
-        }
-        let permissions = if protection.contains(MapProtection::WRITE) {
-            UserPagePermissions::READ_WRITE
-        } else if protection.contains(MapProtection::EXECUTE) {
-            UserPagePermissions::READ_EXECUTE
-        } else {
-            UserPagePermissions::READ_ONLY
-        };
-        let mapped_len = self.anonymous_mappings()[index].mapped_len;
+        let (protection, permissions) = anonymous_permissions(protection)?;
+        let (end, _) = normalize_anonymous_range(address, length)?;
+        let planned = plan_anonymous_change(
+            self.vmas(),
+            address,
+            end,
+            AnonymousChange::Protect(protection),
+        )?;
+        let ranges = committed_anonymous_ranges(self.vmas(), address, end)?;
         self.address_space_mut()
-            .protect_user_range(address, mapped_len, permissions)
+            .protect_user_ranges(&ranges, permissions)
             .map_err(SharedMappingError::AddressSpace)?;
-        self.anonymous_mappings
-            .as_mut()
-            .expect("live process lost its anonymous mapping records")[index]
-            .protection = protection;
+        *self.vmas.as_mut().expect("live process lost its VMA table") = planned;
         Ok(())
     }
 
-    /// Unmaps one exact anonymous mapping and immediately returns its frames.
+    /// Releases committed pages while preserving their anonymous reservation.
+    pub fn decommit_anonymous(
+        &mut self,
+        address: u64,
+        length: u64,
+        allocator: &mut UsableFrameAllocator<'_>,
+    ) -> Result<(), SharedMappingError> {
+        let (end, _) = normalize_anonymous_range(address, length)?;
+        let ranges = committed_anonymous_ranges(self.vmas(), address, end)?;
+        let planned = plan_anonymous_change(self.vmas(), address, end, AnonymousChange::Decommit)?;
+        let committed_pages = ranges
+            .iter()
+            .map(|(_, length)| *length as u64 / PAGE_SIZE)
+            .sum::<u64>();
+        self.address_space_mut()
+            .unmap_user_ranges(&ranges)
+            .map_err(SharedMappingError::AddressSpace)?;
+        *self.vmas.as_mut().expect("live process lost its VMA table") = planned;
+        self.usage.private_pages = self.usage.private_pages.saturating_sub(committed_pages);
+        // PTE and VMA mutation is already committed. Reclamation failure leaves
+        // exact retired ownership in AddressSpace and the allocator's sticky error.
+        let _ = self
+            .address_space_mut()
+            .reclaim_retired_data_frames(allocator);
+        Ok(())
+    }
+
+    /// Removes an arbitrary anonymous subrange and releases any committed pages.
     pub fn unmap_anonymous(
         &mut self,
         address: u64,
         length: u64,
         allocator: &mut UsableFrameAllocator<'_>,
     ) -> Result<(), SharedMappingError> {
-        let index = self
-            .anonymous_mappings()
+        let (end, _) = normalize_anonymous_range(address, length)?;
+        let planned = plan_anonymous_change(self.vmas(), address, end, AnonymousChange::Unmap)?;
+        let ranges = committed_anonymous_ranges(self.vmas(), address, end)?;
+        let committed_pages = ranges
             .iter()
-            .position(|mapping| mapping.address == address && mapping.length == length)
-            .ok_or(SharedMappingError::ExactMappingNotFound { address, length })?;
-        let mapped_len = self.anonymous_mappings()[index].mapped_len;
+            .map(|(_, length)| *length as u64 / PAGE_SIZE)
+            .sum::<u64>();
         self.address_space_mut()
-            .unmap_user_range(address, mapped_len)
+            .unmap_user_ranges(&ranges)
             .map_err(SharedMappingError::AddressSpace)?;
-        self.address_space_mut()
-            .reclaim_retired_data_frames(allocator)
-            .map_err(|error| {
-                SharedMappingError::AddressSpace(AddressSpaceError::FrameAllocator(error))
-            })?;
-        self.anonymous_mappings
-            .as_mut()
-            .expect("live process lost its anonymous mapping records")
-            .swap_remove(index);
-        self.usage.private_pages = self
-            .usage
-            .private_pages
-            .saturating_sub(mapped_len as u64 / PAGE_SIZE);
+        *self.vmas.as_mut().expect("live process lost its VMA table") = planned;
+        self.usage.private_pages = self.usage.private_pages.saturating_sub(committed_pages);
+        // The reservation removal is semantically complete even if physical-frame
+        // reclamation is deferred; retired ownership and sticky allocator error remain.
+        let _ = self
+            .address_space_mut()
+            .reclaim_retired_data_frames(allocator);
         Ok(())
     }
 
@@ -1297,6 +1425,17 @@ impl Process {
             &occupied,
         )?;
 
+        let planned_vmas = plan_vma_insert(
+            self.vmas(),
+            VmArea {
+                start: address,
+                end: address
+                    .checked_add(request.mapped_len as u64)
+                    .ok_or(SharedMappingError::RangeOverflow)?,
+                kind: VmAreaKind::Shared,
+                protection: args.protection,
+            },
+        )?;
         let frames = translate_backing_pages(kernel, lease.info(), request)?;
         self.shared_mappings
             .as_mut()
@@ -1337,10 +1476,12 @@ impl Process {
                             .as_mut()
                             .expect("live process lost its retained leases")
                             .push(lease);
-                        return Err(SharedMappingError::RollbackFailed {
+                        let error = SharedMappingError::RollbackFailed {
                             mapping_error,
                             rollback_error,
-                        });
+                        };
+                        self.fail_stop_vm_rollback(page_address);
+                        return Err(error);
                     }
                 }
                 return Err(SharedMappingError::AddressSpace(mapping_error));
@@ -1359,6 +1500,7 @@ impl Process {
                 protection: args.protection,
                 _lease: lease,
             });
+        *self.vmas.as_mut().expect("live process lost its VMA table") = planned_vmas;
         self.usage.mapped_shared_bytes = new_mapped_total;
         if !args.flags.contains(MapFlags::FIXED) {
             self.next_mapping_cursor = address
@@ -1383,6 +1525,10 @@ impl Process {
             .position(|mapping| mapping.address == address && mapping.length == length)
             .ok_or(SharedMappingError::ExactMappingNotFound { address, length })?;
         let mapped_len = self.shared_mappings()[index].mapped_len;
+        let end = address
+            .checked_add(mapped_len as u64)
+            .ok_or(SharedMappingError::RangeOverflow)?;
+        let planned_vmas = plan_vma_remove_kind(self.vmas(), address, end, VmAreaKind::Shared)?;
         self.address_space_mut()
             .unmap_user_range(address, mapped_len)
             .map_err(SharedMappingError::AddressSpace)?;
@@ -1390,6 +1536,7 @@ impl Process {
             .as_mut()
             .expect("live process lost its mapping records")
             .swap_remove(index);
+        *self.vmas.as_mut().expect("live process lost its VMA table") = planned_vmas;
         self.usage.mapped_shared_bytes = self
             .usage
             .mapped_shared_bytes
@@ -1424,10 +1571,10 @@ impl Process {
             .shared_mappings
             .take()
             .expect("live process lost its mapping records");
-        let anonymous_mappings = self
-            .anonymous_mappings
+        let vmas = self
+            .vmas
             .take()
-            .expect("live process lost its anonymous mapping records");
+            .expect("live process lost its semantic VMA table");
         let retained_failed_mapping_leases = self
             .retained_failed_mapping_leases
             .take()
@@ -1435,12 +1582,12 @@ impl Process {
         let teardown = ProcessTeardown {
             handles_closed: handles.len(),
             mappings_released: shared_mappings.len(),
-            anonymous_mappings_released: anonymous_mappings.len(),
+            anonymous_mappings_released: count_anonymous_reservations(&vmas),
             retained_failed_mapping_leases_released: retained_failed_mapping_leases.len(),
         };
         let address_space = unsafe { address_space.retire() };
         drop(shared_mappings);
-        drop(anonymous_mappings);
+        drop(vmas);
         drop(retained_failed_mapping_leases);
         drop(handles);
 
@@ -1453,21 +1600,14 @@ impl Process {
     }
 
     fn occupied_ranges(&self) -> Result<Vec<VirtualRange>, SharedMappingError> {
-        let mappings = self.address_space().mappings();
         let mut occupied = Vec::new();
         occupied
-            .try_reserve_exact(mappings.len() + 1)
+            .try_reserve_exact(self.vmas().len())
             .map_err(|_| SharedMappingError::OutOfMemory)?;
-        occupied.push(
-            VirtualRange::new(self.layout.stack_guard_start, self.layout.stack_top)
-                .expect("static stack layout is valid"),
-        );
-        for mapping in mappings {
-            occupied.push(
-                VirtualRange::page(mapping.virtual_address)
-                    .ok_or(SharedMappingError::RangeOverflow)?,
-            );
-        }
+        occupied.extend(self.vmas().iter().map(|vma| VirtualRange {
+            start: vma.start,
+            end: vma.end,
+        }));
         Ok(occupied)
     }
 }
@@ -1480,10 +1620,30 @@ impl Drop for Process {
         // resources as a fail-safe. Process::retire takes these fields first and
         // performs the normal clean teardown after the root is no longer active.
         retain_unretired_resource(&mut self.shared_mappings);
-        retain_unretired_resource(&mut self.anonymous_mappings);
+        retain_unretired_resource(&mut self.vmas);
         retain_unretired_resource(&mut self.retained_failed_mapping_leases);
         retain_unretired_resource(&mut self.handles);
     }
+}
+
+fn count_anonymous_reservations(vmas: &[VmArea]) -> usize {
+    vmas.iter()
+        .enumerate()
+        .filter(|(index, vma)| {
+            let VmAreaKind::Anonymous { reservation_id, .. } = vma.kind else {
+                return false;
+            };
+            !vmas[..*index].iter().any(|previous| {
+                matches!(
+                    previous.kind,
+                    VmAreaKind::Anonymous {
+                        reservation_id: previous_id,
+                        ..
+                    } if previous_id == reservation_id
+                )
+            })
+        })
+        .count()
 }
 
 fn retain_unretired_resource<T>(resource: &mut Option<T>) {
@@ -1559,6 +1719,376 @@ fn copy_page_through_hhdm(
         )
     };
     Ok(())
+}
+
+fn initial_vmas(
+    image: &elf::LoadedImage,
+    layout: ProcessLayout,
+) -> Result<Vec<VmArea>, ProcessCreateError> {
+    let mut vmas = Vec::new();
+    vmas.try_reserve_exact(MAX_VMAS)
+        .map_err(|_| ProcessCreateError::ResourceLimit)?;
+    for segment in &image.segments {
+        let mut protection = MapProtection::READ;
+        if segment.permissions.is_writable() {
+            protection |= MapProtection::WRITE;
+        }
+        if segment.permissions.is_executable() {
+            protection |= MapProtection::EXECUTE;
+        }
+        push_merged_vma(
+            &mut vmas,
+            VmArea {
+                start: segment.page_start,
+                end: segment.page_start + segment.page_count * PAGE_SIZE,
+                kind: VmAreaKind::Image,
+                protection,
+            },
+        )
+        .map_err(|_| ProcessCreateError::ResourceLimit)?;
+    }
+    push_merged_vma(
+        &mut vmas,
+        VmArea {
+            start: layout.stack_guard_start,
+            end: layout.stack_bottom,
+            kind: VmAreaKind::StackGuard,
+            protection: MapProtection::empty(),
+        },
+    )
+    .map_err(|_| ProcessCreateError::ResourceLimit)?;
+    push_merged_vma(
+        &mut vmas,
+        VmArea {
+            start: layout.stack_bottom,
+            end: layout.stack_top,
+            kind: VmAreaKind::Stack,
+            protection: MapProtection::READ | MapProtection::WRITE,
+        },
+    )
+    .map_err(|_| ProcessCreateError::ResourceLimit)?;
+    vmas.sort_unstable_by_key(|vma| vma.start);
+    let mut write_index = 0usize;
+    for read_index in 0..vmas.len() {
+        let area = vmas[read_index];
+        if write_index != 0
+            && vmas[write_index - 1].end == area.start
+            && vmas[write_index - 1].kind == area.kind
+            && vmas[write_index - 1].protection == area.protection
+        {
+            vmas[write_index - 1].end = area.end;
+        } else {
+            vmas[write_index] = area;
+            write_index += 1;
+        }
+    }
+    vmas.truncate(write_index);
+    Ok(vmas)
+}
+
+#[derive(Clone, Copy)]
+enum AnonymousChange {
+    Commit,
+    Decommit,
+    Protect(MapProtection),
+    Unmap,
+}
+
+fn clone_vma_plan(vmas: &[VmArea]) -> Result<Vec<VmArea>, SharedMappingError> {
+    let mut planned = Vec::new();
+    planned
+        .try_reserve_exact(MAX_VMAS)
+        .map_err(|_| SharedMappingError::OutOfMemory)?;
+    planned.extend_from_slice(vmas);
+    Ok(planned)
+}
+
+fn push_merged_vma(vmas: &mut Vec<VmArea>, area: VmArea) -> Result<(), SharedMappingError> {
+    if area.start >= area.end {
+        return Err(SharedMappingError::RangeOverflow);
+    }
+    if let Some(previous) = vmas.last_mut() {
+        if previous.end == area.start
+            && previous.kind == area.kind
+            && previous.protection == area.protection
+        {
+            previous.end = area.end;
+            return Ok(());
+        }
+    }
+    if vmas.len() == MAX_VMAS {
+        return Err(SharedMappingError::ResourceLimit);
+    }
+    vmas.push(area);
+    Ok(())
+}
+
+fn plan_vma_insert(vmas: &[VmArea], area: VmArea) -> Result<Vec<VmArea>, SharedMappingError> {
+    let mut planned = Vec::new();
+    planned
+        .try_reserve_exact(MAX_VMAS)
+        .map_err(|_| SharedMappingError::OutOfMemory)?;
+    let mut inserted = false;
+    for current in vmas.iter().copied() {
+        if current.start < area.end && area.start < current.end {
+            return Err(SharedMappingError::AlreadyMapped(area.start));
+        }
+        if !inserted && area.end <= current.start {
+            push_merged_vma(&mut planned, area)?;
+            inserted = true;
+        }
+        push_merged_vma(&mut planned, current)?;
+    }
+    if !inserted {
+        push_merged_vma(&mut planned, area)?;
+    }
+    Ok(planned)
+}
+
+fn plan_anonymous_change(
+    vmas: &[VmArea],
+    start: u64,
+    end: u64,
+    change: AnonymousChange,
+) -> Result<Vec<VmArea>, SharedMappingError> {
+    let mut planned = Vec::new();
+    planned
+        .try_reserve_exact(MAX_VMAS)
+        .map_err(|_| SharedMappingError::OutOfMemory)?;
+    let mut covered = start;
+    for area in vmas.iter().copied() {
+        if area.end <= start || area.start >= end {
+            push_merged_vma(&mut planned, area)?;
+            continue;
+        }
+        if area.start > covered {
+            return Err(SharedMappingError::ExactMappingNotFound {
+                address: start,
+                length: end - start,
+            });
+        }
+        let VmAreaKind::Anonymous {
+            reservation_id,
+            committed,
+        } = area.kind
+        else {
+            return Err(SharedMappingError::ExactMappingNotFound {
+                address: start,
+                length: end - start,
+            });
+        };
+        if matches!(change, AnonymousChange::Commit) && committed {
+            return Err(SharedMappingError::AlreadyMapped(covered));
+        }
+        let middle_start = area.start.max(start);
+        let middle_end = area.end.min(end);
+        if area.start < middle_start {
+            push_merged_vma(
+                &mut planned,
+                VmArea {
+                    end: middle_start,
+                    ..area
+                },
+            )?;
+        }
+        if !matches!(change, AnonymousChange::Unmap) {
+            let (kind, protection) = match change {
+                AnonymousChange::Commit => (
+                    VmAreaKind::Anonymous {
+                        reservation_id,
+                        committed: true,
+                    },
+                    area.protection,
+                ),
+                AnonymousChange::Decommit => (
+                    VmAreaKind::Anonymous {
+                        reservation_id,
+                        committed: false,
+                    },
+                    area.protection,
+                ),
+                AnonymousChange::Protect(protection) => (area.kind, protection),
+                AnonymousChange::Unmap => unreachable!(),
+            };
+            push_merged_vma(
+                &mut planned,
+                VmArea {
+                    start: middle_start,
+                    end: middle_end,
+                    kind,
+                    protection,
+                },
+            )?;
+        }
+        if middle_end < area.end {
+            push_merged_vma(
+                &mut planned,
+                VmArea {
+                    start: middle_end,
+                    ..area
+                },
+            )?;
+        }
+        covered = middle_end;
+    }
+    if covered != end {
+        return Err(SharedMappingError::ExactMappingNotFound {
+            address: start,
+            length: end - start,
+        });
+    }
+    Ok(planned)
+}
+
+fn plan_vma_remove_kind(
+    vmas: &[VmArea],
+    start: u64,
+    end: u64,
+    kind: VmAreaKind,
+) -> Result<Vec<VmArea>, SharedMappingError> {
+    if matches!(kind, VmAreaKind::Anonymous { .. }) {
+        return plan_anonymous_change(vmas, start, end, AnonymousChange::Unmap);
+    }
+    let mut result = clone_vma_plan(vmas)?;
+    result.clear();
+    let mut covered = start;
+    for area in vmas.iter().copied() {
+        if area.end <= start || area.start >= end {
+            push_merged_vma(&mut result, area)?;
+            continue;
+        }
+        if area.kind != kind || area.start > covered {
+            return Err(SharedMappingError::ExactMappingNotFound {
+                address: start,
+                length: end - start,
+            });
+        }
+        let middle_start = area.start.max(start);
+        let middle_end = area.end.min(end);
+        if area.start < middle_start {
+            push_merged_vma(
+                &mut result,
+                VmArea {
+                    end: middle_start,
+                    ..area
+                },
+            )?;
+        }
+        if middle_end < area.end {
+            push_merged_vma(
+                &mut result,
+                VmArea {
+                    start: middle_end,
+                    ..area
+                },
+            )?;
+        }
+        covered = middle_end;
+    }
+    if covered != end {
+        return Err(SharedMappingError::ExactMappingNotFound {
+            address: start,
+            length: end - start,
+        });
+    }
+    Ok(result)
+}
+
+fn committed_anonymous_ranges(
+    vmas: &[VmArea],
+    start: u64,
+    end: u64,
+) -> Result<Vec<(u64, usize)>, SharedMappingError> {
+    let mut ranges = Vec::new();
+    ranges
+        .try_reserve_exact(MAX_VMAS)
+        .map_err(|_| SharedMappingError::OutOfMemory)?;
+    let mut covered = start;
+    for area in vmas {
+        if area.end <= start || area.start >= end {
+            continue;
+        }
+        if area.start > covered || !matches!(area.kind, VmAreaKind::Anonymous { .. }) {
+            return Err(SharedMappingError::ExactMappingNotFound {
+                address: start,
+                length: end - start,
+            });
+        }
+        let range_start = area.start.max(start);
+        let range_end = area.end.min(end);
+        if matches!(
+            area.kind,
+            VmAreaKind::Anonymous {
+                committed: true,
+                ..
+            }
+        ) {
+            let length = usize::try_from(range_end - range_start)
+                .map_err(|_| SharedMappingError::RangeOverflow)?;
+            if let Some((previous_start, previous_length)) = ranges.last_mut() {
+                if *previous_start + *previous_length as u64 == range_start {
+                    *previous_length += length;
+                } else {
+                    ranges.push((range_start, length));
+                }
+            } else {
+                ranges.push((range_start, length));
+            }
+        }
+        covered = range_end;
+    }
+    if covered != end {
+        return Err(SharedMappingError::ExactMappingNotFound {
+            address: start,
+            length: end - start,
+        });
+    }
+    Ok(ranges)
+}
+
+fn normalize_anonymous_range(
+    address: u64,
+    length: u64,
+) -> Result<(u64, usize), SharedMappingError> {
+    if address % PAGE_SIZE != 0 {
+        return Err(SharedMappingError::UnalignedFixedAddress(address));
+    }
+    if length == 0 {
+        return Err(SharedMappingError::ZeroLength);
+    }
+    let mapped_length = length
+        .checked_add(PAGE_SIZE - 1)
+        .map(|rounded| rounded & !(PAGE_SIZE - 1))
+        .ok_or(SharedMappingError::RangeOverflow)?;
+    let end = address
+        .checked_add(mapped_length)
+        .ok_or(SharedMappingError::RangeOverflow)?;
+    user_mapping_range(address, mapped_length)
+        .ok_or(SharedMappingError::InvalidFixedAddress(address))?;
+    Ok((
+        end,
+        usize::try_from(mapped_length).map_err(|_| SharedMappingError::RangeOverflow)?,
+    ))
+}
+
+fn anonymous_permissions(
+    protection: MapProtection,
+) -> Result<(MapProtection, UserPagePermissions), SharedMappingError> {
+    let known = MapProtection::READ | MapProtection::WRITE | MapProtection::EXECUTE;
+    if protection.bits() & !known.bits() != 0
+        || !protection.contains(MapProtection::READ)
+        || protection.contains(MapProtection::WRITE) && protection.contains(MapProtection::EXECUTE)
+    {
+        return Err(SharedMappingError::InvalidProtection(protection));
+    }
+    let permissions = if protection.contains(MapProtection::WRITE) {
+        UserPagePermissions::READ_WRITE
+    } else if protection.contains(MapProtection::EXECUTE) {
+        UserPagePermissions::READ_EXECUTE
+    } else {
+        UserPagePermissions::READ_ONLY
+    };
+    Ok((protection, permissions))
 }
 
 fn validate_protection(
@@ -1678,18 +2208,13 @@ struct VirtualRange {
 }
 
 impl VirtualRange {
+    #[cfg(test)]
     const fn new(start: u64, end: u64) -> Option<Self> {
         if start < end {
             Some(Self { start, end })
         } else {
             None
         }
-    }
-
-    fn page(address: u64) -> Option<Self> {
-        address
-            .checked_add(PAGE_SIZE)
-            .and_then(|end| Self::new(address, end))
     }
 
     const fn overlaps(self, other: Self) -> bool {
@@ -2096,9 +2621,10 @@ mod tests {
             preemption_count: 0,
             blocked_syscall: None,
             shared_mappings: None,
-            anonymous_mappings: None,
+            vmas: None,
             retained_failed_mapping_leases: None,
             next_mapping_cursor: SHARED_MAPPING_BASE,
+            next_anonymous_reservation_id: 1,
             limits: ProcessLimits::STANDARD,
             usage: ProcessUsage::default(),
         }
@@ -2143,7 +2669,14 @@ mod tests {
                 &mut allocator,
             )
             .unwrap();
-        assert_eq!(process.anonymous_mappings().len(), 1);
+        assert_eq!(
+            process
+                .vmas()
+                .iter()
+                .filter(|vma| matches!(vma.kind, VmAreaKind::Anonymous { .. }))
+                .count(),
+            1
+        );
         assert_eq!(process.usage().private_pages, baseline_private + 3);
         let mapped_frames = allocator.allocated_count();
         assert!(mapped_frames >= baseline_frames + 3);
@@ -2180,12 +2713,317 @@ mod tests {
         process
             .unmap_anonymous(address, length, &mut allocator)
             .unwrap();
-        assert!(process.anonymous_mappings().is_empty());
+        assert!(!process
+            .vmas()
+            .iter()
+            .any(|vma| matches!(vma.kind, VmAreaKind::Anonymous { .. })));
         assert_eq!(process.usage().private_pages, baseline_private);
         assert_eq!(allocator.allocated_count(), mapped_frames - 3);
 
         process.retire().unwrap().reclaim(&mut allocator).unwrap();
         assert_eq!(allocator.allocated_count(), 0);
+    }
+
+    #[test]
+    fn anonymous_reserve_commit_decommit_protect_and_partial_unmap_are_semantic() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(96);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let baseline_frames = allocator.allocated_count();
+        let baseline_private = process.usage().private_pages;
+        let address = process
+            .reserve_anonymous(PAGE_SIZE * 4, MapProtection::READ | MapProtection::WRITE)
+            .unwrap();
+
+        assert_eq!(allocator.allocated_count(), baseline_frames);
+        assert_eq!(process.usage().private_pages, baseline_private);
+        assert!(matches!(
+            process.address_space().validate_user_range(
+                address,
+                PAGE_SIZE as usize,
+                UserAccess::Read
+            ),
+            Err(AddressSpaceError::NotMapped(_))
+        ));
+        assert!(process
+            .vmas()
+            .windows(2)
+            .all(|pair| pair[0].end <= pair[1].start));
+
+        process
+            .commit_anonymous(address + PAGE_SIZE, PAGE_SIZE * 2, &mut allocator)
+            .unwrap();
+        assert_eq!(process.usage().private_pages, baseline_private + 2);
+        process
+            .protect_anonymous(
+                address,
+                PAGE_SIZE * 3,
+                MapProtection::READ | MapProtection::EXECUTE,
+            )
+            .unwrap();
+        assert_eq!(
+            process.address_space().validate_user_range(
+                address + PAGE_SIZE,
+                PAGE_SIZE as usize,
+                UserAccess::Execute,
+            ),
+            Ok(())
+        );
+        process
+            .decommit_anonymous(address + PAGE_SIZE * 2, PAGE_SIZE, &mut allocator)
+            .unwrap();
+        assert_eq!(process.usage().private_pages, baseline_private + 1);
+        assert!(matches!(
+            process.address_space().validate_user_range(
+                address + PAGE_SIZE * 2,
+                PAGE_SIZE as usize,
+                UserAccess::Read,
+            ),
+            Err(AddressSpaceError::NotMapped(_))
+        ));
+        process
+            .commit_anonymous(address + PAGE_SIZE * 3, PAGE_SIZE, &mut allocator)
+            .unwrap();
+        process
+            .protect_anonymous(address, PAGE_SIZE * 4, MapProtection::READ)
+            .unwrap();
+
+        process
+            .unmap_anonymous(address, PAGE_SIZE * 3, &mut allocator)
+            .unwrap();
+        assert_eq!(process.usage().private_pages, baseline_private + 1);
+        assert!(process.vmas().iter().any(|vma| {
+            vma.start == address + PAGE_SIZE * 3
+                && vma.end == address + PAGE_SIZE * 4
+                && matches!(
+                    vma.kind,
+                    VmAreaKind::Anonymous {
+                        committed: true,
+                        ..
+                    }
+                )
+        }));
+        process
+            .unmap_anonymous(address + PAGE_SIZE * 3, PAGE_SIZE, &mut allocator)
+            .unwrap();
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+        assert_eq!(allocator.allocated_count(), 0);
+    }
+
+    #[test]
+    fn failed_anonymous_commit_preserves_reservation_quota_and_page_tables() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(64);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let baseline_private = process.usage().private_pages;
+        let address = process
+            .reserve_anonymous(PAGE_SIZE * 2, MapProtection::READ | MapProtection::WRITE)
+            .unwrap();
+        let mut held = Vec::new();
+        while let Some(frame) = allocator.allocate_frame().unwrap() {
+            held.push(frame);
+        }
+        let exhausted_count = allocator.allocated_count();
+
+        assert!(process
+            .commit_anonymous(address, PAGE_SIZE * 2, &mut allocator)
+            .is_err());
+        assert_eq!(allocator.allocated_count(), exhausted_count);
+        assert_eq!(process.usage().private_pages, baseline_private);
+        assert!(process.vmas().iter().any(|vma| {
+            vma.start == address
+                && vma.end == address + PAGE_SIZE * 2
+                && matches!(
+                    vma.kind,
+                    VmAreaKind::Anonymous {
+                        committed: false,
+                        ..
+                    }
+                )
+        }));
+        assert!(matches!(
+            process.address_space().validate_user_range(
+                address,
+                PAGE_SIZE as usize,
+                UserAccess::Read
+            ),
+            Err(AddressSpaceError::NotMapped(_))
+        ));
+
+        allocator.reclaim_frames(&held).unwrap();
+        process
+            .commit_anonymous(address, PAGE_SIZE * 2, &mut allocator)
+            .unwrap();
+        process
+            .unmap_anonymous(address, PAGE_SIZE * 2, &mut allocator)
+            .unwrap();
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+        assert_eq!(allocator.allocated_count(), 0);
+    }
+
+    #[test]
+    fn decommit_is_idempotent_and_charges_only_committed_pages_in_mixed_range() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(96);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let baseline_private = process.usage().private_pages;
+        let address = process
+            .reserve_anonymous(PAGE_SIZE * 4, MapProtection::READ | MapProtection::WRITE)
+            .unwrap();
+        process
+            .commit_anonymous(address + PAGE_SIZE, PAGE_SIZE * 2, &mut allocator)
+            .unwrap();
+        assert_eq!(process.usage().private_pages, baseline_private + 2);
+
+        process
+            .decommit_anonymous(address, PAGE_SIZE * 4, &mut allocator)
+            .unwrap();
+        assert_eq!(process.usage().private_pages, baseline_private);
+        process
+            .decommit_anonymous(address, PAGE_SIZE * 4, &mut allocator)
+            .unwrap();
+        assert_eq!(process.usage().private_pages, baseline_private);
+        assert_eq!(
+            process
+                .vmas()
+                .iter()
+                .filter(|vma| matches!(vma.kind, VmAreaKind::Anonymous { .. }))
+                .count(),
+            1
+        );
+
+        process
+            .unmap_anonymous(address, PAGE_SIZE * 4, &mut allocator)
+            .unwrap();
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+        assert_eq!(allocator.allocated_count(), 0);
+    }
+
+    #[test]
+    fn anonymous_reservation_rollback_restores_cursor_and_failed_map_leaves_no_vma() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(64);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let original_cursor = process.next_mapping_cursor();
+        let (_, rollback) = process
+            .reserve_anonymous_with_rollback(PAGE_SIZE, MapProtection::READ)
+            .unwrap();
+        let rolled_back_id = rollback.reservation_id;
+        assert_ne!(process.next_mapping_cursor(), original_cursor);
+        process.rollback_anonymous_reservation(rollback);
+        assert_eq!(process.next_mapping_cursor(), original_cursor);
+        let (_, next_rollback) = process
+            .reserve_anonymous_with_rollback(PAGE_SIZE, MapProtection::READ)
+            .unwrap();
+        assert!(next_rollback.reservation_id > rolled_back_id);
+        process.rollback_anonymous_reservation(next_rollback);
+        assert_eq!(process.next_mapping_cursor(), original_cursor);
+        assert!(!process
+            .vmas()
+            .iter()
+            .any(|vma| matches!(vma.kind, VmAreaKind::Anonymous { .. })));
+
+        let mut held = Vec::new();
+        while let Some(frame) = allocator.allocate_frame().unwrap() {
+            held.push(frame);
+        }
+        assert!(process
+            .map_anonymous(PAGE_SIZE, MapProtection::READ, &mut allocator)
+            .is_err());
+        assert_eq!(process.next_mapping_cursor(), original_cursor);
+        assert!(!process
+            .vmas()
+            .iter()
+            .any(|vma| matches!(vma.kind, VmAreaKind::Anonymous { .. })));
+
+        allocator.reclaim_frames(&held).unwrap();
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+        assert_eq!(allocator.allocated_count(), 0);
+    }
+
+    #[test]
+    fn reservation_identity_prevents_merge_and_teardown_counts_unique_ids() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(64);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let first = process
+            .reserve_anonymous(PAGE_SIZE * 3, MapProtection::READ)
+            .unwrap();
+        process
+            .protect_anonymous(
+                first + PAGE_SIZE,
+                PAGE_SIZE,
+                MapProtection::READ | MapProtection::WRITE,
+            )
+            .unwrap();
+        let second = process
+            .reserve_anonymous(PAGE_SIZE, MapProtection::READ)
+            .unwrap();
+        assert_eq!(second, first + PAGE_SIZE * 3);
+        assert_eq!(count_anonymous_reservations(process.vmas()), 2);
+        let ids = process
+            .vmas()
+            .iter()
+            .filter_map(|vma| match vma.kind {
+                VmAreaKind::Anonymous { reservation_id, .. } => Some(reservation_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(ids.windows(2).any(|pair| pair[0] != pair[1]));
+
+        let reclaimed = process.retire().unwrap().reclaim(&mut allocator).unwrap();
+        assert_eq!(reclaimed.teardown.anonymous_mappings_released, 2);
+        assert_eq!(allocator.allocated_count(), 0);
+    }
+
+    #[test]
+    fn vm_rollback_fail_stop_is_terminal_and_uses_stable_internal_fault() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(64);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        process.fail_stop_vm_rollback(0x1234_5000);
+
+        assert_eq!(
+            process.state(),
+            ProcessState::Faulted(ProcessFault::at_address(
+                ProcessFaultReason::Other(VM_ROLLBACK_FAILURE_REASON),
+                VM_ROLLBACK_FAILURE_CODE,
+                0x1234_5000,
+            ))
+        );
+        assert!(process.state().is_terminal());
+        assert!(!process.is_runnable());
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+    }
+
+    #[test]
+    fn vma_split_limit_failure_leaves_the_sorted_source_unchanged() {
+        let mut vmas = Vec::new();
+        vmas.push(VmArea {
+            start: 0x10_0000,
+            end: 0x10_0000 + PAGE_SIZE * 3,
+            kind: VmAreaKind::Anonymous {
+                reservation_id: 1,
+                committed: false,
+            },
+            protection: MapProtection::READ,
+        });
+        for index in 1..MAX_VMAS {
+            let start = 0x20_0000 + index as u64 * PAGE_SIZE * 2;
+            vmas.push(VmArea {
+                start,
+                end: start + PAGE_SIZE,
+                kind: VmAreaKind::Image,
+                protection: MapProtection::READ,
+            });
+        }
+        let original = vmas.clone();
+
+        assert_eq!(
+            plan_anonymous_change(
+                &vmas,
+                0x10_0000 + PAGE_SIZE,
+                0x10_0000 + PAGE_SIZE * 2,
+                AnonymousChange::Protect(MapProtection::READ | MapProtection::WRITE),
+            ),
+            Err(SharedMappingError::ResourceLimit)
+        );
+        assert_eq!(vmas, original);
+        assert!(vmas.windows(2).all(|pair| pair[0].end <= pair[1].start));
     }
 
     #[test]

@@ -587,6 +587,83 @@ impl AddressSpace {
         Ok(mappings.pop().expect("one-page unmap returned no metadata"))
     }
 
+    /// Preflights several discontiguous mapped ranges before a compound operation.
+    ///
+    /// Every range is validated before the caller changes any PTE, preventing a
+    /// later hole or untracked mapping from turning a semantic multi-range update
+    /// into a partial operation.
+    pub fn preflight_mapped_user_ranges(
+        &self,
+        ranges: &[(u64, usize)],
+    ) -> Result<(), AddressSpaceError> {
+        let mut previous_end = None;
+        for &(address, length) in ranges {
+            let (_, end) = validate_exact_user_page_range(address, length)?;
+            if previous_end.is_some_and(|previous_end| address <= previous_end) {
+                return Err(AddressSpaceError::InvalidRangeLength(length));
+            }
+            previous_end = Some(end);
+            let mut page_address = address;
+            loop {
+                let walked = match self.walk_user_page(page_address)? {
+                    WalkResult::Unmapped => return Err(AddressSpaceError::NotMapped(page_address)),
+                    WalkResult::Mapped(mapping) => mapping,
+                };
+                let tracked = self
+                    .mappings
+                    .iter()
+                    .find(|mapping| mapping.virtual_address == page_address)
+                    .ok_or(AddressSpaceError::UntrackedMapping(page_address))?;
+                if tracked.frame != walked.frame {
+                    return Err(AddressSpaceError::CorruptPageTable);
+                }
+                match tracked.backing {
+                    UserMappingBacking::OwnedPrivate => {
+                        if !self.owned_data_frames.contains(&tracked.frame) {
+                            return Err(AddressSpaceError::MappedFrameNotOwned(tracked.frame));
+                        }
+                    }
+                    UserMappingBacking::SharedAlias => {
+                        if self.owned_data_frames.contains(&tracked.frame)
+                            || self.retired_data_frames.contains(&tracked.frame)
+                        {
+                            return Err(AddressSpaceError::CorruptPageTable);
+                        }
+                    }
+                }
+                if page_address == end {
+                    break;
+                }
+                page_address = page_address
+                    .checked_add(PAGE_SIZE)
+                    .ok_or(AddressSpaceError::AddressOverflow)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Unmaps several discontiguous ranges after preflighting the complete set.
+    pub fn unmap_user_ranges(
+        &mut self,
+        ranges: &[(u64, usize)],
+    ) -> Result<Vec<UserPageMapping>, AddressSpaceError> {
+        self.preflight_mapped_user_ranges(ranges)?;
+        let mapping_count = ranges
+            .iter()
+            .try_fold(0usize, |total, (_, length)| {
+                total.checked_add(length / PAGE_SIZE as usize)
+            })
+            .ok_or(AddressSpaceError::AddressOverflow)?;
+        let mut removed = Vec::new();
+        removed
+            .try_reserve_exact(mapping_count)
+            .map_err(|_| AddressSpaceError::OutOfFrames)?;
+        for &(address, length) in ranges {
+            removed.extend(self.unmap_user_range(address, length)?);
+        }
+        Ok(removed)
+    }
+
     /// Unmaps exactly `length` bytes of page-aligned user mappings.
     ///
     /// Both the start and length must be 4 KiB aligned and `length` must be
@@ -678,6 +755,19 @@ impl AddressSpace {
             }
         }
         Ok(planned)
+    }
+
+    /// Applies one permission set to several mapped ranges after complete preflight.
+    pub fn protect_user_ranges(
+        &mut self,
+        ranges: &[(u64, usize)],
+        permissions: UserPagePermissions,
+    ) -> Result<(), AddressSpaceError> {
+        self.preflight_mapped_user_ranges(ranges)?;
+        for &(address, length) in ranges {
+            self.protect_user_range(address, length, permissions)?;
+        }
+        Ok(())
     }
 
     /// Returns all private frames retired by successful unmaps or failed mappings.
@@ -1491,6 +1581,75 @@ mod tests {
             address_space.unmap_user_range(0x7000, 1),
             Err(AddressSpaceError::InvalidRangeLength(1))
         );
+    }
+
+    #[test]
+    fn multi_range_protect_later_failure_leaves_earlier_permissions_unchanged() {
+        let mut address_space = fake_address_space();
+        let mut allocator = FakeFrameAllocator::new();
+        let frame = allocator.allocate_frame().unwrap();
+        unsafe {
+            address_space
+                .map_user_4k_with_allocator(
+                    0x7000,
+                    frame,
+                    UserPagePermissions::READ_WRITE,
+                    UserMappingBacking::OwnedPrivate,
+                    &mut allocator,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            address_space.protect_user_ranges(
+                &[(0x7000, PAGE_SIZE as usize), (0x9000, PAGE_SIZE as usize),],
+                UserPagePermissions::READ_ONLY,
+            ),
+            Err(AddressSpaceError::NotMapped(0x9000))
+        );
+        assert_eq!(
+            address_space.validate_user_range(0x7000, 1, UserAccess::Write),
+            Ok(())
+        );
+        assert_eq!(
+            address_space
+                .mappings()
+                .iter()
+                .find(|mapping| mapping.virtual_address == 0x7000)
+                .unwrap()
+                .permissions,
+            UserPagePermissions::READ_WRITE
+        );
+    }
+
+    #[test]
+    fn multi_range_unmap_later_failure_leaves_earlier_mapping_unchanged() {
+        let mut address_space = fake_address_space();
+        let mut allocator = FakeFrameAllocator::new();
+        let frame = allocator.allocate_frame().unwrap();
+        unsafe {
+            address_space
+                .map_user_4k_with_allocator(
+                    0x7000,
+                    frame,
+                    UserPagePermissions::READ_ONLY,
+                    UserMappingBacking::OwnedPrivate,
+                    &mut allocator,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            address_space
+                .unmap_user_ranges(&[(0x7000, PAGE_SIZE as usize), (0x9000, PAGE_SIZE as usize),]),
+            Err(AddressSpaceError::NotMapped(0x9000))
+        );
+        assert_eq!(
+            address_space.validate_user_range(0x7000, 1, UserAccess::Read),
+            Ok(())
+        );
+        assert!(address_space.retired_data_frames().is_empty());
+        assert_eq!(address_space.accounting().mapped_data_frames, 1);
     }
 
     #[test]
