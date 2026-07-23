@@ -1755,6 +1755,27 @@ impl ProcessTable {
             .any(|slot| slot.value.as_ref().is_some_and(Process::is_runnable))
     }
 
+    /// Marks every live process terminal after an orderly-shutdown grace period expires.
+    pub fn force_terminate_all(&mut self) -> usize {
+        self.force_terminate_all_except(None)
+    }
+
+    /// Marks every live process except one trusted coordinator terminal.
+    pub fn force_terminate_all_except(&mut self, retained: Option<ProcessId>) -> usize {
+        let mut terminated = 0;
+        for (index, slot) in self.inner.slots.iter_mut().enumerate() {
+            let Some(process) = slot.value.as_mut() else {
+                continue;
+            };
+            let id = ProcessId::from_parts(index as u32, slot.generation);
+            if Some(id) != retained && !process.state().is_terminal() {
+                process.mark_terminated();
+                terminated += 1;
+            }
+        }
+        terminated
+    }
+
     /// Reserves capacity before callers allocate an address space and handles.
     pub fn prepare_insert(&mut self) -> Result<(), ProcessTableError> {
         self.inner.prepare_insert()

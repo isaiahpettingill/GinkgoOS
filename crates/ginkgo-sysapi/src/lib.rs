@@ -76,6 +76,12 @@ pub enum SyscallNumber {
     FilesystemReadDirectory2 = 34,
     /// Creates or opens an application's private data directory during installation.
     ApplicationDataCreate = 35,
+    /// Requests an orderly power-off or reboot through a system-power capability.
+    SystemPowerRequest = 36,
+    /// Cancels a power request before irreversible synchronization begins.
+    SystemPowerCancel = 37,
+    /// Reads progress and failure information through a system-power capability.
+    SystemPowerGetInfo = 38,
 }
 
 /// An opaque process-local reference to a kernel object.
@@ -198,6 +204,91 @@ bitflags! {
     }
 }
 
+/// Requested terminal machine state.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SystemPowerAction {
+    PowerOff = 1,
+    Reboot = 2,
+}
+
+impl SystemPowerAction {
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            1 => Some(Self::PowerOff),
+            2 => Some(Self::Reboot),
+            _ => None,
+        }
+    }
+}
+
+/// Observable phase of the bounded orderly-shutdown state machine.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SystemPowerState {
+    Idle = 0,
+    Requested = 1,
+    Quiescing = 2,
+    Synchronizing = 3,
+    Committing = 4,
+    Canceled = 5,
+    Failed = 6,
+}
+
+impl SystemPowerState {
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Idle),
+            1 => Some(Self::Requested),
+            2 => Some(Self::Quiescing),
+            3 => Some(Self::Synchronizing),
+            4 => Some(Self::Committing),
+            5 => Some(Self::Canceled),
+            6 => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+bitflags! {
+    /// Policy selected by the authorized requester.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    pub struct SystemPowerFlags: u32 {
+        /// Continue to firmware after bounded process/device failures.
+        const FORCE = 1 << 0;
+    }
+}
+
+/// Stable progress record returned by [`SyscallNumber::SystemPowerGetInfo`].
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq,
+)]
+pub struct SystemPowerInfo {
+    pub state: u32,
+    pub action: u32,
+    pub flags: u32,
+    /// A [`Status`] value, or zero when no failure has occurred.
+    pub failure_status: i32,
+    pub sequence: u64,
+    pub deadline_ns: u64,
+}
+
+impl SystemPowerInfo {
+    pub const fn power_state(self) -> Option<SystemPowerState> {
+        SystemPowerState::from_raw(self.state)
+    }
+
+    pub const fn power_action(self) -> Option<SystemPowerAction> {
+        SystemPowerAction::from_raw(self.action)
+    }
+
+    pub const fn power_flags(self) -> SystemPowerFlags {
+        SystemPowerFlags::from_bits_retain(self.flags)
+    }
+}
+
 bitflags! {
     /// Placement behavior for a shared-memory mapping.
     #[repr(transparent)]
@@ -221,6 +312,7 @@ pub enum ObjectType {
     Process = 7,
     ApplicationData = 8,
     Directory = 9,
+    SystemPower = 10,
 }
 
 /// Stable syscall status values. Additional detail is returned in output structs.
@@ -939,6 +1031,7 @@ const _: () = {
     assert!(core::mem::size_of::<HandleDisposition>() == 16);
     assert!(core::mem::size_of::<ProcessCreateArgs>() == 64);
     assert!(core::mem::size_of::<ProcessInfo>() == 32);
+    assert!(core::mem::size_of::<SystemPowerInfo>() == 32);
     assert!(core::mem::size_of::<ReceivedHandle>() == 16);
     assert!(core::mem::size_of::<ChannelCreateOutput>() == 8);
     assert!(core::mem::size_of::<ChannelWriteArgs>() == 40);
@@ -1010,6 +1103,9 @@ mod tests {
         assert_eq!(SyscallNumber::FilesystemGetMetadata as u64, 33);
         assert_eq!(SyscallNumber::FilesystemReadDirectory2 as u64, 34);
         assert_eq!(SyscallNumber::ApplicationDataCreate as u64, 35);
+        assert_eq!(SyscallNumber::SystemPowerRequest as u64, 36);
+        assert_eq!(SyscallNumber::SystemPowerCancel as u64, 37);
+        assert_eq!(SyscallNumber::SystemPowerGetInfo as u64, 38);
     }
 
     #[test]

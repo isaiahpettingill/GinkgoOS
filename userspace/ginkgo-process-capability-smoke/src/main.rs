@@ -6,9 +6,10 @@ use core::{mem::MaybeUninit, slice};
 use ginkgo_userspace::{
     application_data_create, application_get_data_directory, channel_create, channel_read,
     channel_write, debug_write, filesystem_open, handle_close, handle_duplicate, process_create,
-    process_get_info, process_terminate, process_wait, wait_many, FilesystemOpenFlags, Handle,
-    HandleDisposition, ProcessFault, ProcessState, ProcessTerminationCause, ReceivedHandle, Rights,
-    Signals, Status, WaitItem, DEADLINE_INFINITE,
+    process_get_info, process_terminate, process_wait, system_power_request, wait_many,
+    FilesystemOpenFlags, Handle, HandleDisposition, ProcessFault, ProcessState,
+    ProcessTerminationCause, ReceivedHandle, Rights, Signals, Status, SystemPowerAction,
+    SystemPowerFlags, WaitItem, DEADLINE_INFINITE,
 };
 
 const MAGIC: u32 = u32::from_le_bytes(*b"GKSP");
@@ -117,6 +118,19 @@ impl<'a> Startup<'a> {
 
 fn run_parent(root: Handle) -> ! {
     trace(b"parent entered\n");
+    if system_power_request(
+        Handle::INVALID,
+        SystemPowerAction::PowerOff,
+        SystemPowerFlags::empty(),
+    ) != Err(Status::InvalidHandle)
+    {
+        fail(b"invalid system power handle");
+    }
+    if system_power_request(root, SystemPowerAction::PowerOff, SystemPowerFlags::empty())
+        != Err(Status::AccessDenied)
+    {
+        fail(b"unauthorized system power");
+    }
     let executable = filesystem_open(
         root,
         EXECUTABLE_PATH,

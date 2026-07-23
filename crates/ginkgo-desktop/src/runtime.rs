@@ -175,6 +175,7 @@ pub enum RuntimeMessage {
 
     // Kernel broker -> desktop service.
     ToggleLauncher,
+    CloseAllWindows,
     ClientConnected {
         client_id: ClientId,
         channel_attachment: AttachmentIndex,
@@ -235,6 +236,7 @@ impl RuntimeMessage {
             | Self::Present { .. }
             | Self::LaunchProgram { .. } => RuntimeSender::DesktopService,
             Self::ToggleLauncher
+            | Self::CloseAllWindows
             | Self::ClientConnected { .. }
             | Self::SurfaceReady { .. }
             | Self::PresentResult { .. }

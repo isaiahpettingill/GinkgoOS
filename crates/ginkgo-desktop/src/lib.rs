@@ -215,6 +215,7 @@ pub enum TrustedCommand {
     FocusLeft,
     FocusRight,
     CloseFocused,
+    CloseAll,
     MoveFocusedLeft,
     MoveFocusedRight,
     SetWindowWidth {
@@ -370,6 +371,7 @@ impl Desktop {
             TrustedCommand::FocusLeft => self.focus_left(),
             TrustedCommand::FocusRight => self.focus_right(),
             TrustedCommand::CloseFocused => Ok(self.close_focused()),
+            TrustedCommand::CloseAll => Ok(self.close_all()),
             TrustedCommand::MoveFocusedLeft => self.move_focused_left(),
             TrustedCommand::MoveFocusedRight => self.move_focused_right(),
             TrustedCommand::SetWindowWidth { window_id, width } => {
@@ -446,6 +448,16 @@ impl Desktop {
             client_id: window.owner,
             window_id,
         }]
+    }
+
+    pub fn close_all(&self) -> Vec<DesktopAction> {
+        self.windows
+            .iter()
+            .map(|window| DesktopAction::CloseRequested {
+                client_id: window.owner,
+                window_id: window.id,
+            })
+            .collect()
     }
 
     pub fn move_focused_left(&mut self) -> Result<Vec<DesktopAction>, DesktopError> {

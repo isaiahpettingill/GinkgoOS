@@ -32,16 +32,13 @@ const CHARACTER_WIDTH: usize = 8;
 
 ginkgo_runtime::entry!(process_main);
 
-extern "C" fn process_main(
-    window_raw: u64,
-    filesystem_raw: u64,
-    _arg2: u64,
-    _random_raw: u64,
-) -> ! {
+extern "C" fn process_main(window_raw: u64, filesystem_raw: u64, _arg2: u64, power_raw: u64) -> ! {
     let desktop =
         parse_handle(window_raw).unwrap_or_else(|| fail(b"terminal: invalid desktop channel\n", 1));
     let filesystem = parse_handle(filesystem_raw)
         .unwrap_or_else(|| fail(b"terminal: missing filesystem capability\n", 1));
+    let power = parse_handle(power_raw)
+        .unwrap_or_else(|| fail(b"terminal: missing system-power capability\n", 1));
     let transport = WindowTransport::new(desktop)
         .unwrap_or_else(|_| fail(b"terminal: transport initialization failed\n", 1));
     let mut client = WindowClient::new(transport);
@@ -49,7 +46,7 @@ extern "C" fn process_main(
 
     let (terminal_endpoint, shell_endpoint) =
         channel_create().unwrap_or_else(|_| fail(b"terminal: channel creation failed\n", 1));
-    let mut shell = Shell::new(filesystem, desktop, shell_endpoint);
+    let mut shell = Shell::new(filesystem, desktop, power, shell_endpoint);
     let host = shell.host();
     let mut input_pending = VecDeque::new();
     let mut scrollback = VecDeque::new();

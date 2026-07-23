@@ -430,6 +430,10 @@ impl DesktopBroker {
         self.send_kernel_packet(RuntimePacket::new(RuntimeMessage::ToggleLauncher))
     }
 
+    pub fn send_close_all_windows(&mut self) -> Result<(), DesktopBrokerError> {
+        self.send_kernel_packet(RuntimePacket::new(RuntimeMessage::CloseAllWindows))
+    }
+
     pub fn send_pointer_input(
         &mut self,
         position: InputPoint,

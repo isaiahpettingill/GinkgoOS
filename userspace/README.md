@@ -112,6 +112,12 @@ The headless job table is separate from graphical children and retains each proc
 
 All direct execution functions are headless. This includes installed packages whose metadata kind is graphical: `spawn_installed` and `exec_installed` deliberately do not create or transfer a desktop channel. `run(app_id)` remains the graphical trusted-system-registry policy path: it creates a fresh bidirectional console channel and transfers the child endpoint through the desktop broker, which resolves the trusted registry ID and applies entry capabilities. Console-aware graphical children receive the endpoint as startup argument 3 (`rdx`), and the terminal polls its independently retained endpoint for `Output`, `Error`, and `Exit` messages.
 
+### Machine power
+
+The trusted terminal receives a non-transferable system-power capability. `power_off(confirmed, force)` and `reboot(confirmed, force)` reject calls unless `confirmed` is `true`; `force` permits the firmware transition after a bounded synchronization failure. `cancel_power()` cancels only during the two-second request interval. `power_status()` returns the current state (`idle`, `requested`, `quiescing`, `synchronizing`, `committing`, `canceled`, or `failed`), sequence, cancellation deadline, and failure status.
+
+Once the cancellation interval expires, the kernel rejects new launches, gives existing processes a bounded grace interval, force-terminates remaining processes, checkpoints RedoxFS, explicitly flushes the block device, and invokes ACPI S5 or the FADT reset register. Ordinary and installed applications receive no system-power capability and direct requests fail authorization. The desktop launcher also exposes **Power off** and **Restart** rows; either requires a second click to confirm, and Escape cancels the confirmation.
+
 ### Package installation
 
 `install_package(path)` accepts a bounded GKP file (currently capped at 1 MiB to fit the terminal's 2 MiB static heap), validates it with `ginkgo-app-package`, and installs or updates its registry entry. `desktop`, `file-navigator`, `terminal`, and `minimal-client` are protected system IDs and cannot be installed, updated, removed, or data-purged. `list_installed()` returns maps containing `app_id`, `display_name`, `version`, `kind`, the full immutable executable path, executable `sha256`, and package `package_sha256`.

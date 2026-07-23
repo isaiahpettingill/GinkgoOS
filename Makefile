@@ -10,6 +10,13 @@ FILESYSTEM_SMOKE_ROOT := $(BUILD_DIR)/filesystem_smoke_root
 FILESYSTEM_SMOKE_DISK := $(BUILD_DIR)/filesystem-hierarchy-smoke.img
 PROCESS_CAPABILITY_SMOKE_ROOT := $(BUILD_DIR)/process_capability_smoke_root
 PROCESS_CAPABILITY_SMOKE_DISK := $(BUILD_DIR)/process-capability-smoke.img
+POWER_SYNC_ROOT := $(BUILD_DIR)/power_sync_root
+POWER_VERIFY_ROOT := $(BUILD_DIR)/power_verify_root
+POWER_CANCEL_ROOT := $(BUILD_DIR)/power_cancel_root
+POWER_REBOOT_ROOT := $(BUILD_DIR)/power_reboot_root
+POWER_PERSIST_DISK := $(BUILD_DIR)/power-persist-smoke.img
+POWER_CANCEL_DISK := $(BUILD_DIR)/power-cancel-smoke.img
+POWER_REBOOT_DISK := $(BUILD_DIR)/power-reboot-smoke.img
 KERNEL := target/x86_64-unknown-none/debug/ginkgo-os
 USERSPACE_MANIFEST := userspace/Cargo.toml
 USERSPACE_TARGET := userspace/target/x86_64-unknown-none/release
@@ -43,9 +50,9 @@ else
 QEMU ?= qemu-system-x86_64
 QEMU_AUDIO_FLAGS ?= -audiodev sdl,id=ginkgo-audio
 endif
-QEMU_FLAGS ?= -cpu max -m 512M -M pc,i8042=off -serial stdio -device qemu-xhci,id=xhci,msi=on,msix=off -device usb-hub,id=ginkgo-hub,bus=xhci.0,port=1 -device usb-kbd,bus=xhci.0,port=1.1 -device usb-tablet,bus=xhci.0,port=1.2 $(QEMU_AUDIO_FLAGS) -device ich9-intel-hda -device hda-output,audiodev=ginkgo-audio -no-reboot -no-shutdown
+QEMU_FLAGS ?= -cpu max -m 512M -M pc,i8042=off -serial stdio -device qemu-xhci,id=xhci,msi=on,msix=off -device usb-hub,id=ginkgo-hub,bus=xhci.0,port=1 -device usb-kbd,bus=xhci.0,port=1.1 -device usb-tablet,bus=xhci.0,port=1.2 $(QEMU_AUDIO_FLAGS) -device ich9-intel-hda -device hda-output,audiodev=ginkgo-audio
 
-.PHONY: all userspace kernel iso qemu no-iso run usb-smoke frame-reclaim-smoke filesystem-smoke process-capability-smoke check clean distclean reset-fs
+.PHONY: all userspace kernel iso qemu no-iso run usb-smoke frame-reclaim-smoke filesystem-smoke process-capability-smoke power-smoke check clean distclean reset-fs
 
 all: iso
 
@@ -141,6 +148,32 @@ process-capability-smoke: userspace $(LIMINE_DIR)/BOOTX64.EFI $(OVMF_CODE) $(FS_
 	$(PYTHON) tools/create_gpt_disk.py $(PROCESS_CAPABILITY_SMOKE_DISK) --size-mb 32
 	$(PYTHON) tools/qemu_process_capability_test.py --qemu "$(QEMU)" --ovmf $(OVMF_CODE) --disk $(PROCESS_CAPABILITY_SMOKE_DISK) --boot-root $(PROCESS_CAPABILITY_SMOKE_ROOT)
 
+power-smoke: userspace $(LIMINE_DIR)/BOOTX64.EFI $(OVMF_CODE)
+	GINKGO_POWER_SMOKE=sync GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" GINKGO_TERMINAL_ELF="$(abspath $(TERMINAL_ELF))" cargo build -p ginkgo-kernel --bin ginkgo-os
+	rm -rf $(POWER_SYNC_ROOT)
+	mkdir -p $(POWER_SYNC_ROOT)/boot/limine $(POWER_SYNC_ROOT)/EFI/BOOT
+	cp $(KERNEL) $(POWER_SYNC_ROOT)/boot/kernel
+	cp limine.conf $(POWER_SYNC_ROOT)/boot/limine/limine.conf
+	cp $(LIMINE_DIR)/BOOTX64.EFI $(POWER_SYNC_ROOT)/EFI/BOOT/
+	GINKGO_POWER_SMOKE=verify GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" GINKGO_TERMINAL_ELF="$(abspath $(TERMINAL_ELF))" cargo build -p ginkgo-kernel --bin ginkgo-os
+	rm -rf $(POWER_VERIFY_ROOT)
+	cp -r $(POWER_SYNC_ROOT) $(POWER_VERIFY_ROOT)
+	cp $(KERNEL) $(POWER_VERIFY_ROOT)/boot/kernel
+	GINKGO_POWER_SMOKE=cancel GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" GINKGO_TERMINAL_ELF="$(abspath $(TERMINAL_ELF))" cargo build -p ginkgo-kernel --bin ginkgo-os
+	rm -rf $(POWER_CANCEL_ROOT)
+	cp -r $(POWER_SYNC_ROOT) $(POWER_CANCEL_ROOT)
+	cp $(KERNEL) $(POWER_CANCEL_ROOT)/boot/kernel
+	GINKGO_POWER_SMOKE=reboot GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" GINKGO_TERMINAL_ELF="$(abspath $(TERMINAL_ELF))" cargo build -p ginkgo-kernel --bin ginkgo-os
+	rm -rf $(POWER_REBOOT_ROOT)
+	cp -r $(POWER_SYNC_ROOT) $(POWER_REBOOT_ROOT)
+	cp $(KERNEL) $(POWER_REBOOT_ROOT)/boot/kernel
+	rm -f $(POWER_PERSIST_DISK) $(POWER_CANCEL_DISK) $(POWER_REBOOT_DISK)
+	$(PYTHON) tools/create_gpt_disk.py $(POWER_PERSIST_DISK) --size-mb 32
+	$(PYTHON) tools/create_gpt_disk.py $(POWER_CANCEL_DISK) --size-mb 32
+	$(PYTHON) tools/create_gpt_disk.py $(POWER_REBOOT_DISK) --size-mb 32
+	$(PYTHON) tools/qemu_power_test.py --qemu "$(QEMU)" --ovmf $(OVMF_CODE) --sync-root $(POWER_SYNC_ROOT) --verify-root $(POWER_VERIFY_ROOT) --cancel-root $(POWER_CANCEL_ROOT) --reboot-root $(POWER_REBOOT_ROOT) --persist-disk $(POWER_PERSIST_DISK) --cancel-disk $(POWER_CANCEL_DISK) --reboot-disk $(POWER_REBOOT_DISK)
+	$(MAKE) process-capability-smoke
+
 filesystem-smoke: userspace $(LIMINE_DIR)/BOOTX64.EFI $(OVMF_CODE)
 	GINKGO_FILESYSTEM_HIERARCHY_SMOKE=1 GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" GINKGO_TERMINAL_ELF="$(abspath $(TERMINAL_ELF))" cargo build -p ginkgo-kernel --bin ginkgo-os
 	rm -rf $(FILESYSTEM_SMOKE_ROOT)
@@ -157,7 +190,7 @@ check: userspace
 
 clean:
 	cargo clean
-	rm -rf $(ISO_ROOT) $(NO_ISO_ROOT) $(USB_SMOKE_ROOT) $(FRAME_RECLAIM_ROOT) $(FILESYSTEM_SMOKE_ROOT) $(FILESYSTEM_SMOKE_DISK) $(PROCESS_CAPABILITY_SMOKE_ROOT) $(PROCESS_CAPABILITY_SMOKE_DISK) $(ISO)
+	rm -rf $(ISO_ROOT) $(NO_ISO_ROOT) $(USB_SMOKE_ROOT) $(FRAME_RECLAIM_ROOT) $(FILESYSTEM_SMOKE_ROOT) $(FILESYSTEM_SMOKE_DISK) $(PROCESS_CAPABILITY_SMOKE_ROOT) $(PROCESS_CAPABILITY_SMOKE_DISK) $(POWER_SYNC_ROOT) $(POWER_VERIFY_ROOT) $(POWER_CANCEL_ROOT) $(POWER_REBOOT_ROOT) $(POWER_PERSIST_DISK) $(POWER_CANCEL_DISK) $(POWER_REBOOT_DISK) $(ISO)
 
 reset-fs:
 	rm -f $(FS_IMAGE)

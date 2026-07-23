@@ -21,10 +21,11 @@ use ginkgo_userspace::{
     filesystem_read_directory, filesystem_read_directory2, filesystem_remove_directory,
     filesystem_rename, filesystem_stat, filesystem_sync, filesystem_truncate, filesystem_unlink,
     filesystem_write, handle_close, process_create, process_get_info, process_terminate,
-    process_wait, process_yield, FilesystemEntryKind, FilesystemInfoFlags, FilesystemMetadata,
-    FilesystemOpenFlags, FilesystemRenameFlags, Handle, HandleDisposition, ProcessFault,
-    ProcessInfo, ProcessState, ProcessTerminationCause, Rights, Status, DEADLINE_INFINITE,
-    PROCESS_MAX_ARGS, PROCESS_MAX_STARTUP_BYTES,
+    process_wait, process_yield, system_power_cancel, system_power_get_info, system_power_request,
+    FilesystemEntryKind, FilesystemInfoFlags, FilesystemMetadata, FilesystemOpenFlags,
+    FilesystemRenameFlags, Handle, HandleDisposition, ProcessFault, ProcessInfo, ProcessState,
+    ProcessTerminationCause, Rights, Status, SystemPowerAction, SystemPowerFlags, SystemPowerState,
+    DEADLINE_INFINITE, PROCESS_MAX_ARGS, PROCESS_MAX_STARTUP_BYTES,
 };
 use rhai::{Array, Dynamic, Engine, ImmutableString, Map, INT};
 
@@ -64,6 +65,7 @@ pub struct HeadlessJob {
 pub struct HostState {
     filesystem: Handle,
     desktop: Handle,
+    power: Handle,
     shell_endpoint: Handle,
     pub pending: VecDeque<PendingSend>,
     pub children: Vec<ChildStream>,
@@ -203,10 +205,11 @@ pub struct Shell {
 }
 
 impl Shell {
-    pub fn new(filesystem: Handle, desktop: Handle, shell_endpoint: Handle) -> Self {
+    pub fn new(filesystem: Handle, desktop: Handle, power: Handle, shell_endpoint: Handle) -> Self {
         let host = Rc::new(RefCell::new(HostState {
             filesystem,
             desktop,
+            power,
             shell_endpoint,
             pending: VecDeque::new(),
             children: Vec::new(),
@@ -428,6 +431,83 @@ fn register_functions(engine: &mut Engine, host: Rc<RefCell<HostState>>) {
     let sync_host = host.clone();
     engine.register_fn("sync_filesystem", move || -> bool {
         filesystem_sync(sync_host.borrow().filesystem).is_ok()
+    });
+
+    let poweroff_host = host.clone();
+    engine.register_fn("power_off", move |confirmed: bool, force: bool| -> bool {
+        let mut host = poweroff_host.borrow_mut();
+        if !confirmed {
+            host.error(String::from(
+                "power_off: pass true to confirm machine power-off",
+            ));
+            return false;
+        }
+        let flags = if force {
+            SystemPowerFlags::FORCE
+        } else {
+            SystemPowerFlags::empty()
+        };
+        match system_power_request(host.power, SystemPowerAction::PowerOff, flags) {
+            Ok(()) => true,
+            Err(error) => {
+                host.error(format!("power_off: {:?}", error));
+                false
+            }
+        }
+    });
+
+    let reboot_host = host.clone();
+    engine.register_fn("reboot", move |confirmed: bool, force: bool| -> bool {
+        let mut host = reboot_host.borrow_mut();
+        if !confirmed {
+            host.error(String::from("reboot: pass true to confirm machine restart"));
+            return false;
+        }
+        let flags = if force {
+            SystemPowerFlags::FORCE
+        } else {
+            SystemPowerFlags::empty()
+        };
+        match system_power_request(host.power, SystemPowerAction::Reboot, flags) {
+            Ok(()) => true,
+            Err(error) => {
+                host.error(format!("reboot: {:?}", error));
+                false
+            }
+        }
+    });
+
+    let cancel_power_host = host.clone();
+    engine.register_fn("cancel_power", move || -> bool {
+        system_power_cancel(cancel_power_host.borrow().power).is_ok()
+    });
+
+    let power_status_host = host.clone();
+    engine.register_fn("power_status", move || -> Dynamic {
+        match system_power_get_info(power_status_host.borrow().power) {
+            Ok(info) => {
+                let mut map = Map::new();
+                let state = match info.power_state() {
+                    Some(SystemPowerState::Idle) => "idle",
+                    Some(SystemPowerState::Requested) => "requested",
+                    Some(SystemPowerState::Quiescing) => "quiescing",
+                    Some(SystemPowerState::Synchronizing) => "synchronizing",
+                    Some(SystemPowerState::Committing) => "committing",
+                    Some(SystemPowerState::Canceled) => "canceled",
+                    Some(SystemPowerState::Failed) => "failed",
+                    None => "invalid",
+                };
+                map.insert("state".into(), Dynamic::from(state));
+                map.insert("sequence".into(), filesystem_integer(info.sequence));
+                map.insert("deadline_ns".into(), filesystem_integer(info.deadline_ns));
+                map.insert(
+                    "failure_status".into(),
+                    Dynamic::from(INT::from(info.failure_status)),
+                );
+                Dynamic::from(map)
+            }
+            Err(error) => Dynamic::from(format!("power_status: {:?}", error)),
+        }
     });
     let info_host = host.clone();
     engine.register_fn("filesystem_info", move || -> Dynamic {

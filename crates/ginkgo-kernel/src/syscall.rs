@@ -21,9 +21,10 @@ use ginkgo_ipc::{
 };
 use ginkgo_sysapi::{
     FilesystemDirectoryEntry, FilesystemOpenFlags, FilesystemRenameFlags, Handle, MapFlags,
-    MapProtection, ProcessInfo, SharedMemoryMapArgs, Status, SyscallNumber, CHANNEL_MAX_BYTES,
-    CHANNEL_MAX_HANDLES, DEADLINE_INFINITE, FILESYSTEM_NAME_MAX, FILESYSTEM_READ_MAX_BYTES,
-    PROCESS_MAX_STARTUP_BYTES, PROCESS_MAX_STARTUP_HANDLES, RANDOM_MAX_BYTES,
+    MapProtection, ProcessInfo, SharedMemoryMapArgs, Status, SyscallNumber, SystemPowerAction,
+    SystemPowerFlags, SystemPowerInfo, CHANNEL_MAX_BYTES, CHANNEL_MAX_HANDLES, DEADLINE_INFINITE,
+    FILESYSTEM_NAME_MAX, FILESYSTEM_READ_MAX_BYTES, PROCESS_MAX_STARTUP_BYTES,
+    PROCESS_MAX_STARTUP_HANDLES, RANDOM_MAX_BYTES,
 };
 use redoxfs::Disk;
 
@@ -82,6 +83,8 @@ const FILESYSTEM_PATH_MAX: usize =
     MAX_TRAVERSAL_DEPTH * FILESYSTEM_NAME_MAX + (MAX_TRAVERSAL_DEPTH - 1);
 const PROCESS_CREATE_ARGS_SIZE: usize = 64;
 const PROCESS_INFO_SIZE: usize = size_of::<ProcessInfo>();
+const SYSTEM_POWER_INFO_SIZE: usize = size_of::<SystemPowerInfo>();
+const SYSTEM_POWER_CANCELLATION_NS: u64 = 2_000_000_000;
 const APPLICATION_DATA_CREATE_ARGS_SIZE: usize = 32;
 const MAX_EXECUTABLE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -133,6 +136,7 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
     filesystem: &mut RedoxFs<B>,
     audio: &mut Option<AudioDevice>,
     entropy: &mut EntropyPool,
+    process_creation_allowed: bool,
     child_slot_reserved: bool,
     debug_sink: &mut D,
 ) -> SyscallOutcome {
@@ -170,6 +174,7 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
             filesystem,
             audio,
             entropy,
+            process_creation_allowed,
             child_slot_reserved,
             debug_sink,
         )
@@ -197,6 +202,7 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
     filesystem: &mut RedoxFs<B>,
     audio: &mut Option<AudioDevice>,
     entropy: &mut EntropyPool,
+    process_creation_allowed: bool,
     child_slot_reserved: bool,
     debug_sink: &mut D,
 ) -> DispatchResult {
@@ -269,6 +275,9 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
         SyscallNumber::RandomFill => {
             random_fill(process, entropy, context.rdi, context.rsi, context.rdx)
         }
+        SyscallNumber::ProcessCreate if !process_creation_allowed => {
+            return DispatchResult::Complete(Status::AccessDenied);
+        }
         SyscallNumber::ProcessCreate => {
             return match process_create(
                 process,
@@ -308,6 +317,13 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
         }
         SyscallNumber::ApplicationDataCreate => {
             application_data_create(process, filesystem, context.rdi)
+        }
+        SyscallNumber::SystemPowerRequest => {
+            system_power_request(process, context.rdi, context.rsi, context.rdx, now_ns)
+        }
+        SyscallNumber::SystemPowerCancel => system_power_cancel(process, context.rdi),
+        SyscallNumber::SystemPowerGetInfo => {
+            system_power_get_info(process, context.rdi, context.rsi)
         }
     };
     DispatchResult::Complete(match result {
@@ -354,6 +370,9 @@ const fn decode_syscall_number(raw: u64) -> Option<SyscallNumber> {
         33 => SyscallNumber::FilesystemGetMetadata,
         34 => SyscallNumber::FilesystemReadDirectory2,
         35 => SyscallNumber::ApplicationDataCreate,
+        36 => SyscallNumber::SystemPowerRequest,
+        37 => SyscallNumber::SystemPowerCancel,
+        38 => SyscallNumber::SystemPowerGetInfo,
         _ => return None,
     })
 }
@@ -1711,6 +1730,56 @@ fn process_terminate(process: &Process, raw_process: u64) -> Result<(), Status> 
         .map_err(map_ipc_error)
 }
 
+fn system_power_request(
+    process: &Process,
+    raw_power: u64,
+    raw_action: u64,
+    raw_flags: u64,
+    now_ns: u64,
+) -> Result<(), Status> {
+    let power = decode_handle(raw_power)?;
+    let action = u32::try_from(raw_action)
+        .ok()
+        .and_then(SystemPowerAction::from_raw)
+        .ok_or(Status::InvalidArgument)?;
+    let raw_flags = u32::try_from(raw_flags).map_err(|_| Status::InvalidArgument)?;
+    let flags = SystemPowerFlags::from_bits(raw_flags).ok_or(Status::InvalidArgument)?;
+    let deadline_ns = now_ns.saturating_add(SYSTEM_POWER_CANCELLATION_NS);
+    process
+        .handles()
+        .system_power_request(power, action, flags, deadline_ns)
+        .map_err(map_ipc_error)
+}
+
+fn system_power_cancel(process: &Process, raw_power: u64) -> Result<(), Status> {
+    let power = decode_handle(raw_power)?;
+    process
+        .handles()
+        .system_power_cancel(power)
+        .map_err(map_ipc_error)
+}
+
+fn system_power_get_info(
+    process: &Process,
+    raw_power: u64,
+    output_address: u64,
+) -> Result<(), Status> {
+    let power = decode_handle(raw_power)?;
+    validate_user_output(process, output_address, SYSTEM_POWER_INFO_SIZE)?;
+    let info = process
+        .handles()
+        .system_power_info(power)
+        .map_err(map_ipc_error)?;
+    let mut output = [0_u8; SYSTEM_POWER_INFO_SIZE];
+    put_u32(&mut output, 0, info.state);
+    put_u32(&mut output, 4, info.action);
+    put_u32(&mut output, 8, info.flags);
+    output[12..16].copy_from_slice(&info.failure_status.to_le_bytes());
+    output[16..24].copy_from_slice(&info.sequence.to_le_bytes());
+    output[24..32].copy_from_slice(&info.deadline_ns.to_le_bytes());
+    copy_to_user(process, output_address, &output)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ApplicationDataCreateRequest {
     root: Handle,
@@ -2262,6 +2331,9 @@ mod tests {
             SyscallNumber::FilesystemGetMetadata,
             SyscallNumber::FilesystemReadDirectory2,
             SyscallNumber::ApplicationDataCreate,
+            SyscallNumber::SystemPowerRequest,
+            SyscallNumber::SystemPowerCancel,
+            SyscallNumber::SystemPowerGetInfo,
         ];
         for number in expected {
             assert_eq!(decode_syscall_number(number as u64), Some(number));
@@ -2291,7 +2363,11 @@ mod tests {
             decode_syscall_number(35),
             Some(SyscallNumber::ApplicationDataCreate)
         );
-        assert_eq!(decode_syscall_number(36), None);
+        assert_eq!(
+            decode_syscall_number(38),
+            Some(SyscallNumber::SystemPowerGetInfo)
+        );
+        assert_eq!(decode_syscall_number(39), None);
         assert_eq!(decode_syscall_number(u64::MAX), None);
     }
 

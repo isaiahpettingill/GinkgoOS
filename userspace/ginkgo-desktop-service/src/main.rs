@@ -350,6 +350,13 @@ impl Service {
                     },
                 )?;
             }
+            RuntimeMessage::CloseAllWindows => {
+                let actions = self
+                    .desktop
+                    .handle_trusted_command(TrustedCommand::CloseAll)
+                    .map_err(|_| ServiceError::Desktop)?;
+                self.execute_actions(actions)?;
+            }
             RuntimeMessage::PointerInput { position, kind } => {
                 if !self.launcher_visible {
                     let actions = self

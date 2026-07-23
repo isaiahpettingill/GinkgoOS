@@ -24,8 +24,8 @@ use core::{
 use ginkgo_filesystem::{DirectoryHandle, FileHandle};
 use ginkgo_sysapi::{
     Handle, MessageInfo, ObjectType, ProcessFault, ProcessInfo, ProcessState,
-    ProcessTerminationCause, Rights, Signals, Status, WaitItem, CHANNEL_MAX_BYTES,
-    CHANNEL_MAX_HANDLES,
+    ProcessTerminationCause, Rights, Signals, Status, SystemPowerAction, SystemPowerFlags,
+    SystemPowerInfo, SystemPowerState, WaitItem, CHANNEL_MAX_BYTES, CHANNEL_MAX_HANDLES,
 };
 use spinning_top::Spinlock;
 
@@ -141,6 +141,7 @@ pub enum IpcError {
     MessageTooLarge,
     HandleTableFull,
     InvalidMessage,
+    AlreadyExists,
     OutOfMemory,
     /// The operation would block: a read queue is empty or a write queue is full.
     ShouldWait,
@@ -162,6 +163,7 @@ impl IpcError {
             Self::MessageTooLarge => Status::MessageTooLarge,
             Self::HandleTableFull => Status::HandleTableFull,
             Self::InvalidMessage => Status::InvalidMessage,
+            Self::AlreadyExists => Status::AlreadyExists,
             Self::OutOfMemory => Status::OutOfMemory,
             Self::ShouldWait => Status::ShouldWait,
             Self::PeerClosed => Status::PeerClosed,
@@ -206,6 +208,7 @@ enum KernelObject {
     Window(WindowEndpoint),
     Process(ProcessControl),
     ApplicationData(ApplicationDataScope),
+    SystemPower(SystemPowerControl),
     FilesystemRoot,
     Directory(DirectoryHandle),
     File(FileHandle),
@@ -230,6 +233,105 @@ impl ApplicationDataScope {
 impl AsRef<str> for ApplicationDataScope {
     fn as_ref(&self) -> &str {
         self.app_id()
+    }
+}
+
+/// Shared global orderly-shutdown state retained by the kernel and trusted handles.
+#[derive(Clone)]
+pub struct SystemPowerControl {
+    info: Arc<Spinlock<SystemPowerInfo>>,
+}
+
+impl SystemPowerControl {
+    pub fn new() -> Result<Self, IpcError> {
+        let info = Arc::try_new(Spinlock::new(SystemPowerInfo::default()))
+            .map_err(|_| IpcError::OutOfMemory)?;
+        Ok(Self { info })
+    }
+
+    pub fn info(&self) -> SystemPowerInfo {
+        *self.info.lock()
+    }
+
+    pub fn request(
+        &self,
+        action: SystemPowerAction,
+        flags: SystemPowerFlags,
+        deadline_ns: u64,
+    ) -> Result<(), IpcError> {
+        if !SystemPowerFlags::all().contains(flags) {
+            return Err(IpcError::InvalidMessage);
+        }
+        let mut info = self.info.lock();
+        match info.power_state() {
+            Some(
+                SystemPowerState::Idle | SystemPowerState::Canceled | SystemPowerState::Failed,
+            ) => {}
+            _ => return Err(IpcError::AlreadyExists),
+        }
+        info.state = SystemPowerState::Requested as u32;
+        info.action = action as u32;
+        info.flags = flags.bits();
+        info.failure_status = 0;
+        info.sequence = info.sequence.wrapping_add(1);
+        info.deadline_ns = deadline_ns;
+        Ok(())
+    }
+
+    pub fn cancel(&self) -> Result<(), IpcError> {
+        let mut info = self.info.lock();
+        if info.power_state() != Some(SystemPowerState::Requested) {
+            return Err(IpcError::AccessDenied);
+        }
+        info.state = SystemPowerState::Canceled as u32;
+        info.deadline_ns = 0;
+        Ok(())
+    }
+
+    pub fn begin_quiescing(&self, deadline_ns: u64) -> bool {
+        self.transition(
+            SystemPowerState::Requested,
+            SystemPowerState::Quiescing,
+            deadline_ns,
+        )
+    }
+
+    pub fn begin_synchronizing(&self) -> bool {
+        self.transition(
+            SystemPowerState::Quiescing,
+            SystemPowerState::Synchronizing,
+            0,
+        )
+    }
+
+    pub fn begin_committing(&self, deadline_ns: u64) -> bool {
+        self.transition(
+            SystemPowerState::Synchronizing,
+            SystemPowerState::Committing,
+            deadline_ns,
+        )
+    }
+
+    pub fn fail(&self, status: Status) {
+        let mut info = self.info.lock();
+        info.state = SystemPowerState::Failed as u32;
+        info.failure_status = status.raw();
+        info.deadline_ns = 0;
+    }
+
+    fn transition(
+        &self,
+        expected: SystemPowerState,
+        next: SystemPowerState,
+        deadline_ns: u64,
+    ) -> bool {
+        let mut info = self.info.lock();
+        if info.power_state() != Some(expected) {
+            return false;
+        }
+        info.state = next as u32;
+        info.deadline_ns = deadline_ns;
+        true
     }
 }
 
@@ -707,6 +809,47 @@ impl HandleTable {
         let object = self.object_with_rights(handle, Rights::TERMINATE)?;
         process_control(&object)?.request_terminate();
         Ok(())
+    }
+
+    /// Installs a non-transferable system-power capability over shared global control state.
+    pub fn system_power_install(
+        &mut self,
+        control: &SystemPowerControl,
+    ) -> Result<Handle, IpcError> {
+        let object = Arc::try_new(KernelObject::SystemPower(control.clone()))
+            .map_err(|_| IpcError::OutOfMemory)?;
+        let slot = self.reserve_slots(1)?[0];
+        Ok(self.insert_reserved(slot, object, Rights::MANAGE | Rights::INSPECT))
+    }
+
+    pub fn system_power_request(
+        &self,
+        handle: Handle,
+        action: SystemPowerAction,
+        flags: SystemPowerFlags,
+        deadline_ns: u64,
+    ) -> Result<(), IpcError> {
+        let object = self.object_with_rights(handle, Rights::MANAGE)?;
+        match object.as_ref() {
+            KernelObject::SystemPower(control) => control.request(action, flags, deadline_ns),
+            _ => Err(IpcError::WrongObjectType),
+        }
+    }
+
+    pub fn system_power_cancel(&self, handle: Handle) -> Result<(), IpcError> {
+        let object = self.object_with_rights(handle, Rights::MANAGE)?;
+        match object.as_ref() {
+            KernelObject::SystemPower(control) => control.cancel(),
+            _ => Err(IpcError::WrongObjectType),
+        }
+    }
+
+    pub fn system_power_info(&self, handle: Handle) -> Result<SystemPowerInfo, IpcError> {
+        let object = self.object_with_rights(handle, Rights::INSPECT)?;
+        match object.as_ref() {
+            KernelObject::SystemPower(control) => Ok(control.info()),
+            _ => Err(IpcError::WrongObjectType),
+        }
     }
 
     /// Creates a non-transferable capability authorizing kernel random bytes.
@@ -1532,6 +1675,7 @@ impl HandleTable {
             KernelObject::Window(_) => Ok(ObjectType::Window),
             KernelObject::Process(_) => Ok(ObjectType::Process),
             KernelObject::ApplicationData(_) => Ok(ObjectType::ApplicationData),
+            KernelObject::SystemPower(_) => Ok(ObjectType::SystemPower),
             KernelObject::FilesystemRoot => Ok(ObjectType::FilesystemRoot),
             KernelObject::Directory(_) => Ok(ObjectType::Directory),
             KernelObject::File(_) => Ok(ObjectType::File),
@@ -1547,6 +1691,7 @@ impl HandleTable {
             KernelObject::Window(endpoint) => Ok(endpoint.signals()),
             KernelObject::Process(process) => Ok(process.signals()),
             KernelObject::ApplicationData(_)
+            | KernelObject::SystemPower(_)
             | KernelObject::FilesystemRoot
             | KernelObject::Directory(_)
             | KernelObject::File(_) => Ok(Signals::empty()),
@@ -1803,6 +1948,7 @@ fn channel_endpoint(object: &Arc<KernelObject>) -> Result<&ChannelEndpoint, IpcE
         | KernelObject::Window(_)
         | KernelObject::Process(_)
         | KernelObject::ApplicationData(_)
+        | KernelObject::SystemPower(_)
         | KernelObject::FilesystemRoot
         | KernelObject::Directory(_)
         | KernelObject::File(_) => Err(IpcError::WrongObjectType),
@@ -1817,6 +1963,7 @@ fn shared_memory_object(object: &Arc<KernelObject>) -> Result<&SharedMemoryObjec
         | KernelObject::Window(_)
         | KernelObject::Process(_)
         | KernelObject::ApplicationData(_)
+        | KernelObject::SystemPower(_)
         | KernelObject::FilesystemRoot
         | KernelObject::Directory(_)
         | KernelObject::File(_) => Err(IpcError::WrongObjectType),
@@ -1831,6 +1978,7 @@ fn window_endpoint(object: &Arc<KernelObject>) -> Result<&WindowEndpoint, IpcErr
         | KernelObject::RandomSource
         | KernelObject::Process(_)
         | KernelObject::ApplicationData(_)
+        | KernelObject::SystemPower(_)
         | KernelObject::FilesystemRoot
         | KernelObject::Directory(_)
         | KernelObject::File(_) => Err(IpcError::WrongObjectType),
@@ -1845,6 +1993,7 @@ fn process_control(object: &Arc<KernelObject>) -> Result<&ProcessControl, IpcErr
         | KernelObject::RandomSource
         | KernelObject::Window(_)
         | KernelObject::ApplicationData(_)
+        | KernelObject::SystemPower(_)
         | KernelObject::FilesystemRoot
         | KernelObject::Directory(_)
         | KernelObject::File(_) => Err(IpcError::WrongObjectType),
@@ -2811,6 +2960,82 @@ mod tests {
             table.handle_duplicate(source, Rights::READ),
             Err(IpcError::AccessDenied)
         );
+    }
+
+    #[test]
+    fn system_power_capability_gates_requests_cancellation_and_progress() {
+        let control = SystemPowerControl::new().unwrap();
+        let mut trusted = HandleTable::new();
+        let power = trusted.system_power_install(&control).unwrap();
+        assert_eq!(trusted.object_type(power), Ok(ObjectType::SystemPower));
+        assert_eq!(
+            trusted.handle_rights(power),
+            Ok(Rights::MANAGE | Rights::INSPECT)
+        );
+        assert_eq!(
+            trusted.handle_duplicate(power, Rights::INSPECT),
+            Err(IpcError::AccessDenied)
+        );
+
+        let ordinary = trusted.random_source_create().unwrap();
+        assert_eq!(
+            trusted.system_power_request(
+                ordinary,
+                SystemPowerAction::PowerOff,
+                SystemPowerFlags::empty(),
+                10,
+            ),
+            Err(IpcError::AccessDenied)
+        );
+        trusted
+            .system_power_request(
+                power,
+                SystemPowerAction::PowerOff,
+                SystemPowerFlags::empty(),
+                10,
+            )
+            .unwrap();
+        let requested = trusted.system_power_info(power).unwrap();
+        assert_eq!(requested.power_state(), Some(SystemPowerState::Requested));
+        assert_eq!(requested.power_action(), Some(SystemPowerAction::PowerOff));
+        assert_eq!(requested.deadline_ns, 10);
+        assert_eq!(
+            trusted.system_power_request(
+                power,
+                SystemPowerAction::Reboot,
+                SystemPowerFlags::empty(),
+                20,
+            ),
+            Err(IpcError::AlreadyExists)
+        );
+        trusted.system_power_cancel(power).unwrap();
+        assert_eq!(
+            control.info().power_state(),
+            Some(SystemPowerState::Canceled)
+        );
+
+        trusted
+            .system_power_request(
+                power,
+                SystemPowerAction::Reboot,
+                SystemPowerFlags::FORCE,
+                30,
+            )
+            .unwrap();
+        assert!(control.begin_quiescing(40));
+        assert_eq!(
+            trusted.system_power_cancel(power),
+            Err(IpcError::AccessDenied)
+        );
+        assert!(control.begin_synchronizing());
+        assert!(control.begin_committing(50));
+        assert_eq!(control.info().deadline_ns, 50);
+        assert_eq!(
+            control.info().power_state(),
+            Some(SystemPowerState::Committing)
+        );
+        control.fail(Status::Io);
+        assert_eq!(control.info().failure_status, Status::Io.raw());
     }
 
     #[test]

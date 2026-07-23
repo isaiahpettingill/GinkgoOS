@@ -219,6 +219,11 @@ impl<D: Disk> RedoxFs<D> {
         self.inner.disk
     }
 
+    /// Exposes the owned backing disk for explicit device-cache synchronization.
+    pub fn disk_mut(&mut self) -> &mut D {
+        &mut self.inner.disk
+    }
+
     pub fn image_size(&mut self) -> Result<u64, FsError> {
         self.inner.disk.size().map_err(map_error)
     }

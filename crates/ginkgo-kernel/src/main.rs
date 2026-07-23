@@ -26,7 +26,7 @@ use framebuffer::{FramebufferWriter, Rgb};
 use ginkgo_desktop::ClientId;
 use ginkgo_filesystem::{FsError, NodeKind, NodeMetadata, RedoxFs, RenameMode};
 use ginkgo_hid::{ApplicationKind, Axis, InputEvent, AXIS_MAX, AXIS_MIN};
-use ginkgo_ipc::{shared_memory_backing_stats, IpcError};
+use ginkgo_ipc::{shared_memory_backing_stats, IpcError, SystemPowerControl};
 use ginkgo_kernel::{
     ahci::{AhciDisk, AhciError},
     arch::{self, CpuPrivilegeState, ExternalInterruptState, KernelExit, PrivilegeStackTops},
@@ -37,12 +37,13 @@ use ginkgo_kernel::{
     input::{DeviceInputEvent, InputManager},
     io::SerialPort,
     limine::{
-        self, BaseRevision, FramebufferRequest, HhdmRequest, MemoryMapRequest, StackSizeRequest,
-        TscFrequencyRequest,
+        self, BaseRevision, FramebufferRequest, HhdmRequest, MemoryMapRequest, RsdpRequest,
+        StackSizeRequest, TscFrequencyRequest,
     },
     local_apic::LocalApicTimer,
     memory::{UsableFrameAllocator, VirtAddr, VirtPage},
     paging::{ActivePageTable, PageTableFlags},
+    power::AcpiPower,
     process::{Process, ProcessFault, ProcessFaultReason, ProcessId, ProcessState, ProcessTable},
     syscall::{self, DebugSink, SyscallOutcome},
     task::{Scheduler, TaskPoll, TaskState},
@@ -85,6 +86,10 @@ static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
 #[used]
 #[link_section = ".limine_requests"]
 static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+
+#[used]
+#[link_section = ".limine_requests"]
+static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 
 #[used]
 #[link_section = ".limine_requests_end"]
@@ -132,6 +137,10 @@ fn filesystem_hierarchy_smoke_enabled() -> bool {
 
 fn process_capability_smoke_enabled() -> bool {
     option_env!("GINKGO_PROCESS_CAPABILITY_SMOKE") == Some("1")
+}
+
+fn power_smoke_mode() -> Option<&'static str> {
+    option_env!("GINKGO_POWER_SMOKE")
 }
 
 const SYSTEM_DIRECTORY: &str = "system";
@@ -857,6 +866,29 @@ pub extern "C" fn _start() -> ! {
     ui.catalog = catalog;
     ui.render_boot_log(&mut screen, "redoxfs: desktop ELF and registry loaded");
 
+    let acpi_power = RSDP_REQUEST.response().and_then(|response| {
+        match unsafe { AcpiPower::discover(response.address, hhdm.offset, tsc_frequency) } {
+            Ok(power) => {
+                let mut sink = SerialDebugSink::new(&mut serial);
+                let (sleep_a, sleep_b) = power.sleep_types();
+                let (pm1a, pm1b) = power.control_addresses();
+                let _ = writeln!(
+                    sink,
+                    "acpi: reset and S5 power-off ready types={sleep_a}/{sleep_b} pm1={pm1a:#x}/{pm1b:?}\r"
+                );
+                ui.render_boot_log(&mut screen, "acpi: reset and S5 power-off ready");
+                Some(power)
+            }
+            Err(error) => {
+                let mut sink = SerialDebugSink::new(&mut serial);
+                let _ = writeln!(sink, "acpi: power discovery failed: {error:?}\r");
+                ui.render_boot_log(&mut screen, "acpi: machine power unavailable");
+                None
+            }
+        }
+    });
+    let power_control = SystemPowerControl::new().unwrap_or_else(|_| halt_forever());
+
     let mut context = KernelContext {
         frames,
         page_table,
@@ -867,6 +899,9 @@ pub extern "C" fn _start() -> ! {
         audio: None,
         timer,
         entropy,
+        acpi_power,
+        power_control,
+        launch_quiesced: false,
         screen,
         ui,
         paging_verified: false,
@@ -881,6 +916,7 @@ pub extern "C" fn _start() -> ! {
         }),
         processes: ProcessTable::new(),
         desktop: None,
+        desktop_process_id: None,
         process_clients: Vec::new(),
         next_client_id: 1,
         launch_requested: None,
@@ -903,6 +939,10 @@ pub extern "C" fn _start() -> ! {
     context
         .ui
         .render_boot_log(&mut context.screen, "paging: mappings verified");
+
+    if power_smoke_mode().is_some() {
+        run_power_smoke(&mut context);
+    }
 
     match unsafe {
         InputManager::initialize(
@@ -1080,15 +1120,15 @@ pub extern "C" fn _start() -> ! {
             halt_forever();
         }
     };
-    let random_source = process
+    let power = process
         .handles_mut()
-        .random_source_create()
+        .system_power_install(&context.power_control)
         .unwrap_or_else(|_| halt_forever());
     process.set_start_arguments([
         u64::from(process_channel.raw()),
         context.screen.width() as u64,
         context.screen.height() as u64,
-        u64::from(random_source.raw()),
+        u64::from(power.raw()),
     ]);
     context.desktop = Some(desktop);
 
@@ -1103,6 +1143,7 @@ pub extern "C" fn _start() -> ! {
             halt_forever();
         }
     };
+    context.desktop_process_id = Some(process_id);
     {
         let mut sink = SerialDebugSink::new(&mut context.serial);
         let _ = writeln!(
@@ -1156,8 +1197,110 @@ pub extern "C" fn _start() -> ! {
     run_scheduler(&mut context)
 }
 
+fn run_power_smoke(context: &mut KernelContext) -> ! {
+    const PERSIST_PATH: &str = "/power-smoke-persisted";
+    const PERSIST_CONTENT: &[u8] = b"sync-before-poweroff\n";
+    const REBOOT_PATH: &str = "/power-smoke-rebooted";
+
+    let now_ns = context.timer.clock().now_ns();
+    let action = match power_smoke_mode().unwrap_or("") {
+        "sync" => {
+            let result = context
+                .fs
+                .open(PERSIST_PATH)
+                .or_else(|_| context.fs.create(PERSIST_PATH))
+                .and_then(|file| {
+                    context.fs.truncate(file, 0)?;
+                    let written = context.fs.write(file, 0, PERSIST_CONTENT)?;
+                    (written == PERSIST_CONTENT.len())
+                        .then_some(())
+                        .ok_or(FsError::Io)
+                });
+            if result.is_err() {
+                let mut sink = SerialDebugSink::new(&mut context.serial);
+                let _ = writeln!(sink, "power-smoke: sync staging failed\r");
+                halt_forever();
+            }
+            let mut sink = SerialDebugSink::new(&mut context.serial);
+            let _ = writeln!(sink, "power-smoke: sync-before-poweroff staged\r");
+            ginkgo_sysapi::SystemPowerAction::PowerOff
+        }
+        "verify" => {
+            let mut bytes = [0_u8; 64];
+            let verified = context
+                .fs
+                .open(PERSIST_PATH)
+                .and_then(|file| {
+                    context
+                        .fs
+                        .read(file, 0, &mut bytes[..PERSIST_CONTENT.len()])
+                })
+                .is_ok_and(|read| {
+                    read == PERSIST_CONTENT.len()
+                        && bytes[..PERSIST_CONTENT.len()] == *PERSIST_CONTENT
+                });
+            let mut sink = SerialDebugSink::new(&mut context.serial);
+            if verified {
+                let _ = writeln!(sink, "power-smoke: persisted after poweroff\r");
+            } else {
+                let _ = writeln!(sink, "power-smoke: persistence verification failed\r");
+                halt_forever();
+            }
+            ginkgo_sysapi::SystemPowerAction::PowerOff
+        }
+        "cancel" => {
+            let deadline = now_ns.saturating_add(10_000_000_000);
+            context
+                .power_control
+                .request(
+                    ginkgo_sysapi::SystemPowerAction::PowerOff,
+                    ginkgo_sysapi::SystemPowerFlags::empty(),
+                    deadline,
+                )
+                .unwrap_or_else(|_| halt_forever());
+            context
+                .power_control
+                .cancel()
+                .unwrap_or_else(|_| halt_forever());
+            let mut sink = SerialDebugSink::new(&mut context.serial);
+            let _ = writeln!(sink, "power-smoke: cancellation passed\r");
+            ginkgo_sysapi::SystemPowerAction::PowerOff
+        }
+        "reboot" => {
+            if context.fs.open(REBOOT_PATH).is_ok() {
+                let mut sink = SerialDebugSink::new(&mut context.serial);
+                let _ = writeln!(sink, "power-smoke: reboot observed\r");
+                ginkgo_sysapi::SystemPowerAction::PowerOff
+            } else {
+                let created = context.fs.create(REBOOT_PATH).and_then(|file| {
+                    (context.fs.write(file, 0, b"reboot\n")? == 7)
+                        .then_some(())
+                        .ok_or(FsError::Io)
+                });
+                if created.is_err() {
+                    halt_forever();
+                }
+                let mut sink = SerialDebugSink::new(&mut context.serial);
+                let _ = writeln!(sink, "power-smoke: reboot requested\r");
+                ginkgo_sysapi::SystemPowerAction::Reboot
+            }
+        }
+        _ => halt_forever(),
+    };
+
+    context
+        .power_control
+        .request(
+            action,
+            ginkgo_sysapi::SystemPowerFlags::empty(),
+            now_ns.saturating_add(100_000_000),
+        )
+        .unwrap_or_else(|_| halt_forever());
+    run_scheduler(context)
+}
+
 fn run_scheduler(context: &mut KernelContext) -> ! {
-    let mut scheduler = Scheduler::<KernelContext, 8>::new();
+    let mut scheduler = Scheduler::<KernelContext, 9>::new();
     if scheduler.spawn(filesystem_task).is_err()
         || scheduler.spawn(console_task).is_err()
         || scheduler.spawn(accounting_task).is_err()
@@ -1165,6 +1308,7 @@ fn run_scheduler(context: &mut KernelContext) -> ! {
         || scheduler.spawn(input_task).is_err()
         || scheduler.spawn(audio_task).is_err()
         || scheduler.spawn(desktop_task).is_err()
+        || scheduler.spawn(power_task).is_err()
     {
         halt_forever();
     }
@@ -1202,6 +1346,9 @@ struct KernelContext {
     audio: Option<AudioDevice>,
     timer: LocalApicTimer,
     entropy: EntropyPool,
+    acpi_power: Option<AcpiPower>,
+    power_control: SystemPowerControl,
+    launch_quiesced: bool,
     screen: FramebufferWriter<'static>,
     ui: ValidationUi,
     paging_verified: bool,
@@ -1211,6 +1358,7 @@ struct KernelContext {
     frame_reclaim_stress: Option<FrameReclaimStress>,
     processes: ProcessTable,
     desktop: Option<DesktopBroker>,
+    desktop_process_id: Option<ProcessId>,
     process_clients: Vec<ProcessClient>,
     next_client_id: u64,
     launch_requested: Option<usize>,
@@ -1286,6 +1434,14 @@ const LAUNCHER_MAX_WIDTH: usize = 620;
 const LAUNCHER_SEARCH_HEIGHT: usize = 58;
 const LAUNCHER_ROW_HEIGHT: usize = 66;
 const LAUNCHER_GAP: usize = 10;
+const LAUNCHER_POWER_ROWS: usize = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LauncherSelection {
+    Program(usize),
+    PowerOff,
+    Reboot,
+}
 
 const fn blend_channel(source: u8, background: u8, alpha: u8) -> u8 {
     let alpha = alpha as u32;
@@ -1306,6 +1462,7 @@ struct ValidationUi {
     desktop_ready: bool,
     desktop_failed: bool,
     launcher_visible: bool,
+    power_confirmation: Option<ginkgo_sysapi::SystemPowerAction>,
     catalog: ProgramCatalog,
     launcher_backing: Vec<u32>,
     launcher_backing_geometry: Option<(usize, usize, usize, usize)>,
@@ -1334,6 +1491,7 @@ impl ValidationUi {
             desktop_ready: false,
             desktop_failed: false,
             launcher_visible: false,
+            power_confirmation: None,
             catalog: ProgramCatalog::EMPTY,
             launcher_backing: Vec::new(),
             launcher_backing_geometry: None,
@@ -1395,6 +1553,30 @@ impl ValidationUi {
             };
             let _ = screen.write_rgb_pixel(x, y, color);
         }
+        self.cursor_visible = false;
+    }
+
+    fn render_power_progress(&mut self, screen: &mut FramebufferWriter<'_>, message: &str) {
+        let background = Rgb::new(8, 13, 22);
+        let panel = Rgb::new(31, 41, 61);
+        let primary = Rgb::new(232, 238, 247);
+        let accent = Rgb::new(110, 231, 183);
+        screen.clear(background);
+        screen.fill_rect(
+            UI_MARGIN,
+            self.height / 3,
+            self.width.saturating_sub(UI_MARGIN * 2),
+            150,
+            panel,
+        );
+        screen.draw_text(
+            UI_MARGIN + 30,
+            self.height / 3 + 28,
+            3,
+            "System power",
+            accent,
+        );
+        screen.draw_text(UI_MARGIN + 30, self.height / 3 + 82, 2, message, primary);
         self.cursor_visible = false;
     }
 
@@ -1509,7 +1691,11 @@ impl ValidationUi {
 
     fn launcher_geometry(&self) -> (usize, usize, usize, usize) {
         let width = LAUNCHER_MAX_WIDTH.min(self.width.saturating_sub(UI_MARGIN * 2));
-        let rows = self.catalog.len.min(MAX_LAUNCHER_PROGRAMS);
+        let rows = self
+            .catalog
+            .len
+            .min(MAX_LAUNCHER_PROGRAMS)
+            .saturating_add(LAUNCHER_POWER_ROWS);
         let result_height = rows.saturating_mul(LAUNCHER_ROW_HEIGHT);
         let height = LAUNCHER_SEARCH_HEIGHT.saturating_add(if rows == 0 {
             0
@@ -1591,7 +1777,7 @@ impl ValidationUi {
         self.show_cursor(screen);
     }
 
-    fn launcher_program_at(&self, x: usize, y: usize) -> Option<usize> {
+    fn launcher_selection_at(&self, x: usize, y: usize) -> Option<LauncherSelection> {
         if !self.launcher_visible {
             return None;
         }
@@ -1601,7 +1787,15 @@ impl ValidationUi {
             return None;
         }
         let row = (y - results_y) / LAUNCHER_ROW_HEIGHT;
-        (row < self.catalog.len).then_some(row)
+        if row < self.catalog.len {
+            Some(LauncherSelection::Program(row))
+        } else if row == self.catalog.len {
+            Some(LauncherSelection::PowerOff)
+        } else if row == self.catalog.len + 1 {
+            Some(LauncherSelection::Reboot)
+        } else {
+            None
+        }
     }
 
     fn render_launcher_search(&self, screen: &mut FramebufferWriter<'_>) {
@@ -1708,7 +1902,8 @@ impl ValidationUi {
 
         if self.launcher_visible && !self.desktop_failed {
             self.render_launcher_search(screen);
-            let rows = self.catalog.len.min(MAX_LAUNCHER_PROGRAMS);
+            let program_rows = self.catalog.len.min(MAX_LAUNCHER_PROGRAMS);
+            let rows = program_rows.saturating_add(LAUNCHER_POWER_ROWS);
             if rows != 0 {
                 let result_y = y + LAUNCHER_SEARCH_HEIGHT + LAUNCHER_GAP;
                 let border = Rgb::new(232, 238, 247);
@@ -1747,6 +1942,29 @@ impl ValidationUi {
                             program.path(),
                             Rgb::new(148, 163, 184),
                         );
+                    } else {
+                        let action = if row == program_rows {
+                            ginkgo_sysapi::SystemPowerAction::PowerOff
+                        } else {
+                            ginkgo_sysapi::SystemPowerAction::Reboot
+                        };
+                        let confirmed = self.power_confirmation == Some(action);
+                        let (title, detail) = match (action, confirmed) {
+                            (ginkgo_sysapi::SystemPowerAction::PowerOff, false) => {
+                                ("Power off", "Orderly shutdown and storage sync")
+                            }
+                            (ginkgo_sysapi::SystemPowerAction::PowerOff, true) => {
+                                ("Confirm power off", "Click again; Escape cancels")
+                            }
+                            (ginkgo_sysapi::SystemPowerAction::Reboot, false) => {
+                                ("Restart", "Orderly restart and storage sync")
+                            }
+                            (ginkgo_sysapi::SystemPowerAction::Reboot, true) => {
+                                ("Confirm restart", "Click again; Escape cancels")
+                            }
+                        };
+                        screen.draw_text(x + 72, row_y + 16, 2, title, border);
+                        screen.draw_text(x + 72, row_y + 42, 1, detail, Rgb::new(148, 163, 184));
                     }
                 }
             }
@@ -1861,6 +2079,7 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                                 &mut context.fs,
                                 &mut context.audio,
                                 &mut context.entropy,
+                                !context.launch_quiesced,
                                 child_slot_reserved,
                                 &mut sink,
                             );
@@ -2096,6 +2315,203 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
     TaskPoll::Pending
 }
 
+fn power_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
+    const PROCESS_GRACE_NS: u64 = 1_000_000_000;
+
+    let info = context.power_control.info();
+    let Some(power_state) = info.power_state() else {
+        context.power_control.fail(ginkgo_sysapi::Status::Io);
+        return TaskPoll::Pending;
+    };
+    let sequence = usize::try_from(info.sequence).unwrap_or(usize::MAX);
+    let phase = power_state as usize;
+    let changed = state.get(0) != Some(sequence) || state.get(1) != Some(phase);
+    if changed {
+        state.set(0, sequence);
+        state.set(1, phase);
+    }
+
+    match power_state {
+        ginkgo_sysapi::SystemPowerState::Idle => {}
+        ginkgo_sysapi::SystemPowerState::Requested => {
+            if changed {
+                let message = match info.power_action() {
+                    Some(ginkgo_sysapi::SystemPowerAction::PowerOff) => {
+                        "Power off requested; cancellation is still available"
+                    }
+                    Some(ginkgo_sysapi::SystemPowerAction::Reboot) => {
+                        "Restart requested; cancellation is still available"
+                    }
+                    None => "Invalid power request",
+                };
+                context
+                    .ui
+                    .render_power_progress(&mut context.screen, message);
+                let mut sink = SerialDebugSink::new(&mut context.serial);
+                let _ = writeln!(sink, "power: request accepted sequence={}\r", info.sequence);
+            }
+            let now_ns = context.timer.clock().now_ns();
+            if now_ns >= info.deadline_ns {
+                let force = info
+                    .power_flags()
+                    .contains(ginkgo_sysapi::SystemPowerFlags::FORCE);
+                let acpi_supported =
+                    context
+                        .acpi_power
+                        .as_ref()
+                        .is_some_and(|power| match info.power_action() {
+                            Some(ginkgo_sysapi::SystemPowerAction::PowerOff) => {
+                                power.supports_power_off()
+                            }
+                            Some(ginkgo_sysapi::SystemPowerAction::Reboot) => {
+                                power.supports_reboot()
+                            }
+                            None => false,
+                        });
+                let filesystem_synced = context.fs.sync().is_ok();
+                let device_flushed = context.fs.disk_mut().flush().is_ok();
+                if !acpi_supported || ((!filesystem_synced || !device_flushed) && !force) {
+                    context.power_control.fail(ginkgo_sysapi::Status::Io);
+                    context.launch_quiesced = false;
+                    let mut sink = SerialDebugSink::new(&mut context.serial);
+                    let _ = writeln!(
+                        sink,
+                        "power: preflight failed acpi={acpi_supported} filesystem={filesystem_synced} device={device_flushed}\r"
+                    );
+                    redraw_desktop(context);
+                    return TaskPoll::Pending;
+                }
+
+                context.launch_quiesced = true;
+                context.launch_requested = None;
+                if context
+                    .power_control
+                    .begin_quiescing(now_ns.saturating_add(PROCESS_GRACE_NS))
+                {
+                    let close_requested = context
+                        .desktop
+                        .as_mut()
+                        .is_some_and(|desktop| desktop.send_close_all_windows().is_ok());
+                    context.ui.render_power_progress(
+                        &mut context.screen,
+                        "Stopping applications and services...",
+                    );
+                    let mut sink = SerialDebugSink::new(&mut context.serial);
+                    let _ = writeln!(
+                        sink,
+                        "power: launches quiesced orderly-close-requested={close_requested}\r"
+                    );
+                }
+            }
+        }
+        ginkgo_sysapi::SystemPowerState::Quiescing => {
+            let now_ns = context.timer.clock().now_ns();
+            if now_ns >= info.deadline_ns {
+                let terminated = context
+                    .processes
+                    .force_terminate_all_except(context.desktop_process_id);
+                if terminated != 0 {
+                    let mut sink = SerialDebugSink::new(&mut context.serial);
+                    let _ = writeln!(sink, "power: forced termination count={terminated}\r");
+                }
+                let retained_desktop = context
+                    .desktop_process_id
+                    .filter(|id| context.processes.get(*id).is_some());
+                let non_desktop_processes = context
+                    .processes
+                    .len()
+                    .saturating_sub(usize::from(retained_desktop.is_some()));
+                if non_desktop_processes == 0 && context.power_control.begin_synchronizing() {
+                    context.ui.render_power_progress(
+                        &mut context.screen,
+                        "Synchronizing filesystem and storage...",
+                    );
+                }
+            }
+        }
+        ginkgo_sysapi::SystemPowerState::Synchronizing => {
+            let force = info
+                .power_flags()
+                .contains(ginkgo_sysapi::SystemPowerFlags::FORCE);
+            let filesystem_synced = context.fs.sync().is_ok();
+            let device_flushed = context.fs.disk_mut().flush().is_ok();
+            if (!filesystem_synced || !device_flushed) && !force {
+                context.power_control.fail(ginkgo_sysapi::Status::Io);
+                context.launch_quiesced = false;
+                let mut sink = SerialDebugSink::new(&mut context.serial);
+                let _ = writeln!(sink, "power: synchronization failed\r");
+                drop(sink);
+                redraw_desktop(context);
+                return TaskPoll::Pending;
+            }
+            let mut sink = SerialDebugSink::new(&mut context.serial);
+            let _ = writeln!(
+                sink,
+                "power: synchronization complete filesystem={filesystem_synced} device={device_flushed}\r"
+            );
+            let _ = writeln!(sink, "power: committing action={:?}\r", info.power_action());
+            drop(sink);
+            let serial_deadline = context.timer.clock().now_ns().saturating_add(50_000_000);
+            while context.timer.clock().now_ns() < serial_deadline {
+                core::hint::spin_loop();
+            }
+            let commit_deadline = context.timer.clock().now_ns().saturating_add(500_000_000);
+            if !context.power_control.begin_committing(commit_deadline) {
+                return TaskPoll::Pending;
+            }
+            context.ui.render_power_progress(
+                &mut context.screen,
+                "Committing firmware power transition...",
+            );
+            let result =
+                context
+                    .acpi_power
+                    .as_ref()
+                    .ok_or(())
+                    .and_then(|power| match info.power_action() {
+                        Some(ginkgo_sysapi::SystemPowerAction::PowerOff) => {
+                            power.power_off().map_err(|_| ())
+                        }
+                        Some(ginkgo_sysapi::SystemPowerAction::Reboot) => {
+                            power.reboot().map_err(|_| ())
+                        }
+                        None => Err(()),
+                    });
+            if result.is_err() {
+                context.power_control.fail(ginkgo_sysapi::Status::Io);
+                context.launch_quiesced = false;
+                context
+                    .ui
+                    .render_power_progress(&mut context.screen, "Firmware power transition failed");
+                let mut sink = SerialDebugSink::new(&mut context.serial);
+                let _ = writeln!(sink, "power: ACPI transition failed\r");
+                drop(sink);
+                redraw_desktop(context);
+            }
+        }
+        ginkgo_sysapi::SystemPowerState::Canceled => {
+            context.launch_quiesced = false;
+            if changed {
+                redraw_desktop(context);
+                let mut sink = SerialDebugSink::new(&mut context.serial);
+                let _ = writeln!(sink, "power: request canceled\r");
+            }
+        }
+        ginkgo_sysapi::SystemPowerState::Committing => {
+            if context.timer.clock().now_ns() >= info.deadline_ns {
+                context.power_control.fail(ginkgo_sysapi::Status::TimedOut);
+                context.launch_quiesced = false;
+                let mut sink = SerialDebugSink::new(&mut context.serial);
+                let _ = writeln!(sink, "power: firmware transition timed out\r");
+                drop(sink);
+                redraw_desktop(context);
+            }
+        }
+        ginkgo_sysapi::SystemPowerState::Failed => {}
+    }
+    TaskPoll::Pending
+}
+
 fn filesystem_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
     const MESSAGE: &[u8] = b"GinkgoOS: paging, RedoxFS, devices, and scheduler online\r\n";
 
@@ -2208,6 +2624,9 @@ fn launch_program(
     program: ProgramSummary,
     startup: Option<ginkgo_sysapi::Handle>,
 ) -> Result<(), ()> {
+    if context.launch_quiesced {
+        return Err(());
+    }
     context.processes.prepare_insert().map_err(|_| ())?;
     let image =
         read_trusted_system_file(&mut context.fs, program.path(), MAX_EXECUTABLE_BYTES).ok_or(())?;
@@ -2287,7 +2706,14 @@ fn launch_program(
         },
         None => ginkgo_sysapi::Handle::INVALID,
     };
-    let random_source = match process.handles_mut().random_source_create() {
+    let auxiliary = if program.app_id() == "terminal" {
+        process
+            .handles_mut()
+            .system_power_install(&context.power_control)
+    } else {
+        process.handles_mut().random_source_create()
+    };
+    let auxiliary = match auxiliary {
         Ok(handle) => handle,
         Err(_) => return reject_unstarted_client(context, client_id, process),
     };
@@ -2295,7 +2721,7 @@ fn launch_program(
         u64::from(channel.raw()),
         u64::from(filesystem.raw()),
         u64::from(startup.raw()),
-        u64::from(random_source.raw()),
+        u64::from(auxiliary.raw()),
     ]);
     let process_id = context
         .processes
@@ -2620,6 +3046,25 @@ fn desktop_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
     TaskPoll::Pending
 }
 
+fn request_desktop_power(context: &mut KernelContext, action: ginkgo_sysapi::SystemPowerAction) {
+    if context.ui.power_confirmation != Some(action) {
+        context.ui.power_confirmation = Some(action);
+        redraw_desktop(context);
+        return;
+    }
+    context.ui.power_confirmation = None;
+    let deadline = context.timer.clock().now_ns().saturating_add(2_000_000_000);
+    if context
+        .power_control
+        .request(action, ginkgo_sysapi::SystemPowerFlags::empty(), deadline)
+        .is_err()
+    {
+        let mut sink = SerialDebugSink::new(&mut context.serial);
+        let _ = writeln!(sink, "power: desktop request rejected\r");
+        redraw_desktop(context);
+    }
+}
+
 fn request_launcher_toggle(context: &mut KernelContext) {
     if context.launcher_toggle_pending {
         context.launcher_toggle_pending = false;
@@ -2893,7 +3338,9 @@ fn handle_input_event(
             if pressed && usage == 0x11 && logo {
                 request_launcher_toggle(context);
             } else if context.ui.launcher_visible {
-                if pressed && usage == 0x28 && context.ui.catalog.len != 0 {
+                if pressed && usage == 0x29 && context.ui.power_confirmation.take().is_some() {
+                    redraw_desktop(context);
+                } else if pressed && usage == 0x28 && context.ui.catalog.len != 0 {
                     context.launch_requested = Some(0);
                 } else if pressed {
                     let modifiers = current_modifiers(state);
@@ -2954,9 +3401,26 @@ fn handle_input_event(
             }
             if context.ui.launcher_visible {
                 if button == 1 && pressed {
-                    context.launch_requested = context
+                    match context
                         .ui
-                        .launcher_program_at(context.ui.mouse_x, context.ui.mouse_y);
+                        .launcher_selection_at(context.ui.mouse_x, context.ui.mouse_y)
+                    {
+                        Some(LauncherSelection::Program(index)) => {
+                            context.ui.power_confirmation = None;
+                            context.launch_requested = Some(index);
+                        }
+                        Some(LauncherSelection::PowerOff) => request_desktop_power(
+                            context,
+                            ginkgo_sysapi::SystemPowerAction::PowerOff,
+                        ),
+                        Some(LauncherSelection::Reboot) => {
+                            request_desktop_power(context, ginkgo_sysapi::SystemPowerAction::Reboot)
+                        }
+                        None => {
+                            context.ui.power_confirmation = None;
+                            redraw_desktop(context);
+                        }
+                    }
                 }
             } else if let Some(pointer_button) = pointer_button(button) {
                 if let Some(desktop) = context.desktop.as_mut() {

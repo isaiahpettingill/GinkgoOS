@@ -31,6 +31,8 @@ const MEMORY_MAP_REQUEST_MAGIC: [u64; 2] = [0x67cf_3d9d_378a_806f, 0xe304_acdf_c
 
 const HHDM_REQUEST_MAGIC: [u64; 2] = [0x48dc_f1cb_8ad2_b852, 0x6398_4e95_9a98_244b];
 
+const RSDP_REQUEST_MAGIC: [u64; 2] = [0xc5e7_7b6b_397e_7b43, 0x2763_7845_accd_cf3c];
+
 pub const MEMORY_MAP_USABLE: u64 = 0;
 pub const MEMORY_MAP_RESERVED: u64 = 1;
 pub const MEMORY_MAP_ACPI_RECLAIMABLE: u64 = 2;
@@ -243,6 +245,41 @@ impl Iterator for MemoryMapEntries<'_> {
 
         Some(Ok(unsafe { ptr::read_volatile(entry) }))
     }
+}
+
+#[repr(C)]
+pub struct RsdpRequest {
+    id: [u64; 4],
+    revision: u64,
+    response: UnsafeCell<*mut RsdpResponse>,
+}
+
+unsafe impl Sync for RsdpRequest {}
+
+impl RsdpRequest {
+    pub const fn new() -> Self {
+        Self {
+            id: [
+                COMMON_MAGIC[0],
+                COMMON_MAGIC[1],
+                RSDP_REQUEST_MAGIC[0],
+                RSDP_REQUEST_MAGIC[1],
+            ],
+            revision: 0,
+            response: UnsafeCell::new(ptr::null_mut()),
+        }
+    }
+
+    pub fn response(&self) -> Option<&'static RsdpResponse> {
+        let response = unsafe { ptr::read_volatile(self.response.get()) };
+        unsafe { response.as_ref() }
+    }
+}
+
+#[repr(C)]
+pub struct RsdpResponse {
+    pub revision: u64,
+    pub address: *mut u8,
 }
 
 #[repr(C)]

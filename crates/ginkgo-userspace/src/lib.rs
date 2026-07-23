@@ -181,6 +181,61 @@ pub fn process_terminate(process: Handle) -> SyscallResult<()> {
     })
 }
 
+/// Requests a bounded orderly machine power transition through explicit authority.
+pub fn system_power_request(
+    power: Handle,
+    action: SystemPowerAction,
+    flags: SystemPowerFlags,
+) -> SyscallResult<()> {
+    // SAFETY: SystemPowerRequest receives only integer values.
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::SystemPowerRequest,
+            u64::from(power.raw()),
+            action as u64,
+            u64::from(flags.bits()),
+            0,
+            0,
+            0,
+        )
+    })
+}
+
+/// Cancels a request while it remains in its confirmation interval.
+pub fn system_power_cancel(power: Handle) -> SyscallResult<()> {
+    // SAFETY: SystemPowerCancel receives only an integer handle value.
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::SystemPowerCancel,
+            u64::from(power.raw()),
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    })
+}
+
+/// Returns current orderly-shutdown progress and any terminal failure.
+pub fn system_power_get_info(power: Handle) -> SyscallResult<SystemPowerInfo> {
+    let mut output = SystemPowerInfo::default();
+    // SAFETY: output is writable and remains alive until the syscall returns.
+    let raw = unsafe {
+        raw_syscall6(
+            SyscallNumber::SystemPowerGetInfo,
+            u64::from(power.raw()),
+            mut_pointer_address(&mut output),
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    status_result(raw)?;
+    Ok(output)
+}
+
 /// Waits for a process to terminate and returns its final information.
 pub fn process_wait(process: Handle, deadline_ns: i64) -> SyscallResult<ProcessInfo> {
     let mut item = [WaitItem::new(process, Signals::TERMINATED)];

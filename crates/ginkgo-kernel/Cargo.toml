@@ -16,6 +16,7 @@ test = false
 bench = false
 
 [dependencies]
+acpi = "6.1.1"
 bitflags.workspace = true
 embedded-graphics.workspace = true
 embedded-icon.workspace = true
