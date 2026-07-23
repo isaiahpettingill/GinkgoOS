@@ -8,8 +8,8 @@ use alloc::vec::Vec;
 use core::ptr;
 
 use x86_64::structures::paging::{
-    mapper::{MapToError, MapperFlush, UnmapError as X86UnmapError},
-    FrameAllocator, Mapper, OffsetPageTable, PageTable, PhysFrame, Size4KiB,
+    mapper::{FlagUpdateError, MapToError, MapperFlush, UnmapError as X86UnmapError},
+    FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PhysFrame, Size4KiB,
 };
 use x86_64::VirtAddr;
 
@@ -682,6 +682,55 @@ impl AddressSpace {
 
     /// Returns all private frames retired by successful unmaps or failed mappings.
     /// The complete batch remains owned by this address space if reclamation fails.
+    pub fn protect_user_range(
+        &mut self,
+        address: u64,
+        length: usize,
+        permissions: UserPagePermissions,
+    ) -> Result<(), AddressSpaceError> {
+        let (_, end) = validate_exact_user_page_range(address, length)?;
+        let mut page_address = address;
+        loop {
+            if matches!(self.walk_user_page(page_address)?, WalkResult::Unmapped) {
+                return Err(AddressSpaceError::NotMapped(page_address));
+            }
+            if !self
+                .mappings
+                .iter()
+                .any(|mapping| mapping.virtual_address == page_address)
+            {
+                return Err(AddressSpaceError::UntrackedMapping(page_address));
+            }
+            if page_address == end {
+                break;
+            }
+            page_address += PAGE_SIZE;
+        }
+
+        let flags = permissions.page_table_flags();
+        page_address = address;
+        loop {
+            let page = Page::from_start_address(VirtAddr::new(page_address))
+                .map_err(|_| AddressSpaceError::UnalignedAddress(page_address))?;
+            let flush =
+                unsafe { self.mapper.update_flags(page, flags) }.map_err(|error| match error {
+                    FlagUpdateError::PageNotMapped => AddressSpaceError::NotMapped(page_address),
+                    FlagUpdateError::ParentEntryHugePage => AddressSpaceError::HugePageConflict,
+                })?;
+            finish_flush(self.root, flush);
+            self.mappings
+                .iter_mut()
+                .find(|mapping| mapping.virtual_address == page_address)
+                .expect("protection range was completely preflighted")
+                .permissions = permissions;
+            if page_address == end {
+                break;
+            }
+            page_address += PAGE_SIZE;
+        }
+        Ok(())
+    }
+
     pub fn reclaim_retired_data_frames(
         &mut self,
         allocator: &mut UsableFrameAllocator<'_>,

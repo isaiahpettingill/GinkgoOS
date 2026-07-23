@@ -86,6 +86,8 @@ pub enum SyscallNumber {
     AnonymousMap = 39,
     /// Unmaps one exact anonymous mapping and releases its resident frames.
     AnonymousUnmap = 40,
+    /// Changes one exact anonymous mapping's permissions with W^X enforcement.
+    AnonymousProtect = 41,
 }
 
 /// An opaque process-local reference to a kernel object.

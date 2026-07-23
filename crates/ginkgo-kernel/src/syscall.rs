@@ -335,6 +335,9 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
         SyscallNumber::AnonymousUnmap => {
             anonymous_unmap(process, context.rdi, context.rsi, frame_allocator)
         }
+        SyscallNumber::AnonymousProtect => {
+            anonymous_protect(process, context.rdi, context.rsi, context.rdx)
+        }
     };
     DispatchResult::Complete(match result {
         Ok(()) => Status::Ok,
@@ -385,6 +388,7 @@ const fn decode_syscall_number(raw: u64) -> Option<SyscallNumber> {
         38 => SyscallNumber::SystemPowerGetInfo,
         39 => SyscallNumber::AnonymousMap,
         40 => SyscallNumber::AnonymousUnmap,
+        41 => SyscallNumber::AnonymousProtect,
         _ => return None,
     })
 }
@@ -852,6 +856,19 @@ fn anonymous_unmap(
 ) -> Result<(), Status> {
     process
         .unmap_anonymous(address, length, frame_allocator)
+        .map_err(map_shared_mapping_error)
+}
+
+fn anonymous_protect(
+    process: &mut Process,
+    address: u64,
+    length: u64,
+    raw_protection: u64,
+) -> Result<(), Status> {
+    let bits = u32::try_from(raw_protection).map_err(|_| Status::InvalidArgument)?;
+    let protection = MapProtection::from_bits(bits).ok_or(Status::InvalidArgument)?;
+    process
+        .protect_anonymous(address, length, protection)
         .map_err(map_shared_mapping_error)
 }
 
@@ -2382,6 +2399,7 @@ mod tests {
             SyscallNumber::SystemPowerGetInfo,
             SyscallNumber::AnonymousMap,
             SyscallNumber::AnonymousUnmap,
+            SyscallNumber::AnonymousProtect,
         ];
         for number in expected {
             assert_eq!(decode_syscall_number(number as u64), Some(number));
@@ -2420,7 +2438,11 @@ mod tests {
             decode_syscall_number(40),
             Some(SyscallNumber::AnonymousUnmap)
         );
-        assert_eq!(decode_syscall_number(41), None);
+        assert_eq!(
+            decode_syscall_number(41),
+            Some(SyscallNumber::AnonymousProtect)
+        );
+        assert_eq!(decode_syscall_number(42), None);
         assert_eq!(decode_syscall_number(u64::MAX), None);
     }
 

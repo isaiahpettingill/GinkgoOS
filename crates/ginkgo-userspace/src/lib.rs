@@ -882,6 +882,30 @@ pub unsafe fn anonymous_map(
     NonNull::new(output.address as usize as *mut u8).ok_or(Status::InvalidAddress)
 }
 
+/// Changes permissions on one exact private anonymous mapping.
+///
+/// # Safety
+///
+/// The caller must ensure existing references and executable code obey the new permissions.
+#[inline]
+pub unsafe fn anonymous_protect(
+    address: NonNull<u8>,
+    length: usize,
+    protection: MapProtection,
+) -> SyscallResult<()> {
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::AnonymousProtect,
+            pointer_address(address.as_ptr()),
+            length as u64,
+            u64::from(protection.bits()),
+            0,
+            0,
+            0,
+        )
+    })
+}
+
 /// Releases one exact private anonymous mapping.
 ///
 /// # Safety

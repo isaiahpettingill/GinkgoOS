@@ -1191,6 +1191,41 @@ impl Process {
         Ok(address)
     }
 
+    pub fn protect_anonymous(
+        &mut self,
+        address: u64,
+        length: u64,
+        protection: MapProtection,
+    ) -> Result<(), SharedMappingError> {
+        let index = self
+            .anonymous_mappings()
+            .iter()
+            .position(|mapping| mapping.address == address && mapping.length == length)
+            .ok_or(SharedMappingError::ExactMappingNotFound { address, length })?;
+        if !protection.contains(MapProtection::READ)
+            || (protection.contains(MapProtection::WRITE)
+                && protection.contains(MapProtection::EXECUTE))
+        {
+            return Err(SharedMappingError::InvalidProtection(protection));
+        }
+        let permissions = if protection.contains(MapProtection::WRITE) {
+            UserPagePermissions::READ_WRITE
+        } else if protection.contains(MapProtection::EXECUTE) {
+            UserPagePermissions::READ_EXECUTE
+        } else {
+            UserPagePermissions::READ_ONLY
+        };
+        let mapped_len = self.anonymous_mappings()[index].mapped_len;
+        self.address_space_mut()
+            .protect_user_range(address, mapped_len, permissions)
+            .map_err(SharedMappingError::AddressSpace)?;
+        self.anonymous_mappings
+            .as_mut()
+            .expect("live process lost its anonymous mapping records")[index]
+            .protection = protection;
+        Ok(())
+    }
+
     /// Unmaps one exact anonymous mapping and immediately returns its frames.
     pub fn unmap_anonymous(
         &mut self,
@@ -2119,6 +2154,27 @@ mod tests {
                 UserAccess::Write
             ),
             Ok(())
+        );
+        process
+            .protect_anonymous(address, length, MapProtection::READ)
+            .unwrap();
+        assert!(matches!(
+            process.address_space().validate_user_range(
+                address,
+                length as usize,
+                UserAccess::Write
+            ),
+            Err(AddressSpaceError::PermissionDenied { .. })
+        ));
+        assert_eq!(
+            process.protect_anonymous(
+                address,
+                length,
+                MapProtection::READ | MapProtection::WRITE | MapProtection::EXECUTE,
+            ),
+            Err(SharedMappingError::InvalidProtection(
+                MapProtection::READ | MapProtection::WRITE | MapProtection::EXECUTE
+            ))
         );
 
         process
