@@ -5,6 +5,7 @@ members = [
     "ginkgo-minimal-client",
     "ginkgo-file-navigator",
     "ginkgo-terminal",
+    "ginkgo-process-capability-smoke",
 ]
 exclude = ["validator"]
 resolver = "2"

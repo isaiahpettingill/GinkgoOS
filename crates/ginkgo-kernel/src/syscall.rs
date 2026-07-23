@@ -9,15 +9,15 @@
 //! with [`poll_blocked`] and, after activating the process address space, calls
 //! [`complete_blocked`] to publish user output and the deferred syscall status.
 
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{boxed::Box, string::String, vec, vec::Vec};
 use core::mem::size_of;
 
 use ginkgo_filesystem::{
     DirectoryHandle, FsError, NodeKind, NodeMetadata, RedoxFs, RenameMode, MAX_TRAVERSAL_DEPTH,
 };
 use ginkgo_ipc::{
-    handle_transfer_batch_between, HandleOperation, HandleOperationDisposition, IpcError,
-    MessageInfo, ObjectType, Rights, Signals, WaitItem,
+    handle_transfer_batch_between, HandleOperation, HandleOperationDisposition, HandleTable,
+    IpcError, MessageInfo, ObjectType, Rights, Signals, WaitItem, APPLICATION_DATA_MAX_APP_ID_LEN,
 };
 use ginkgo_sysapi::{
     FilesystemDirectoryEntry, FilesystemOpenFlags, FilesystemRenameFlags, Handle, MapFlags,
@@ -82,6 +82,7 @@ const FILESYSTEM_PATH_MAX: usize =
     MAX_TRAVERSAL_DEPTH * FILESYSTEM_NAME_MAX + (MAX_TRAVERSAL_DEPTH - 1);
 const PROCESS_CREATE_ARGS_SIZE: usize = 64;
 const PROCESS_INFO_SIZE: usize = size_of::<ProcessInfo>();
+const APPLICATION_DATA_CREATE_ARGS_SIZE: usize = 32;
 const MAX_EXECUTABLE_BYTES: usize = 4 * 1024 * 1024;
 
 /// A bounded destination for early userspace diagnostics.
@@ -99,13 +100,13 @@ pub enum SyscallOutcome {
     /// The process requested termination with this code.
     Exit(i32),
     /// A fully initialized child whose scheduler slot was reserved before dispatch.
-    ChildCreated(Process),
+    ChildCreated(Box<Process>),
 }
 
 enum DispatchResult {
     Complete(Status),
     Blocked,
-    ChildCreated(Process),
+    ChildCreated(Box<Process>),
 }
 
 /// Result of one bounded scheduler poll of a blocked process.
@@ -284,7 +285,9 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
         }
         SyscallNumber::ProcessGetInfo => process_get_info(process, context.rdi, context.rsi),
         SyscallNumber::ProcessTerminate => process_terminate(process, context.rdi),
-        SyscallNumber::ApplicationGetDataDirectory => Err(Status::NotFound),
+        SyscallNumber::ApplicationGetDataDirectory => {
+            application_get_data_directory(process, filesystem, context.rdi)
+        }
         SyscallNumber::FilesystemOpenDirectory => {
             filesystem_open_directory(process, filesystem, context.rdi)
         }
@@ -302,6 +305,9 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
         }
         SyscallNumber::FilesystemReadDirectory2 => {
             filesystem_read_directory2(process, filesystem, context.rdi)
+        }
+        SyscallNumber::ApplicationDataCreate => {
+            application_data_create(process, filesystem, context.rdi)
         }
     };
     DispatchResult::Complete(match result {
@@ -347,6 +353,7 @@ const fn decode_syscall_number(raw: u64) -> Option<SyscallNumber> {
         32 => SyscallNumber::FilesystemGetInfo,
         33 => SyscallNumber::FilesystemGetMetadata,
         34 => SyscallNumber::FilesystemReadDirectory2,
+        35 => SyscallNumber::ApplicationDataCreate,
         _ => return None,
     })
 }
@@ -1067,8 +1074,15 @@ fn resolve_directory_anchor<B: Disk>(
     }
 }
 
-fn child_directory_rights(anchor_rights: Rights, is_root: bool) -> Rights {
-    let namespace_rights = anchor_rights & (Rights::READ | Rights::WRITE);
+fn child_directory_rights(
+    anchor_rights: Rights,
+    is_root: bool,
+    protected_system_path: bool,
+) -> Rights {
+    let mut namespace_rights = anchor_rights & (Rights::READ | Rights::WRITE);
+    if protected_system_path {
+        namespace_rights.remove(Rights::WRITE);
+    }
     let delegation_rights = if is_root {
         Rights::DUPLICATE | Rights::TRANSFER
     } else {
@@ -1091,7 +1105,8 @@ fn filesystem_open_directory<B: Disk>(
     let directory = filesystem
         .open_directory_at(anchor.directory, &path)
         .map_err(map_fs_error)?;
-    let rights = child_directory_rights(anchor.rights, anchor.is_root);
+    let protected_system_path = anchor.is_root && is_protected_system_path(&path);
+    let rights = child_directory_rights(anchor.rights, anchor.is_root, protected_system_path);
     let handle = process
         .handles_mut()
         .filesystem_directory_create(directory, rights)
@@ -1459,7 +1474,8 @@ fn is_protected_system_path(path: &str) -> bool {
 }
 
 fn is_protected_system_file(name: &str) -> bool {
-    name == "desktop.elf"
+    name == "system"
+        || name == "desktop.elf"
         || name == "minimal-client.elf"
         || name == "file-navigator.elf"
         || name == "terminal.elf"
@@ -1521,7 +1537,7 @@ fn process_create<B: Disk>(
     frame_allocator: &mut UsableFrameAllocator<'_>,
     entropy: &mut EntropyPool,
     child_slot_reserved: bool,
-) -> Result<Process, Status> {
+) -> Result<Box<Process>, Status> {
     if !child_slot_reserved {
         return Err(Status::ResourceLimit);
     }
@@ -1566,6 +1582,9 @@ fn process_create<B: Disk>(
     for raw in raw_dispositions.chunks_exact(HANDLE_DISPOSITION_SIZE) {
         dispositions.push(parse_handle_disposition(raw)?);
     }
+    let application_data_index = application_data_disposition_index(&dispositions, |handle| {
+        process.handles().object_type(handle)
+    })?;
     let mut startup = DirectStartupBlock::new(&args, &config, disposition_count)?;
 
     let file = process
@@ -1582,14 +1601,19 @@ fn process_create<B: Disk>(
         return Err(Status::Io);
     }
 
+    let mut child_storage = Box::<Process>::try_new_uninit().map_err(|_| Status::OutOfMemory)?;
     let randomness = [entropy.next_u64(), entropy.next_u64(), entropy.next_u64()];
-    let mut child =
-        Process::from_elf_randomized(&image, kernel_page_table, frame_allocator, randomness)
-            .map_err(map_process_create_error)?;
+    unsafe { kernel_page_table.activate() };
+    let child =
+        Process::from_elf_randomized(&image, kernel_page_table, frame_allocator, randomness);
+    unsafe { process.address_space().activate() };
+    let child = child.map_err(map_process_create_error)?;
+    child_storage.write(child);
+    let mut child = unsafe { child_storage.assume_init() };
     let (process_handle, control) = match process.handles_mut().process_create() {
         Ok(created) => created,
         Err(error) => {
-            reclaim_unstarted_process(child, frame_allocator);
+            reclaim_unstarted_process(*child, frame_allocator);
             return Err(map_ipc_error(error));
         }
     };
@@ -1603,10 +1627,15 @@ fn process_create<B: Disk>(
         Ok(handles) => handles,
         Err(error) => {
             let _ = process.handles_mut().handle_close(process_handle);
-            reclaim_unstarted_process(child, frame_allocator);
+            reclaim_unstarted_process(*child, frame_allocator);
             return Err(map_ipc_error(error));
         }
     };
+    if let Some(index) = application_data_index {
+        child
+            .set_application_data(child_handles[index])
+            .expect("prevalidated application-data disposition changed type after commit");
+    }
     startup.set_handles(&child_handles);
 
     // All fallible allocation, parsing, range validation, and handle reservation
@@ -1624,6 +1653,33 @@ fn process_create<B: Disk>(
     )
     .expect("validated process-create output failed after handle commit");
     Ok(child)
+}
+
+fn application_data_disposition_index<F>(
+    dispositions: &[HandleOperationDisposition],
+    mut object_type: F,
+) -> Result<Option<usize>, Status>
+where
+    F: FnMut(Handle) -> Result<ObjectType, IpcError>,
+{
+    let mut application_data = None;
+    for (index, disposition) in dispositions.iter().enumerate() {
+        if object_type(disposition.handle).map_err(map_ipc_error)? != ObjectType::ApplicationData {
+            continue;
+        }
+        if application_data.is_some() {
+            return Err(Status::InvalidArgument);
+        }
+        let allowed = Rights::READ | Rights::WRITE;
+        if !disposition.rights.contains(Rights::READ)
+            || !allowed.contains(disposition.rights)
+            || disposition.rights.contains(Rights::TRANSFER)
+        {
+            return Err(Status::InvalidRights);
+        }
+        application_data = Some(index);
+    }
+    Ok(application_data)
 }
 
 fn process_get_info(
@@ -1653,6 +1709,134 @@ fn process_terminate(process: &Process, raw_process: u64) -> Result<(), Status> 
         .handles()
         .process_terminate(handle)
         .map_err(map_ipc_error)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ApplicationDataCreateRequest {
+    root: Handle,
+    app_id_address: u64,
+    app_id_length: usize,
+    output_address: u64,
+}
+
+fn parse_application_data_create_args(
+    raw: &[u8; APPLICATION_DATA_CREATE_ARGS_SIZE],
+) -> Result<ApplicationDataCreateRequest, Status> {
+    if read_u32(raw, 4) != 0 {
+        return Err(Status::InvalidArgument);
+    }
+    Ok(ApplicationDataCreateRequest {
+        root: Handle::from_raw(read_u32(raw, 0)),
+        app_id_address: read_u64(raw, 8),
+        app_id_length: checked_array_bytes(
+            read_u64(raw, 16),
+            1,
+            APPLICATION_DATA_MAX_APP_ID_LEN as u64,
+            Status::InvalidArgument,
+        )?,
+        output_address: read_u64(raw, 24),
+    })
+}
+
+fn require_application_data_installation_authority(
+    handles: &HandleTable,
+    root: Handle,
+) -> Result<(), Status> {
+    handles
+        .filesystem_root(root, Rights::WRITE | Rights::EXECUTE)
+        .map_err(map_ipc_error)
+}
+
+fn application_data_create<B: Disk>(
+    process: &mut Process,
+    filesystem: &mut RedoxFs<B>,
+    args_address: u64,
+) -> Result<(), Status> {
+    let raw = copy_block_from_user::<APPLICATION_DATA_CREATE_ARGS_SIZE>(process, args_address)?;
+    let request = parse_application_data_create_args(&raw)?;
+    validate_user_output(process, request.output_address, HANDLE_OUTPUT_SIZE)?;
+    require_application_data_installation_authority(process.handles(), request.root)?;
+    let app_id_bytes = copy_vec_from_user(process, request.app_id_address, request.app_id_length)?;
+    let app_id = core::str::from_utf8(&app_id_bytes).map_err(|_| Status::InvalidArgument)?;
+
+    let handle = process
+        .handles_mut()
+        .application_data_create(app_id)
+        .map_err(map_ipc_error)?;
+    let result = (|| {
+        let scope = process
+            .handles()
+            .application_data_scope(handle, Rights::READ)
+            .map_err(map_ipc_error)?;
+        ensure_application_data_directory(filesystem, scope.app_id())?;
+        copy_to_user(
+            process,
+            request.output_address,
+            &encode_handle_output(handle),
+        )
+    })();
+    if let Err(status) = result {
+        close_handles(process, core::slice::from_ref(&handle));
+        return Err(status);
+    }
+    Ok(())
+}
+
+fn application_get_data_directory<B: Disk>(
+    process: &mut Process,
+    filesystem: &mut RedoxFs<B>,
+    output_address: u64,
+) -> Result<(), Status> {
+    let identity = process.application_data().ok_or(Status::NotFound)?;
+    validate_user_output(process, output_address, HANDLE_OUTPUT_SIZE)?;
+    let scope = process
+        .handles()
+        .application_data_scope(identity, Rights::READ)
+        .map_err(map_ipc_error)?;
+    let directory = open_application_data_directory(filesystem, scope.app_id())?;
+    let handle = process
+        .handles_mut()
+        .filesystem_directory_create(directory, Rights::READ | Rights::WRITE)
+        .map_err(map_ipc_error)?;
+    if let Err(status) = copy_to_user(process, output_address, &encode_handle_output(handle)) {
+        close_handles(process, core::slice::from_ref(&handle));
+        return Err(status);
+    }
+    Ok(())
+}
+
+fn ensure_application_data_directory<B: Disk>(
+    filesystem: &mut RedoxFs<B>,
+    app_id: &str,
+) -> Result<DirectoryHandle, Status> {
+    let root = filesystem.root_directory().map_err(map_fs_error)?;
+    let appdata = match filesystem.open_directory_at(root, "appdata") {
+        Ok(directory) => directory,
+        Err(FsError::NotFound) => filesystem
+            .create_directory_at(root, "appdata")
+            .map_err(map_fs_error)?,
+        Err(error) => return Err(map_fs_error(error)),
+    };
+    match filesystem.open_directory_at(appdata, app_id) {
+        Ok(directory) => Ok(directory),
+        Err(FsError::NotFound) => filesystem
+            .create_directory_at(appdata, app_id)
+            .map_err(map_fs_error),
+        Err(error) => Err(map_fs_error(error)),
+    }
+}
+
+fn open_application_data_directory<B: Disk>(
+    filesystem: &mut RedoxFs<B>,
+    app_id: &str,
+) -> Result<DirectoryHandle, Status> {
+    let root = filesystem.root_directory().map_err(map_fs_error)?;
+    let appdata = filesystem
+        .open_directory_at(root, "appdata")
+        .map_err(map_fs_error)?;
+    filesystem
+        .open_directory_at(appdata, app_id)
+        .map_err(map_fs_error)
 }
 
 fn bounded_startup_length(raw: u64) -> Result<usize, Status> {
@@ -2077,6 +2261,7 @@ mod tests {
             SyscallNumber::FilesystemGetInfo,
             SyscallNumber::FilesystemGetMetadata,
             SyscallNumber::FilesystemReadDirectory2,
+            SyscallNumber::ApplicationDataCreate,
         ];
         for number in expected {
             assert_eq!(decode_syscall_number(number as u64), Some(number));
@@ -2102,7 +2287,11 @@ mod tests {
             decode_syscall_number(34),
             Some(SyscallNumber::FilesystemReadDirectory2)
         );
-        assert_eq!(decode_syscall_number(35), None);
+        assert_eq!(
+            decode_syscall_number(35),
+            Some(SyscallNumber::ApplicationDataCreate)
+        );
+        assert_eq!(decode_syscall_number(36), None);
         assert_eq!(decode_syscall_number(u64::MAX), None);
     }
 
@@ -2139,6 +2328,112 @@ mod tests {
             (Signals::READABLE | Signals::PEER_CLOSED).bits()
         );
         assert_eq!(read_u32(&output, 8), Signals::PEER_CLOSED.bits());
+    }
+
+    #[test]
+    fn application_data_create_parser_validates_layout_reserved_and_bounds() {
+        let mut raw = [0_u8; APPLICATION_DATA_CREATE_ARGS_SIZE];
+        put_u32(&mut raw, 0, 7);
+        raw[8..16].copy_from_slice(&0x1000_u64.to_le_bytes());
+        raw[16..24].copy_from_slice(&12_u64.to_le_bytes());
+        raw[24..32].copy_from_slice(&0x2000_u64.to_le_bytes());
+        assert_eq!(
+            parse_application_data_create_args(&raw),
+            Ok(ApplicationDataCreateRequest {
+                root: Handle::from_raw(7),
+                app_id_address: 0x1000,
+                app_id_length: 12,
+                output_address: 0x2000,
+            })
+        );
+
+        put_u32(&mut raw, 4, 1);
+        assert_eq!(
+            parse_application_data_create_args(&raw),
+            Err(Status::InvalidArgument)
+        );
+        put_u32(&mut raw, 4, 0);
+        raw[16..24].copy_from_slice(&((APPLICATION_DATA_MAX_APP_ID_LEN + 1) as u64).to_le_bytes());
+        assert_eq!(
+            parse_application_data_create_args(&raw),
+            Err(Status::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn application_data_create_requires_write_execute_root_authority() {
+        let mut handles = HandleTable::new();
+        let installer = handles
+            .filesystem_root_create_with_rights(Rights::WRITE | Rights::EXECUTE)
+            .unwrap();
+        let ordinary = handles.filesystem_root_create().unwrap();
+        let application_data = handles.application_data_create("example.editor").unwrap();
+
+        assert_eq!(
+            require_application_data_installation_authority(&handles, installer),
+            Ok(())
+        );
+        assert_eq!(
+            require_application_data_installation_authority(&handles, ordinary),
+            Err(Status::AccessDenied)
+        );
+        assert_eq!(
+            require_application_data_installation_authority(&handles, application_data),
+            Err(Status::AccessDenied)
+        );
+    }
+
+    #[test]
+    fn application_data_directory_creation_is_idempotent_and_scoped() {
+        let mut filesystem = RedoxFs::new().unwrap();
+
+        let first = ensure_application_data_directory(&mut filesystem, "example.editor").unwrap();
+        let second = ensure_application_data_directory(&mut filesystem, "example.editor").unwrap();
+        assert_eq!(first, second);
+        assert!(filesystem.open_file_at(first, "settings").is_err());
+
+        let other = ensure_application_data_directory(&mut filesystem, "example.viewer").unwrap();
+        assert_ne!(first, other);
+        assert_eq!(
+            open_application_data_directory(&mut filesystem, "example.editor"),
+            Ok(first)
+        );
+    }
+
+    #[test]
+    fn application_data_dispositions_are_unique_and_require_read_only_scope_rights() {
+        let app = HandleOperationDisposition {
+            handle: Handle::from_raw(7),
+            operation: HandleOperation::Move,
+            rights: Rights::READ,
+        };
+        let ordinary = HandleOperationDisposition {
+            handle: Handle::from_raw(9),
+            operation: HandleOperation::Move,
+            rights: Rights::READ,
+        };
+        assert_eq!(
+            application_data_disposition_index(&[ordinary, app], |handle| Ok(
+                if handle == app.handle {
+                    ObjectType::ApplicationData
+                } else {
+                    ObjectType::Channel
+                }
+            )),
+            Ok(Some(1))
+        );
+        assert_eq!(
+            application_data_disposition_index(&[app, app], |_| Ok(ObjectType::ApplicationData)),
+            Err(Status::InvalidArgument)
+        );
+
+        for rights in [Rights::WRITE, Rights::READ | Rights::TRANSFER] {
+            let invalid = HandleOperationDisposition { rights, ..app };
+            assert_eq!(
+                application_data_disposition_index(&[invalid], |_| Ok(ObjectType::ApplicationData)),
+                Err(Status::InvalidRights)
+            );
+        }
     }
 
     #[test]
@@ -2365,8 +2660,11 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_namespace_protection_covers_top_level_nodes() {
+    fn filesystem_namespace_protection_covers_system_subtree_and_legacy_nodes() {
         for protected in [
+            "system",
+            "system/desktop.elf",
+            "system/nested/artifact",
             "desktop.elf",
             "programs.gkr/metadata",
             "system.log/archive",
@@ -2374,24 +2672,36 @@ mod tests {
         ] {
             assert!(is_protected_system_path(protected));
         }
-        assert!(!is_protected_system_path("apps/desktop.elf"));
-        assert!(!is_protected_system_path("desktop.elf.backup"));
+        for mutable in [
+            "applications",
+            "applications/example/versions/app.elf",
+            "appdata",
+            "appdata/example/settings",
+            "apps/desktop.elf",
+            "desktop.elf.backup",
+        ] {
+            assert!(!is_protected_system_path(mutable));
+        }
     }
 
     #[test]
     fn directory_rights_are_attenuated_to_anchor_authority() {
         let full = Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER;
-        assert_eq!(child_directory_rights(full, false), full);
+        assert_eq!(child_directory_rights(full, false, false), full);
         assert_eq!(
-            child_directory_rights(Rights::READ | Rights::TRANSFER, false),
+            child_directory_rights(Rights::READ | Rights::TRANSFER, false, false),
             Rights::READ | Rights::TRANSFER
         );
         assert_eq!(
-            child_directory_rights(Rights::READ | Rights::WRITE, true),
+            child_directory_rights(Rights::READ | Rights::WRITE, true, false),
             full
         );
         assert_eq!(
-            child_directory_rights(Rights::READ, true),
+            child_directory_rights(Rights::READ, true, false),
+            Rights::READ | Rights::DUPLICATE | Rights::TRANSFER
+        );
+        assert_eq!(
+            child_directory_rights(full, true, true),
             Rights::READ | Rights::DUPLICATE | Rights::TRANSFER
         );
     }

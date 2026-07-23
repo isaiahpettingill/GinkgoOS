@@ -636,6 +636,7 @@ pub struct Process {
     context: UserContext,
     layout: ProcessLayout,
     handles: Option<HandleTable>,
+    application_data: Option<Handle>,
     control: Option<ProcessControl>,
     state: ProcessState,
     preemption_count: u64,
@@ -796,6 +797,7 @@ impl Process {
             context,
             layout,
             handles: Some(HandleTable::new()),
+            application_data: None,
             control: None,
             state: ProcessState::Ready,
             preemption_count: 0,
@@ -818,6 +820,23 @@ impl Process {
 
     pub const fn state(&self) -> ProcessState {
         self.state
+    }
+
+    /// Designates a process-local application-data identity owned by this process's
+    /// handle table. The raw handle is kernel-internal and is never returned by the
+    /// data-directory syscall.
+    pub fn set_application_data(&mut self, handle: Handle) -> Result<(), IpcError> {
+        if self.application_data.is_some() {
+            return Err(IpcError::InvalidMessage);
+        }
+        self.handles()
+            .application_data_scope(handle, ginkgo_sysapi::Rights::READ)?;
+        self.application_data = Some(handle);
+        Ok(())
+    }
+
+    pub const fn application_data(&self) -> Option<Handle> {
+        self.application_data
     }
 
     pub fn attach_control(&mut self, control: ProcessControl) {
@@ -1858,6 +1877,7 @@ mod tests {
             context: UserContext::new(0x1000, USER_STACK_TOP),
             layout: ProcessLayout::STANDARD,
             handles: None,
+            application_data: None,
             control: None,
             state,
             preemption_count: 0,
@@ -2181,6 +2201,28 @@ mod tests {
             DirectStartupBlock::new(&too_many, &[], 0),
             Err(Status::ResourceLimit)
         ));
+    }
+
+    #[test]
+    fn application_data_identity_is_child_local_owned_and_single_assignment() {
+        let mut handles = HandleTable::new();
+        let application_data = handles.application_data_create("example.editor").unwrap();
+        let (channel, _) = handles.channel_create().unwrap();
+        let mut process = test_process(ProcessState::Ready);
+        process.handles = Some(handles);
+
+        assert_eq!(
+            process.set_application_data(channel),
+            Err(IpcError::WrongObjectType)
+        );
+        assert!(process.set_application_data(application_data).is_ok());
+        assert_eq!(process.application_data(), Some(application_data));
+        assert_eq!(
+            process.set_application_data(application_data),
+            Err(IpcError::InvalidMessage)
+        );
+
+        drop(process.handles.take());
     }
 
     #[test]

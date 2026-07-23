@@ -207,6 +207,27 @@ pub fn application_get_data_directory() -> SyscallResult<Handle> {
     Ok(output.handle)
 }
 
+/// Creates or opens private application data through an installation-authority root.
+pub fn application_data_create(root: Handle, app_id: &str) -> SyscallResult<Handle> {
+    let mut output = HandleOutput::default();
+    let args = application_data_create_args(root, app_id, &mut output);
+    // SAFETY: args and output remain valid, and app_id remains readable until
+    // the syscall returns. An empty app ID uses address zero.
+    let raw = unsafe {
+        raw_syscall6(
+            SyscallNumber::ApplicationDataCreate,
+            pointer_address(&args),
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    status_result(raw)?;
+    Ok(output.handle)
+}
+
 /// Terminates the current process with `exit_code`.
 ///
 /// This function returns only if the kernel rejects the request. The returned
@@ -856,6 +877,20 @@ fn filesystem_open_args(name: &str, flags: FilesystemOpenFlags) -> FilesystemOpe
     }
 }
 
+fn application_data_create_args(
+    root: Handle,
+    app_id: &str,
+    output: &mut HandleOutput,
+) -> ApplicationDataCreateArgs {
+    ApplicationDataCreateArgs {
+        root,
+        reserved: 0,
+        app_id_address: slice_address(app_id.as_bytes()),
+        app_id_length: app_id.len() as u64,
+        output_address: mut_pointer_address(output),
+    }
+}
+
 fn filesystem_open_directory_args(
     anchor: Handle,
     path: &str,
@@ -1096,6 +1131,26 @@ mod tests {
         assert_eq!(args.disposition_count, 1);
         assert_eq!(args.flags, 0);
         assert_eq!(args.reserved, 0);
+    }
+
+    #[test]
+    fn application_data_create_arguments_retain_root_app_id_and_output() {
+        let root = Handle::from_raw(37);
+        let app_id = "org.ginkgo.example";
+        let mut output = HandleOutput::default();
+        let output_address = mut_pointer_address(&mut output);
+
+        let args = application_data_create_args(root, app_id, &mut output);
+
+        assert_eq!(args.root, root);
+        assert_eq!(args.reserved, 0);
+        assert_eq!(args.app_id_address, pointer_address(app_id.as_ptr()));
+        assert_eq!(args.app_id_length, app_id.len() as u64);
+        assert_eq!(args.output_address, output_address);
+
+        let empty = application_data_create_args(root, "", &mut output);
+        assert_eq!(empty.app_id_address, 0);
+        assert_eq!(empty.app_id_length, 0);
     }
 
     #[test]

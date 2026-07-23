@@ -3,7 +3,7 @@
 
 import argparse
 import os
-import shutil
+
 import subprocess
 import tempfile
 import time
@@ -78,18 +78,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--qemu", required=True)
     parser.add_argument("--ovmf", required=True)
-    parser.add_argument("--source-disk", required=True)
     parser.add_argument("--disk", required=True)
     parser.add_argument("--boot-root", required=True)
     parser.add_argument("--timeout", type=float, default=60)
     args = parser.parse_args()
 
-    source = os.path.abspath(args.source_disk)
-    dedicated = os.path.abspath(args.disk)
-    if source == dedicated:
-        raise RuntimeError("filesystem smoke disk must be a dedicated copy")
-    os.makedirs(os.path.dirname(dedicated), exist_ok=True)
-    shutil.copyfile(source, dedicated)
+
 
     with tempfile.TemporaryDirectory(prefix="ginkgo-filesystem-") as temporary:
         first_log = os.path.join(temporary, "first-boot.log")

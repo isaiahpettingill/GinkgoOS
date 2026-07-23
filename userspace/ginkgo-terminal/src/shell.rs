@@ -11,19 +11,20 @@ use alloc::{
 use core::cell::RefCell;
 
 use ginkgo_app_package::{
-    sha256, ExecutableGeneration, InstalledRegistry, Package, Provenance, Sha256, MAX_REGISTRY_LEN,
+    generation_filename, sha256, ExecutableGeneration, InstalledRegistry, Package, Provenance,
+    Sha256, MAX_REGISTRY_LEN,
 };
 use ginkgo_terminal_protocol::ConsoleMessage;
 use ginkgo_userspace::{
-    channel_create, filesystem_create_directory, filesystem_get_info, filesystem_get_metadata,
-    filesystem_open, filesystem_open_directory, filesystem_read, filesystem_read_directory,
-    filesystem_read_directory2, filesystem_remove_directory, filesystem_rename, filesystem_stat,
-    filesystem_sync, filesystem_truncate, filesystem_unlink, filesystem_write, handle_close,
-    process_create, process_get_info, process_terminate, process_wait, process_yield,
-    FilesystemEntryKind, FilesystemInfoFlags, FilesystemMetadata, FilesystemOpenFlags,
-    FilesystemRenameFlags, Handle, ProcessFault, ProcessInfo, ProcessState,
-    ProcessTerminationCause, Status, DEADLINE_INFINITE, PROCESS_MAX_ARGS,
-    PROCESS_MAX_STARTUP_BYTES,
+    application_data_create, channel_create, filesystem_create_directory, filesystem_get_info,
+    filesystem_get_metadata, filesystem_open, filesystem_open_directory, filesystem_read,
+    filesystem_read_directory, filesystem_read_directory2, filesystem_remove_directory,
+    filesystem_rename, filesystem_stat, filesystem_sync, filesystem_truncate, filesystem_unlink,
+    filesystem_write, handle_close, process_create, process_get_info, process_terminate,
+    process_wait, process_yield, FilesystemEntryKind, FilesystemInfoFlags, FilesystemMetadata,
+    FilesystemOpenFlags, FilesystemRenameFlags, Handle, HandleDisposition, ProcessFault,
+    ProcessInfo, ProcessState, ProcessTerminationCause, Rights, Status, DEADLINE_INFINITE,
+    PROCESS_MAX_ARGS, PROCESS_MAX_STARTUP_BYTES,
 };
 use rhai::{Array, Dynamic, Engine, ImmutableString, Map, INT};
 
@@ -42,9 +43,13 @@ const MAX_JOBS: usize = 32;
 const MAX_OUTPUT_BYTES: usize = 8 * 1024;
 const FILE_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_INSTALL_PACKAGE_BYTES: usize = 1024 * 1024;
-const INSTALLED_REGISTRY_PATH: &str = "installed-apps.gki";
-const STAGED_REGISTRY_PATH: &str = "installed-apps.gki.new";
-const PROTECTED_SYSTEM_IDS: &[&str] = &["desktop", "files", "terminal", "minimal-client"];
+const MAX_PURGE_ENTRIES: usize = 512;
+const MAX_PURGE_DEPTH: usize = 32;
+const APPLICATIONS_DIRECTORY: &str = "applications";
+const APP_DATA_DIRECTORY: &str = "appdata";
+const INSTALLED_REGISTRY_PATH: &str = "applications/installed.gki";
+const STAGED_REGISTRY_PATH: &str = "applications/installed.gki.new";
+const PROTECTED_SYSTEM_IDS: &[&str] = &["desktop", "file-navigator", "terminal", "minimal-client"];
 
 pub struct ChildStream {
     pub app_id: String,
@@ -107,6 +112,31 @@ impl HostState {
             Ok(process) => process,
             Err(error) => {
                 self.error(format!("spawn_elf: {:?}", error));
+                return -1;
+            }
+        };
+        let id = self.next_job_id;
+        self.next_job_id += 1;
+        self.jobs.push(HeadlessJob { id, process });
+        id
+    }
+
+    fn spawn_installed(&mut self, app_id: &str, arguments: Array) -> INT {
+        if self.jobs.len() >= MAX_JOBS || self.next_job_id == INT::MAX {
+            self.error(String::from("spawn_installed: terminal job limit reached"));
+            return -1;
+        }
+        let arguments = match argument_strings(arguments) {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                self.error(format!("spawn_installed: {}", error));
+                return -1;
+            }
+        };
+        let process = match create_installed_process(self.filesystem, app_id, &arguments) {
+            Ok(process) => process,
+            Err(error) => {
+                self.error(format!("spawn_installed: {}", error));
                 return -1;
             }
         };
@@ -478,6 +508,15 @@ fn register_functions(engine: &mut Engine, host: Rc<RefCell<HostState>>) {
             spawn_host.borrow_mut().spawn(path.as_str(), arguments)
         },
     );
+    let installed_spawn_host = host.clone();
+    engine.register_fn(
+        "spawn_installed",
+        move |app_id: ImmutableString, arguments: Array| -> INT {
+            installed_spawn_host
+                .borrow_mut()
+                .spawn_installed(app_id.as_str(), arguments)
+        },
+    );
     let status_host = host.clone();
     engine.register_fn("process_status", move |job_id: INT| -> Dynamic {
         let Some(process) = status_host.borrow().job_process(job_id) else {
@@ -525,6 +564,24 @@ fn register_functions(engine: &mut Engine, host: Rc<RefCell<HostState>>) {
             process_result("exec_elf", result)
         },
     );
+    let installed_exec_host = host.clone();
+    engine.register_fn(
+        "exec_installed",
+        move |app_id: ImmutableString, arguments: Array| -> Dynamic {
+            let arguments = match argument_strings(arguments) {
+                Ok(arguments) => arguments,
+                Err(error) => return Dynamic::from(format!("exec_installed: {}", error)),
+            };
+            let filesystem = installed_exec_host.borrow().filesystem;
+            let process = match create_installed_process(filesystem, app_id.as_str(), &arguments) {
+                Ok(process) => process,
+                Err(error) => return Dynamic::from(format!("exec_installed: {}", error)),
+            };
+            let result = process_wait(process, DEADLINE_INFINITE);
+            let _ = handle_close(process);
+            process_result("exec_installed", result)
+        },
+    );
 
     let install_host = host.clone();
     engine.register_fn("install_package", move |path: ImmutableString| -> bool {
@@ -548,6 +605,19 @@ fn register_functions(engine: &mut Engine, host: Rc<RefCell<HostState>>) {
                 uninstall_host
                     .borrow_mut()
                     .error(format!("uninstall_app: {}", error));
+                false
+            }
+        }
+    });
+    let purge_host = host.clone();
+    engine.register_fn("purge_app_data", move |app_id: ImmutableString| -> bool {
+        let filesystem = purge_host.borrow().filesystem;
+        match purge_app_data(filesystem, app_id.as_str()) {
+            Ok(()) => true,
+            Err(error) => {
+                purge_host
+                    .borrow_mut()
+                    .error(format!("purge_app_data: {}", error));
                 false
             }
         }
@@ -622,6 +692,69 @@ fn create_headless_process(root: Handle, path: &str, arguments: &[u8]) -> Result
     let result = process_create(executable, arguments, &[], &[]);
     let _ = handle_close(executable);
     result
+}
+
+fn create_installed_process(
+    root: Handle,
+    app_id: &str,
+    arguments: &[String],
+) -> Result<Handle, String> {
+    let registry = load_registry(root)?;
+    let installed = registry
+        .get(app_id)
+        .ok_or_else(|| format!("application {} is not installed", app_id))?;
+    let path = executable_path(app_id, &installed.executable.filename);
+    let expected_length = installed.executable.length;
+    let expected_digest = installed.executable.digest;
+    let argument_blob = encode_arguments(&path, arguments)
+        .map_err(|error| format!("invalid arguments: {}", error))?;
+
+    let application_data = application_data_create(root, app_id)
+        .map_err(|error| format!("cannot mint application-data identity: {:?}", error))?;
+    let executable = match filesystem_open(
+        root,
+        &path,
+        FilesystemOpenFlags::READ | FilesystemOpenFlags::EXECUTE,
+    ) {
+        Ok(executable) => executable,
+        Err(error) => {
+            let _ = handle_close(application_data);
+            return Err(format!("cannot open installed executable: {:?}", error));
+        }
+    };
+
+    let verification = file_digest_handle(executable);
+    match verification {
+        Ok((length, digest)) if length == expected_length && digest == expected_digest => {}
+        Ok(_) => {
+            let _ = handle_close(executable);
+            let _ = handle_close(application_data);
+            return Err(String::from(
+                "installed executable length or SHA-256 does not match the registry",
+            ));
+        }
+        Err(error) => {
+            let _ = handle_close(executable);
+            let _ = handle_close(application_data);
+            return Err(format!("cannot verify installed executable: {:?}", error));
+        }
+    }
+
+    let startup_handles = [HandleDisposition::move_handle(
+        application_data,
+        Rights::READ,
+    )];
+    let result = process_create(executable, &argument_blob, &startup_handles, &[]);
+    let _ = handle_close(executable);
+    match result {
+        Ok(process) => Ok(process),
+        Err(error) => {
+            // Move dispositions commit only when process creation succeeds. On
+            // failure the identity is still owned by this process and must close.
+            let _ = handle_close(application_data);
+            Err(format!("process creation failed: {:?}", error))
+        }
+    }
 }
 
 fn process_result(operation: &str, result: Result<ProcessInfo, Status>) -> Dynamic {
@@ -728,41 +861,84 @@ fn install_package(root: Handle, path: &str) -> Result<(), String> {
             .map_err(|error| format!("registry install rejected: {:?}", error))?;
     }
 
-    let executable_created = ensure_immutable_file(
+    let mut created_directories = Vec::new();
+    if let Err(error) =
+        ensure_directory_chain(root, APPLICATIONS_DIRECTORY, &mut created_directories)
+    {
+        return Err(format!("cannot create applications directory: {:?}", error));
+    }
+    let versions_directory = versions_directory(package.app_id);
+    if let Err(error) = ensure_directory_chain(root, &versions_directory, &mut created_directories)
+    {
+        cleanup_created_paths(root, &[], &created_directories);
+        return Err(format!("cannot create version directory: {:?}", error));
+    }
+
+    let new_executable_path = executable_path(package.app_id, generation.filename.as_str());
+    let mut created_files = Vec::new();
+    match ensure_immutable_file(
         root,
-        generation.filename.as_str(),
+        &new_executable_path,
         package.executable,
         executable_digest,
-    )?;
-    let mut created_assets = Vec::new();
+    ) {
+        Ok(true) => created_files.push(new_executable_path),
+        Ok(false) => {}
+        Err(error) => {
+            cleanup_created_paths(root, &created_files, &created_directories);
+            return Err(error);
+        }
+    }
+
+    let data_directory = app_data_path(package.app_id);
+    if let Err(error) = ensure_directory_chain(root, &data_directory, &mut created_directories) {
+        cleanup_created_paths(root, &created_files, &created_directories);
+        return Err(format!("cannot create app-data directory: {:?}", error));
+    }
     for asset in package.assets() {
-        let backing_name = seed_backing_name(package.app_id, asset.path);
-        match ensure_seed_file(root, backing_name.as_str(), asset.data) {
-            Ok(true) => created_assets.push(backing_name),
+        let asset_path = format!("{}/{}/{}", APP_DATA_DIRECTORY, package.app_id, asset.path);
+        if let Some((parent, _)) = asset_path.rsplit_once('/') {
+            if let Err(error) = ensure_directory_chain(root, parent, &mut created_directories) {
+                cleanup_created_paths(root, &created_files, &created_directories);
+                return Err(format!("cannot create asset directory: {:?}", error));
+            }
+        }
+        match ensure_seed_file(root, &asset_path, asset.data) {
+            Ok(true) => created_files.push(asset_path),
             Ok(false) => {}
             Err(error) => {
-                cleanup_created_files(root, &created_assets);
-                if executable_created {
-                    let _ = filesystem_unlink(root, generation.filename.as_str());
-                }
+                cleanup_created_paths(root, &created_files, &created_directories);
                 return Err(error);
             }
         }
     }
 
-    if let Err((error, rollback_safe)) = publish_registry(root, &registry) {
-        if rollback_safe {
-            cleanup_created_files(root, &created_assets);
-            if executable_created {
-                let _ = filesystem_unlink(root, generation.filename.as_str());
-            }
+    if let Err(error) = filesystem_sync(root) {
+        cleanup_created_paths(root, &created_files, &created_directories);
+        return Err(format!("cannot sync installed files: {:?}", error));
+    }
+    if let Err((error, safe_to_clean)) = publish_registry(root, &registry) {
+        if safe_to_clean {
+            cleanup_created_paths(root, &created_files, &created_directories);
         }
         return Err(error);
     }
 
     if let Some(old_filename) = old_filename {
         if old_filename != generation.filename {
-            let _ = filesystem_unlink(root, old_filename.as_str());
+            let old_path = executable_path(package.app_id, &old_filename);
+            remove_file_if_present(root, &old_path).map_err(|error| {
+                format!(
+                    "registry updated but old version cleanup failed: {:?}",
+                    error
+                )
+            })?;
+            filesystem_sync(root).map_err(|error| {
+                format!(
+                    "registry updated but version cleanup did not sync: {:?}",
+                    error
+                )
+            })?;
         }
     }
     Ok(())
@@ -774,7 +950,46 @@ fn uninstall_app(root: Handle, app_id: &str) -> Result<(), String> {
         .remove(app_id, PROTECTED_SYSTEM_IDS)
         .map_err(|error| format!("registry removal rejected: {:?}", error))?;
     publish_registry(root, &registry).map_err(|(error, _)| error)?;
-    let _ = filesystem_unlink(root, removed.executable.filename.as_str());
+
+    let executable_path = executable_path(app_id, &removed.executable.filename);
+    remove_file_if_present(root, &executable_path).map_err(|error| {
+        format!(
+            "registry removed but executable cleanup failed: {:?}",
+            error
+        )
+    })?;
+    remove_empty_directory(root, &versions_directory(app_id))
+        .map_err(|error| format!("registry removed but versions cleanup failed: {:?}", error))?;
+    remove_empty_directory(root, &application_directory(app_id)).map_err(|error| {
+        format!(
+            "registry removed but application cleanup failed: {:?}",
+            error
+        )
+    })?;
+    filesystem_sync(root)
+        .map_err(|error| format!("registry removed but cleanup did not sync: {:?}", error))?;
+    Ok(())
+}
+
+fn purge_app_data(root: Handle, app_id: &str) -> Result<(), String> {
+    validate_mutable_app_id(app_id)?;
+    let path = app_data_path(app_id);
+    let mut removals = Vec::new();
+    match collect_removals(root, &path, 0, &mut removals) {
+        Ok(()) => {}
+        Err(Status::NotFound) => return Ok(()),
+        Err(error) => return Err(format!("cannot inspect app data: {:?}", error)),
+    }
+    for removal in removals {
+        let result = match removal.kind {
+            FilesystemEntryKind::File => filesystem_unlink(root, &removal.path),
+            FilesystemEntryKind::Directory => filesystem_remove_directory(root, &removal.path),
+        };
+        result.map_err(|error| format!("cannot remove {}: {:?}", removal.path, error))?;
+    }
+    remove_empty_directory(root, APP_DATA_DIRECTORY)
+        .map_err(|error| format!("cannot clean app-data root: {:?}", error))?;
+    filesystem_sync(root).map_err(|error| format!("cannot sync app-data purge: {:?}", error))?;
     Ok(())
 }
 
@@ -788,18 +1003,8 @@ fn load_registry(root: Handle) -> Result<InstalledRegistry, String> {
 }
 
 fn publish_registry(root: Handle, registry: &InstalledRegistry) -> Result<(), (String, bool)> {
-    let old_bytes = match read_bounded(root, INSTALLED_REGISTRY_PATH, MAX_REGISTRY_LEN) {
-        Ok(bytes) => Some(bytes),
-        Err(Status::NotFound) => None,
-        Err(error) => {
-            return Err((
-                format!("cannot snapshot installed registry: {:?}", error),
-                true,
-            ))
-        }
-    };
     let encoded = registry.encode();
-    if let Err(error) = write_bytes(root, STAGED_REGISTRY_PATH, &encoded, false) {
+    if let Err(error) = write_bytes_synced(root, STAGED_REGISTRY_PATH, &encoded) {
         let _ = filesystem_unlink(root, STAGED_REGISTRY_PATH);
         return Err((
             format!("cannot stage installed registry: {:?}", error),
@@ -817,23 +1022,25 @@ fn publish_registry(root: Handle, registry: &InstalledRegistry) -> Result<(), (S
             true,
         ));
     }
-
-    if let Err(error) = write_bytes(root, INSTALLED_REGISTRY_PATH, &encoded, false) {
-        let rollback_safe = match old_bytes {
-            Some(ref old) => write_bytes(root, INSTALLED_REGISTRY_PATH, old, false).is_ok(),
-            None => matches!(
-                filesystem_unlink(root, INSTALLED_REGISTRY_PATH),
-                Ok(()) | Err(Status::NotFound)
-            ),
-        };
+    if let Err(error) = filesystem_rename(
+        root,
+        STAGED_REGISTRY_PATH,
+        root,
+        INSTALLED_REGISTRY_PATH,
+        FilesystemRenameFlags::REPLACE,
+    ) {
         let _ = filesystem_unlink(root, STAGED_REGISTRY_PATH);
         return Err((
             format!("cannot publish installed registry: {:?}", error),
-            rollback_safe,
+            true,
         ));
     }
-    let _ = filesystem_unlink(root, STAGED_REGISTRY_PATH);
-    Ok(())
+    filesystem_sync(root).map_err(|error| {
+        (
+            format!("installed registry published but sync failed: {:?}", error),
+            false,
+        )
+    })
 }
 
 fn ensure_immutable_file(
@@ -854,7 +1061,7 @@ fn ensure_immutable_file(
         Err(Status::NotFound) => {}
         Err(error) => return Err(format!("cannot inspect executable generation: {:?}", error)),
     }
-    if let Err(error) = write_bytes(root, path, bytes, false) {
+    if let Err(error) = write_bytes_synced(root, path, bytes) {
         let _ = filesystem_unlink(root, path);
         return Err(format!("cannot write executable generation: {:?}", error));
     }
@@ -876,7 +1083,7 @@ fn ensure_seed_file(root: Handle, path: &str, bytes: &[u8]) -> Result<bool, Stri
             Ok(false)
         }
         Err(Status::NotFound) => {
-            if let Err(error) = write_bytes(root, path, bytes, false) {
+            if let Err(error) = write_bytes_synced(root, path, bytes) {
                 let _ = filesystem_unlink(root, path);
                 Err(format!("cannot write seed asset {}: {:?}", path, error))
             } else {
@@ -887,12 +1094,23 @@ fn ensure_seed_file(root: Handle, path: &str, bytes: &[u8]) -> Result<bool, Stri
     }
 }
 
-fn seed_backing_name(app_id: &str, virtual_path: &str) -> String {
+fn application_directory(app_id: &str) -> String {
+    format!("{}/{}", APPLICATIONS_DIRECTORY, app_id)
+}
+
+fn versions_directory(app_id: &str) -> String {
+    format!("{}/{}/versions", APPLICATIONS_DIRECTORY, app_id)
+}
+
+fn executable_path(app_id: &str, filename: &str) -> String {
     format!(
-        "{}-seed-{}.dat",
-        app_id,
-        digest_hex(&sha256(virtual_path.as_bytes()))
+        "{}/{}/versions/{}",
+        APPLICATIONS_DIRECTORY, app_id, filename
     )
+}
+
+fn app_data_path(app_id: &str) -> String {
+    format!("{}/{}", APP_DATA_DIRECTORY, app_id)
 }
 
 fn installed_array(registry: &InstalledRegistry) -> Array {
@@ -910,7 +1128,7 @@ fn installed_array(registry: &InstalledRegistry) -> Array {
             map.insert("kind".into(), Dynamic::from(format!("{:?}", entry.kind)));
             map.insert(
                 "executable".into(),
-                Dynamic::from(entry.executable.filename.clone()),
+                Dynamic::from(executable_path(&entry.app_id, &entry.executable.filename)),
             );
             map.insert(
                 "sha256".into(),
@@ -925,10 +1143,122 @@ fn installed_array(registry: &InstalledRegistry) -> Array {
         .collect()
 }
 
-fn cleanup_created_files(root: Handle, paths: &[String]) {
-    for path in paths {
-        let _ = filesystem_unlink(root, path.as_str());
+struct Removal {
+    path: String,
+    kind: FilesystemEntryKind,
+}
+
+fn validate_mutable_app_id(app_id: &str) -> Result<(), String> {
+    generation_filename(app_id, &[0; 32])
+        .map_err(|error| format!("invalid application ID: {:?}", error))?;
+    if PROTECTED_SYSTEM_IDS.contains(&app_id) {
+        return Err(String::from(
+            "protected system application data cannot be purged",
+        ));
     }
+    Ok(())
+}
+
+fn ensure_directory_chain(
+    root: Handle,
+    path: &str,
+    created: &mut Vec<String>,
+) -> Result<(), Status> {
+    let mut current = String::new();
+    for component in path.split('/') {
+        if !current.is_empty() {
+            current.push('/');
+        }
+        current.push_str(component);
+        match filesystem_create_directory(root, &current) {
+            Ok(()) => created.push(current.clone()),
+            Err(Status::AlreadyExists) => {
+                if filesystem_get_metadata(root, &current)?.entry_kind()
+                    != Some(FilesystemEntryKind::Directory)
+                {
+                    return Err(Status::NotDirectory);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_created_paths(root: Handle, files: &[String], directories: &[String]) {
+    for path in files.iter().rev() {
+        let _ = filesystem_unlink(root, path);
+    }
+    for path in directories.iter().rev() {
+        let _ = filesystem_remove_directory(root, path);
+    }
+    let _ = filesystem_sync(root);
+}
+
+fn remove_file_if_present(root: Handle, path: &str) -> Result<(), Status> {
+    match filesystem_unlink(root, path) {
+        Ok(()) | Err(Status::NotFound) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_empty_directory(root: Handle, path: &str) -> Result<(), Status> {
+    match filesystem_remove_directory(root, path) {
+        Ok(()) | Err(Status::NotFound) | Err(Status::DirectoryNotEmpty) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn collect_removals(
+    root: Handle,
+    path: &str,
+    depth: usize,
+    removals: &mut Vec<Removal>,
+) -> Result<(), Status> {
+    if depth >= MAX_PURGE_DEPTH {
+        return Err(Status::ResourceLimit);
+    }
+    let directory = filesystem_open_directory(root, path)?;
+    let result = (|| {
+        let mut cookie = 0;
+        loop {
+            let entry = match filesystem_read_directory2(directory, cookie) {
+                Ok(entry) => entry,
+                Err(Status::EndOfDirectory) => break,
+                Err(error) => return Err(error),
+            };
+            let length = usize::from(entry.name_length).min(entry.name.len());
+            let name =
+                core::str::from_utf8(&entry.name[..length]).map_err(|_| Status::InvalidMessage)?;
+            let child_path = format!("{}/{}", path, name);
+            match entry.entry_kind() {
+                Some(FilesystemEntryKind::File) => {
+                    if removals.len() >= MAX_PURGE_ENTRIES {
+                        return Err(Status::ResourceLimit);
+                    }
+                    removals.push(Removal {
+                        path: child_path,
+                        kind: FilesystemEntryKind::File,
+                    });
+                }
+                Some(FilesystemEntryKind::Directory) => {
+                    collect_removals(root, &child_path, depth + 1, removals)?;
+                }
+                None => return Err(Status::InvalidMessage),
+            }
+            cookie = entry.next_cookie;
+        }
+        if removals.len() >= MAX_PURGE_ENTRIES {
+            return Err(Status::ResourceLimit);
+        }
+        removals.push(Removal {
+            path: String::from(path),
+            kind: FilesystemEntryKind::Directory,
+        });
+        Ok(())
+    })();
+    let _ = handle_close(directory);
+    result
 }
 
 fn read_bounded(root: Handle, path: &str, maximum: usize) -> Result<Vec<u8>, Status> {
@@ -957,23 +1287,25 @@ fn read_bounded(root: Handle, path: &str, maximum: usize) -> Result<Vec<u8>, Sta
 
 fn file_digest(root: Handle, path: &str) -> Result<(u64, [u8; 32]), Status> {
     let file = filesystem_open(root, path, FilesystemOpenFlags::READ)?;
-    let result = (|| {
-        let length = filesystem_stat(file)?.length;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0; FILE_CHUNK_BYTES];
-        let mut offset = 0u64;
-        while offset < length {
-            let count = filesystem_read(file, offset, &mut buffer)?;
-            if count == 0 {
-                return Err(Status::Io);
-            }
-            hasher.update(&buffer[..count]);
-            offset = offset.checked_add(count as u64).ok_or(Status::OutOfRange)?;
-        }
-        Ok((length, hasher.finalize()))
-    })();
+    let result = file_digest_handle(file);
     let _ = handle_close(file);
     result
+}
+
+fn file_digest_handle(file: Handle) -> Result<(u64, [u8; 32]), Status> {
+    let length = filesystem_stat(file)?.length;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; FILE_CHUNK_BYTES];
+    let mut offset = 0u64;
+    while offset < length {
+        let count = filesystem_read(file, offset, &mut buffer)?;
+        if count == 0 {
+            return Err(Status::Io);
+        }
+        hasher.update(&buffer[..count]);
+        offset = offset.checked_add(count as u64).ok_or(Status::OutOfRange)?;
+    }
+    Ok((length, hasher.finalize()))
 }
 
 fn digest_hex(digest: &[u8; 32]) -> String {
@@ -1048,6 +1380,32 @@ fn write_bytes(root: Handle, path: &str, bytes: &[u8], append: bool) -> Result<(
             filesystem_truncate(file, bytes.len() as u64)?;
         }
         Ok(())
+    })();
+    let _ = handle_close(file);
+    result
+}
+
+fn write_bytes_synced(root: Handle, path: &str, bytes: &[u8]) -> Result<(), Status> {
+    let file = filesystem_open(
+        root,
+        path,
+        FilesystemOpenFlags::WRITE | FilesystemOpenFlags::CREATE | FilesystemOpenFlags::TRUNCATE,
+    )?;
+    let result = (|| {
+        let mut offset = 0u64;
+        for chunk in bytes.chunks(FILE_CHUNK_BYTES) {
+            let mut written = 0;
+            while written < chunk.len() {
+                let count = filesystem_write(file, offset, &chunk[written..])?;
+                if count == 0 {
+                    return Err(Status::Io);
+                }
+                written += count;
+                offset = offset.checked_add(count as u64).ok_or(Status::OutOfRange)?;
+            }
+        }
+        filesystem_truncate(file, bytes.len() as u64)?;
+        filesystem_sync(file)
     })();
     let _ = handle_close(file);
     result

@@ -266,6 +266,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ginkgo-process-capability-smoke"
+version = "0.1.0"
+dependencies = [
+ "ginkgo-runtime",
+ "ginkgo-userspace",
+]
+
+[[package]]
 name = "ginkgo-runtime"
 version = "0.1.0"
 dependencies = [

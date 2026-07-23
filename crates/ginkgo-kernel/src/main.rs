@@ -108,6 +108,14 @@ static FRAME_RECLAIM_EXIT_ELF: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-frame-reclaim-exit.elf"));
 static FRAME_RECLAIM_FAULT_ELF: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-frame-reclaim-fault.elf"));
+static PROCESS_CAPABILITY_SMOKE_ELF: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/ginkgo-process-capability-smoke.elf"
+));
+static PROCESS_CAPABILITY_MALFORMED_ELF: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/ginkgo-process-capability-malformed.elf"
+));
 static GINKGO_SPLASH_RGBA: &[u8; 256 * 256 * 4] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-splash.rgba"));
 fn preemption_smoke_enabled() -> bool {
@@ -122,11 +130,18 @@ fn filesystem_hierarchy_smoke_enabled() -> bool {
     option_env!("GINKGO_FILESYSTEM_HIERARCHY_SMOKE") == Some("1")
 }
 
-const DESKTOP_PATH: &str = "/desktop.elf";
-const MINIMAL_CLIENT_PATH: &str = "/minimal-client.elf";
-const FILE_NAVIGATOR_PATH: &str = "/file-navigator.elf";
-const TERMINAL_PATH: &str = "/terminal.elf";
-const PROGRAM_REGISTRY_PATH: &str = "/programs.gkr";
+fn process_capability_smoke_enabled() -> bool {
+    option_env!("GINKGO_PROCESS_CAPABILITY_SMOKE") == Some("1")
+}
+
+const SYSTEM_DIRECTORY: &str = "system";
+const DESKTOP_PATH: &str = "/system/desktop.elf";
+const MINIMAL_CLIENT_PATH: &str = "/system/minimal-client.elf";
+const FILE_NAVIGATOR_PATH: &str = "/system/file-navigator.elf";
+const TERMINAL_PATH: &str = "/system/terminal.elf";
+const PROGRAM_REGISTRY_PATH: &str = "/system/programs.gkr";
+const PROCESS_CAPABILITY_SMOKE_PATH: &str = "/system/process-capability-smoke.elf";
+const PROCESS_CAPABILITY_MALFORMED_PATH: &str = "/system/process-capability-malformed.elf";
 const MAX_EXECUTABLE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LAUNCHER_PROGRAMS: usize = 6;
 const FRAME_RECLAIM_STRESS_CYCLES: u32 = 512;
@@ -271,11 +286,25 @@ impl ProgramCatalog {
 fn install_and_load_system_programs<D: Disk>(
     fs: &mut RedoxFs<D>,
 ) -> Option<(Vec<u8>, ProgramCatalog)> {
+    let system = ensure_system_directory(fs)?;
+    migrate_legacy_system_files(fs, system)?;
     install_system_file(fs, DESKTOP_PATH, DESKTOP_ELF)?;
     install_system_file(fs, MINIMAL_CLIENT_PATH, MINIMAL_CLIENT_ELF)?;
     install_system_file(fs, FILE_NAVIGATOR_PATH, FILE_NAVIGATOR_ELF)?;
     install_system_file(fs, TERMINAL_PATH, TERMINAL_ELF)?;
     install_system_file(fs, PROGRAM_REGISTRY_PATH, PROGRAM_REGISTRY)?;
+    if process_capability_smoke_enabled() {
+        install_system_file(
+            fs,
+            PROCESS_CAPABILITY_SMOKE_PATH,
+            PROCESS_CAPABILITY_SMOKE_ELF,
+        )?;
+        install_system_file(
+            fs,
+            PROCESS_CAPABILITY_MALFORMED_PATH,
+            PROCESS_CAPABILITY_MALFORMED_ELF,
+        )?;
+    }
 
     let registry_bytes = read_trusted_system_file(fs, PROGRAM_REGISTRY_PATH, 16 * 1024)?;
     let registry = Registry::parse(&registry_bytes).ok()?;
@@ -328,6 +357,42 @@ fn copy_program_string<const N: usize>(output: &mut [u8; N], value: &str) -> Opt
     let destination = output.get_mut(..value.len())?;
     destination.copy_from_slice(value.as_bytes());
     Some(value.len())
+}
+
+fn ensure_system_directory<D: Disk>(
+    fs: &mut RedoxFs<D>,
+) -> Option<ginkgo_filesystem::DirectoryHandle> {
+    let root = fs.root_directory().ok()?;
+    match fs.open_directory_at(root, SYSTEM_DIRECTORY) {
+        Ok(directory) => Some(directory),
+        Err(FsError::NotFound) => fs.create_directory_at(root, SYSTEM_DIRECTORY).ok(),
+        Err(_) => None,
+    }
+}
+
+fn migrate_legacy_system_files<D: Disk>(
+    fs: &mut RedoxFs<D>,
+    system: ginkgo_filesystem::DirectoryHandle,
+) -> Option<()> {
+    let root = fs.root_directory().ok()?;
+    for name in [
+        "desktop.elf",
+        "minimal-client.elf",
+        "file-navigator.elf",
+        "terminal.elf",
+        "programs.gkr",
+    ] {
+        let Ok(legacy) = fs.open_file_at(root, name) else {
+            continue;
+        };
+        if fs.open_file_at(system, name).is_ok() {
+            fs.remove(legacy).ok()?;
+        } else {
+            fs.rename_at(root, name, system, name, RenameMode::NoReplace)
+                .ok()?;
+        }
+    }
+    Some(())
 }
 
 fn install_system_file<D: Disk>(fs: &mut RedoxFs<D>, path: &str, bytes: &[u8]) -> Option<()> {
@@ -561,7 +626,7 @@ fn run_filesystem_hierarchy_smoke<D: Disk>(
 
 const PRIVILEGE_STACK_SIZE: usize = 64 * 1024;
 
-#[repr(C, align(16))]
+#[repr(C, align(64))]
 struct PrivilegeStack([u8; PRIVILEGE_STACK_SIZE]);
 
 static mut RSP0_STACK: PrivilegeStack = PrivilegeStack([0; PRIVILEGE_STACK_SIZE]);
@@ -688,6 +753,8 @@ pub extern "C" fn _start() -> ! {
         }
     }
     let Some((desktop_image, catalog)) = install_and_load_system_programs(&mut fs) else {
+        let mut sink = SerialDebugSink::new(&mut serial);
+        let _ = writeln!(sink, "redoxfs: system program installation failed\r");
         ui.render_boot_log(&mut screen, "redoxfs: system program installation failed");
         halt_forever();
     };
@@ -709,6 +776,7 @@ pub extern "C" fn _start() -> ! {
         paging_verified: false,
         preemption_observed: false,
         preemption_smoke_id: None,
+        process_capability_smoke_id: None,
         frame_reclaim_stress: frame_reclaim_stress_enabled().then_some(FrameReclaimStress {
             current: None,
             completed: 0,
@@ -872,6 +940,18 @@ pub extern "C" fn _start() -> ! {
         .render_boot_log(&mut context.screen, "userspace: SMAP copy fixup verified");
     context.ui.render_splash(&mut context.screen);
 
+    if process_capability_smoke_enabled() {
+        if spawn_process_capability_smoke(&mut context).is_err() {
+            let mut sink = SerialDebugSink::new(&mut context.serial);
+            let _ = writeln!(
+                sink,
+                "ginkgo-process-capability-smoke: FAIL kernel launch\r"
+            );
+            halt_forever();
+        }
+        run_scheduler(&mut context);
+    }
+
     let desktop_randomness = [
         context.entropy.next_u64(),
         context.entropy.next_u64(),
@@ -977,6 +1057,10 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
+    run_scheduler(&mut context)
+}
+
+fn run_scheduler(context: &mut KernelContext) -> ! {
     let mut scheduler = Scheduler::<KernelContext, 8>::new();
     if scheduler.spawn(filesystem_task).is_err()
         || scheduler.spawn(console_task).is_err()
@@ -993,7 +1077,7 @@ pub extern "C" fn _start() -> ! {
     }
 
     loop {
-        scheduler.run_round(&mut context);
+        scheduler.run_round(context);
         if !context.processes.has_runnable()
             && context.timer.arm_one_shot(KERNEL_IDLE_POLL_NS).is_ok()
         {
@@ -1027,6 +1111,7 @@ struct KernelContext {
     paging_verified: bool,
     preemption_observed: bool,
     preemption_smoke_id: Option<ProcessId>,
+    process_capability_smoke_id: Option<ProcessId>,
     frame_reclaim_stress: Option<FrameReclaimStress>,
     processes: ProcessTable,
     desktop: Option<DesktopBroker>,
@@ -1768,7 +1853,7 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
     if let Some(child) = created_child {
         context
             .processes
-            .insert(child)
+            .insert(*child)
             .expect("reserved child process insertion must succeed");
     }
     let Some(final_state) = context.processes.get(process_id).map(Process::state) else {
@@ -1787,6 +1872,7 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
         .map(Process::preemption_count)
         .unwrap_or(0);
     let is_preemption_smoke = context.preemption_smoke_id == Some(process_id);
+    let is_process_capability_smoke = context.process_capability_smoke_id == Some(process_id);
     let is_frame_reclaim_stress = context
         .frame_reclaim_stress
         .as_ref()
@@ -1883,6 +1969,18 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                     context.frames.free_count(),
                     shared_memory_backing_stats().live_objects
                 );
+            }
+            if is_process_capability_smoke {
+                context.process_capability_smoke_id = None;
+                let mut sink = SerialDebugSink::new(&mut context.serial);
+                if retired_state == ProcessState::Exited(0) {
+                    let _ = writeln!(sink, "ginkgo-process-capability-smoke: PASS\r");
+                } else {
+                    let _ = writeln!(
+                        sink,
+                        "ginkgo-process-capability-smoke: FAIL parent state={retired_state:?}\r"
+                    );
+                }
             }
             if is_frame_reclaim_stress {
                 finish_frame_reclaim_stress(context, process_id, retired_state);
@@ -1987,6 +2085,28 @@ fn reject_unstarted_client(
     Err(())
 }
 
+fn ensure_application_data_directory<B: Disk>(
+    filesystem: &mut RedoxFs<B>,
+    app_id: &str,
+) -> Result<(), ()> {
+    let root = filesystem.root_directory().map_err(|_| ())?;
+    let appdata = match filesystem.open_directory_at(root, "appdata") {
+        Ok(directory) => directory,
+        Err(FsError::NotFound) => filesystem
+            .create_directory_at(root, "appdata")
+            .map_err(|_| ())?,
+        Err(_) => return Err(()),
+    };
+    match filesystem.open_directory_at(appdata, app_id) {
+        Ok(_) => Ok(()),
+        Err(FsError::NotFound) => filesystem
+            .create_directory_at(appdata, app_id)
+            .map(|_| ())
+            .map_err(|_| ()),
+        Err(_) => Err(()),
+    }
+}
+
 fn launch_program(
     context: &mut KernelContext,
     program: ProgramSummary,
@@ -2003,6 +2123,22 @@ fn launch_program(
     let mut process =
         Process::from_elf_randomized(&image, &context.page_table, &mut context.frames, randomness)
             .map_err(|_| ())?;
+    let application_data = match process
+        .handles_mut()
+        .application_data_create(program.app_id())
+    {
+        Ok(handle) => handle,
+        Err(_) => {
+            discard_unstarted_process(context, process);
+            return Err(());
+        }
+    };
+    if ensure_application_data_directory(&mut context.fs, program.app_id()).is_err()
+        || process.set_application_data(application_data).is_err()
+    {
+        discard_unstarted_process(context, process);
+        return Err(());
+    }
 
     let Some(client_id) = ClientId::new(context.next_client_id) else {
         discard_unstarted_process(context, process);
@@ -2088,6 +2224,44 @@ fn launch_program(
 fn launch_registered_program(context: &mut KernelContext, program_index: usize) -> Result<(), ()> {
     let program = context.ui.catalog.get(program_index).ok_or(())?;
     launch_program(context, program, None)
+}
+
+fn spawn_process_capability_smoke(context: &mut KernelContext) -> Result<(), ()> {
+    context.processes.prepare_insert().map_err(|_| ())?;
+    let randomness = [
+        context.entropy.next_u64(),
+        context.entropy.next_u64(),
+        context.entropy.next_u64(),
+    ];
+    let mut process = Process::from_elf_randomized(
+        PROCESS_CAPABILITY_SMOKE_ELF,
+        &context.page_table,
+        &mut context.frames,
+        randomness,
+    )
+    .map_err(|_| ())?;
+    let root = match process.handles_mut().filesystem_root_create_with_rights(
+        ginkgo_sysapi::Rights::READ | ginkgo_sysapi::Rights::WRITE | ginkgo_sysapi::Rights::EXECUTE,
+    ) {
+        Ok(root) => root,
+        Err(_) => {
+            discard_unstarted_process(context, process);
+            return Err(());
+        }
+    };
+    process.set_start_arguments([u64::from(root.raw()), 0, 0, 0]);
+    let process_id = context
+        .processes
+        .insert(process)
+        .expect("prepared process capability smoke insertion must succeed");
+    context.process_capability_smoke_id = Some(process_id);
+    let mut sink = SerialDebugSink::new(&mut context.serial);
+    let _ = writeln!(
+        sink,
+        "scheduler: process capability smoke started pid={}\r",
+        process_id.raw()
+    );
+    Ok(())
 }
 
 fn spawn_frame_reclaim_stress(context: &mut KernelContext) -> Result<(), ()> {

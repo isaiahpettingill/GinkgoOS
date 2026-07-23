@@ -724,7 +724,7 @@ impl HandleTable {
         }
     }
 
-    /// Creates a non-transferable application-private data namespace capability.
+    /// Creates a transferable application-private data identity capability.
     ///
     /// The identifier is independently validated against the lowercase registry
     /// grammar and copied into bounded immutable storage.
@@ -743,7 +743,7 @@ impl HandleTable {
         }))
         .map_err(|_| IpcError::OutOfMemory)?;
         let slot = self.reserve_slots(1)?[0];
-        Ok(self.insert_reserved(slot, object, Rights::READ | Rights::WRITE))
+        Ok(self.insert_reserved(slot, object, Rights::READ | Rights::TRANSFER))
     }
 
     /// Returns an owned clone of an application-data scope after checking rights.
@@ -752,7 +752,7 @@ impl HandleTable {
         handle: Handle,
         required_rights: Rights,
     ) -> Result<ApplicationDataScope, IpcError> {
-        let object = self.object_with_rights(handle, required_rights)?;
+        let object = self.object_with_rights(handle, required_rights | Rights::READ)?;
         match object.as_ref() {
             KernelObject::ApplicationData(scope) => Ok(scope.clone()),
             _ => Err(IpcError::WrongObjectType),
@@ -2406,19 +2406,19 @@ mod tests {
         );
         assert_eq!(
             table.handle_rights(application_data),
-            Ok(Rights::READ | Rights::WRITE)
+            Ok(Rights::READ | Rights::TRANSFER)
         );
-        for rights in [Rights::READ, Rights::WRITE, Rights::READ | Rights::WRITE] {
-            let scope = table
-                .application_data_scope(application_data, rights)
-                .unwrap();
-            assert_eq!(scope.app_id(), "tools.paint-2");
-            assert_eq!(scope.as_ref(), "tools.paint-2");
+        let scope = table
+            .application_data_scope(application_data, Rights::READ)
+            .unwrap();
+        assert_eq!(scope.app_id(), "tools.paint-2");
+        assert_eq!(scope.as_ref(), "tools.paint-2");
+        for rights in [Rights::WRITE, Rights::EXECUTE] {
+            assert_eq!(
+                table.application_data_scope(application_data, rights),
+                Err(IpcError::AccessDenied)
+            );
         }
-        assert_eq!(
-            table.application_data_scope(application_data, Rights::EXECUTE),
-            Err(IpcError::AccessDenied)
-        );
 
         let retained = table
             .application_data_scope(application_data, Rights::READ)
@@ -2428,7 +2428,7 @@ mod tests {
     }
 
     #[test]
-    fn application_data_scopes_are_independent_and_nontransferable() {
+    fn application_data_scopes_are_independent_and_transfer_with_attenuation() {
         let mut source = HandleTable::new();
         let mut destination = HandleTable::new();
         let alpha = source.application_data_create("alpha.editor").unwrap();
@@ -2443,23 +2443,22 @@ mod tests {
             source.handle_duplicate(alpha, Rights::READ),
             Err(IpcError::AccessDenied)
         );
+        let moved = handle_move_between(&mut source, &mut destination, alpha, Rights::READ)
+            .expect("application-data identity should move with attenuation");
+        assert_eq!(source.object_type(alpha), Err(IpcError::InvalidHandle));
+        assert_eq!(destination.handle_rights(moved), Ok(Rights::READ));
         assert_eq!(
-            handle_move_between(&mut source, &mut destination, alpha, Rights::READ),
-            Err(IpcError::AccessDenied)
+            destination
+                .application_data_scope(moved, Rights::READ)
+                .unwrap()
+                .app_id(),
+            "alpha.editor"
         );
-        assert!(destination.is_empty());
-        assert_eq!(source.object_type(alpha), Ok(ObjectType::ApplicationData));
-
-        let (send, receive) = source.channel_create().unwrap();
         assert_eq!(
-            source.channel_write(send, b"scope", &[beta]),
+            handle_move_between(&mut destination, &mut source, moved, Rights::READ),
             Err(IpcError::AccessDenied)
         );
         assert_eq!(source.object_type(beta), Ok(ObjectType::ApplicationData));
-        assert_eq!(
-            source.channel_read(receive, &mut [], &mut []),
-            Err(IpcError::ShouldWait)
-        );
 
         let root = source.filesystem_root_create().unwrap();
         assert_eq!(

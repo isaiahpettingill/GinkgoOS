@@ -74,6 +74,8 @@ pub enum SyscallNumber {
     FilesystemGetInfo = 32,
     FilesystemGetMetadata = 33,
     FilesystemReadDirectory2 = 34,
+    /// Creates or opens an application's private data directory during installation.
+    ApplicationDataCreate = 35,
 }
 
 /// An opaque process-local reference to a kernel object.
@@ -840,6 +842,19 @@ pub struct FilesystemReadDirectory2Args {
     pub output_address: u64,
 }
 
+/// Argument block for [`SyscallNumber::ApplicationDataCreate`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApplicationDataCreateArgs {
+    /// Filesystem-root capability carrying installation authority.
+    pub root: Handle,
+    pub reserved: u32,
+    pub app_id_address: u64,
+    pub app_id_length: u64,
+    /// Address of a writable [`HandleOutput`].
+    pub output_address: u64,
+}
+
 /// One rich directory entry returned by [`SyscallNumber::FilesystemReadDirectory2`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -946,6 +961,7 @@ const _: () = {
     assert!(core::mem::size_of::<FilesystemGetMetadataArgs>() == 32);
     assert!(core::mem::size_of::<FilesystemMetadata>() == 64);
     assert!(core::mem::size_of::<FilesystemReadDirectory2Args>() == 24);
+    assert!(core::mem::size_of::<ApplicationDataCreateArgs>() == 32);
     assert!(core::mem::size_of::<FilesystemDirectoryEntry2>() == 288);
     assert!(RPC_HEADER_SIZE == 24);
 };
@@ -993,6 +1009,7 @@ mod tests {
         assert_eq!(SyscallNumber::FilesystemGetInfo as u64, 32);
         assert_eq!(SyscallNumber::FilesystemGetMetadata as u64, 33);
         assert_eq!(SyscallNumber::FilesystemReadDirectory2 as u64, 34);
+        assert_eq!(SyscallNumber::ApplicationDataCreate as u64, 35);
     }
 
     #[test]
@@ -1201,6 +1218,14 @@ mod tests {
         assert_eq!(offset_of!(FilesystemReadDirectory2Args, directory), 0);
         assert_eq!(offset_of!(FilesystemReadDirectory2Args, cookie), 8);
         assert_eq!(offset_of!(FilesystemReadDirectory2Args, output_address), 16);
+        assert_eq!(size_of::<ApplicationDataCreateArgs>(), 32);
+        assert_eq!(align_of::<ApplicationDataCreateArgs>(), 8);
+        assert_eq!(offset_of!(ApplicationDataCreateArgs, root), 0);
+        assert_eq!(offset_of!(ApplicationDataCreateArgs, reserved), 4);
+        assert_eq!(offset_of!(ApplicationDataCreateArgs, app_id_address), 8);
+        assert_eq!(offset_of!(ApplicationDataCreateArgs, app_id_length), 16);
+        assert_eq!(offset_of!(ApplicationDataCreateArgs, output_address), 24);
+
         assert_eq!(size_of::<FilesystemDirectoryEntry2>(), 288);
         assert_eq!(offset_of!(FilesystemDirectoryEntry2, next_cookie), 0);
         assert_eq!(offset_of!(FilesystemDirectoryEntry2, size), 8);

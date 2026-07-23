@@ -59,6 +59,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GINKGO_PREEMPTION_SMOKE");
     println!("cargo:rerun-if-env-changed=GINKGO_FRAME_RECLAIM_STRESS");
     println!("cargo:rerun-if-env-changed=GINKGO_FILESYSTEM_HIERARCHY_SMOKE");
+    println!("cargo:rerun-if-env-changed=GINKGO_PROCESS_CAPABILITY_SMOKE");
+    println!("cargo:rerun-if-env-changed=GINKGO_PROCESS_CAPABILITY_SMOKE_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_TRUST_SIGNING_KEY_HEX");
     println!("cargo:rustc-link-arg-bin=ginkgo-os=-T{}", linker.display());
 
@@ -84,6 +86,24 @@ fn main() {
         build_frame_reclaim_elf(true),
     )
     .expect("write Ginkgo frame reclaim fault ELF");
+    let process_capability_smoke = if env::var_os("GINKGO_PROCESS_CAPABILITY_SMOKE").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        read_userspace_artifact("GINKGO_PROCESS_CAPABILITY_SMOKE_ELF")
+            .expect("GINKGO_PROCESS_CAPABILITY_SMOKE_ELF is required when the smoke is enabled")
+    } else {
+        Vec::new()
+    };
+    fs::write(
+        out_dir.join("ginkgo-process-capability-smoke.elf"),
+        process_capability_smoke,
+    )
+    .expect("write Ginkgo process capability smoke ELF");
+    fs::write(
+        out_dir.join("ginkgo-process-capability-malformed.elf"),
+        b"not a GinkgoOS ELF\n",
+    )
+    .expect("write malformed process capability smoke ELF");
     let desktop = read_userspace_artifact("GINKGO_DESKTOP_ELF").unwrap_or_else(build_desktop_elf);
     let minimal_client = read_userspace_artifact("GINKGO_MINIMAL_CLIENT_ELF")
         .unwrap_or_else(build_userspace_smoke_elf);
@@ -93,11 +113,11 @@ fn main() {
         read_userspace_artifact("GINKGO_TERMINAL_ELF").unwrap_or_else(build_userspace_smoke_elf);
     let registry = build_program_registry();
     let artifacts = [
-        ("/desktop.elf", desktop.as_slice()),
-        ("/minimal-client.elf", minimal_client.as_slice()),
-        ("/file-navigator.elf", file_navigator.as_slice()),
-        ("/terminal.elf", terminal.as_slice()),
-        ("/programs.gkr", registry.as_slice()),
+        ("/system/desktop.elf", desktop.as_slice()),
+        ("/system/minimal-client.elf", minimal_client.as_slice()),
+        ("/system/file-navigator.elf", file_navigator.as_slice()),
+        ("/system/terminal.elf", terminal.as_slice()),
+        ("/system/programs.gkr", registry.as_slice()),
     ];
     let (manifest, signature, public_key) = build_trust_manifest(&artifacts);
     fs::write(out_dir.join("ginkgo-desktop.elf"), desktop).expect("write ginkgo desktop ELF");
@@ -754,25 +774,25 @@ fn build_program_registry() -> Vec<u8> {
         EncodeEntry {
             app_id: "desktop",
             display_name: "Ginkgo Desktop",
-            executable_path: "/desktop.elf",
+            executable_path: "/system/desktop.elf",
             flags: EntryFlags::HIDDEN,
         },
         EncodeEntry {
             app_id: "file-navigator",
             display_name: "Files",
-            executable_path: "/file-navigator.elf",
+            executable_path: "/system/file-navigator.elf",
             flags: EntryFlags::FILESYSTEM,
         },
         EncodeEntry {
             app_id: "terminal",
             display_name: "Terminal",
-            executable_path: "/terminal.elf",
+            executable_path: "/system/terminal.elf",
             flags: EntryFlags::FILESYSTEM | EntryFlags::PROCESS_LAUNCH,
         },
         EncodeEntry {
             app_id: "minimal-client",
             display_name: "Ginkgo Demo",
-            executable_path: "/minimal-client.elf",
+            executable_path: "/system/minimal-client.elf",
             flags: EntryFlags::EMPTY,
         },
     ])
@@ -783,7 +803,7 @@ fn build_program_registry() -> Vec<u8> {
         .next()
         .expect("desktop registry entry exists");
     assert_eq!(desktop.app_id, "desktop");
-    assert_eq!(desktop.executable_path, "/desktop.elf");
+    assert_eq!(desktop.executable_path, "/system/desktop.elf");
     assert!(!desktop.is_visible());
     registry
 }
