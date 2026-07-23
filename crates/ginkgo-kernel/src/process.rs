@@ -39,8 +39,12 @@ pub const USER_STACK_BOTTOM: u64 = USER_STACK_TOP - USER_STACK_MAX_SIZE;
 pub const USER_STACK_INITIAL_BOTTOM: u64 = USER_STACK_TOP - USER_STACK_INITIAL_SIZE;
 pub const USER_STACK_GUARD_START: u64 = USER_STACK_BOTTOM - PAGE_SIZE;
 pub const SHARED_MAPPING_BASE: u64 = 0x0000_0001_0000_0000;
-/// Hard ceiling for one process's sorted semantic virtual-memory areas.
-pub const MAX_VMAS: usize = 256;
+/// Architectural/metadata ceiling for one process's sorted semantic VMAs.
+/// The lower RAM-derived `ProcessLimits::vma_count` is the controlling policy.
+pub const MAX_VMAS: usize = 4096;
+const MIB: u64 = 1024 * 1024;
+/// Default maximum executable payload accepted by the package format.
+pub const PACKAGE_DEFAULT_EXECUTABLE_BYTES: u64 = 16 * MIB;
 /// Stable internal fault reason/code used when page-table rollback cannot restore
 /// a process to a coherent mapping state. Such a process is quarantined terminally.
 const VM_ROLLBACK_FAILURE_REASON: u16 = 1;
@@ -369,28 +373,95 @@ impl ProcessLayout {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessLimits {
     pub private_pages: u64,
+    /// Page-rounded physical backing bytes created by this process.
     pub shared_memory_bytes: u64,
     pub mapped_shared_bytes: u64,
+    pub reserved_virtual_bytes: u64,
+    pub vma_count: u64,
+    pub executable_image_pages: u64,
+    pub executable_source_bytes: u64,
     pub channel_traffic_bytes: u64,
     /// Maximum uninterrupted execution before the scheduler rotates processes.
     pub cpu_quantum_ns: u64,
 }
 
 impl ProcessLimits {
-    pub const STANDARD: Self = Self {
-        private_pages: 262_144,
-        shared_memory_bytes: 64 * 1024 * 1024,
-        mapped_shared_bytes: 64 * 1024 * 1024,
-        channel_traffic_bytes: 64 * 1024 * 1024,
-        cpu_quantum_ns: 10_000_000,
-    };
+    /// Conservative package-default policy used only by isolated host fixtures.
+    pub const STANDARD: Self = Self::from_available_memory_bytes(512 * MIB);
+
+    /// Derives bounded per-process policy from physical RAM that is currently
+    /// allocatable after boot reservations and allocations. Every operation is
+    /// saturating or checked, and no physical-memory quota exceeds this snapshot.
+    pub const fn from_available_memory_bytes(available_bytes: u64) -> Self {
+        let available_pages = available_bytes / PAGE_SIZE;
+        let private_pages = bounded_policy(
+            available_pages / 4,
+            (8 * MIB) / PAGE_SIZE,
+            available_pages / 2,
+        );
+        let private_bytes = private_pages.saturating_mul(PAGE_SIZE);
+        let shared_memory_bytes =
+            bounded_policy(available_bytes / 16, 4 * MIB, available_bytes / 4);
+        let mapped_shared_bytes = bounded_policy(available_bytes / 8, 8 * MIB, available_bytes / 2);
+        let reserved_max = (USER_ADDRESS_END / 4).saturating_sub(PAGE_SIZE);
+        let reserved_virtual_bytes =
+            bounded_policy(available_bytes.saturating_mul(8), 256 * MIB, reserved_max);
+        let vma_count = bounded_policy(available_bytes / (8 * MIB), 64, MAX_VMAS as u64);
+        let executable_image_pages = bounded_policy(
+            available_pages / 8,
+            (4 * MIB) / PAGE_SIZE,
+            private_pages.saturating_sub(USER_STACK_INITIAL_SIZE / PAGE_SIZE),
+        );
+        let executable_source_bytes = bounded_policy(
+            available_bytes / 32,
+            PACKAGE_DEFAULT_EXECUTABLE_BYTES,
+            private_bytes / 2,
+        );
+        Self {
+            private_pages,
+            shared_memory_bytes,
+            mapped_shared_bytes,
+            reserved_virtual_bytes,
+            vma_count,
+            executable_image_pages,
+            executable_source_bytes,
+            channel_traffic_bytes: bounded_policy(
+                available_bytes / 8,
+                8 * MIB,
+                available_bytes / 2,
+            ),
+            cpu_quantum_ns: 10_000_000,
+        }
+    }
+}
+
+const fn bounded_policy(derived: u64, minimum: u64, maximum: u64) -> u64 {
+    if maximum == 0 {
+        0
+    } else {
+        let effective_minimum = if minimum < maximum { minimum } else { maximum };
+        if derived < effective_minimum {
+            effective_minimum
+        } else if derived > maximum {
+            maximum
+        } else {
+            derived
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ProcessUsage {
+    /// Committed image, stack, and anonymous private pages.
     pub private_pages: u64,
+    pub reserved_virtual_bytes: u64,
+    pub resident_owned_frames: u64,
+    /// Page-rounded physical backing bytes charged at object creation.
     pub shared_memory_bytes: u64,
+    pub mapped_shared_pages: u64,
     pub mapped_shared_bytes: u64,
+    pub quota_failures: u64,
+    pub oom_failures: u64,
     pub channel_traffic_bytes: u64,
     pub cpu_time_ns: u64,
 }
@@ -420,6 +491,10 @@ pub enum ProcessCreateError {
     },
     EntryNotExecutable(AddressSpaceError),
     StackNotWritable(AddressSpaceError),
+    /// Explicit executable/private/VMA/reservation policy rejection.
+    MemoryPolicy,
+    /// Kernel metadata allocation failed before the process became runnable.
+    OutOfMemory,
     ResourceLimit,
 }
 
@@ -743,6 +818,12 @@ impl Process {
         allocator: &mut UsableFrameAllocator<'_>,
         randomness: Option<[u64; 3]>,
     ) -> Result<Self, ProcessCreateError> {
+        let limits = ProcessLimits::from_available_memory_bytes(allocator.available_bytes());
+        if u64::try_from(file.len()).map_or(true, |length| {
+            length == 0 || length > limits.executable_source_bytes
+        }) {
+            return Err(ProcessCreateError::MemoryPolicy);
+        }
         let parsed = match randomness {
             Some(values) => elf::parse_randomized(file, values[0]),
             None => elf::parse(file),
@@ -751,14 +832,14 @@ impl Process {
         let layout = randomness
             .map(|values| ProcessLayout::randomized(values[1]))
             .unwrap_or(ProcessLayout::STANDARD);
-        let limits = ProcessLimits::STANDARD;
         let initial_stack_pages = layout.initial_stack_size() / PAGE_SIZE;
         if parsed
             .total_load_pages()
             .saturating_add(initial_stack_pages)
             > limits.private_pages
+            || parsed.total_load_pages() > limits.executable_image_pages
         {
-            return Err(ProcessCreateError::ResourceLimit);
+            return Err(ProcessCreateError::MemoryPolicy);
         }
         if parsed
             .overlaps_reserved_range(
@@ -862,6 +943,23 @@ impl Process {
                 return reclaim_failed_construction(address_space, allocator, error);
             }
         };
+        if vmas.len() as u64 > limits.vma_count {
+            return reclaim_failed_construction(
+                address_space,
+                allocator,
+                ProcessCreateError::MemoryPolicy,
+            );
+        }
+        let reserved_virtual_bytes = vmas
+            .iter()
+            .fold(0u64, |total, vma| total.saturating_add(vma.length()));
+        if reserved_virtual_bytes > limits.reserved_virtual_bytes {
+            return reclaim_failed_construction(
+                address_space,
+                allocator,
+                ProcessCreateError::MemoryPolicy,
+            );
+        }
         let private_pages = image
             .segments
             .iter()
@@ -893,6 +991,7 @@ impl Process {
             limits,
             usage: ProcessUsage {
                 private_pages,
+                reserved_virtual_bytes,
                 ..ProcessUsage::default()
             },
         })
@@ -975,8 +1074,21 @@ impl Process {
         self.limits
     }
 
-    pub const fn usage(&self) -> ProcessUsage {
-        self.usage
+    pub fn usage(&self) -> ProcessUsage {
+        let accounting = self.address_space().accounting();
+        let mut usage = self.usage;
+        usage.resident_owned_frames = (accounting.mapped_data_frames as u64)
+            .saturating_add(accounting.retired_data_frames as u64)
+            .saturating_add(accounting.page_table_frames as u64);
+        usage
+    }
+
+    pub fn record_quota_failure(&mut self) {
+        self.usage.quota_failures = self.usage.quota_failures.saturating_add(1);
+    }
+
+    pub fn record_oom_failure(&mut self) {
+        self.usage.oom_failures = self.usage.oom_failures.saturating_add(1);
     }
 
     /// Resolves an eligible non-present userspace stack fault transactionally.
@@ -1019,6 +1131,7 @@ impl Process {
 
         let pages = (committed_bottom - fault_page) / PAGE_SIZE;
         let Some(new_private_pages) = self.usage.private_pages.checked_add(pages) else {
+            self.record_quota_failure();
             return UserPageFaultResolution::Fault(ProcessFault::at_address(
                 ProcessFaultReason::ResourceLimit,
                 error_code,
@@ -1026,6 +1139,7 @@ impl Process {
             ));
         };
         if new_private_pages > self.limits.private_pages {
+            self.record_quota_failure();
             return UserPageFaultResolution::Fault(ProcessFault::at_address(
                 ProcessFaultReason::ResourceLimit,
                 error_code,
@@ -1065,6 +1179,7 @@ impl Process {
                 }
                 return match mapping_error {
                     AddressSpaceError::OutOfFrames => {
+                        self.record_oom_failure();
                         UserPageFaultResolution::Fault(ProcessFault::at_address(
                             ProcessFaultReason::OutOfMemory,
                             error_code,
@@ -1103,11 +1218,15 @@ impl Process {
         ))
     }
 
-    pub fn can_allocate_shared_memory(&self, bytes: usize) -> bool {
-        self.usage
-            .shared_memory_bytes
-            .checked_add(bytes as u64)
-            .is_some_and(|total| total <= self.limits.shared_memory_bytes)
+    /// Checks a page-rounded shared backing charge, not its logical byte length.
+    pub fn can_allocate_shared_memory(&self, backing_bytes: usize) -> bool {
+        backing_bytes != 0
+            && backing_bytes % PAGE_SIZE as usize == 0
+            && self
+                .usage
+                .shared_memory_bytes
+                .checked_add(backing_bytes as u64)
+                .is_some_and(|total| total <= self.limits.shared_memory_bytes)
     }
 
     pub fn record_shared_memory_allocation(&mut self, bytes: usize) {
@@ -1333,7 +1452,17 @@ impl Process {
                 protection,
             },
         )?;
+        let new_reserved = self
+            .usage
+            .reserved_virtual_bytes
+            .checked_add(mapped_len as u64)
+            .filter(|total| *total <= self.limits.reserved_virtual_bytes);
+        if planned.len() as u64 > self.limits.vma_count || new_reserved.is_none() {
+            self.record_quota_failure();
+            return Err(SharedMappingError::ResourceLimit);
+        }
         *self.vmas.as_mut().expect("live process lost its VMA table") = planned;
+        self.usage.reserved_virtual_bytes = new_reserved.expect("checked above");
         self.next_mapping_cursor = if end < self.layout.stack_guard_start {
             end
         } else {
@@ -1371,9 +1500,13 @@ impl Process {
             .expect("fresh anonymous reservation rollback lost its exact VMA");
         self.vmas
             .as_mut()
-            .expect("live process lost its VMA table")
+            .expect("live process lost its semantic VMA table")
             .remove(index);
         self.next_mapping_cursor = rollback.previous_cursor;
+        self.usage.reserved_virtual_bytes = self
+            .usage
+            .reserved_virtual_bytes
+            .saturating_sub(rollback.end - rollback.start);
     }
 
     fn restore_mapping_cursor(&mut self, rollback: AnonymousReservationRollback) {
@@ -1417,13 +1550,20 @@ impl Process {
     ) -> Result<(), SharedMappingError> {
         let (end, mapped_len) = normalize_anonymous_range(address, length)?;
         let planned = plan_anonymous_change(self.vmas(), address, end, AnonymousChange::Commit)?;
+        if planned.len() as u64 > self.limits.vma_count {
+            self.record_quota_failure();
+            return Err(SharedMappingError::ResourceLimit);
+        }
         let pages = mapped_len as u64 / PAGE_SIZE;
-        let new_private_pages = self
+        let Some(new_private_pages) = self
             .usage
             .private_pages
             .checked_add(pages)
             .filter(|total| *total <= self.limits.private_pages)
-            .ok_or(SharedMappingError::ResourceLimit)?;
+        else {
+            self.record_quota_failure();
+            return Err(SharedMappingError::ResourceLimit);
+        };
 
         let mut mapped = 0usize;
         while mapped < mapped_len {
@@ -1456,6 +1596,9 @@ impl Process {
                     .map_err(|error| {
                         SharedMappingError::AddressSpace(AddressSpaceError::FrameAllocator(error))
                     })?;
+                if matches!(mapping_error, AddressSpaceError::OutOfFrames) {
+                    self.record_oom_failure();
+                }
                 return Err(SharedMappingError::AddressSpace(mapping_error));
             }
             mapped += PAGE_SIZE as usize;
@@ -1480,6 +1623,10 @@ impl Process {
             end,
             AnonymousChange::Protect(protection),
         )?;
+        if planned.len() as u64 > self.limits.vma_count {
+            self.record_quota_failure();
+            return Err(SharedMappingError::ResourceLimit);
+        }
         let ranges = committed_anonymous_ranges(self.vmas(), address, end)?;
         self.address_space_mut()
             .protect_user_ranges(&ranges, permissions)
@@ -1498,6 +1645,10 @@ impl Process {
         let (end, _) = normalize_anonymous_range(address, length)?;
         let ranges = committed_anonymous_ranges(self.vmas(), address, end)?;
         let planned = plan_anonymous_change(self.vmas(), address, end, AnonymousChange::Decommit)?;
+        if planned.len() as u64 > self.limits.vma_count {
+            self.record_quota_failure();
+            return Err(SharedMappingError::ResourceLimit);
+        }
         let committed_pages = ranges
             .iter()
             .map(|(_, length)| *length as u64 / PAGE_SIZE)
@@ -1524,6 +1675,10 @@ impl Process {
     ) -> Result<(), SharedMappingError> {
         let (end, _) = normalize_anonymous_range(address, length)?;
         let planned = plan_anonymous_change(self.vmas(), address, end, AnonymousChange::Unmap)?;
+        if planned.len() as u64 > self.limits.vma_count {
+            self.record_quota_failure();
+            return Err(SharedMappingError::ResourceLimit);
+        }
         let ranges = committed_anonymous_ranges(self.vmas(), address, end)?;
         let committed_pages = ranges
             .iter()
@@ -1534,6 +1689,10 @@ impl Process {
             .map_err(SharedMappingError::AddressSpace)?;
         *self.vmas.as_mut().expect("live process lost its VMA table") = planned;
         self.usage.private_pages = self.usage.private_pages.saturating_sub(committed_pages);
+        self.usage.reserved_virtual_bytes = self
+            .usage
+            .reserved_virtual_bytes
+            .saturating_sub(end - address);
         // The reservation removal is semantically complete even if physical-frame
         // reclamation is deferred; retired ownership and sticky allocator error remain.
         let _ = self
@@ -1559,12 +1718,24 @@ impl Process {
 
         let lease = self.handles().shared_memory_mapping_lease(handle, access)?;
         let request = validate_mapping_range(lease.info(), args.offset, args.length)?;
-        let new_mapped_total = self
+        let Some(new_mapped_total) = self
             .usage
             .mapped_shared_bytes
             .checked_add(request.mapped_len as u64)
             .filter(|total| *total <= self.limits.mapped_shared_bytes)
-            .ok_or(SharedMappingError::ResourceLimit)?;
+        else {
+            self.record_quota_failure();
+            return Err(SharedMappingError::ResourceLimit);
+        };
+        let Some(new_reserved_total) = self
+            .usage
+            .reserved_virtual_bytes
+            .checked_add(request.mapped_len as u64)
+            .filter(|total| *total <= self.limits.reserved_virtual_bytes)
+        else {
+            self.record_quota_failure();
+            return Err(SharedMappingError::ResourceLimit);
+        };
 
         let occupied = self.occupied_ranges()?;
         let address = select_mapping_address(
@@ -1587,6 +1758,10 @@ impl Process {
                 protection: args.protection,
             },
         )?;
+        if planned_vmas.len() as u64 > self.limits.vma_count {
+            self.record_quota_failure();
+            return Err(SharedMappingError::ResourceLimit);
+        }
         let frames = backing_pages(&lease, request)?;
         self.shared_mappings
             .as_mut()
@@ -1653,6 +1828,11 @@ impl Process {
             });
         *self.vmas.as_mut().expect("live process lost its VMA table") = planned_vmas;
         self.usage.mapped_shared_bytes = new_mapped_total;
+        self.usage.mapped_shared_pages = self
+            .usage
+            .mapped_shared_pages
+            .saturating_add(request.mapped_len as u64 / PAGE_SIZE);
+        self.usage.reserved_virtual_bytes = new_reserved_total;
         if !args.flags.contains(MapFlags::FIXED) {
             self.next_mapping_cursor = address
                 .checked_add(request.mapped_len as u64)
@@ -1691,6 +1871,14 @@ impl Process {
         self.usage.mapped_shared_bytes = self
             .usage
             .mapped_shared_bytes
+            .saturating_sub(mapped_len as u64);
+        self.usage.mapped_shared_pages = self
+            .usage
+            .mapped_shared_pages
+            .saturating_sub(mapped_len as u64 / PAGE_SIZE);
+        self.usage.reserved_virtual_bytes = self
+            .usage
+            .reserved_virtual_bytes
             .saturating_sub(mapped_len as u64);
         Ok(())
     }
@@ -1878,8 +2066,8 @@ fn initial_vmas(
     layout: ProcessLayout,
 ) -> Result<Vec<VmArea>, ProcessCreateError> {
     let mut vmas = Vec::new();
-    vmas.try_reserve_exact(MAX_VMAS)
-        .map_err(|_| ProcessCreateError::ResourceLimit)?;
+    vmas.try_reserve_exact(image.segments.len().saturating_add(3).min(MAX_VMAS))
+        .map_err(|_| ProcessCreateError::OutOfMemory)?;
     for segment in &image.segments {
         let mut protection = MapProtection::READ;
         if segment.permissions.is_writable() {
@@ -1959,7 +2147,7 @@ enum AnonymousChange {
 fn clone_vma_plan(vmas: &[VmArea]) -> Result<Vec<VmArea>, SharedMappingError> {
     let mut planned = Vec::new();
     planned
-        .try_reserve_exact(MAX_VMAS)
+        .try_reserve_exact(vmas.len())
         .map_err(|_| SharedMappingError::OutOfMemory)?;
     planned.extend_from_slice(vmas);
     Ok(planned)
@@ -1988,7 +2176,7 @@ fn push_merged_vma(vmas: &mut Vec<VmArea>, area: VmArea) -> Result<(), SharedMap
 fn plan_vma_insert(vmas: &[VmArea], area: VmArea) -> Result<Vec<VmArea>, SharedMappingError> {
     let mut planned = Vec::new();
     planned
-        .try_reserve_exact(MAX_VMAS)
+        .try_reserve_exact(vmas.len().saturating_add(1).min(MAX_VMAS))
         .map_err(|_| SharedMappingError::OutOfMemory)?;
     let mut inserted = false;
     for current in vmas.iter().copied() {
@@ -2095,7 +2283,7 @@ fn plan_anonymous_change(
 ) -> Result<Vec<VmArea>, SharedMappingError> {
     let mut planned = Vec::new();
     planned
-        .try_reserve_exact(MAX_VMAS)
+        .try_reserve_exact(vmas.len().saturating_add(2).min(MAX_VMAS))
         .map_err(|_| SharedMappingError::OutOfMemory)?;
     let mut covered = start;
     for area in vmas.iter().copied() {
@@ -2243,7 +2431,7 @@ fn committed_anonymous_ranges(
 ) -> Result<Vec<(u64, usize)>, SharedMappingError> {
     let mut ranges = Vec::new();
     ranges
-        .try_reserve_exact(MAX_VMAS)
+        .try_reserve_exact(vmas.len())
         .map_err(|_| SharedMappingError::OutOfMemory)?;
     let mut covered = start;
     for area in vmas {
@@ -2787,6 +2975,47 @@ mod tests {
     static FRAME_RECLAIM_TEST_ELF: &[u8] =
         include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-frame-reclaim-exit.elf"));
 
+    #[test]
+    fn ram_derived_policy_scales_across_low_normal_and_high_memory() {
+        let low = ProcessLimits::from_available_memory_bytes(32 * MIB);
+        let normal = ProcessLimits::from_available_memory_bytes(512 * MIB);
+        let high = ProcessLimits::from_available_memory_bytes(16 * 1024 * MIB);
+
+        assert!(low.private_pages < normal.private_pages);
+        assert!(normal.private_pages < high.private_pages);
+        assert!(low.shared_memory_bytes <= normal.shared_memory_bytes);
+        assert!(normal.shared_memory_bytes < high.shared_memory_bytes);
+        assert!(low.reserved_virtual_bytes <= normal.reserved_virtual_bytes);
+        assert!(normal.reserved_virtual_bytes < high.reserved_virtual_bytes);
+        assert!(low.vma_count <= normal.vma_count);
+        assert!(normal.vma_count < high.vma_count);
+        assert!(low.executable_source_bytes <= normal.executable_source_bytes);
+        assert!(normal.executable_source_bytes < high.executable_source_bytes);
+        assert!(high.executable_image_pages <= high.private_pages);
+        assert!(high.vma_count <= MAX_VMAS as u64);
+    }
+
+    #[test]
+    fn process_memory_failure_counters_saturate() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(64);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        process.usage.quota_failures = u64::MAX;
+        process.usage.oom_failures = u64::MAX;
+        process.record_quota_failure();
+        process.record_oom_failure();
+        assert_eq!(process.usage().quota_failures, u64::MAX);
+        assert_eq!(process.usage().oom_failures, u64::MAX);
+    }
+
+    #[test]
+    fn tiny_ram_policy_never_inverts_checked_minimum_and_maximum() {
+        let limits = ProcessLimits::from_available_memory_bytes(2 * MIB);
+        assert!(limits.private_pages <= (2 * MIB) / PAGE_SIZE / 2);
+        assert!(limits.shared_memory_bytes <= (2 * MIB) / 4);
+        assert!(limits.executable_source_bytes <= limits.private_pages * PAGE_SIZE / 2);
+        assert!(limits.executable_image_pages <= limits.private_pages);
+    }
+
     struct TestFrameRegion {
         pointer: NonNull<u8>,
         layout: Layout,
@@ -3106,6 +3335,57 @@ mod tests {
             .unwrap();
         process.retire().unwrap().reclaim(&mut allocator).unwrap();
         assert_eq!(allocator.allocated_count(), 0);
+    }
+
+    #[test]
+    fn decommit_and_partial_unmap_cannot_bypass_vma_limit() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(96);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let address = process
+            .reserve_anonymous(PAGE_SIZE * 4, MapProtection::READ | MapProtection::WRITE)
+            .unwrap();
+        process
+            .commit_anonymous(address, PAGE_SIZE * 4, &mut allocator)
+            .unwrap();
+
+        let original_vmas = process.vmas().to_vec();
+        let original_usage = process.usage();
+        let original_frames = allocator.allocated_count();
+        process.limits.vma_count = original_vmas.len() as u64 + 1;
+        assert_eq!(
+            process.decommit_anonymous(address + PAGE_SIZE, PAGE_SIZE, &mut allocator),
+            Err(SharedMappingError::ResourceLimit)
+        );
+        assert_eq!(process.vmas(), original_vmas);
+        assert_eq!(process.usage().private_pages, original_usage.private_pages);
+        assert_eq!(allocator.allocated_count(), original_frames);
+        assert_eq!(
+            process.address_space().validate_user_range(
+                address + PAGE_SIZE,
+                PAGE_SIZE as usize,
+                UserAccess::Write,
+            ),
+            Ok(())
+        );
+
+        process.limits.vma_count = original_vmas.len() as u64;
+        assert_eq!(
+            process.unmap_anonymous(address + PAGE_SIZE, PAGE_SIZE, &mut allocator),
+            Err(SharedMappingError::ResourceLimit)
+        );
+        assert_eq!(process.vmas(), original_vmas);
+        assert_eq!(process.usage().private_pages, original_usage.private_pages);
+        assert_eq!(allocator.allocated_count(), original_frames);
+        assert_eq!(
+            process.usage().quota_failures,
+            original_usage.quota_failures + 2
+        );
+
+        process.limits = ProcessLimits::STANDARD;
+        process
+            .unmap_anonymous(address, PAGE_SIZE * 4, &mut allocator)
+            .unwrap();
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
     }
 
     #[test]
@@ -4115,9 +4395,14 @@ mod tests {
     #[test]
     fn resource_accounting_enforces_memory_and_traffic_ceilings() {
         let mut process = test_process(ProcessState::Ready);
-        assert!(process.can_allocate_shared_memory(1024));
-        process.usage.shared_memory_bytes = process.limits.shared_memory_bytes;
+        assert!(process.can_allocate_shared_memory(PAGE_SIZE as usize));
         assert!(!process.can_allocate_shared_memory(1));
+        process.record_shared_memory_allocation(PAGE_SIZE as usize);
+        assert_eq!(process.usage.shared_memory_bytes, PAGE_SIZE);
+        process.release_shared_memory_charge(PAGE_SIZE as usize);
+        assert_eq!(process.usage.shared_memory_bytes, 0);
+        process.usage.shared_memory_bytes = process.limits.shared_memory_bytes;
+        assert!(!process.can_allocate_shared_memory(PAGE_SIZE as usize));
         assert!(process.can_send_channel_bytes(1));
         process.usage.channel_traffic_bytes = process.limits.channel_traffic_bytes;
         assert!(!process.can_send_channel_bytes(1));

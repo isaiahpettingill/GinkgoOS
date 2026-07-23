@@ -97,6 +97,27 @@ pub fn monotonic_time_ns() -> SyscallResult<u64> {
     Ok(output.now_ns)
 }
 
+/// Returns one coherent system-and-caller memory accounting checkpoint.
+#[inline]
+pub fn memory_get_info() -> SyscallResult<MemoryInfo> {
+    let mut output = MemoryInfo::default();
+    // SAFETY: output is writable and remains alive until the syscall returns;
+    // version and size exactly identify the fixed ABI layout.
+    let raw = unsafe {
+        raw_syscall6(
+            SyscallNumber::MemoryGetInfo,
+            mut_pointer_address(&mut output),
+            u64::from(MemoryInfo::SIZE),
+            u64::from(MEMORY_INFO_VERSION),
+            0,
+            0,
+            0,
+        )
+    };
+    status_result(raw)?;
+    Ok(output)
+}
+
 /// Fills `output` with unpredictable bytes through an explicit random capability.
 #[inline]
 pub fn random_fill(source: Handle, output: &mut [u8]) -> SyscallResult<()> {

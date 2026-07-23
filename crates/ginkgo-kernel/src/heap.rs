@@ -86,8 +86,9 @@ impl PageBackedHeap {
         ALLOCATOR.lock().counters().available_bytes
     }
 
+    /// Total allocator capacity supplied by the bootstrap arena and page-backed heap.
     pub const fn committed_bytes(&self) -> u64 {
-        self.mapped_end - PAGE_BACKED_HEAP_BASE
+        total_committed_bytes(self.mapped_end - PAGE_BACKED_HEAP_BASE)
     }
 
     pub const fn growth_count(&self) -> u64 {
@@ -106,7 +107,6 @@ impl PageBackedHeap {
     ) -> Result<(), HeapGrowError> {
         while self.available_bytes() < minimum_available {
             if let Err(error) = self.grow(page_table, frames, PAGE_BACKED_GROWTH_BYTES) {
-                self.failed_growth_count = self.failed_growth_count.saturating_add(1);
                 return Err(error);
             }
         }
@@ -114,6 +114,19 @@ impl PageBackedHeap {
     }
 
     pub fn grow(
+        &mut self,
+        page_table: &mut ActivePageTable,
+        frames: &mut UsableFrameAllocator<'_>,
+        bytes: usize,
+    ) -> Result<(), HeapGrowError> {
+        let result = self.grow_inner(page_table, frames, bytes);
+        if result.is_err() {
+            self.failed_growth_count = self.failed_growth_count.saturating_add(1);
+        }
+        result
+    }
+
+    fn grow_inner(
         &mut self,
         page_table: &mut ActivePageTable,
         frames: &mut UsableFrameAllocator<'_>,
@@ -138,6 +151,10 @@ impl PageBackedHeap {
         self.growth_count = self.growth_count.saturating_add(1);
         Ok(())
     }
+}
+
+const fn total_committed_bytes(page_backed_bytes: u64) -> u64 {
+    (BOOTSTRAP_HEAP_SIZE as u64).saturating_add(page_backed_bytes)
 }
 
 fn page_rounded_bytes(bytes: usize) -> Result<usize, HeapGrowError> {
@@ -253,5 +270,18 @@ fn rollback_partial(
         frames
             .deallocate_frames(allocated)
             .expect("heap rollback frames must remain allocator-owned");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{total_committed_bytes, BOOTSTRAP_HEAP_SIZE, INITIAL_PAGE_BACKED_BYTES};
+
+    #[test]
+    fn committed_capacity_includes_bootstrap_and_page_backed_arenas() {
+        assert_eq!(
+            total_committed_bytes(INITIAL_PAGE_BACKED_BYTES as u64),
+            (BOOTSTRAP_HEAP_SIZE + INITIAL_PAGE_BACKED_BYTES) as u64,
+        );
     }
 }

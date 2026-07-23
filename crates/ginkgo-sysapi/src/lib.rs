@@ -94,6 +94,8 @@ pub enum SyscallNumber {
     AnonymousCommit = 43,
     /// Decommits an aligned page-rounded range while preserving its reservation.
     AnonymousDecommit = 44,
+    /// Returns one coherent system-and-caller memory accounting checkpoint.
+    MemoryGetInfo = 45,
 }
 
 /// An opaque process-local reference to a kernel object.
@@ -285,6 +287,63 @@ pub struct SystemPowerInfo {
     pub failure_status: i32,
     pub sequence: u64,
     pub deadline_ns: u64,
+}
+
+/// Current fixed-layout [`MemoryInfo`] ABI version.
+pub const MEMORY_INFO_VERSION: u32 = 1;
+
+/// Coherent system and calling-process memory checkpoint returned by
+/// [`SyscallNumber::MemoryGetInfo`]. All quantities are u64 to preserve systems
+/// with physical memory above 4 GiB. Addresses are physical frame starts, or zero
+/// when no matching frame exists.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq,
+)]
+pub struct MemoryInfo {
+    pub version: u32,
+    pub size: u32,
+    pub total_eligible_frames: u64,
+    pub total_eligible_bytes: u64,
+    pub below_4g_frames: u64,
+    pub above_4g_frames: u64,
+    pub highest_usable_address: u64,
+    pub highest_issued_address: u64,
+    pub fresh_issued_frames: u64,
+    pub fresh_remaining_frames: u64,
+    /// Frames immediately allocatable from untouched or reclaimed storage.
+    pub available_frames: u64,
+    pub available_bytes: u64,
+    pub live_allocated_frames: u64,
+    pub reclaimed_free_frames: u64,
+    pub reserved_eligible_frames: u64,
+    pub dma_low_allocations: u64,
+    pub dma_low_live_frames: u64,
+    pub dma_low_failures: u64,
+    pub allocation_failures: u64,
+    pub kernel_heap_committed_bytes: u64,
+    pub kernel_heap_available_bytes: u64,
+    pub kernel_heap_growth_failures: u64,
+    pub private_page_limit: u64,
+    pub shared_memory_byte_limit: u64,
+    pub mapped_shared_byte_limit: u64,
+    pub reserved_virtual_byte_limit: u64,
+    pub vma_limit: u64,
+    pub executable_image_page_limit: u64,
+    pub executable_source_byte_limit: u64,
+    pub reserved_virtual_bytes: u64,
+    pub committed_private_pages: u64,
+    pub resident_owned_frames: u64,
+    /// Page-rounded physical backing bytes charged to the caller.
+    pub shared_memory_bytes: u64,
+    pub mapped_shared_pages: u64,
+    pub mapped_shared_bytes: u64,
+    pub quota_failures: u64,
+    pub oom_failures: u64,
+}
+
+impl MemoryInfo {
+    pub const SIZE: u32 = core::mem::size_of::<Self>() as u32;
 }
 
 impl SystemPowerInfo {
@@ -1051,6 +1110,7 @@ const _: () = {
     assert!(core::mem::size_of::<ProcessCreateArgs>() == 64);
     assert!(core::mem::size_of::<ProcessInfo>() == 32);
     assert!(core::mem::size_of::<SystemPowerInfo>() == 32);
+    assert!(core::mem::size_of::<MemoryInfo>() == 288);
     assert!(core::mem::size_of::<ReceivedHandle>() == 16);
     assert!(core::mem::size_of::<ChannelCreateOutput>() == 8);
     assert!(core::mem::size_of::<ChannelWriteArgs>() == 40);
@@ -1131,6 +1191,7 @@ mod tests {
         assert_eq!(SyscallNumber::AnonymousReserve as u64, 42);
         assert_eq!(SyscallNumber::AnonymousCommit as u64, 43);
         assert_eq!(SyscallNumber::AnonymousDecommit as u64, 44);
+        assert_eq!(SyscallNumber::MemoryGetInfo as u64, 45);
     }
 
     #[test]
@@ -1228,6 +1289,17 @@ mod tests {
         assert_eq!(offset_of!(WaitManyArgs, deadline_ns), 16);
         assert_eq!(size_of::<MonotonicTimeOutput>(), 8);
         assert_eq!(offset_of!(MonotonicTimeOutput, now_ns), 0);
+        assert_eq!(size_of::<MemoryInfo>(), 288);
+        assert_eq!(align_of::<MemoryInfo>(), 8);
+        assert_eq!(offset_of!(MemoryInfo, version), 0);
+        assert_eq!(offset_of!(MemoryInfo, size), 4);
+        assert_eq!(offset_of!(MemoryInfo, total_eligible_frames), 8);
+        assert_eq!(offset_of!(MemoryInfo, available_frames), 72);
+        assert_eq!(offset_of!(MemoryInfo, available_bytes), 80);
+        assert_eq!(offset_of!(MemoryInfo, kernel_heap_committed_bytes), 144);
+        assert_eq!(offset_of!(MemoryInfo, private_page_limit), 168);
+        assert_eq!(offset_of!(MemoryInfo, reserved_virtual_bytes), 224);
+        assert_eq!(offset_of!(MemoryInfo, oom_failures), 280);
 
         assert_eq!(size_of::<ChannelWriteArgs>(), 40);
         assert_eq!(align_of::<ChannelWriteArgs>(), 8);

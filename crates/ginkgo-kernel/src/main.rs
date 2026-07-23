@@ -162,7 +162,6 @@ const TERMINAL_PATH: &str = "/system/terminal.elf";
 const PROGRAM_REGISTRY_PATH: &str = "/system/programs.gkr";
 const PROCESS_CAPABILITY_SMOKE_PATH: &str = "/system/process-capability-smoke.elf";
 const PROCESS_CAPABILITY_MALFORMED_PATH: &str = "/system/process-capability-malformed.elf";
-const MAX_EXECUTABLE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_LAUNCHER_PROGRAMS: usize = 6;
 const FRAME_RECLAIM_STRESS_CYCLES: u32 = 512;
 
@@ -333,6 +332,7 @@ impl RegistryLaunchAuthority {
 
 fn install_and_load_system_programs<D: Disk>(
     fs: &mut RedoxFs<D>,
+    executable_source_limit: usize,
 ) -> Result<(Vec<u8>, ProgramCatalog), &'static str> {
     let system = ensure_system_directory(fs).ok_or("create system directory")?;
     migrate_legacy_system_files(fs, system).ok_or("migrate legacy system files")?;
@@ -389,8 +389,9 @@ fn install_and_load_system_programs<D: Disk>(
         catalog.len += 1;
     }
 
-    let desktop_image = read_trusted_system_file(fs, desktop.executable_path, MAX_EXECUTABLE_BYTES)
-        .ok_or("verify desktop executable")?;
+    let desktop_image =
+        read_trusted_system_file(fs, desktop.executable_path, executable_source_limit)
+            .ok_or("verify desktop executable")?;
     Ok((desktop_image, catalog))
 }
 
@@ -961,18 +962,26 @@ pub extern "C" fn _start() -> ! {
             }
         }
     }
-    let (desktop_image, catalog) = match install_and_load_system_programs(&mut fs) {
-        Ok(installed) => installed,
-        Err(stage) => {
-            let mut sink = SerialDebugSink::new(&mut serial);
-            let _ = writeln!(
-                sink,
-                "redoxfs: system program installation failed ({stage})\r"
-            );
-            ui.render_boot_log(&mut screen, "redoxfs: system program installation failed");
-            halt_forever();
-        }
-    };
+    let executable_source_limit = usize::try_from(
+        ginkgo_kernel::process::ProcessLimits::from_available_memory_bytes(
+            frames.available_bytes(),
+        )
+        .executable_source_bytes,
+    )
+    .unwrap_or(usize::MAX);
+    let (desktop_image, catalog) =
+        match install_and_load_system_programs(&mut fs, executable_source_limit) {
+            Ok(installed) => installed,
+            Err(stage) => {
+                let mut sink = SerialDebugSink::new(&mut serial);
+                let _ = writeln!(
+                    sink,
+                    "redoxfs: system program installation failed ({stage})\r"
+                );
+                ui.render_boot_log(&mut screen, "redoxfs: system program installation failed");
+                halt_forever();
+            }
+        };
     ui.catalog = catalog;
     ui.render_boot_log(&mut screen, "redoxfs: desktop ELF and registry loaded");
 
@@ -2221,6 +2230,14 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                     context.timer.disarm();
                     match exit {
                         Ok(KernelExit::YieldToKernel) => {
+                            let heap_committed = context.kernel_heap.committed_bytes();
+                            let heap_available = context.kernel_heap.available_bytes() as u64;
+                            debug_assert!(heap_available <= heap_committed);
+                            let kernel_heap_stats = syscall::KernelHeapStats {
+                                committed_bytes: heap_committed,
+                                available_bytes: heap_available,
+                                growth_failures: context.kernel_heap.failed_growth_count(),
+                            };
                             let mut sink = SerialDebugSink::new(&mut context.serial);
                             let outcome = syscall::dispatch(
                                 process,
@@ -2228,6 +2245,7 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                                 context.timer.clock().now_ns(),
                                 &context.page_table,
                                 &mut context.frames,
+                                kernel_heap_stats,
                                 &context.shared_frame_arena,
                                 &mut context.fs,
                                 &mut context.audio,
@@ -2830,8 +2848,18 @@ fn launch_program(
         return Err(());
     }
     context.processes.prepare_insert().map_err(|_| ())?;
-    let image =
-        read_trusted_system_file(&mut context.fs, program.path(), MAX_EXECUTABLE_BYTES).ok_or(())?;
+    let image = read_trusted_system_file(
+        &mut context.fs,
+        program.path(),
+        usize::try_from(
+            ginkgo_kernel::process::ProcessLimits::from_available_memory_bytes(
+                context.frames.available_bytes(),
+            )
+            .executable_source_bytes,
+        )
+        .map_err(|_| ())?,
+    )
+    .ok_or(())?;
     let randomness = [
         context.entropy.next_u64(),
         context.entropy.next_u64(),

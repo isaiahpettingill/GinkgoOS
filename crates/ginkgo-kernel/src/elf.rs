@@ -20,11 +20,10 @@ use core::cmp::{max, min};
 
 pub const PAGE_SIZE: u64 = 4096;
 pub const MAX_PROGRAM_HEADERS: usize = 128;
-/// Hard safety ceiling for ELF metadata before per-process RAM policy is applied:
-/// 1 GiB at 4 KiB/page. Actual loading remains constrained by the process's
-/// private-page quota and cleanly rolls back on physical-memory exhaustion.
-pub const MAX_TOTAL_LOAD_PAGES: u64 = 262_144;
 pub const USER_ADDRESS_END: u64 = 0x0000_8000_0000_0000;
+/// Metadata-work ceiling (1 TiB of mapped image pages). Process construction
+/// applies the much lower RAM-derived executable quota before loading any page.
+pub const MAX_TOTAL_LOAD_PAGES: u64 = (1_u64 << 40) / PAGE_SIZE;
 
 const ELF_HEADER_SIZE: u16 = 64;
 const PROGRAM_HEADER_SIZE: u16 = 56;

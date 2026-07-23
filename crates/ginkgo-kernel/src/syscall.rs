@@ -21,12 +21,13 @@ use ginkgo_ipc::{
 };
 use ginkgo_sysapi::{
     FilesystemDirectoryEntry, FilesystemOpenFlags, FilesystemRenameFlags, Handle, MapFlags,
-    MapProtection, ProcessInfo, SharedMemoryMapArgs, Status, SyscallNumber, SystemPowerAction,
-    SystemPowerFlags, SystemPowerInfo, CHANNEL_MAX_BYTES, CHANNEL_MAX_HANDLES, DEADLINE_INFINITE,
-    FILESYSTEM_NAME_MAX, FILESYSTEM_READ_MAX_BYTES, PROCESS_MAX_STARTUP_BYTES,
-    PROCESS_MAX_STARTUP_HANDLES, RANDOM_MAX_BYTES,
+    MapProtection, MemoryInfo, ProcessInfo, SharedMemoryMapArgs, Status, SyscallNumber,
+    SystemPowerAction, SystemPowerFlags, SystemPowerInfo, CHANNEL_MAX_BYTES, CHANNEL_MAX_HANDLES,
+    DEADLINE_INFINITE, FILESYSTEM_NAME_MAX, FILESYSTEM_READ_MAX_BYTES, MEMORY_INFO_VERSION,
+    PROCESS_MAX_STARTUP_BYTES, PROCESS_MAX_STARTUP_HANDLES, RANDOM_MAX_BYTES,
 };
 use redoxfs::Disk;
+use zerocopy::IntoBytes;
 
 use crate::{
     arch::UserContext,
@@ -38,8 +39,8 @@ use crate::{
         ActivePageTable, MapError,
     },
     process::{
-        DirectStartupBlock, PendingWaitMany, Process, ProcessCreateError, SharedMappingError,
-        WaitDeadline, WaitManyCompletion,
+        DirectStartupBlock, PendingWaitMany, Process, ProcessCreateError, ProcessLimits,
+        SharedMappingError, WaitDeadline, WaitManyCompletion,
     },
     shared_memory::{SharedFrameArena, SharedMemoryFactory},
 };
@@ -85,9 +86,16 @@ const FILESYSTEM_PATH_MAX: usize =
 const PROCESS_CREATE_ARGS_SIZE: usize = 64;
 const PROCESS_INFO_SIZE: usize = size_of::<ProcessInfo>();
 const SYSTEM_POWER_INFO_SIZE: usize = size_of::<SystemPowerInfo>();
+const MEMORY_INFO_SIZE: usize = size_of::<MemoryInfo>();
 const SYSTEM_POWER_CANCELLATION_NS: u64 = 2_000_000_000;
 const APPLICATION_DATA_CREATE_ARGS_SIZE: usize = 32;
-const MAX_EXECUTABLE_BYTES: usize = 256 * 1024 * 1024;
+/// Heap values captured immediately before syscall dispatch.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KernelHeapStats {
+    pub committed_bytes: u64,
+    pub available_bytes: u64,
+    pub growth_failures: u64,
+}
 
 /// A bounded destination for early userspace diagnostics.
 pub trait DebugSink {
@@ -134,6 +142,7 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
     now_ns: u64,
     kernel_page_table: &ActivePageTable,
     frame_allocator: &mut UsableFrameAllocator<'_>,
+    kernel_heap: KernelHeapStats,
     shared_frame_arena: &SharedFrameArena,
     filesystem: &mut RedoxFs<B>,
     audio: &mut Option<AudioDevice>,
@@ -173,6 +182,7 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
             now_ns,
             kernel_page_table,
             frame_allocator,
+            kernel_heap,
             shared_frame_arena,
             filesystem,
             audio,
@@ -202,6 +212,7 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
     now_ns: u64,
     kernel_page_table: &ActivePageTable,
     frame_allocator: &mut UsableFrameAllocator<'_>,
+    kernel_heap: KernelHeapStats,
     shared_frame_arena: &SharedFrameArena,
     filesystem: &mut RedoxFs<B>,
     audio: &mut Option<AudioDevice>,
@@ -214,6 +225,7 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
         return wait_many(process, context.rdi, context.rsi, now_ns);
     }
 
+    let memory_failures_before = process.usage();
     let result = match number {
         SyscallNumber::ProcessYield => Ok(()),
         SyscallNumber::ProcessExit => unreachable!("process exit is handled before dispatch"),
@@ -297,7 +309,12 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
                 child_slot_reserved,
             ) {
                 Ok(child) => DispatchResult::ChildCreated(child),
-                Err(status) => DispatchResult::Complete(status),
+                Err(status) => {
+                    if status == Status::OutOfMemory {
+                        process.record_oom_failure();
+                    }
+                    DispatchResult::Complete(status)
+                }
             };
         }
         SyscallNumber::ProcessGetInfo => process_get_info(process, context.rdi, context.rsi),
@@ -355,11 +372,50 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
         SyscallNumber::AnonymousDecommit => {
             anonymous_decommit(process, context.rdi, context.rsi, frame_allocator)
         }
+        SyscallNumber::MemoryGetInfo => memory_get_info(
+            process,
+            context.rdi,
+            context.rsi,
+            context.rdx,
+            frame_allocator,
+            kernel_heap,
+        ),
     };
-    DispatchResult::Complete(match result {
-        Ok(()) => Status::Ok,
-        Err(status) => status,
-    })
+    if let Err(status) = result {
+        if is_memory_accounted_syscall(number) {
+            let after = process.usage();
+            match status {
+                Status::ResourceLimit
+                    if after.quota_failures == memory_failures_before.quota_failures =>
+                {
+                    process.record_quota_failure();
+                }
+                Status::OutOfMemory
+                    if after.oom_failures == memory_failures_before.oom_failures =>
+                {
+                    process.record_oom_failure();
+                }
+                _ => {}
+            }
+        }
+        DispatchResult::Complete(status)
+    } else {
+        DispatchResult::Complete(Status::Ok)
+    }
+}
+
+const fn is_memory_accounted_syscall(number: SyscallNumber) -> bool {
+    matches!(
+        number,
+        SyscallNumber::SharedMemoryCreate
+            | SyscallNumber::SharedMemoryMap
+            | SyscallNumber::AnonymousMap
+            | SyscallNumber::AnonymousReserve
+            | SyscallNumber::AnonymousCommit
+            | SyscallNumber::AnonymousDecommit
+            | SyscallNumber::AnonymousUnmap
+            | SyscallNumber::AnonymousProtect
+    )
 }
 
 const fn decode_syscall_number(raw: u64) -> Option<SyscallNumber> {
@@ -409,6 +465,7 @@ const fn decode_syscall_number(raw: u64) -> Option<SyscallNumber> {
         42 => SyscallNumber::AnonymousReserve,
         43 => SyscallNumber::AnonymousCommit,
         44 => SyscallNumber::AnonymousDecommit,
+        45 => SyscallNumber::MemoryGetInfo,
         _ => return None,
     })
 }
@@ -633,6 +690,75 @@ fn clock_get_monotonic(process: &Process, output_address: u64, now_ns: u64) -> R
     copy_to_user(process, output_address, &now_ns.to_le_bytes())
 }
 
+fn memory_get_info(
+    process: &Process,
+    output_address: u64,
+    raw_size: u64,
+    raw_version: u64,
+    frame_allocator: &UsableFrameAllocator<'_>,
+    kernel_heap: KernelHeapStats,
+) -> Result<(), Status> {
+    validate_memory_info_query(raw_version, raw_size)?;
+    validate_user_output(process, output_address, MEMORY_INFO_SIZE)?;
+
+    let frames = frame_allocator.stats();
+    let limits = process.limits();
+    let usage = process.usage();
+    let info = MemoryInfo {
+        version: MEMORY_INFO_VERSION,
+        size: MemoryInfo::SIZE,
+        total_eligible_frames: frames.total_eligible_frames,
+        total_eligible_bytes: frames.total_eligible_bytes,
+        below_4g_frames: frames.below_4g_frames,
+        above_4g_frames: frames.above_4g_frames,
+        highest_usable_address: frames.highest_usable_address,
+        highest_issued_address: frames.highest_issued_address,
+        fresh_issued_frames: frames.fresh_issued_frames,
+        fresh_remaining_frames: frames.fresh_remaining_frames,
+        available_frames: frames.available_frames,
+        available_bytes: frames.available_bytes,
+        live_allocated_frames: frames.live_allocated_frames,
+        reclaimed_free_frames: frames.reclaimed_free_frames,
+        reserved_eligible_frames: frames.reserved_eligible_frames,
+        dma_low_allocations: frames.dma_low_allocations,
+        dma_low_live_frames: frames.dma_low_live_frames,
+        dma_low_failures: frames.dma_low_failures,
+        allocation_failures: frames.allocation_failures,
+        kernel_heap_committed_bytes: kernel_heap.committed_bytes,
+        kernel_heap_available_bytes: kernel_heap.available_bytes,
+        kernel_heap_growth_failures: kernel_heap.growth_failures,
+        private_page_limit: limits.private_pages,
+        shared_memory_byte_limit: limits.shared_memory_bytes,
+        mapped_shared_byte_limit: limits.mapped_shared_bytes,
+        reserved_virtual_byte_limit: limits.reserved_virtual_bytes,
+        vma_limit: limits.vma_count,
+        executable_image_page_limit: limits.executable_image_pages,
+        executable_source_byte_limit: limits.executable_source_bytes,
+        reserved_virtual_bytes: usage.reserved_virtual_bytes,
+        committed_private_pages: usage.private_pages,
+        resident_owned_frames: usage.resident_owned_frames,
+        shared_memory_bytes: usage.shared_memory_bytes,
+        mapped_shared_pages: usage.mapped_shared_pages,
+        mapped_shared_bytes: usage.mapped_shared_bytes,
+        quota_failures: usage.quota_failures,
+        oom_failures: usage.oom_failures,
+    };
+    copy_to_user(process, output_address, info.as_bytes())
+}
+
+const fn validate_memory_info_query(raw_version: u64, raw_size: u64) -> Result<(), Status> {
+    if raw_version != MEMORY_INFO_VERSION as u64 {
+        return Err(Status::InvalidArgument);
+    }
+    if raw_size < MemoryInfo::SIZE as u64 {
+        return Err(Status::BufferTooSmall);
+    }
+    if raw_size != MemoryInfo::SIZE as u64 {
+        return Err(Status::InvalidArgument);
+    }
+    Ok(())
+}
+
 fn channel_create(process: &mut Process, output_address: u64) -> Result<(), Status> {
     validate_user_output(process, output_address, CHANNEL_CREATE_OUTPUT_SIZE)?;
     let (first, second) = process
@@ -776,6 +902,16 @@ fn channel_read(process: &mut Process, raw_channel: u64, args_address: u64) -> R
     Ok(())
 }
 
+fn page_rounded_shared_backing_bytes(logical_bytes: usize) -> Result<usize, Status> {
+    if logical_bytes == 0 {
+        return Ok(0);
+    }
+    logical_bytes
+        .checked_add(crate::memory::PAGE_SIZE as usize - 1)
+        .map(|bytes| bytes / crate::memory::PAGE_SIZE as usize * crate::memory::PAGE_SIZE as usize)
+        .ok_or(Status::OutOfRange)
+}
+
 fn shared_memory_create(
     process: &mut Process,
     raw_size: u64,
@@ -785,20 +921,23 @@ fn shared_memory_create(
     frame_allocator: &mut UsableFrameAllocator<'_>,
 ) -> Result<(), Status> {
     let size = usize::try_from(raw_size).map_err(|_| Status::OutOfRange)?;
-    if !process.can_allocate_shared_memory(size) {
+    let backing_bytes = page_rounded_shared_backing_bytes(size)?;
+    if backing_bytes != 0 && !process.can_allocate_shared_memory(backing_bytes) {
+        process.record_quota_failure();
         return Err(Status::ResourceLimit);
     }
     validate_user_output(process, output_address, HANDLE_OUTPUT_SIZE)?;
     let mut factory =
         SharedMemoryFactory::new(shared_frame_arena, frame_allocator, kernel_page_table);
-    let handle = factory
-        .create_handle(process.handles_mut(), size)
-        .map_err(map_ipc_error)?;
-    process.record_shared_memory_allocation(size);
+    let handle = match factory.create_handle(process.handles_mut(), size) {
+        Ok(handle) => handle,
+        Err(error) => return Err(map_ipc_error(error)),
+    };
+    process.record_shared_memory_allocation(backing_bytes);
     let output = encode_handle_output(handle);
     if let Err(status) = copy_to_user(process, output_address, &output) {
         close_handles(process, core::slice::from_ref(&handle));
-        process.release_shared_memory_charge(size);
+        process.release_shared_memory_charge(backing_bytes);
         return Err(status);
     }
     Ok(())
@@ -831,9 +970,10 @@ fn shared_memory_map(
     let args = parse_shared_memory_map_args(&raw_args)?;
     validate_user_output(process, output_address, SHARED_MEMORY_MAP_OUTPUT_SIZE)?;
 
-    let mapped_address = process
-        .map_shared_memory(handle, args, frame_allocator)
-        .map_err(map_shared_mapping_error)?;
+    let mapped_address = match process.map_shared_memory(handle, args, frame_allocator) {
+        Ok(address) => address,
+        Err(error) => return Err(map_shared_mapping_error(error)),
+    };
     if let Err(copy_status) = copy_to_user(process, output_address, &mapped_address.to_le_bytes()) {
         return match process.unmap_shared_memory(mapped_address, args.length) {
             Ok(()) => Err(copy_status),
@@ -859,9 +999,10 @@ fn anonymous_map(
     let protection_bits = u32::try_from(raw_protection).map_err(|_| Status::InvalidArgument)?;
     let protection = MapProtection::from_bits(protection_bits).ok_or(Status::InvalidArgument)?;
     validate_user_output(process, output_address, SHARED_MEMORY_MAP_OUTPUT_SIZE)?;
-    let address = process
-        .map_anonymous(length, protection, frame_allocator)
-        .map_err(map_shared_mapping_error)?;
+    let address = match process.map_anonymous(length, protection, frame_allocator) {
+        Ok(address) => address,
+        Err(error) => return Err(map_shared_mapping_error(error)),
+    };
     if let Err(status) = copy_to_user(process, output_address, &address.to_le_bytes()) {
         process
             .unmap_anonymous(address, length, frame_allocator)
@@ -1739,7 +1880,10 @@ fn process_create<B: Disk>(
         .map_err(map_ipc_error)?;
     let executable_length = usize::try_from(filesystem.stat(file).map_err(map_fs_error)?.len)
         .map_err(|_| Status::ResourceLimit)?;
-    if executable_length == 0 || executable_length > MAX_EXECUTABLE_BYTES {
+    let launch_limits =
+        ProcessLimits::from_available_memory_bytes(frame_allocator.available_bytes());
+    if executable_length == 0 || executable_length as u64 > launch_limits.executable_source_bytes {
+        process.record_quota_failure();
         return Err(Status::ResourceLimit);
     }
     let mut image = zeroed_vec(executable_length)?;
@@ -1753,7 +1897,15 @@ fn process_create<B: Disk>(
     let child =
         Process::from_elf_randomized(&image, kernel_page_table, frame_allocator, randomness);
     unsafe { process.address_space().activate() };
-    let child = child.map_err(map_process_create_error)?;
+    let child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            if is_process_memory_policy_error(error) {
+                process.record_quota_failure();
+            }
+            return Err(map_process_create_error(error));
+        }
+    };
     child_storage.write(child);
     let mut child = unsafe { child_storage.assume_init() };
     let (process_handle, control) = match process.handles_mut().process_create() {
@@ -2053,10 +2205,17 @@ fn reclaim_unstarted_process(process: Process, frame_allocator: &mut UsableFrame
         .expect("failed to reclaim unstarted child process");
 }
 
+const fn is_process_memory_policy_error(error: ProcessCreateError) -> bool {
+    matches!(error, ProcessCreateError::MemoryPolicy)
+}
+
 const fn map_process_create_error(error: ProcessCreateError) -> Status {
     match error {
-        ProcessCreateError::ResourceLimit => Status::ResourceLimit,
-        ProcessCreateError::AddressSpace(AddressSpaceError::OutOfFrames)
+        ProcessCreateError::MemoryPolicy | ProcessCreateError::ResourceLimit => {
+            Status::ResourceLimit
+        }
+        ProcessCreateError::OutOfMemory
+        | ProcessCreateError::AddressSpace(AddressSpaceError::OutOfFrames)
         | ProcessCreateError::AddressSpace(AddressSpaceError::FrameAllocator(_))
         | ProcessCreateError::StackPage {
             error: AddressSpaceError::OutOfFrames,
@@ -2465,6 +2624,7 @@ mod tests {
             SyscallNumber::AnonymousReserve,
             SyscallNumber::AnonymousCommit,
             SyscallNumber::AnonymousDecommit,
+            SyscallNumber::MemoryGetInfo,
         ];
         for number in expected {
             assert_eq!(decode_syscall_number(number as u64), Some(number));
@@ -2519,8 +2679,62 @@ mod tests {
             decode_syscall_number(44),
             Some(SyscallNumber::AnonymousDecommit)
         );
-        assert_eq!(decode_syscall_number(45), None);
+        assert_eq!(
+            decode_syscall_number(45),
+            Some(SyscallNumber::MemoryGetInfo)
+        );
+        assert_eq!(decode_syscall_number(46), None);
         assert_eq!(decode_syscall_number(u64::MAX), None);
+    }
+
+    #[test]
+    fn shared_memory_quota_uses_page_rounded_backing_bytes() {
+        assert_eq!(page_rounded_shared_backing_bytes(0), Ok(0));
+        assert_eq!(
+            page_rounded_shared_backing_bytes(1),
+            Ok(crate::memory::PAGE_SIZE as usize)
+        );
+        assert_eq!(
+            page_rounded_shared_backing_bytes(crate::memory::PAGE_SIZE as usize + 1),
+            Ok(crate::memory::PAGE_SIZE as usize * 2)
+        );
+        assert_eq!(
+            page_rounded_shared_backing_bytes(usize::MAX),
+            Err(Status::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn only_explicit_process_memory_policy_errors_are_quota_failures() {
+        assert!(is_process_memory_policy_error(
+            ProcessCreateError::MemoryPolicy
+        ));
+        assert!(!is_process_memory_policy_error(
+            ProcessCreateError::ResourceLimit
+        ));
+        assert!(!is_process_memory_policy_error(
+            ProcessCreateError::StackCollision
+        ));
+    }
+
+    #[test]
+    fn memory_info_query_requires_exact_version_and_layout_size() {
+        assert_eq!(
+            validate_memory_info_query(MEMORY_INFO_VERSION as u64, MemoryInfo::SIZE as u64),
+            Ok(())
+        );
+        assert_eq!(
+            validate_memory_info_query(0, MemoryInfo::SIZE as u64),
+            Err(Status::InvalidArgument)
+        );
+        assert_eq!(
+            validate_memory_info_query(MEMORY_INFO_VERSION as u64, MemoryInfo::SIZE as u64 - 1,),
+            Err(Status::BufferTooSmall)
+        );
+        assert_eq!(
+            validate_memory_info_query(MEMORY_INFO_VERSION as u64, MemoryInfo::SIZE as u64 + 8,),
+            Err(Status::InvalidArgument)
+        );
     }
 
     #[test]
