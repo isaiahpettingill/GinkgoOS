@@ -584,6 +584,7 @@ pub enum ProcessFault {
     InvalidUserContext = 4,
     ResourceLimit = 5,
     Other = 6,
+    OutOfMemory = 7,
 }
 
 impl ProcessFault {
@@ -596,6 +597,7 @@ impl ProcessFault {
             4 => Some(Self::InvalidUserContext),
             5 => Some(Self::ResourceLimit),
             6 => Some(Self::Other),
+            7 => Some(Self::OutOfMemory),
             _ => None,
         }
     }
@@ -1217,6 +1219,7 @@ mod tests {
         assert_eq!(ProcessFault::InvalidUserContext as u32, 4);
         assert_eq!(ProcessFault::ResourceLimit as u32, 5);
         assert_eq!(ProcessFault::Other as u32, 6);
+        assert_eq!(ProcessFault::OutOfMemory as u32, 7);
     }
 
     #[test]

@@ -31,9 +31,12 @@ use crate::{
     },
 };
 
-pub const USER_STACK_SIZE: u64 = 64 * 1024;
+pub const USER_STACK_INITIAL_SIZE: u64 = 64 * 1024;
+pub const USER_STACK_MAX_SIZE: u64 = 8 * 1024 * 1024;
+pub const USER_STACK_GROWTH_SLOP: u64 = 64 * 1024;
 pub const USER_STACK_TOP: u64 = 0x0000_7fff_ffff_f000;
-pub const USER_STACK_BOTTOM: u64 = USER_STACK_TOP - USER_STACK_SIZE;
+pub const USER_STACK_BOTTOM: u64 = USER_STACK_TOP - USER_STACK_MAX_SIZE;
+pub const USER_STACK_INITIAL_BOTTOM: u64 = USER_STACK_TOP - USER_STACK_INITIAL_SIZE;
 pub const USER_STACK_GUARD_START: u64 = USER_STACK_BOTTOM - PAGE_SIZE;
 pub const SHARED_MAPPING_BASE: u64 = 0x0000_0001_0000_0000;
 /// Hard ceiling for one process's sorted semantic virtual-memory areas.
@@ -42,6 +45,10 @@ pub const MAX_VMAS: usize = 256;
 /// a process to a coherent mapping state. Such a process is quarantined terminally.
 const VM_ROLLBACK_FAILURE_REASON: u16 = 1;
 const VM_ROLLBACK_FAILURE_CODE: u64 = 0x564d_0001;
+const STACK_GROWTH_INVARIANT_REASON: u16 = 2;
+const STACK_GROWTH_INVARIANT_CODE: u64 = 0x5354_0001;
+const PAGE_FAULT_PRESENT: u64 = 1 << 0;
+const PAGE_FAULT_USER: u64 = 1 << 2;
 
 /// Magic (`GKSP`) and version for the direct-process startup block passed in RDI.
 ///
@@ -104,6 +111,7 @@ pub enum ProcessFaultReason {
     InvalidOpcode,
     InvalidUserContext,
     ResourceLimit,
+    OutOfMemory,
     Other(u16),
 }
 
@@ -239,7 +247,7 @@ impl DirectStartupBlock {
             DIRECT_STARTUP_ALIGNMENT,
         )
         .ok_or(Status::ResourceLimit)?;
-        if total_size > USER_STACK_SIZE as usize {
+        if total_size > USER_STACK_INITIAL_SIZE as usize {
             return Err(Status::ResourceLimit);
         }
 
@@ -318,11 +326,12 @@ fn put_startup_u32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
 }
 
-/// Fixed initial userspace stack layout.
+/// Reserved and initially committed userspace stack layout.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessLayout {
     pub stack_guard_start: u64,
     pub stack_bottom: u64,
+    pub stack_initial_bottom: u64,
     pub stack_top: u64,
 }
 
@@ -330,6 +339,7 @@ impl ProcessLayout {
     pub const STANDARD: Self = Self {
         stack_guard_start: USER_STACK_GUARD_START,
         stack_bottom: USER_STACK_BOTTOM,
+        stack_initial_bottom: USER_STACK_INITIAL_BOTTOM,
         stack_top: USER_STACK_TOP,
     };
 
@@ -337,13 +347,18 @@ impl ProcessLayout {
         self.stack_top - self.stack_bottom
     }
 
+    pub const fn initial_stack_size(self) -> u64 {
+        self.stack_top - self.stack_initial_bottom
+    }
+
     pub const fn randomized(random: u64) -> Self {
         let displacement = (random % STACK_ASLR_SLOTS) * STACK_ASLR_ALIGNMENT;
         let stack_top = USER_STACK_TOP - displacement;
-        let stack_bottom = stack_top - USER_STACK_SIZE;
+        let stack_bottom = stack_top - USER_STACK_MAX_SIZE;
         Self {
             stack_guard_start: stack_bottom - PAGE_SIZE,
             stack_bottom,
+            stack_initial_bottom: stack_top - USER_STACK_INITIAL_SIZE,
             stack_top,
         }
     }
@@ -416,7 +431,9 @@ pub enum VmAreaKind {
         reservation_id: u64,
         committed: bool,
     },
-    Stack,
+    Stack {
+        committed: bool,
+    },
     StackGuard,
     Shared,
 }
@@ -428,6 +445,12 @@ pub struct VmArea {
     pub end: u64,
     pub kind: VmAreaKind,
     pub protection: MapProtection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserPageFaultResolution {
+    Resolved { pages: u64 },
+    Fault(ProcessFault),
 }
 
 impl VmArea {
@@ -731,8 +754,12 @@ impl Process {
             .map(|values| ProcessLayout::randomized(values[1]))
             .unwrap_or(ProcessLayout::STANDARD);
         let limits = ProcessLimits::STANDARD;
-        let stack_pages = layout.stack_size() / PAGE_SIZE;
-        if parsed.total_load_pages().saturating_add(stack_pages) > limits.private_pages {
+        let initial_stack_pages = layout.initial_stack_size() / PAGE_SIZE;
+        if parsed
+            .total_load_pages()
+            .saturating_add(initial_stack_pages)
+            > limits.private_pages
+        {
             return Err(ProcessCreateError::ResourceLimit);
         }
         if parsed
@@ -793,7 +820,7 @@ impl Process {
             }
         };
 
-        let mut stack_page = layout.stack_bottom;
+        let mut stack_page = layout.stack_initial_bottom;
         while stack_page < layout.stack_top {
             if let Err(error) = address_space.map_zeroed_user_4k(
                 stack_page,
@@ -820,8 +847,8 @@ impl Process {
             );
         }
         if let Err(error) = address_space.validate_user_range(
-            layout.stack_bottom,
-            layout.stack_size() as usize,
+            layout.stack_initial_bottom,
+            layout.initial_stack_size() as usize,
             UserAccess::Write,
         ) {
             return reclaim_failed_construction(
@@ -842,7 +869,7 @@ impl Process {
             .iter()
             .map(|segment| segment.page_count)
             .sum::<u64>()
-            .saturating_add(layout.stack_size() / PAGE_SIZE);
+            .saturating_add(layout.initial_stack_size() / PAGE_SIZE);
         let context = UserContext::new(image.entry, layout.stack_top);
         debug_assert_eq!(context.rsp & 0xf, 0);
 
@@ -952,6 +979,130 @@ impl Process {
 
     pub const fn usage(&self) -> ProcessUsage {
         self.usage
+    }
+
+    /// Resolves an eligible non-present userspace stack fault transactionally.
+    ///
+    /// The supplied `user_rsp` must be the context captured with this fault, not
+    /// the process's previously saved scheduler context. Ineligible faults retain
+    /// their original page-fault code and address. Resource exhaustion is attributed
+    /// only to this process; allocator invariants and rollback failures quarantine it
+    /// with a stable `Other` fault rather than panicking the kernel.
+    pub fn resolve_user_page_fault(
+        &mut self,
+        fault_address: u64,
+        error_code: u64,
+        user_rsp: u64,
+        allocator: &mut UsableFrameAllocator<'_>,
+    ) -> UserPageFaultResolution {
+        let page_fault = || {
+            UserPageFaultResolution::Fault(ProcessFault::at_address(
+                ProcessFaultReason::PageFault,
+                error_code,
+                fault_address,
+            ))
+        };
+        if error_code & PAGE_FAULT_PRESENT != 0 || error_code & PAGE_FAULT_USER == 0 {
+            return page_fault();
+        }
+        if fault_address > user_rsp
+            || fault_address < user_rsp.saturating_sub(USER_STACK_GROWTH_SLOP)
+        {
+            return page_fault();
+        }
+
+        let fault_page = fault_address & !(PAGE_SIZE - 1);
+        let Some(committed_bottom) = self.stack_committed_bottom() else {
+            return self.stack_growth_invariant_fault(fault_address);
+        };
+        if fault_page < self.layout.stack_bottom || fault_page >= committed_bottom {
+            return page_fault();
+        }
+
+        let pages = (committed_bottom - fault_page) / PAGE_SIZE;
+        let Some(new_private_pages) = self.usage.private_pages.checked_add(pages) else {
+            return UserPageFaultResolution::Fault(ProcessFault::at_address(
+                ProcessFaultReason::ResourceLimit,
+                error_code,
+                fault_address,
+            ));
+        };
+        if new_private_pages > self.limits.private_pages {
+            return UserPageFaultResolution::Fault(ProcessFault::at_address(
+                ProcessFaultReason::ResourceLimit,
+                error_code,
+                fault_address,
+            ));
+        }
+        let planned_vmas = match plan_stack_growth(self.vmas(), fault_page, committed_bottom) {
+            Ok(planned) => planned,
+            Err(error) => {
+                return stack_growth_planning_fault(error, error_code, fault_address);
+            }
+        };
+
+        let mut mapped = 0usize;
+        let mapped_len = (committed_bottom - fault_page) as usize;
+        while mapped < mapped_len {
+            let page_address = fault_page + mapped as u64;
+            if let Err(mapping_error) = self.address_space_mut().map_zeroed_user_4k(
+                page_address,
+                UserPagePermissions::READ_WRITE,
+                allocator,
+            ) {
+                if mapped != 0
+                    && self
+                        .address_space_mut()
+                        .unmap_user_range(fault_page, mapped)
+                        .is_err()
+                {
+                    return self.stack_growth_invariant_fault(fault_address);
+                }
+                if self
+                    .address_space_mut()
+                    .reclaim_retired_data_frames(allocator)
+                    .is_err()
+                {
+                    return self.stack_growth_invariant_fault(fault_address);
+                }
+                return match mapping_error {
+                    AddressSpaceError::OutOfFrames => {
+                        UserPageFaultResolution::Fault(ProcessFault::at_address(
+                            ProcessFaultReason::OutOfMemory,
+                            error_code,
+                            fault_address,
+                        ))
+                    }
+                    AddressSpaceError::FrameAllocator(_) => {
+                        self.stack_growth_invariant_fault(fault_address)
+                    }
+                    _ => self.stack_growth_invariant_fault(fault_address),
+                };
+            }
+            mapped += PAGE_SIZE as usize;
+        }
+
+        *self.vmas.as_mut().expect("live process lost its VMA table") = planned_vmas;
+        self.usage.private_pages = new_private_pages;
+        UserPageFaultResolution::Resolved { pages }
+    }
+
+    fn stack_committed_bottom(&self) -> Option<u64> {
+        self.vmas()
+            .iter()
+            .filter_map(|vma| match vma.kind {
+                VmAreaKind::Stack { committed: true } => Some(vma.start),
+                _ => None,
+            })
+            .min()
+    }
+
+    fn stack_growth_invariant_fault(&self, fault_address: u64) -> UserPageFaultResolution {
+        UserPageFaultResolution::Fault(ProcessFault::at_address(
+            ProcessFaultReason::Other(STACK_GROWTH_INVARIANT_REASON),
+            STACK_GROWTH_INVARIANT_CODE,
+            fault_address,
+        ))
     }
 
     pub fn can_allocate_shared_memory(&self, bytes: usize) -> bool {
@@ -1161,7 +1312,14 @@ impl Process {
             .ok_or(SharedMappingError::ResourceLimit)?;
         let previous_cursor = self.next_mapping_cursor;
         let occupied = self.occupied_ranges()?;
-        let address = select_mapping_address(0, false, mapped_len, previous_cursor, &occupied)?;
+        let address = select_mapping_address(
+            0,
+            false,
+            mapped_len,
+            previous_cursor,
+            self.layout.stack_guard_start,
+            &occupied,
+        )?;
         let end = address
             .checked_add(mapped_len as u64)
             .ok_or(SharedMappingError::RangeOverflow)?;
@@ -1422,6 +1580,7 @@ impl Process {
             args.flags.contains(MapFlags::FIXED),
             request.mapped_len,
             self.next_mapping_cursor,
+            self.layout.stack_guard_start,
             &occupied,
         )?;
 
@@ -1505,7 +1664,7 @@ impl Process {
         if !args.flags.contains(MapFlags::FIXED) {
             self.next_mapping_cursor = address
                 .checked_add(request.mapped_len as u64)
-                .filter(|next| *next < USER_STACK_GUARD_START)
+                .filter(|next| *next < self.layout.stack_guard_start)
                 .unwrap_or(SHARED_MAPPING_BASE);
         }
         Ok(address)
@@ -1674,6 +1833,7 @@ const fn public_fault(reason: ProcessFaultReason) -> PublicProcessFault {
         ProcessFaultReason::InvalidOpcode => PublicProcessFault::InvalidOpcode,
         ProcessFaultReason::InvalidUserContext => PublicProcessFault::InvalidUserContext,
         ProcessFaultReason::ResourceLimit => PublicProcessFault::ResourceLimit,
+        ProcessFaultReason::OutOfMemory => PublicProcessFault::OutOfMemory,
         ProcessFaultReason::Other(_) => PublicProcessFault::Other,
     }
 }
@@ -1761,8 +1921,18 @@ fn initial_vmas(
         &mut vmas,
         VmArea {
             start: layout.stack_bottom,
+            end: layout.stack_initial_bottom,
+            kind: VmAreaKind::Stack { committed: false },
+            protection: MapProtection::READ | MapProtection::WRITE,
+        },
+    )
+    .map_err(|_| ProcessCreateError::ResourceLimit)?;
+    push_merged_vma(
+        &mut vmas,
+        VmArea {
+            start: layout.stack_initial_bottom,
             end: layout.stack_top,
-            kind: VmAreaKind::Stack,
+            kind: VmAreaKind::Stack { committed: true },
             protection: MapProtection::READ | MapProtection::WRITE,
         },
     )
@@ -1841,6 +2011,86 @@ fn plan_vma_insert(vmas: &[VmArea], area: VmArea) -> Result<Vec<VmArea>, SharedM
     }
     if !inserted {
         push_merged_vma(&mut planned, area)?;
+    }
+    Ok(planned)
+}
+
+fn stack_growth_planning_fault(
+    error: SharedMappingError,
+    error_code: u64,
+    fault_address: u64,
+) -> UserPageFaultResolution {
+    let reason = match error {
+        SharedMappingError::OutOfMemory => ProcessFaultReason::OutOfMemory,
+        SharedMappingError::ResourceLimit => ProcessFaultReason::ResourceLimit,
+        _ => ProcessFaultReason::Other(STACK_GROWTH_INVARIANT_REASON),
+    };
+    let code = if matches!(reason, ProcessFaultReason::Other(_)) {
+        STACK_GROWTH_INVARIANT_CODE
+    } else {
+        error_code
+    };
+    UserPageFaultResolution::Fault(ProcessFault::at_address(reason, code, fault_address))
+}
+
+fn plan_stack_growth(
+    vmas: &[VmArea],
+    start: u64,
+    end: u64,
+) -> Result<Vec<VmArea>, SharedMappingError> {
+    if start >= end || start % PAGE_SIZE != 0 || end % PAGE_SIZE != 0 {
+        return Err(SharedMappingError::RangeOverflow);
+    }
+    let mut planned = clone_vma_plan(vmas)?;
+    planned.clear();
+    let mut covered = start;
+    for area in vmas.iter().copied() {
+        if area.end <= start || area.start >= end {
+            push_merged_vma(&mut planned, area)?;
+            continue;
+        }
+        if area.start > covered || area.kind != (VmAreaKind::Stack { committed: false }) {
+            return Err(SharedMappingError::ExactMappingNotFound {
+                address: start,
+                length: end - start,
+            });
+        }
+        let middle_start = area.start.max(start);
+        let middle_end = area.end.min(end);
+        if area.start < middle_start {
+            push_merged_vma(
+                &mut planned,
+                VmArea {
+                    end: middle_start,
+                    ..area
+                },
+            )?;
+        }
+        push_merged_vma(
+            &mut planned,
+            VmArea {
+                start: middle_start,
+                end: middle_end,
+                kind: VmAreaKind::Stack { committed: true },
+                ..area
+            },
+        )?;
+        if middle_end < area.end {
+            push_merged_vma(
+                &mut planned,
+                VmArea {
+                    start: middle_end,
+                    ..area
+                },
+            )?;
+        }
+        covered = middle_end;
+    }
+    if covered != end {
+        return Err(SharedMappingError::ExactMappingNotFound {
+            address: start,
+            length: end - start,
+        });
     }
     Ok(planned)
 }
@@ -2227,6 +2477,7 @@ fn select_mapping_address(
     fixed: bool,
     mapped_len: usize,
     cursor: u64,
+    automatic_limit: u64,
     occupied: &[VirtualRange],
 ) -> Result<u64, SharedMappingError> {
     let mapped_len = u64::try_from(mapped_len).map_err(|_| SharedMappingError::RangeOverflow)?;
@@ -2253,9 +2504,9 @@ fn select_mapping_address(
     }
 
     let start = align_up(cursor.max(SHARED_MAPPING_BASE), PAGE_SIZE)
-        .filter(|address| *address < USER_STACK_GUARD_START)
+        .filter(|address| *address < automatic_limit)
         .unwrap_or(SHARED_MAPPING_BASE);
-    if let Some(address) = first_fit_mapping(start, USER_STACK_GUARD_START, mapped_len, occupied)? {
+    if let Some(address) = first_fit_mapping(start, automatic_limit, mapped_len, occupied)? {
         return Ok(address);
     }
     if start > SHARED_MAPPING_BASE {
@@ -2595,6 +2846,13 @@ mod tests {
     fn construct_test_process(
         allocator: &mut UsableFrameAllocator<'_>,
     ) -> Result<Process, ProcessCreateError> {
+        construct_test_process_with_limits(allocator, ProcessLimits::STANDARD)
+    }
+
+    fn construct_test_process_with_limits(
+        allocator: &mut UsableFrameAllocator<'_>,
+        limits: ProcessLimits,
+    ) -> Result<Process, ProcessCreateError> {
         let parsed = elf::parse(FRAME_RECLAIM_TEST_ELF).map_err(ProcessCreateError::Elf)?;
         let address_space =
             AddressSpace::new_for_test(allocator).map_err(ProcessCreateError::AddressSpace)?;
@@ -2603,7 +2861,7 @@ mod tests {
             address_space,
             VirtAddr::zero(),
             ProcessLayout::STANDARD,
-            ProcessLimits::STANDARD,
+            limits,
             allocator,
             None,
         )
@@ -3463,11 +3721,337 @@ mod tests {
     }
 
     #[test]
-    fn standard_layout_has_guard_and_aligned_stack() {
+    fn stack_vmas_reserve_the_full_maximum_and_reject_anonymous_overlap() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(64);
+        let process = construct_test_process(&mut allocator).unwrap();
+        let layout = process.layout();
+        assert!(process.vmas().iter().any(|vma| {
+            vma.start == layout.stack_guard_start
+                && vma.end == layout.stack_bottom
+                && vma.kind == VmAreaKind::StackGuard
+        }));
+        assert!(process.vmas().iter().any(|vma| {
+            vma.start == layout.stack_bottom
+                && vma.end == layout.stack_initial_bottom
+                && vma.kind == (VmAreaKind::Stack { committed: false })
+        }));
+        assert!(process.vmas().iter().any(|vma| {
+            vma.start == layout.stack_initial_bottom
+                && vma.end == layout.stack_top
+                && vma.kind == (VmAreaKind::Stack { committed: true })
+        }));
+        assert_eq!(
+            plan_vma_insert(
+                process.vmas(),
+                VmArea {
+                    start: layout.stack_bottom,
+                    end: layout.stack_bottom + PAGE_SIZE,
+                    kind: VmAreaKind::Anonymous {
+                        reservation_id: 99,
+                        committed: false,
+                    },
+                    protection: MapProtection::READ,
+                },
+            ),
+            Err(SharedMappingError::AlreadyMapped(layout.stack_bottom))
+        );
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+    }
+
+    #[test]
+    fn eligible_stack_fault_grows_zeroed_pages_and_updates_vma_accounting() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(96);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let old_bottom = process.layout().stack_initial_bottom;
+        let fault_page = old_bottom - PAGE_SIZE * 2;
+        let fault_address = fault_page + 24;
+        let baseline_private = process.usage().private_pages;
+
+        assert_eq!(
+            process.resolve_user_page_fault(
+                fault_address,
+                PAGE_FAULT_USER,
+                fault_address + 8,
+                &mut allocator,
+            ),
+            UserPageFaultResolution::Resolved { pages: 2 }
+        );
+        assert_eq!(process.usage().private_pages, baseline_private + 2);
+        assert_eq!(process.stack_committed_bottom(), Some(fault_page));
+        assert_eq!(
+            process.address_space().validate_user_range(
+                fault_page,
+                (PAGE_SIZE * 2) as usize,
+                UserAccess::Write,
+            ),
+            Ok(())
+        );
+        for page in [fault_page, fault_page + PAGE_SIZE] {
+            let frame = process
+                .address_space()
+                .mappings()
+                .iter()
+                .find(|mapping| mapping.virtual_address == page)
+                .expect("grown stack page mapping")
+                .frame;
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    frame.start_address().as_u64() as *const u8,
+                    PAGE_SIZE as usize,
+                )
+            };
+            assert!(bytes.iter().all(|byte| *byte == 0));
+        }
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+    }
+
+    #[test]
+    fn stack_fault_uses_current_captured_rsp_not_saved_process_rsp() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(80);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let old_bottom = process.layout().stack_initial_bottom;
+        let fault_address = old_bottom - 8;
+        assert_eq!(process.context().rsp, process.layout().stack_top);
+        assert!(fault_address < process.context().rsp.saturating_sub(USER_STACK_GROWTH_SLOP));
+
+        assert_eq!(
+            process.resolve_user_page_fault(
+                fault_address,
+                PAGE_FAULT_USER,
+                fault_address,
+                &mut allocator,
+            ),
+            UserPageFaultResolution::Resolved { pages: 1 }
+        );
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+    }
+
+    #[test]
+    fn guard_limit_protection_kernel_and_far_rsp_faults_remain_page_faults() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(80);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let layout = process.layout();
+        let old_bottom = layout.stack_initial_bottom;
+        let cases = [
+            (
+                layout.stack_bottom - 1,
+                PAGE_FAULT_USER,
+                layout.stack_bottom - 1,
+            ),
+            (
+                layout.stack_guard_start,
+                PAGE_FAULT_USER,
+                layout.stack_guard_start,
+            ),
+            (
+                old_bottom - 8,
+                PAGE_FAULT_USER | PAGE_FAULT_PRESENT,
+                old_bottom - 8,
+            ),
+            (old_bottom - 8, 0, old_bottom - 8),
+            (
+                old_bottom - USER_STACK_GROWTH_SLOP - PAGE_SIZE,
+                PAGE_FAULT_USER,
+                old_bottom,
+            ),
+        ];
+        let baseline_vmas = process.vmas().to_vec();
+        let baseline_private = process.usage().private_pages;
+        for (address, code, rsp) in cases {
+            assert_eq!(
+                process.resolve_user_page_fault(address, code, rsp, &mut allocator),
+                UserPageFaultResolution::Fault(ProcessFault::at_address(
+                    ProcessFaultReason::PageFault,
+                    code,
+                    address,
+                ))
+            );
+        }
+        assert_eq!(process.vmas(), baseline_vmas);
+        assert_eq!(process.usage().private_pages, baseline_private);
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+    }
+
+    #[test]
+    fn stack_growth_quota_returns_resource_limit_without_mapping() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(80);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        process.limits.private_pages = process.usage().private_pages;
+        let fault_address = process.layout().stack_initial_bottom - 8;
+        let baseline_vmas = process.vmas().to_vec();
+        let baseline_frames = allocator.allocated_count();
+
+        assert_eq!(
+            process.resolve_user_page_fault(
+                fault_address,
+                PAGE_FAULT_USER,
+                fault_address,
+                &mut allocator,
+            ),
+            UserPageFaultResolution::Fault(ProcessFault::at_address(
+                ProcessFaultReason::ResourceLimit,
+                PAGE_FAULT_USER,
+                fault_address,
+            ))
+        );
+        assert_eq!(process.vmas(), baseline_vmas);
+        assert_eq!(allocator.allocated_count(), baseline_frames);
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+    }
+
+    #[test]
+    fn stack_growth_physical_oom_is_attributed_to_faulting_process() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(64);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let mut held = Vec::new();
+        while let Some(frame) = allocator.allocate_frame().unwrap() {
+            held.push(frame);
+        }
+        let fault_address = process.layout().stack_initial_bottom - 8;
+        let baseline_vmas = process.vmas().to_vec();
+        let baseline_private = process.usage().private_pages;
+
+        assert_eq!(
+            process.resolve_user_page_fault(
+                fault_address,
+                PAGE_FAULT_USER,
+                fault_address,
+                &mut allocator,
+            ),
+            UserPageFaultResolution::Fault(ProcessFault::at_address(
+                ProcessFaultReason::OutOfMemory,
+                PAGE_FAULT_USER,
+                fault_address,
+            ))
+        );
+        assert_eq!(process.state(), ProcessState::Ready);
+        assert_eq!(process.vmas(), baseline_vmas);
+        assert_eq!(process.usage().private_pages, baseline_private);
+        allocator.reclaim_frames(&held).unwrap();
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+    }
+
+    #[test]
+    fn partial_stack_growth_oom_rolls_back_pages_vma_and_accounting() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(80);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let mut held = Vec::new();
+        while let Some(frame) = allocator.allocate_frame().unwrap() {
+            held.push(frame);
+        }
+        let available = held.pop().expect("one frame to release");
+        allocator.deallocate_frame(available).unwrap();
+        let old_bottom = process.layout().stack_initial_bottom;
+        let fault_page = old_bottom - PAGE_SIZE * 2;
+        let fault_address = fault_page + 8;
+        let baseline_vmas = process.vmas().to_vec();
+        let baseline_private = process.usage().private_pages;
+        let baseline_frames = allocator.allocated_count();
+
+        assert_eq!(
+            process.resolve_user_page_fault(
+                fault_address,
+                PAGE_FAULT_USER,
+                fault_address,
+                &mut allocator,
+            ),
+            UserPageFaultResolution::Fault(ProcessFault::at_address(
+                ProcessFaultReason::OutOfMemory,
+                PAGE_FAULT_USER,
+                fault_address,
+            ))
+        );
+        assert_eq!(process.vmas(), baseline_vmas);
+        assert_eq!(process.usage().private_pages, baseline_private);
+        assert_eq!(allocator.allocated_count(), baseline_frames);
+        for page in [fault_page, fault_page + PAGE_SIZE] {
+            assert!(matches!(
+                process.address_space().validate_user_range(
+                    page,
+                    PAGE_SIZE as usize,
+                    UserAccess::Read,
+                ),
+                Err(AddressSpaceError::NotMapped(_))
+            ));
+        }
+        allocator.reclaim_frames(&held).unwrap();
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+    }
+
+    #[test]
+    fn stack_growth_planning_preserves_resource_failure_classification() {
+        let address = USER_STACK_INITIAL_BOTTOM - 8;
+        assert_eq!(
+            stack_growth_planning_fault(SharedMappingError::OutOfMemory, PAGE_FAULT_USER, address,),
+            UserPageFaultResolution::Fault(ProcessFault::at_address(
+                ProcessFaultReason::OutOfMemory,
+                PAGE_FAULT_USER,
+                address,
+            ))
+        );
+        assert_eq!(
+            stack_growth_planning_fault(
+                SharedMappingError::ResourceLimit,
+                PAGE_FAULT_USER,
+                address,
+            ),
+            UserPageFaultResolution::Fault(ProcessFault::at_address(
+                ProcessFaultReason::ResourceLimit,
+                PAGE_FAULT_USER,
+                address,
+            ))
+        );
+        assert_eq!(
+            stack_growth_planning_fault(
+                SharedMappingError::ExactMappingNotFound {
+                    address,
+                    length: PAGE_SIZE,
+                },
+                PAGE_FAULT_USER,
+                address,
+            ),
+            UserPageFaultResolution::Fault(ProcessFault::at_address(
+                ProcessFaultReason::Other(STACK_GROWTH_INVARIANT_REASON),
+                STACK_GROWTH_INVARIANT_CODE,
+                address,
+            ))
+        );
+    }
+
+    #[test]
+    fn malformed_stack_vma_returns_other_process_fault_without_panicking() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(80);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        process
+            .vmas
+            .as_mut()
+            .unwrap()
+            .retain(|vma| !matches!(vma.kind, VmAreaKind::Stack { committed: true }));
+        let fault_address = process.layout().stack_initial_bottom - 8;
+        assert_eq!(
+            process.resolve_user_page_fault(
+                fault_address,
+                PAGE_FAULT_USER,
+                fault_address,
+                &mut allocator,
+            ),
+            UserPageFaultResolution::Fault(ProcessFault::at_address(
+                ProcessFaultReason::Other(STACK_GROWTH_INVARIANT_REASON),
+                STACK_GROWTH_INVARIANT_CODE,
+                fault_address,
+            ))
+        );
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+    }
+
+    #[test]
+    fn standard_layout_has_permanent_guard_reservation_and_initial_commit() {
         let layout = ProcessLayout::STANDARD;
-        assert_eq!(layout.stack_size(), 64 * 1024);
+        assert_eq!(layout.stack_size(), USER_STACK_MAX_SIZE);
+        assert_eq!(layout.initial_stack_size(), USER_STACK_INITIAL_SIZE);
         assert_eq!(layout.stack_bottom - layout.stack_guard_start, PAGE_SIZE);
         assert_eq!(layout.stack_bottom % PAGE_SIZE, 0);
+        assert_eq!(layout.stack_initial_bottom % PAGE_SIZE, 0);
         assert_eq!(layout.stack_top % 16, 0);
         assert!(layout.stack_top < USER_ADDRESS_END);
     }
@@ -3478,7 +4062,8 @@ mod tests {
         let second = ProcessLayout::randomized(2);
         assert_ne!(first, second);
         for layout in [first, second] {
-            assert_eq!(layout.stack_size(), USER_STACK_SIZE);
+            assert_eq!(layout.stack_size(), USER_STACK_MAX_SIZE);
+            assert_eq!(layout.initial_stack_size(), USER_STACK_INITIAL_SIZE);
             assert_eq!(layout.stack_top % 16, 0);
             assert_eq!(layout.stack_guard_start % PAGE_SIZE, 0);
             assert!(layout.stack_guard_start >= PAGE_SIZE);
@@ -3574,15 +4159,36 @@ mod tests {
     fn fixed_selection_is_exact_and_rejects_overlap() {
         let occupied = [VirtualRange::new(0x4000, 0x6000).unwrap()];
         assert_eq!(
-            select_mapping_address(0x8000, true, 4096, SHARED_MAPPING_BASE, &occupied),
+            select_mapping_address(
+                0x8000,
+                true,
+                4096,
+                SHARED_MAPPING_BASE,
+                USER_STACK_GUARD_START,
+                &occupied,
+            ),
             Ok(0x8000)
         );
         assert_eq!(
-            select_mapping_address(0x5000, true, 4096, SHARED_MAPPING_BASE, &occupied),
+            select_mapping_address(
+                0x5000,
+                true,
+                4096,
+                SHARED_MAPPING_BASE,
+                USER_STACK_GUARD_START,
+                &occupied,
+            ),
             Err(SharedMappingError::AlreadyMapped(0x5000))
         );
         assert_eq!(
-            select_mapping_address(0x8001, true, 4096, SHARED_MAPPING_BASE, &occupied),
+            select_mapping_address(
+                0x8001,
+                true,
+                4096,
+                SHARED_MAPPING_BASE,
+                USER_STACK_GUARD_START,
+                &occupied,
+            ),
             Err(SharedMappingError::UnalignedFixedAddress(0x8001))
         );
     }
@@ -3594,11 +4200,25 @@ mod tests {
             VirtualRange::new(SHARED_MAPPING_BASE, SHARED_MAPPING_BASE + PAGE_SIZE).unwrap(),
         ];
         assert_eq!(
-            select_mapping_address(0xa001, false, 4096, SHARED_MAPPING_BASE, &occupied),
+            select_mapping_address(
+                0xa001,
+                false,
+                4096,
+                SHARED_MAPPING_BASE,
+                USER_STACK_GUARD_START,
+                &occupied,
+            ),
             Ok(0xb000)
         );
         assert_eq!(
-            select_mapping_address(0x8000, false, 4096, SHARED_MAPPING_BASE, &occupied),
+            select_mapping_address(
+                0x8000,
+                false,
+                4096,
+                SHARED_MAPPING_BASE,
+                USER_STACK_GUARD_START,
+                &occupied,
+            ),
             Ok(SHARED_MAPPING_BASE + PAGE_SIZE)
         );
     }
@@ -3608,7 +4228,14 @@ mod tests {
         let occupied =
             [VirtualRange::new(SHARED_MAPPING_BASE, USER_STACK_GUARD_START - PAGE_SIZE).unwrap()];
         assert_eq!(
-            select_mapping_address(0, false, PAGE_SIZE as usize, SHARED_MAPPING_BASE, &occupied),
+            select_mapping_address(
+                0,
+                false,
+                PAGE_SIZE as usize,
+                SHARED_MAPPING_BASE,
+                USER_STACK_GUARD_START,
+                &occupied,
+            ),
             Ok(USER_STACK_GUARD_START - PAGE_SIZE)
         );
         assert_eq!(
@@ -3617,6 +4244,7 @@ mod tests {
                 false,
                 (PAGE_SIZE * 2) as usize,
                 SHARED_MAPPING_BASE,
+                USER_STACK_GUARD_START,
                 &occupied,
             ),
             Err(SharedMappingError::NoAddressSpace)

@@ -1550,6 +1550,7 @@ fn fault_name(fault: Option<ProcessFault>) -> &'static str {
         Some(ProcessFault::InvalidUserContext) => "invalid-user-context",
         Some(ProcessFault::ResourceLimit) => "resource-limit",
         Some(ProcessFault::Other) => "other",
+        Some(ProcessFault::OutOfMemory) => "out-of-memory",
         None => "unknown",
     }
 }

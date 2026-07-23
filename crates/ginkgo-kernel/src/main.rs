@@ -44,7 +44,10 @@ use ginkgo_kernel::{
     memory::{UsableFrameAllocator, VirtAddr, VirtPage},
     paging::{ActivePageTable, PageTableFlags},
     power::AcpiPower,
-    process::{Process, ProcessFault, ProcessFaultReason, ProcessId, ProcessState, ProcessTable},
+    process::{
+        Process, ProcessFault, ProcessFaultReason, ProcessId, ProcessState, ProcessTable,
+        UserPageFaultResolution,
+    },
     syscall::{self, DebugSink, SyscallOutcome},
     task::{Scheduler, TaskPoll, TaskState},
     trust::TrustedManifest,
@@ -2222,19 +2225,35 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                             }
                         }
                         Ok(KernelExit::Fault(fault)) => {
-                            let reason = match fault.vector {
-                                14 => ProcessFaultReason::PageFault,
-                                13 => ProcessFaultReason::GeneralProtection,
-                                6 => ProcessFaultReason::InvalidOpcode,
-                                vector => ProcessFaultReason::Other(
-                                    u16::try_from(vector).unwrap_or(u16::MAX),
-                                ),
-                            };
-                            process.mark_faulted(ProcessFault {
-                                reason,
-                                code: fault.error_code,
-                                address: fault.fault_address,
-                            });
+                            if fault.vector == 14 {
+                                let fault_address = fault
+                                    .fault_address
+                                    .expect("page-fault exit must include CR2");
+                                match process.resolve_user_page_fault(
+                                    fault_address,
+                                    fault.error_code,
+                                    user_context.rsp,
+                                    &mut context.frames,
+                                ) {
+                                    UserPageFaultResolution::Resolved { .. } => {}
+                                    UserPageFaultResolution::Fault(fault) => {
+                                        process.mark_faulted(fault);
+                                    }
+                                }
+                            } else {
+                                let reason = match fault.vector {
+                                    13 => ProcessFaultReason::GeneralProtection,
+                                    6 => ProcessFaultReason::InvalidOpcode,
+                                    vector => ProcessFaultReason::Other(
+                                        u16::try_from(vector).unwrap_or(u16::MAX),
+                                    ),
+                                };
+                                process.mark_faulted(ProcessFault {
+                                    reason,
+                                    code: fault.error_code,
+                                    address: fault.fault_address,
+                                });
+                            }
                         }
                         Ok(KernelExit::ExitToKernel) => {
                             let mut sink = SerialDebugSink::new(&mut context.serial);
