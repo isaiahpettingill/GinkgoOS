@@ -63,8 +63,11 @@ impl EntryFlags {
     pub const FILESYSTEM: Self = Self(1 << 1);
     /// Allow this application to request registry-governed child launches.
     pub const PROCESS_LAUNCH: Self = Self(1 << 2);
+    /// Allow this application to open documents with the registered text editor.
+    pub const OPEN_DOCUMENT: Self = Self(1 << 3);
 
-    const KNOWN_BITS: u16 = Self::HIDDEN.0 | Self::FILESYSTEM.0 | Self::PROCESS_LAUNCH.0;
+    const KNOWN_BITS: u16 =
+        Self::HIDDEN.0 | Self::FILESYSTEM.0 | Self::PROCESS_LAUNCH.0 | Self::OPEN_DOCUMENT.0;
 
     /// Creates flags if every bit is known to this format version.
     pub const fn from_bits(bits: u16) -> Option<Self> {
@@ -107,6 +110,10 @@ impl fmt::Debug for EntryFlags {
             formatter.write_str("EntryFlags(HIDDEN)")
         } else if *self == Self::FILESYSTEM {
             formatter.write_str("EntryFlags(FILESYSTEM)")
+        } else if *self == Self::PROCESS_LAUNCH {
+            formatter.write_str("EntryFlags(PROCESS_LAUNCH)")
+        } else if *self == Self::OPEN_DOCUMENT {
+            formatter.write_str("EntryFlags(OPEN_DOCUMENT)")
         } else {
             write!(formatter, "EntryFlags({:#06x})", self.0)
         }
@@ -568,7 +575,7 @@ pub fn encode(entries: &[EncodeEntry<'_>]) -> Result<alloc::vec::Vec<u8>, ParseE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::{vec, vec::Vec};
+    use alloc::{format, vec, vec::Vec};
 
     type RawEntry<'a> = (&'a [u8], &'a [u8], &'a [u8], u16);
     type InvalidUtf8Case<'a> = (&'a [u8], &'a [u8], &'a [u8], Field);
@@ -844,6 +851,21 @@ mod tests {
                 flags: entry.flags,
             })
         );
+    }
+
+    #[test]
+    fn accepts_open_document_as_a_known_wire_flag() {
+        let bytes = raw_registry(&[(
+            b"org.ginkgo.files",
+            b"Files",
+            b"/bin/files",
+            EntryFlags::OPEN_DOCUMENT.bits(),
+        )]);
+        let entry = Registry::parse(&bytes).unwrap().entries().next().unwrap();
+
+        assert_eq!(EntryFlags::OPEN_DOCUMENT.bits(), 1 << 3);
+        assert_eq!(entry.flags, EntryFlags::OPEN_DOCUMENT);
+        assert_eq!(format!("{:?}", entry.flags), "EntryFlags(OPEN_DOCUMENT)");
     }
 
     #[test]

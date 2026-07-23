@@ -14,16 +14,23 @@ use serde::{Deserialize, Serialize};
 pub const CONSOLE_PROTOCOL_ID: u32 = u32::from_le_bytes(*b"GCON");
 /// Stable RPC protocol identifier for terminal launch requests (`GLCH`).
 pub const LAUNCH_PROTOCOL_ID: u32 = u32::from_le_bytes(*b"GLCH");
+/// Stable RPC protocol identifier for document startup messages (`GDOC`).
+pub const DOCUMENT_PROTOCOL_ID: u32 = u32::from_le_bytes(*b"GDOC");
 /// RPC method carrying a postcard-encoded [`ConsoleMessage`].
 pub const CONSOLE_MESSAGE_METHOD_ID: u32 = 1;
 /// RPC method carrying a postcard-encoded [`LaunchRequest`].
 pub const LAUNCH_REQUEST_METHOD_ID: u32 = 1;
+/// RPC method carrying a postcard-encoded [`OpenDocument`].
+pub const OPEN_DOCUMENT_METHOD_ID: u32 = 1;
 /// Maximum application identifier length accepted by the program registry.
 pub const MAX_APP_ID_LEN: usize = 255;
+/// Maximum UTF-8 byte length accepted for an [`OpenDocument`] path.
+pub const MAX_DOCUMENT_PATH_BYTES: usize = 512;
 
 const TRANSACTION_ID: u64 = 0;
 const CONSOLE_ATTACHMENT_COUNT: usize = 0;
 const LAUNCH_ATTACHMENT_COUNT: usize = 1;
+const DOCUMENT_ATTACHMENT_COUNT: usize = 0;
 const STARTUP_ATTACHMENT_INDEX: u16 = 0;
 
 /// One message on a terminal console channel.
@@ -42,6 +49,12 @@ pub struct LaunchRequest {
     pub startup_attachment: u16,
 }
 
+/// Requests that a text editor open one document over its existing startup channel.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct OpenDocument {
+    pub path: String,
+}
+
 /// Strict terminal protocol framing, attachment, or payload validation failure.
 #[derive(Debug)]
 pub enum ProtocolCodecError {
@@ -52,6 +65,7 @@ pub enum ProtocolCodecError {
     TransactionMismatch { expected: u64, received: u64 },
     AttachmentCountMismatch { expected: usize, received: usize },
     InvalidAppId,
+    InvalidDocumentPath,
     InvalidStartupAttachment { received: u16 },
 }
 
@@ -120,6 +134,33 @@ pub fn decode_launch_request(
     Ok(request)
 }
 
+/// Encodes one validated document startup message as an `RpcHeader` and postcard payload.
+pub fn encode_open_document(document: &OpenDocument) -> Result<Vec<u8>, ProtocolCodecError> {
+    validate_open_document(document)?;
+    encode_structured(
+        RpcHeader::new(
+            TRANSACTION_ID,
+            DOCUMENT_PROTOCOL_ID,
+            OPEN_DOCUMENT_METHOD_ID,
+            RpcFlags::ONE_WAY,
+        ),
+        document,
+    )
+    .map_err(Into::into)
+}
+
+/// Decodes and strictly validates one document startup message with no attachments.
+pub fn decode_open_document(
+    bytes: &[u8],
+    attachment_count: usize,
+) -> Result<OpenDocument, ProtocolCodecError> {
+    let (header, document) = decode_structured::<OpenDocument>(bytes)?;
+    validate_header(&header, DOCUMENT_PROTOCOL_ID, OPEN_DOCUMENT_METHOD_ID)?;
+    validate_attachment_count(DOCUMENT_ATTACHMENT_COUNT, attachment_count)?;
+    validate_open_document(&document)?;
+    Ok(document)
+}
+
 fn validate_header(
     header: &RpcHeader,
     expected_protocol: u32,
@@ -171,6 +212,27 @@ fn validate_launch_request(request: &LaunchRequest) -> Result<(), ProtocolCodecE
     Ok(())
 }
 
+fn validate_open_document(document: &OpenDocument) -> Result<(), ProtocolCodecError> {
+    if !valid_document_path(&document.path) {
+        return Err(ProtocolCodecError::InvalidDocumentPath);
+    }
+    Ok(())
+}
+
+fn valid_document_path(path: &str) -> bool {
+    if path.is_empty()
+        || path.len() > MAX_DOCUMENT_PATH_BYTES
+        || path.starts_with('/')
+        || path.ends_with('/')
+        || path.contains(['\\', '\0'])
+    {
+        return false;
+    }
+
+    path.split('/')
+        .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
 fn valid_app_id(app_id: &str) -> bool {
     if app_id.is_empty() || app_id.len() > MAX_APP_ID_LEN {
         return false;
@@ -199,6 +261,25 @@ mod tests {
             app_id: "org.ginkgo.shell-2".to_string(),
             startup_attachment: 0,
         }
+    }
+
+    fn open_document(path: &str) -> OpenDocument {
+        OpenDocument {
+            path: path.to_string(),
+        }
+    }
+
+    fn encode_unvalidated_open_document(document: &OpenDocument) -> Vec<u8> {
+        encode_structured(
+            RpcHeader::new(
+                0,
+                DOCUMENT_PROTOCOL_ID,
+                OPEN_DOCUMENT_METHOD_ID,
+                RpcFlags::ONE_WAY,
+            ),
+            document,
+        )
+        .unwrap()
     }
 
     fn replace_u32(message: &mut [u8], offset: usize, value: u32) {
@@ -408,6 +489,112 @@ mod tests {
             Err(ProtocolCodecError::TransactionMismatch {
                 expected: 0,
                 received: 12
+            })
+        ));
+    }
+
+    #[test]
+    fn open_document_round_trips_unicode_relative_paths() {
+        for path in ["notes.txt", "docs/design/overview.md", "資料/設計書.md"] {
+            let document = open_document(path);
+            let bytes = encode_open_document(&document).unwrap();
+
+            assert_eq!(decode_open_document(&bytes, 0).unwrap(), document);
+        }
+    }
+
+    #[test]
+    fn open_document_codec_accepts_exact_path_byte_limit() {
+        let document = OpenDocument {
+            path: "a".repeat(MAX_DOCUMENT_PATH_BYTES),
+        };
+        let bytes = encode_open_document(&document).unwrap();
+
+        assert_eq!(decode_open_document(&bytes, 0).unwrap(), document);
+    }
+
+    #[test]
+    fn open_document_codec_rejects_invalid_paths_on_encode_and_decode() {
+        let oversized = "a".repeat(MAX_DOCUMENT_PATH_BYTES + 1);
+        let invalid = [
+            "",
+            "/absolute.txt",
+            "trailing/",
+            "dir\\file.txt",
+            "nul\0file.txt",
+            "dir//file.txt",
+            ".",
+            "..",
+            "./file.txt",
+            "dir/./file.txt",
+            "../file.txt",
+            "dir/../file.txt",
+            oversized.as_str(),
+        ];
+
+        for path in invalid {
+            let document = open_document(path);
+            assert!(
+                matches!(
+                    encode_open_document(&document),
+                    Err(ProtocolCodecError::InvalidDocumentPath)
+                ),
+                "encoded invalid path {path:?}"
+            );
+
+            let bytes = encode_unvalidated_open_document(&document);
+            assert!(
+                matches!(
+                    decode_open_document(&bytes, 0),
+                    Err(ProtocolCodecError::InvalidDocumentPath)
+                ),
+                "decoded invalid path {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_document_decoder_requires_zero_attachments() {
+        let bytes = encode_open_document(&open_document("notes.txt")).unwrap();
+
+        for count in [1, 2] {
+            assert!(matches!(
+                decode_open_document(&bytes, count),
+                Err(ProtocolCodecError::AttachmentCountMismatch {
+                    expected: 0,
+                    received
+                }) if received == count
+            ));
+        }
+    }
+
+    #[test]
+    fn open_document_decoder_rejects_header_changes() {
+        let original = encode_open_document(&open_document("notes.txt")).unwrap();
+        let u32_cases = [
+            (8, LAUNCH_PROTOCOL_ID, "protocol"),
+            (12, 99, "method"),
+            (16, RpcFlags::RESPONSE.bits(), "flags"),
+        ];
+        for (offset, value, kind) in u32_cases {
+            let mut bytes = original.clone();
+            replace_u32(&mut bytes, offset, value);
+            let error = decode_open_document(&bytes, 0).unwrap_err();
+            assert!(matches!(
+                (kind, error),
+                ("protocol", ProtocolCodecError::WrongProtocol { .. })
+                    | ("method", ProtocolCodecError::WrongMethod { .. })
+                    | ("flags", ProtocolCodecError::WrongFlags { .. })
+            ));
+        }
+
+        let mut bytes = original;
+        replace_u64(&mut bytes, 0, 1);
+        assert!(matches!(
+            decode_open_document(&bytes, 0),
+            Err(ProtocolCodecError::TransactionMismatch {
+                expected: 0,
+                received: 1
             })
         ));
     }

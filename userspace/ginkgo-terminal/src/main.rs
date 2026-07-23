@@ -56,7 +56,7 @@ extern "C" fn process_main(window_raw: u64, filesystem_raw: u64, _arg2: u64, pow
     );
     push_line(
         &mut scrollback,
-        String::from("Use source \"file.rhai\" to run a script."),
+        String::from("Type help for commands, syntax, and application launching."),
     );
     let mut redraw = false;
 

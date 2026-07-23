@@ -6,12 +6,15 @@ extern crate alloc;
 use alloc::{format, string::String, vec, vec::Vec};
 
 use ginkgo_graphics::Rgb;
+use ginkgo_terminal_protocol::{
+    encode_launch_request, encode_open_document, LaunchRequest, OpenDocument,
+};
 use ginkgo_userspace::{
-    debug_write, filesystem_open, filesystem_open_directory, filesystem_read,
-    filesystem_read_directory2, filesystem_remove_directory, filesystem_stat, filesystem_unlink,
-    handle_close, process_yield,
+    channel_create, channel_write, debug_write, filesystem_open_directory,
+    filesystem_read_directory2, filesystem_remove_directory, filesystem_unlink, handle_close,
+    process_yield,
     window::{ButtonState, ClientError, Event, WindowClient, WindowOptions},
-    FilesystemEntryKind, FilesystemOpenFlags, Handle, Status, WindowTransport,
+    FilesystemEntryKind, Handle, HandleDisposition, Rights, Status, WindowTransport,
     WindowTransportError,
 };
 
@@ -20,9 +23,11 @@ const DOWN_USAGE: u16 = 0x51;
 const ENTER_USAGE: u16 = 0x28;
 const BACKSPACE_USAGE: u16 = 0x2a;
 const DELETE_USAGE: u16 = 0x4c;
-const MAX_PREVIEW_BYTES: usize = 8 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 128;
 const MAX_EVENTS_PER_TURN: usize = 32;
+const EDITOR_CHANNEL_RIGHTS: Rights = Rights::from_bits_retain(
+    Rights::READ.bits() | Rights::WRITE.bits() | Rights::WAIT.bits() | Rights::TRANSFER.bits(),
+);
 
 ginkgo_runtime::entry!(process_main);
 
@@ -82,6 +87,10 @@ extern "C" fn process_main(
             }
         }
 
+        if navigator.retry_launch(client.transport().channel()) {
+            redraw = true;
+        }
+
         if redraw {
             match submit_frame(&mut client, &navigator) {
                 SubmitResult::Submitted => redraw = false,
@@ -112,17 +121,43 @@ struct DirectoryLevel {
     owned: bool,
 }
 
-struct Preview {
-    name: String,
-    bytes: Vec<u8>,
-    size: u64,
+#[derive(Clone, Copy)]
+enum LaunchPhase {
+    QueueDocument,
+    SendLaunch,
+}
+
+struct PendingLaunch {
+    sender: Option<Handle>,
+    editor_endpoint: Option<Handle>,
+    document_bytes: Vec<u8>,
+    launch_bytes: Vec<u8>,
+    phase: LaunchPhase,
+    path: String,
+}
+
+impl Drop for PendingLaunch {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            let _ = handle_close(sender);
+        }
+        if let Some(editor_endpoint) = self.editor_endpoint.take() {
+            let _ = handle_close(editor_endpoint);
+        }
+    }
+}
+
+enum LaunchProgress {
+    Pending,
+    Launched,
+    Failed(Status),
 }
 
 struct Navigator {
     directories: Vec<DirectoryLevel>,
     entries: Vec<Entry>,
     selected: usize,
-    preview: Option<Preview>,
+    pending_launch: Option<PendingLaunch>,
     status: String,
 }
 
@@ -136,7 +171,7 @@ impl Navigator {
             }],
             entries: Vec::new(),
             selected: 0,
-            preview: None,
+            pending_launch: None,
             status: String::from("Loading filesystem..."),
         }
     }
@@ -149,19 +184,31 @@ impl Navigator {
     }
 
     fn current_path(&self) -> String {
-        let mut path = String::from("/");
-        for (index, directory) in self.directories.iter().skip(1).enumerate() {
-            if index != 0 {
-                path.push('/');
-            }
+        let mut path = String::from("/user");
+        for directory in self.directories.iter().skip(1) {
+            path.push('/');
             path.push_str(&directory.name);
         }
         path
     }
 
+    fn selected_path(&self, name: &str) -> String {
+        let mut path = String::new();
+        for directory in self.directories.iter().skip(1) {
+            if !path.is_empty() {
+                path.push('/');
+            }
+            path.push_str(&directory.name);
+        }
+        if !path.is_empty() {
+            path.push('/');
+        }
+        path.push_str(name);
+        path
+    }
+
     fn refresh(&mut self) {
         self.entries.clear();
-        self.preview = None;
 
         let directory = self.current_directory();
 
@@ -210,7 +257,7 @@ impl Navigator {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        if self.preview.is_some() || self.entries.is_empty() {
+        if self.entries.is_empty() {
             return;
         }
         if delta < 0 {
@@ -221,13 +268,10 @@ impl Navigator {
     }
 
     fn open_selected(&mut self) {
-        if self.preview.is_some() {
-            return;
-        }
-        let Some((name, kind, metadata_size)) = self
+        let Some((name, kind)) = self
             .entries
             .get(self.selected)
-            .map(|entry| (entry.name.clone(), entry.kind, entry.size))
+            .map(|entry| (entry.name.clone(), entry.kind))
         else {
             return;
         };
@@ -247,46 +291,69 @@ impl Navigator {
             }
             return;
         }
+        if self.pending_launch.is_some() {
+            self.status = String::from("An editor launch is already pending");
+            return;
+        }
 
-        let file = match filesystem_open(anchor, &name, FilesystemOpenFlags::READ) {
-            Ok(file) => file,
-            Err(error) => {
-                self.status = format!("Open failed: {:?}", error);
+        let path = self.selected_path(&name);
+        let document_bytes = match encode_open_document(&OpenDocument { path: path.clone() }) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.status = String::from("Selected path cannot be opened by the editor");
                 return;
             }
         };
-        let result = (|| {
-            let stat = filesystem_stat(file)?;
-            let length = usize::try_from(stat.length)
-                .unwrap_or(usize::MAX)
-                .min(MAX_PREVIEW_BYTES);
-            let mut bytes = vec![0; length];
-            let count = filesystem_read(file, 0, &mut bytes)?;
-            bytes.truncate(count);
-            Ok::<_, Status>((bytes, stat.length))
-        })();
-        let _ = handle_close(file);
-        match result {
-            Ok((bytes, size)) => {
-                self.status = if size > MAX_PREVIEW_BYTES as u64 {
-                    String::from("Preview truncated to 8 KiB")
-                } else {
-                    format!("{} bytes read", bytes.len())
-                };
-                self.preview = Some(Preview {
-                    name,
-                    bytes,
-                    size: metadata_size,
-                });
+        let launch_bytes = match encode_launch_request(&LaunchRequest {
+            app_id: String::from("text-editor"),
+            startup_attachment: 0,
+        }) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.status = String::from("Could not encode the editor launch request");
+                return;
             }
-            Err(error) => self.status = format!("Read failed: {:?}", error),
+        };
+        let (sender, editor_endpoint) = match channel_create() {
+            Ok(pair) => pair,
+            Err(error) => {
+                self.status = format!("Editor channel creation failed: {:?}", error);
+                return;
+            }
+        };
+        self.status = format!("Opening {} in text editor...", path);
+        self.pending_launch = Some(PendingLaunch {
+            sender: Some(sender),
+            editor_endpoint: Some(editor_endpoint),
+            document_bytes,
+            launch_bytes,
+            phase: LaunchPhase::QueueDocument,
+            path,
+        });
+    }
+
+    fn retry_launch(&mut self, desktop: Handle) -> bool {
+        let Some(pending) = self.pending_launch.as_mut() else {
+            return false;
+        };
+        let progress = pending.advance(desktop);
+        match progress {
+            LaunchProgress::Pending => false,
+            LaunchProgress::Launched => {
+                let path = pending.path.clone();
+                self.pending_launch = None;
+                self.status = format!("Requested text editor for {}", path);
+                true
+            }
+            LaunchProgress::Failed(error) => {
+                self.pending_launch = None;
+                self.status = format!("Editor launch failed: {:?}", error);
+                true
+            }
         }
     }
 
     fn delete_selected(&mut self) {
-        if self.preview.is_some() {
-            return;
-        }
         let Some((name, kind)) = self
             .entries
             .get(self.selected)
@@ -313,10 +380,6 @@ impl Navigator {
     }
 
     fn show_directory(&mut self) {
-        if self.preview.take().is_some() {
-            self.status = format!("{} entries", self.entries.len());
-            return;
-        }
         if self.directories.len() <= 1 {
             return;
         }
@@ -330,11 +393,53 @@ impl Navigator {
     }
 
     fn shutdown(&mut self) {
+        self.pending_launch = None;
         while self.directories.len() > 1 {
             if let Some(directory) = self.directories.pop() {
                 if directory.owned {
                     let _ = handle_close(directory.handle);
                 }
+            }
+        }
+    }
+}
+
+impl PendingLaunch {
+    fn advance(&mut self, desktop: Handle) -> LaunchProgress {
+        loop {
+            let result = match self.phase {
+                LaunchPhase::QueueDocument => {
+                    let Some(sender) = self.sender else {
+                        return LaunchProgress::Failed(Status::InvalidHandle);
+                    };
+                    channel_write(sender, &self.document_bytes, &[])
+                }
+                LaunchPhase::SendLaunch => {
+                    let Some(editor_endpoint) = self.editor_endpoint else {
+                        return LaunchProgress::Failed(Status::InvalidHandle);
+                    };
+                    let disposition =
+                        HandleDisposition::move_handle(editor_endpoint, EDITOR_CHANNEL_RIGHTS);
+                    channel_write(desktop, &self.launch_bytes, &[disposition])
+                }
+            };
+
+            match result {
+                Ok(()) => match self.phase {
+                    LaunchPhase::QueueDocument => {
+                        if let Some(sender) = self.sender.take() {
+                            let _ = handle_close(sender);
+                        }
+                        self.phase = LaunchPhase::SendLaunch;
+                    }
+                    LaunchPhase::SendLaunch => {
+                        // A successful move consumed the endpoint; disarm Drop's cleanup.
+                        self.editor_endpoint = None;
+                        return LaunchProgress::Launched;
+                    }
+                },
+                Err(Status::ShouldWait) => return LaunchProgress::Pending,
+                Err(error) => return LaunchProgress::Failed(error),
             }
         }
     }
@@ -398,107 +503,50 @@ fn submit_frame(client: &mut WindowClient<WindowTransport>, navigator: &Navigato
     surface.draw_text(20, 68, 1, &navigator.status, Rgb::new(165, 180, 200));
 
     let available_lines = surface.height().saturating_sub(116) / 18;
-    if let Some(preview) = navigator.preview.as_ref() {
-        surface.draw_text(20, 96, 1, &preview.name, Rgb::new(245, 190, 90));
-        surface.draw_text(
-            20,
-            114,
-            1,
-            &format!("file   metadata size: {} B", preview.size),
-            Rgb::new(165, 180, 200),
+    let first = navigator
+        .selected
+        .saturating_sub(available_lines.saturating_sub(1));
+    for (row, (index, entry)) in navigator
+        .entries
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(available_lines)
+        .enumerate()
+    {
+        let marker = if index == navigator.selected {
+            ">"
+        } else {
+            " "
+        };
+        let kind = match entry.kind {
+            FilesystemEntryKind::File => "file",
+            FilesystemEntryKind::Directory => "dir ",
+        };
+        let line = format!(
+            "{} {:<4} {:<35} {:>8} B",
+            marker, kind, entry.name, entry.size
         );
-        let text = printable_preview(&preview.bytes, available_lines.saturating_sub(2), 74);
-        surface.draw_text_wrapped(
-            20,
-            136,
-            surface.width().saturating_sub(40),
-            1,
-            &text,
-            Rgb::new(220, 225, 235),
-        );
-        surface.draw_text(
-            20,
-            surface.height().saturating_sub(22),
-            1,
-            "Backspace: file list",
-            Rgb::new(120, 140, 160),
-        );
-    } else {
-        let first = navigator
-            .selected
-            .saturating_sub(available_lines.saturating_sub(1));
-        for (row, (index, entry)) in navigator
-            .entries
-            .iter()
-            .enumerate()
-            .skip(first)
-            .take(available_lines)
-            .enumerate()
-        {
-            let marker = if index == navigator.selected {
-                ">"
-            } else {
-                " "
-            };
-            let kind = match entry.kind {
-                FilesystemEntryKind::File => "file",
-                FilesystemEntryKind::Directory => "dir ",
-            };
-            let line = format!(
-                "{} {:<4} {:<35} {:>8} B",
-                marker, kind, entry.name, entry.size
-            );
-            let color = if index == navigator.selected {
-                Rgb::new(110, 231, 183)
-            } else {
-                Rgb::new(220, 225, 235)
-            };
-            surface.draw_text(20, 100 + row * 18, 1, &line, color);
-        }
-        surface.draw_text(
-            20,
-            surface.height().saturating_sub(22),
-            1,
-            "Up/Down: select   Enter: open   Backspace: up   Delete: remove",
-            Rgb::new(120, 140, 160),
-        );
+        let color = if index == navigator.selected {
+            Rgb::new(110, 231, 183)
+        } else {
+            Rgb::new(220, 225, 235)
+        };
+        surface.draw_text(20, 100 + row * 18, 1, &line, color);
     }
+    surface.draw_text(
+        20,
+        surface.height().saturating_sub(22),
+        1,
+        "Up/Down: select   Enter: enter directory / edit file   Backspace: up   Delete: remove",
+        Rgb::new(120, 140, 160),
+    );
 
     match frame.present(Vec::new()) {
         Ok(_) => SubmitResult::Submitted,
         Err(error) if should_wait(&error) => SubmitResult::RetryLater,
         Err(_) => SubmitResult::Fatal,
     }
-}
-
-fn printable_preview(bytes: &[u8], maximum_lines: usize, columns: usize) -> String {
-    let mut output = String::new();
-    let mut line = 0;
-    let mut column = 0;
-    for byte in bytes.iter().copied() {
-        if line >= maximum_lines {
-            break;
-        }
-        let character = match byte {
-            b'\n' => {
-                output.push('\n');
-                line += 1;
-                column = 0;
-                continue;
-            }
-            b'\r' | b'\t' => ' ',
-            0x20..=0x7e => byte as char,
-            _ => '.',
-        };
-        output.push(character);
-        column += 1;
-        if column >= columns {
-            output.push('\n');
-            line += 1;
-            column = 0;
-        }
-    }
-    output
 }
 
 fn should_wait(error: &ClientError<WindowTransportError>) -> bool {

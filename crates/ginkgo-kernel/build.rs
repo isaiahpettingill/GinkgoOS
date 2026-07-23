@@ -789,13 +789,13 @@ fn build_program_registry() -> Vec<u8> {
             app_id: "file-navigator",
             display_name: "Files",
             executable_path: "/system/file-navigator.elf",
-            flags: EntryFlags::FILESYSTEM,
+            flags: EntryFlags::OPEN_DOCUMENT,
         },
         EncodeEntry {
             app_id: "text-editor",
             display_name: "Text Editor",
             executable_path: "/system/text-editor.elf",
-            flags: EntryFlags::FILESYSTEM,
+            flags: EntryFlags::EMPTY,
         },
         EncodeEntry {
             app_id: "terminal",
@@ -819,6 +819,29 @@ fn build_program_registry() -> Vec<u8> {
     assert_eq!(desktop.app_id, "desktop");
     assert_eq!(desktop.executable_path, "/system/desktop.elf");
     assert!(!desktop.is_visible());
+
+    let file_navigator = parsed
+        .entries()
+        .find(|entry| entry.app_id == "file-navigator")
+        .expect("file navigator registry entry exists");
+    assert_eq!(file_navigator.flags, EntryFlags::OPEN_DOCUMENT);
+    assert!(!file_navigator.flags.contains(EntryFlags::FILESYSTEM));
+    assert!(!file_navigator.flags.contains(EntryFlags::PROCESS_LAUNCH));
+
+    let text_editor = parsed
+        .entries()
+        .find(|entry| entry.app_id == "text-editor")
+        .expect("text editor registry entry exists");
+    assert!(!text_editor.flags.contains(EntryFlags::FILESYSTEM));
+
+    let terminal = parsed
+        .entries()
+        .find(|entry| entry.app_id == "terminal")
+        .expect("terminal registry entry exists");
+    assert_eq!(
+        terminal.flags,
+        EntryFlags::FILESYSTEM | EntryFlags::PROCESS_LAUNCH
+    );
     registry
 }
 

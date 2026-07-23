@@ -4,18 +4,20 @@
 extern crate alloc;
 
 use alloc::{format, string::String, vec, vec::Vec};
+use core::mem::MaybeUninit;
 
 use ginkgo_graphics::Rgb;
+use ginkgo_terminal_protocol::{decode_open_document, ProtocolCodecError};
 use ginkgo_text_editor_core::{Document, DocumentError, MAX_DOCUMENT_BYTES};
 use ginkgo_userspace::{
-    debug_write, filesystem_open, filesystem_read, filesystem_rename, filesystem_stat,
-    filesystem_sync, filesystem_truncate, filesystem_unlink, filesystem_write, handle_close,
-    process_yield, random_fill,
+    channel_read, debug_write, filesystem_open, filesystem_read, filesystem_rename,
+    filesystem_stat, filesystem_sync, filesystem_truncate, filesystem_unlink, filesystem_write,
+    handle_close, process_yield, random_fill,
     window::{
         ButtonState, ClientError, Event, KeyboardEvent, RequestId, WindowClient, WindowOptions,
     },
     FilesystemOpenFlags, FilesystemRenameFlags, Handle, Status, WindowTransport,
-    WindowTransportError,
+    WindowTransportError, CHANNEL_MAX_BYTES, CHANNEL_MAX_HANDLES,
 };
 
 const MAX_EVENTS_PER_TURN: usize = 32;
@@ -80,8 +82,8 @@ impl Editor {
         self.mode = mode;
         self.path_input = self.path.clone().unwrap_or_default();
         self.status = match mode {
-            Mode::OpenPath => String::from("Enter a relative path to open"),
-            Mode::SaveAsPath => String::from("Enter a relative path to save"),
+            Mode::OpenPath => String::from("Enter a path to open, relative to /user"),
+            Mode::SaveAsPath => String::from("Enter a path to save, relative to /user"),
             Mode::Editing => String::new(),
         };
     }
@@ -374,7 +376,7 @@ ginkgo_runtime::entry!(process_main);
 extern "C" fn process_main(
     window_raw: u64,
     filesystem_raw: u64,
-    _startup_raw: u64,
+    startup_raw: u64,
     random_raw: u64,
 ) -> ! {
     let window = parse_handle(window_raw)
@@ -385,11 +387,13 @@ extern "C" fn process_main(
         .unwrap_or_else(|| fail(b"text-editor: missing random capability\n", 1));
     let transport = WindowTransport::new(window)
         .unwrap_or_else(|_| fail(b"text-editor: transport initialization failed\n", 1));
+    let startup = read_startup(startup_raw);
     let mut client = WindowClient::new(transport);
     let mut editor = Editor::new(filesystem, random);
     if let Some(mode) = option_env!("GINKGO_TEXT_EDITOR_SMOKE") {
         editor.run_smoke(mode);
     }
+    apply_startup(&mut editor, startup);
     create_window(&mut client);
     let mut redraw = false;
 
@@ -594,8 +598,8 @@ fn submit_frame(client: &mut WindowClient<WindowTransport>, editor: &mut Editor)
         Mode::Editing => {
             String::from("Ctrl+N/O/S  Ctrl+X/C/V  Ctrl+Z/Y  Ctrl+Backspace  Shift+arrows")
         }
-        Mode::OpenPath => format!("Open: {}_", editor.path_input),
-        Mode::SaveAsPath => format!("Save as: {}_", editor.path_input),
+        Mode::OpenPath => format!("Open relative to /user: {}_", editor.path_input),
+        Mode::SaveAsPath => format!("Save relative to /user as: {}_", editor.path_input),
     };
     surface.draw_text(16, 48, 1, &prompt, Rgb::new(245, 190, 90));
     surface.draw_text(16, 64, 1, &editor.status, Rgb::new(165, 180, 200));
@@ -694,6 +698,77 @@ fn render_document(surface: &mut ginkgo_graphics::PixelSurface<'_>, editor: &mut
         ),
         Rgb::new(120, 140, 160),
     );
+}
+
+enum StartupOutcome {
+    Untitled,
+    Open(String),
+    Error(String),
+}
+
+fn read_startup(startup_raw: u64) -> StartupOutcome {
+    let Some(startup) = parse_handle(startup_raw) else {
+        return StartupOutcome::Untitled;
+    };
+
+    let mut bytes = vec![0; CHANNEL_MAX_BYTES];
+    let mut handles = [MaybeUninit::uninit(); CHANNEL_MAX_HANDLES];
+    let result = channel_read(startup, &mut bytes, &mut handles);
+    let _ = handle_close(startup);
+
+    let info = match result {
+        Ok(info) => info,
+        Err(Status::ShouldWait | Status::PeerClosed | Status::InvalidHandle) => {
+            return StartupOutcome::Untitled;
+        }
+        Err(Status::BufferTooSmall) => {
+            return StartupOutcome::Error(String::from(
+                "Startup open failed: request is too large",
+            ));
+        }
+        Err(error) => {
+            return StartupOutcome::Error(format!(
+                "Startup open failed: channel read returned {:?}",
+                error
+            ));
+        }
+    };
+
+    let attachment_count = usize::from(info.handle_count);
+    for received in handles.iter().take(attachment_count) {
+        // SAFETY: channel_read initializes the reported prefix on success.
+        let received = unsafe { received.assume_init() };
+        let _ = handle_close(received.handle);
+    }
+    if attachment_count != 0 {
+        return StartupOutcome::Error(String::from(
+            "Startup open failed: attachments are not allowed",
+        ));
+    }
+
+    bytes.truncate(info.byte_count as usize);
+    match decode_open_document(&bytes, attachment_count) {
+        Ok(document) => StartupOutcome::Open(document.path),
+        Err(ProtocolCodecError::InvalidDocumentPath) => {
+            StartupOutcome::Error(String::from("Startup open failed: invalid document path"))
+        }
+        Err(ProtocolCodecError::Framing(_)) => StartupOutcome::Error(String::from(
+            "Startup open failed: malformed or oversized request",
+        )),
+        Err(_) => StartupOutcome::Error(String::from(
+            "Startup open failed: expected an open-document request",
+        )),
+    }
+}
+
+fn apply_startup(editor: &mut Editor, startup: StartupOutcome) {
+    match startup {
+        StartupOutcome::Untitled => {}
+        StartupOutcome::Open(path) => {
+            let _ = editor.open(&path);
+        }
+        StartupOutcome::Error(status) => editor.status = status,
+    }
 }
 
 fn validate_path(path: &str) -> Result<(), &'static str> {

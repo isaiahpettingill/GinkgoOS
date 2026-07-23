@@ -7,19 +7,21 @@ This is the production, nested `x86_64-unknown-none` workspace. It is intentiona
 - `ginkgo-runtime`: shared `no_std` talc static heap, panic/exit handling, `_start` entry macro, linker script, and build-script helper.
 - `ginkgo-desktop-service`: production window-policy service using `ginkgo_desktop::Desktop`, the broker runtime protocol, per-app channels, and protected two-buffer surface pools.
 - `ginkgo-minimal-client`: production syscall-backed `WindowTransport`/`WindowClient` demo with a centered “Hello World” surface and `F11` fullscreen toggling.
-- `ginkgo-file-navigator`: keyboard-controlled persistent root-directory browser using the stable filesystem syscall wrappers; Up/Down selects, Enter previews, Backspace returns, and Delete removes non-system files.
+- `ginkgo-file-navigator`: keyboard-controlled `/user` workspace browser; Up/Down selects, Enter enters a directory or securely launches the text editor for a file, Backspace returns, and Delete removes entries.
+- `ginkgo-text-editor`: persistent UTF-8 editor scoped to `/user`, with open/save/save-as, selection, clipboard, undo/redo, and startup document requests from the file navigator.
 - `ginkgo-terminal`: terminal emulator and bounded Rhai shell. Keyboard input and graphical child output use framed Ginkgo channel messages rather than file descriptors. Scripts can perform root file I/O, launch and inspect headless ELF jobs through process capabilities, manage bounded GKP installations, source another script, and request registry-governed graphical launches.
 - `validator`: host-only copy of the existing validation harness pattern which imports the kernel ELF parser directly.
 
 ## Build and validate
 
-Normal root Makefile builds compile all four production ELFs before the kernel and pass their paths into the kernel build for embedding as `/system/desktop.elf`, `/system/file-navigator.elf`, `/system/minimal-client.elf`, and `/system/terminal.elf` alongside `/system/programs.gkr`. To build or validate them directly, run from `userspace/`:
+Normal root Makefile builds compile the production ELFs before the kernel and pass their paths into the kernel build for embedding as `/system/desktop.elf`, `/system/file-navigator.elf`, `/system/text-editor.elf`, `/system/minimal-client.elf`, and `/system/terminal.elf` alongside `/system/programs.gkr`.
 
 ```sh
-cargo build --release --target x86_64-unknown-none -p ginkgo-desktop-service -p ginkgo-file-navigator -p ginkgo-minimal-client -p ginkgo-terminal
+cargo build --release --target x86_64-unknown-none -p ginkgo-desktop-service -p ginkgo-file-navigator -p ginkgo-text-editor -p ginkgo-minimal-client -p ginkgo-terminal
 cargo run --manifest-path validator/Cargo.toml --target x86_64-pc-windows-msvc -- \
   target/x86_64-unknown-none/release/ginkgo-desktop-service \
   target/x86_64-unknown-none/release/ginkgo-file-navigator \
+  target/x86_64-unknown-none/release/ginkgo-text-editor \
   target/x86_64-unknown-none/release/ginkgo-minimal-client \
   target/x86_64-unknown-none/release/ginkgo-terminal
 ```
@@ -35,11 +37,12 @@ Artifacts:
 - `target/x86_64-unknown-none/release/ginkgo-desktop-service`
 - `target/x86_64-unknown-none/release/ginkgo-minimal-client`
 - `target/x86_64-unknown-none/release/ginkgo-file-navigator`
+- `target/x86_64-unknown-none/release/ginkgo-text-editor`
 - `target/x86_64-unknown-none/release/ginkgo-terminal`
 
 ## Runtime integration
 
-The kernel boots `ginkgo-desktop-service` with only one bootstrap channel and the output dimensions. It launches each registered app with its attenuated per-app desktop channel; registry entries explicitly marked for filesystem access also receive a non-transferable filesystem-root capability. The service and kernel broker then provision protected shared-memory surfaces and client/manager capabilities. The boot registry exposes `Files`, `Terminal`, and `Ginkgo Demo` while keeping the desktop service hidden. The terminal alone receives launch authority; the kernel still resolves every request through the registry and applies the target entry's capability flags.
+The kernel boots `ginkgo-desktop-service` with only one bootstrap channel and the output dimensions. It creates the persistent `/user` workspace idempotently and launches ordinary registered applications with a non-transferable, non-duplicable `READ | WRITE` directory capability rooted there; paths cannot escape to `/system`, `/applications`, or `/appdata`. The trusted terminal is the exception: package management and explicit executable launch require its existing root `READ | WRITE | EXECUTE` authority, but its logical starting directory is `/user`. The service and kernel broker provision protected shared-memory surfaces and client/manager capabilities. The boot registry exposes `Files`, `Text Editor`, `Terminal`, and `Ginkgo Demo` while keeping the desktop service hidden. General launch authority remains terminal-only; the file navigator has a separate narrow permission that can launch only the trusted text editor for a selected document.
 
 ## Terminal shell
 
@@ -60,6 +63,8 @@ clear
 ps
 kill 1
 print "hello from Rhai"
+help
+help ls
 
 @edit
 @files
@@ -87,8 +92,9 @@ Built-in canonical names and aliases are:
 | `show_processes` | `ps`, `tasks` | Structured terminal-owned job array |
 | `terminate_process` | `kill`, `stop` | Terminates a terminal-owned job ID |
 | `print` | `output` | Evaluates and prints one Rhai expression |
+| `help` | — | Shows the command/syntax summary or detailed command help |
 
-Shell arguments are literal strings unless wrapped in `$(...)`. Pipelines pass Rhai `Dynamic` values rather than formatted terminal text. For example, `ls /system` returns entry maps that `filter`, `sort`, and later stages consume directly. Unknown identifiers are left to Rhai and are never guessed to be commands.
+Shell arguments are literal strings unless wrapped in `$(...)`. Pipelines pass Rhai `Dynamic` values rather than formatted terminal text. For example, `ls /system` returns entry maps that `filter`, `sort`, and later stages consume directly. Directory-entry arrays and terminal-job arrays are rendered as compact tables when printed; other arrays render one item per line. Unknown identifiers are left to Rhai and are never guessed to be commands.
 
 A statement-boundary `@` sigil launches executables without adding every application to the command registry. `@edit` and `@editor` launch `text-editor`; `@files` launches `file-navigator`; `@demo` launches `minimal-client`; and any other bare target is passed to the trusted graphical program registry as its application ID. Targets ending in `.elf` or containing `/` are opened beneath the terminal's filesystem capability and started as headless terminal jobs; following shell arguments become process arguments. Graphical launch arguments are rejected because the desktop launch protocol does not currently carry an argument vector. Executable launches cannot be pipeline inputs.
 
@@ -132,11 +138,11 @@ purge_app_data("tools.paint")      // explicit recursive data removal
 run("minimal-client")
 ```
 
-Enter `source "script.rhai"` to preprocess and evaluate another script by a path relative to the filesystem-root capability.
+Enter `source "script.rhai"` to preprocess and evaluate another script relative to the terminal's logical directory, initially `/user`. A leading `/` explicitly addresses the trusted terminal's filesystem root.
 
 ### Filesystem functions
 
-All terminal filesystem access remains beneath the explicit filesystem-root capability supplied at startup. Low-level Rhai filesystem functions continue to accept capability-root-relative paths and reject absolute, `.`/`..`, and backslash forms. Shell commands additionally maintain a logical current directory: `/` means the capability root, relative paths resolve beneath the logical directory, and normalization rejects attempts to ascend above that root. No ambient kernel current-working-directory state is used. Operations that enumerate a path open and close a directory capability beneath the root.
+All terminal filesystem access remains beneath its explicit trusted filesystem-root capability. The shell starts in `/user`; shell commands, sourced scripts, and `@` executable paths resolve relative to that logical directory. A leading `/` addresses the capability root, and normalization rejects attempts to ascend above it. Low-level Rhai filesystem functions remain explicit capability-root-relative APIs. The kernel has no ambient current-working-directory state: ordinary graphical processes instead receive `/user` itself as their scoped filesystem capability, so their relative paths naturally remain in the user workspace.
 
 - `mkdir(path)` creates one directory at `path`; parent directories must already exist.
 - `rmdir(path)` removes an empty directory.

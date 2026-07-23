@@ -149,6 +149,7 @@ fn power_smoke_mode() -> Option<&'static str> {
 }
 
 const SYSTEM_DIRECTORY: &str = "system";
+const USER_DIRECTORY: &str = "user";
 const DESKTOP_PATH: &str = "/system/desktop.elf";
 const MINIMAL_CLIENT_PATH: &str = "/system/minimal-client.elf";
 const FILE_NAVIGATOR_PATH: &str = "/system/file-navigator.elf";
@@ -242,8 +243,7 @@ struct ProgramSummary {
     name_len: usize,
     path: [u8; 64],
     path_len: usize,
-    filesystem: bool,
-    process_launch: bool,
+    flags: EntryFlags,
 }
 
 impl ProgramSummary {
@@ -254,8 +254,7 @@ impl ProgramSummary {
         name_len: 0,
         path: [0; 64],
         path_len: 0,
-        filesystem: false,
-        process_launch: false,
+        flags: EntryFlags::EMPTY,
     };
 
     fn app_id(&self) -> &str {
@@ -298,12 +297,40 @@ impl ProgramCatalog {
     }
 }
 
+#[derive(Clone, Copy)]
+enum RegistryLaunchAuthority {
+    None,
+    OpenDocument,
+    AnyRegistered,
+}
+
+impl RegistryLaunchAuthority {
+    fn for_program(program: ProgramSummary) -> Self {
+        if program.flags.contains(EntryFlags::PROCESS_LAUNCH) {
+            Self::AnyRegistered
+        } else if program.flags.contains(EntryFlags::OPEN_DOCUMENT) {
+            Self::OpenDocument
+        } else {
+            Self::None
+        }
+    }
+
+    fn allows(self, target_app_id: &str) -> bool {
+        match self {
+            Self::None => false,
+            Self::OpenDocument => target_app_id == "text-editor",
+            Self::AnyRegistered => true,
+        }
+    }
+}
+
 fn install_and_load_system_programs<D: Disk>(
     fs: &mut RedoxFs<D>,
 ) -> Result<(Vec<u8>, ProgramCatalog), &'static str> {
     let system = ensure_system_directory(fs).ok_or("create system directory")?;
     migrate_legacy_system_files(fs, system).ok_or("migrate legacy system files")?;
     recover_system_installation_space(fs).map_err(|_| "recover system installation space")?;
+    ensure_user_directory(fs).ok_or("create user directory")?;
     install_system_file(fs, DESKTOP_PATH, DESKTOP_ELF).map_err(|_| "install desktop")?;
     install_system_file(fs, MINIMAL_CLIENT_PATH, MINIMAL_CLIENT_ELF)
         .map_err(|_| "install minimal client")?;
@@ -329,6 +356,8 @@ fn install_and_load_system_programs<D: Disk>(
         .map_err(|_| "install malformed-process smoke")?;
     }
 
+    fs.sync().map_err(|_| "sync system installation")?;
+
     let registry_bytes = read_trusted_system_file(fs, PROGRAM_REGISTRY_PATH, 16 * 1024)
         .ok_or("verify program registry")?;
     let registry = Registry::parse(&registry_bytes).map_err(|_| "parse program registry")?;
@@ -349,8 +378,7 @@ fn install_and_load_system_programs<D: Disk>(
             .ok_or("copy application name")?;
         slot.path_len = copy_program_string(&mut slot.path, entry.executable_path)
             .ok_or("copy executable path")?;
-        slot.filesystem = entry.flags.contains(EntryFlags::FILESYSTEM);
-        slot.process_launch = entry.flags.contains(EntryFlags::PROCESS_LAUNCH);
+        slot.flags = entry.flags;
         catalog.len += 1;
     }
 
@@ -392,10 +420,23 @@ fn copy_program_string<const N: usize>(output: &mut [u8; N], value: &str) -> Opt
 fn ensure_system_directory<D: Disk>(
     fs: &mut RedoxFs<D>,
 ) -> Option<ginkgo_filesystem::DirectoryHandle> {
+    ensure_top_level_directory(fs, SYSTEM_DIRECTORY)
+}
+
+fn ensure_user_directory<D: Disk>(
+    fs: &mut RedoxFs<D>,
+) -> Option<ginkgo_filesystem::DirectoryHandle> {
+    ensure_top_level_directory(fs, USER_DIRECTORY)
+}
+
+fn ensure_top_level_directory<D: Disk>(
+    fs: &mut RedoxFs<D>,
+    name: &str,
+) -> Option<ginkgo_filesystem::DirectoryHandle> {
     let root = fs.root_directory().ok()?;
-    match fs.open_directory_at(root, SYSTEM_DIRECTORY) {
+    match fs.open_directory_at(root, name) {
         Ok(directory) => Some(directory),
-        Err(FsError::NotFound) => fs.create_directory_at(root, SYSTEM_DIRECTORY).ok(),
+        Err(FsError::NotFound) => fs.create_directory_at(root, name).ok(),
         Err(_) => None,
     }
 }
@@ -1355,7 +1396,7 @@ fn run_scheduler(context: &mut KernelContext) -> ! {
 struct ProcessClient {
     process_id: ProcessId,
     client_id: ClientId,
-    may_launch: bool,
+    launch_authority: RegistryLaunchAuthority,
 }
 
 struct KernelContext {
@@ -2641,6 +2682,34 @@ fn ensure_application_data_directory<B: Disk>(
     }
 }
 
+fn install_program_workspace<B: Disk>(
+    filesystem: &mut RedoxFs<B>,
+    process: &mut Process,
+    program: ProgramSummary,
+) -> Result<ginkgo_sysapi::Handle, ()> {
+    let rights = ginkgo_sysapi::Rights::READ | ginkgo_sysapi::Rights::WRITE;
+    if program.flags.contains(EntryFlags::FILESYSTEM) {
+        let rights = if program.flags.contains(EntryFlags::PROCESS_LAUNCH) {
+            rights | ginkgo_sysapi::Rights::EXECUTE
+        } else {
+            rights
+        };
+        return process
+            .handles_mut()
+            .filesystem_root_create_with_rights(rights)
+            .map_err(|_| ());
+    }
+
+    let root = filesystem.root_directory().map_err(|_| ())?;
+    let user = filesystem
+        .open_directory_at(root, USER_DIRECTORY)
+        .map_err(|_| ())?;
+    process
+        .handles_mut()
+        .filesystem_directory_create(user, rights)
+        .map_err(|_| ())
+}
+
 fn launch_program(
     context: &mut KernelContext,
     program: ProgramSummary,
@@ -2702,20 +2771,9 @@ fn launch_program(
     };
     context.next_client_id = next_client_id;
 
-    let filesystem = if program.filesystem {
-        let mut rights = ginkgo_sysapi::Rights::READ | ginkgo_sysapi::Rights::WRITE;
-        if program.process_launch {
-            rights |= ginkgo_sysapi::Rights::EXECUTE;
-        }
-        match process
-            .handles_mut()
-            .filesystem_root_create_with_rights(rights)
-        {
-            Ok(handle) => handle,
-            Err(_) => return reject_unstarted_client(context, client_id, process),
-        }
-    } else {
-        ginkgo_sysapi::Handle::INVALID
+    let filesystem = match install_program_workspace(&mut context.fs, &mut process, program) {
+        Ok(handle) => handle,
+        Err(()) => return reject_unstarted_client(context, client_id, process),
     };
     let startup = match startup {
         Some(startup) => match context.desktop.as_mut().ok_or(()).and_then(|desktop| {
@@ -2752,7 +2810,7 @@ fn launch_program(
     context.process_clients.push(ProcessClient {
         process_id,
         client_id,
-        may_launch: program.process_launch,
+        launch_authority: RegistryLaunchAuthority::for_program(program),
     });
     let mut sink = SerialDebugSink::new(&mut context.serial);
     let _ = writeln!(
@@ -3024,10 +3082,9 @@ fn desktop_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                 app_id,
                 startup,
             } => {
-                let authorized = context
-                    .process_clients
-                    .iter()
-                    .any(|known| known.client_id == requester && known.may_launch);
+                let authorized = context.process_clients.iter().any(|known| {
+                    known.client_id == requester && known.launch_authority.allows(&app_id)
+                });
                 let program = authorized
                     .then(|| context.ui.catalog.find(&app_id))
                     .flatten();

@@ -11,6 +11,7 @@ name = "ginkgo-file-navigator"
 path = "src/main.rs"
 
 [dependencies]
+ginkgo-terminal-protocol.workspace = true
 
 ginkgo-graphics.workspace = true
 

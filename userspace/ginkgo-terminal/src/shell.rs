@@ -72,6 +72,7 @@ static COMMAND_SPECS: &[CommandSpec<'static>] = &[
     CommandSpec::no_arguments("clear_terminal", &["clear", "cls"]),
     CommandSpec::no_arguments("show_processes", &["ps", "tasks"]),
     CommandSpec::shell("terminate_process", &["kill", "stop"], 1, Some(1)),
+    CommandSpec::shell("help", &[], 0, Some(1)),
     CommandSpec::expression("print", &["output"], 1, Some(1)),
 ];
 
@@ -239,7 +240,7 @@ impl Shell {
             children: Vec::new(),
             jobs: Vec::new(),
             next_job_id: 1,
-            current_directory: String::new(),
+            current_directory: String::from("user"),
         }));
         let mut engine = Engine::new();
         engine.set_max_operations(100_000);
@@ -320,12 +321,25 @@ impl Shell {
         }
 
         let (script, source_name) = if let Some(path) = source_command(&source) {
-            match read_text(self.host.borrow().filesystem, path) {
-                Ok(script) => (script, String::from(path)),
+            let resolved = {
+                let host = self.host.borrow();
+                match resolve_shell_path(&host.current_directory, path) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        drop(host);
+                        self.host
+                            .borrow_mut()
+                            .error(format!("source: {}: {}", path, error));
+                        return;
+                    }
+                }
+            };
+            match read_text(self.host.borrow().filesystem, &resolved) {
+                Ok(script) => (script, format!("/{}", resolved)),
                 Err(error) => {
                     self.host
                         .borrow_mut()
-                        .error(format!("source: {}: {:?}", path, error));
+                        .error(format!("source: /{}: {:?}", resolved, error));
                     return;
                 }
             }
@@ -347,7 +361,9 @@ impl Shell {
         };
 
         match self.engine.eval::<Dynamic>(&preprocessed.source) {
-            Ok(value) if !value.is_unit() => self.host.borrow_mut().output(value.to_string()),
+            Ok(value) if !value.is_unit() => {
+                self.host.borrow_mut().output(format_terminal_value(&value))
+            }
             Ok(_) => {}
             Err(mut error) => {
                 let position = error.position();
@@ -798,8 +814,146 @@ fn dispatch_command(host: &mut HostState, name: &str, arguments: Array) -> Dynam
             ),
             Err(_) => command_error(host, name, "job ID must be an integer"),
         },
+        "help" => Dynamic::from(command_help(values.first().map(String::as_str))),
         _ => command_error(host, name, "unknown canonical command"),
     }
+}
+
+fn command_help(command: Option<&str>) -> String {
+    match command {
+        Some("ls" | "dir" | "list_files") => String::from(
+            "ls, dir [path]\n    List directory entries as structured values.",
+        ),
+        Some("cd" | "chdir" | "change_directory") => String::from(
+            "cd, chdir <path>\n    Change the logical directory beneath the filesystem capability root.",
+        ),
+        Some("pwd" | "cwd" | "current_directory") => {
+            String::from("pwd, cwd\n    Show the logical current directory.")
+        }
+        Some("cp" | "copy") => String::from(
+            "cp <source> <destination>\n    Atomically copy one file.",
+        ),
+        Some("mv" | "move" | "ren" | "rename") => String::from(
+            "mv, ren, rename <source> <destination>\n    Move or rename without replacing an existing destination.",
+        ),
+        Some("rm" | "del" | "delete" | "remove") => String::from(
+            "rm, del, delete <path>...\n    Remove one or more files.",
+        ),
+        Some("mkdir" | "md" | "make_directory") => String::from(
+            "mkdir, md <path>...\n    Create one or more directories; parents must exist.",
+        ),
+        Some("rmdir" | "rd" | "remove_directory") => String::from(
+            "rmdir, rd <path>...\n    Remove one or more empty directories.",
+        ),
+        Some("cat" | "type" | "show_file") => String::from(
+            "cat, type <path>...\n    Display UTF-8 text files.",
+        ),
+        Some("clear" | "cls" | "clear_terminal") => {
+            String::from("clear, cls\n    Clear terminal scrollback.")
+        }
+        Some("ps" | "tasks" | "show_processes") => String::from(
+            "ps, tasks\n    List jobs started by this terminal.",
+        ),
+        Some("kill" | "stop" | "terminate_process") => String::from(
+            "kill, stop <job-id>\n    Terminate a job started by this terminal.",
+        ),
+        Some("print" | "output") => String::from(
+            "print <rhai-expression>\n    Evaluate and print one Rhai expression.",
+        ),
+        Some("help") => String::from("help [command]\n    Show command help."),
+        Some(name) => format!("help: no registered command named `{}`", name),
+        None => String::from(
+            "Ginkgo Rhai shell\n\nCOMMANDS\n  ls, dir [path]             list directory entries\n  cd, chdir <path>           change logical directory\n  pwd, cwd                   show logical directory\n  cp <source> <destination>  copy a file atomically\n  mv, ren <source> <dest>    move or rename\n  rm, del <path>...          remove files\n  mkdir, md <path>...        create directories\n  rmdir, rd <path>...        remove empty directories\n  cat, type <path>...        display text files\n  clear, cls                 clear the terminal\n  ps, tasks                  list terminal jobs\n  kill, stop <job-id>        terminate a terminal job\n  print <expression>         evaluate and print Rhai\n  help [command]             show this help\n\nSYNTAX\n  Shell arguments are strings; use $(expression) for Rhai values.\n  value |> function(args) passes value as the first argument.\n  @edit opens the text editor. @files opens the file navigator.\n  @app-id launches a registered app; @path/program.elf starts a job.\n  Ordinary Rhai remains available, including function-call syntax.\n  source \"file.rhai\" preprocesses and evaluates a script.",
+        ),
+    }
+}
+
+fn table_cell(value: &str, width: usize) -> String {
+    let mut cell: String = value.chars().take(width).collect();
+    let length = cell.chars().count();
+    if value.chars().count() > width && width != 0 {
+        cell.pop();
+        cell.push('~');
+    }
+    for _ in length..width {
+        cell.push(' ');
+    }
+    cell
+}
+
+fn map_text(map: &Map, key: &str) -> String {
+    map.get(key).map_or_else(String::new, Dynamic::to_string)
+}
+
+fn format_map_table(values: &[Dynamic]) -> Option<String> {
+    let maps: Option<Vec<Map>> = values
+        .iter()
+        .map(|value| value.clone().try_cast::<Map>())
+        .collect();
+    let maps = maps?;
+    if maps.iter().all(|map| map.contains_key("name")) {
+        let name_width = maps
+            .iter()
+            .map(|map| map_text(map, "name").chars().count())
+            .max()
+            .unwrap_or(4)
+            .clamp(4, 32);
+        let mut output = format!(
+            "{}  {}  {}\n{}  ----------  ----------",
+            table_cell("NAME", name_width),
+            table_cell("KIND", 10),
+            table_cell("SIZE", 10),
+            table_cell("", name_width).replace(' ', "-")
+        );
+        for map in &maps {
+            output.push_str(&format!(
+                "\n{}  {}  {}",
+                table_cell(&map_text(map, "name"), name_width),
+                table_cell(&map_text(map, "kind"), 10),
+                table_cell(&map_text(map, "size"), 10),
+            ));
+        }
+        return Some(output);
+    }
+    if maps.iter().all(|map| map.contains_key("job_id")) {
+        let mut output =
+            String::from("JOB   STATE       RESULT\n----  ----------  ----------------");
+        for map in &maps {
+            let result = if map.contains_key("exit_code") {
+                map_text(map, "exit_code")
+            } else if map.contains_key("fault") {
+                map_text(map, "fault")
+            } else if map.contains_key("error") {
+                map_text(map, "error")
+            } else {
+                String::new()
+            };
+            output.push_str(&format!(
+                "\n{}  {}  {}",
+                table_cell(&map_text(map, "job_id"), 4),
+                table_cell(&map_text(map, "state"), 10),
+                result
+            ));
+        }
+        return Some(output);
+    }
+    None
+}
+
+fn format_terminal_value(value: &Dynamic) -> String {
+    let Some(values) = value.clone().try_cast::<Array>() else {
+        return value.to_string();
+    };
+    if values.is_empty() {
+        return String::from("(no entries)");
+    }
+    format_map_table(&values).unwrap_or_else(|| {
+        values
+            .iter()
+            .map(structured_value_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
 }
 
 fn structured_value_text(value: &Dynamic) -> String {
@@ -857,7 +1011,9 @@ fn register_functions(engine: &mut Engine, host: Rc<RefCell<HostState>>) {
     for name in ["print", "output"] {
         let output_host = host.clone();
         engine.register_fn(name, move |value: Dynamic| {
-            output_host.borrow_mut().output(value.to_string());
+            output_host
+                .borrow_mut()
+                .output(format_terminal_value(&value));
         });
     }
     let error_host = host.clone();

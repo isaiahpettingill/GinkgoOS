@@ -232,6 +232,7 @@ version = "0.1.0"
 dependencies = [
  "ginkgo-graphics",
  "ginkgo-runtime",
+ "ginkgo-terminal-protocol",
  "ginkgo-userspace",
  "ginkgo-window",
 ]
@@ -326,6 +327,7 @@ version = "0.1.0"
 dependencies = [
  "ginkgo-graphics",
  "ginkgo-runtime",
+ "ginkgo-terminal-protocol",
  "ginkgo-text-editor-core",
  "ginkgo-userspace",
  "ginkgo-window",
