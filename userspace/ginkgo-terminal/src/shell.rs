@@ -50,7 +50,13 @@ const APPLICATIONS_DIRECTORY: &str = "applications";
 const APP_DATA_DIRECTORY: &str = "appdata";
 const INSTALLED_REGISTRY_PATH: &str = "applications/installed.gki";
 const STAGED_REGISTRY_PATH: &str = "applications/installed.gki.new";
-const PROTECTED_SYSTEM_IDS: &[&str] = &["desktop", "file-navigator", "terminal", "minimal-client"];
+const PROTECTED_SYSTEM_IDS: &[&str] = &[
+    "desktop",
+    "file-navigator",
+    "text-editor",
+    "terminal",
+    "minimal-client",
+];
 
 pub struct ChildStream {
     pub app_id: String,

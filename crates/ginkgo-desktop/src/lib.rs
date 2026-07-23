@@ -357,6 +357,10 @@ impl Desktop {
             } => self.present(
                 client_id, request_id, window_id, generation, buffer_id, damage,
             ),
+            WireRequest::SetClipboardText { request_id, .. }
+            | WireRequest::RequestClipboardText { request_id, .. } => {
+                failed(client_id, request_id, ServerErrorCode::Unsupported)
+            }
         }
     }
 

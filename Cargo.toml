@@ -10,6 +10,7 @@ members = [
     "crates/ginkgo-graphics",
     "crates/ginkgo-sysapi",
     "crates/ginkgo-terminal-protocol",
+    "crates/ginkgo-text-editor-core",
     "crates/ginkgo-window",
     "crates/ginkgo-fonts",
     "crates/ginkgo-scroll-layout",
@@ -49,6 +50,7 @@ ginkgo-program-registry = { path = "crates/ginkgo-program-registry" }
 ginkgo-scroll-layout = { path = "crates/ginkgo-scroll-layout" }
 ginkgo-sysapi = { path = "crates/ginkgo-sysapi" }
 ginkgo-terminal-protocol = { path = "crates/ginkgo-terminal-protocol" }
+ginkgo-text-editor-core = { path = "crates/ginkgo-text-editor-core" }
 ginkgo-window = { path = "crates/ginkgo-window" }
 
 [profile.dev]

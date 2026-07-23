@@ -100,6 +100,7 @@ static MINIMAL_CLIENT_ELF: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-minimal-client.elf"));
 static FILE_NAVIGATOR_ELF: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-file-navigator.elf"));
+static TEXT_EDITOR_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-text-editor.elf"));
 static TERMINAL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-terminal.elf"));
 static PROGRAM_REGISTRY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/programs.gkr"));
 static TRUST_MANIFEST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/system-trust.manifest"));
@@ -139,6 +140,10 @@ fn process_capability_smoke_enabled() -> bool {
     option_env!("GINKGO_PROCESS_CAPABILITY_SMOKE") == Some("1")
 }
 
+fn text_editor_smoke_enabled() -> bool {
+    option_env!("GINKGO_TEXT_EDITOR_SMOKE") == Some("1")
+}
+
 fn power_smoke_mode() -> Option<&'static str> {
     option_env!("GINKGO_POWER_SMOKE")
 }
@@ -147,6 +152,7 @@ const SYSTEM_DIRECTORY: &str = "system";
 const DESKTOP_PATH: &str = "/system/desktop.elf";
 const MINIMAL_CLIENT_PATH: &str = "/system/minimal-client.elf";
 const FILE_NAVIGATOR_PATH: &str = "/system/file-navigator.elf";
+const TEXT_EDITOR_PATH: &str = "/system/text-editor.elf";
 const TERMINAL_PATH: &str = "/system/terminal.elf";
 const PROGRAM_REGISTRY_PATH: &str = "/system/programs.gkr";
 const PROCESS_CAPABILITY_SMOKE_PATH: &str = "/system/process-capability-smoke.elf";
@@ -303,6 +309,8 @@ fn install_and_load_system_programs<D: Disk>(
         .map_err(|_| "install minimal client")?;
     install_system_file(fs, FILE_NAVIGATOR_PATH, FILE_NAVIGATOR_ELF)
         .map_err(|_| "install file navigator")?;
+    install_system_file(fs, TEXT_EDITOR_PATH, TEXT_EDITOR_ELF)
+        .map_err(|_| "install text editor")?;
     install_system_file(fs, TERMINAL_PATH, TERMINAL_ELF).map_err(|_| "install terminal")?;
     install_system_file(fs, PROGRAM_REGISTRY_PATH, PROGRAM_REGISTRY)
         .map_err(|_| "install program registry")?;
@@ -401,6 +409,7 @@ fn migrate_legacy_system_files<D: Disk>(
         "desktop.elf",
         "minimal-client.elf",
         "file-navigator.elf",
+        "text-editor.elf",
         "terminal.elf",
         "programs.gkr",
     ] {
@@ -428,6 +437,7 @@ fn recover_system_installation_space<D: Disk>(fs: &mut RedoxFs<D>) -> Result<(),
         (DESKTOP_PATH, DESKTOP_ELF),
         (MINIMAL_CLIENT_PATH, MINIMAL_CLIENT_ELF),
         (FILE_NAVIGATOR_PATH, FILE_NAVIGATOR_ELF),
+        (TEXT_EDITOR_PATH, TEXT_EDITOR_ELF),
         (TERMINAL_PATH, TERMINAL_ELF),
         (PROGRAM_REGISTRY_PATH, PROGRAM_REGISTRY),
     ];
@@ -2964,6 +2974,18 @@ fn desktop_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                     context.ui.render(&mut context.screen);
                     let mut sink = SerialDebugSink::new(&mut context.serial);
                     let _ = writeln!(sink, "desktop: protected Rust userland ready\r");
+                    if text_editor_smoke_enabled() {
+                        let result = context
+                            .ui
+                            .catalog
+                            .find("text-editor")
+                            .ok_or(())
+                            .and_then(|program| launch_program(context, program, None));
+                        if result.is_err() {
+                            let mut sink = SerialDebugSink::new(&mut context.serial);
+                            let _ = writeln!(sink, "text-editor-smoke: failure\r");
+                        }
+                    }
                 }
                 let should_start_stress = context
                     .frame_reclaim_stress

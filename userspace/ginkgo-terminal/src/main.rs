@@ -93,6 +93,7 @@ extern "C" fn process_main(window_raw: u64, filesystem_raw: u64, _arg2: u64, pow
                 | Event::Pointer { .. }
                 | Event::Keyboard { .. }
                 | Event::FocusChanged { .. }
+                | Event::ClipboardText { .. }
                 | Event::RequestFailed { .. } => {}
             }
         }

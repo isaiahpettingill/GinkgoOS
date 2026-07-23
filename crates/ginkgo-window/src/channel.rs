@@ -42,7 +42,9 @@ impl WireRequest {
             | Self::SetMaximumSize { request_id, .. }
             | Self::SetFullscreen { request_id, .. }
             | Self::ToggleFullscreen { request_id, .. }
-            | Self::Present { request_id, .. } => *request_id,
+            | Self::Present { request_id, .. }
+            | Self::SetClipboardText { request_id, .. }
+            | Self::RequestClipboardText { request_id, .. } => *request_id,
         }
     }
 }
@@ -52,9 +54,9 @@ impl WireEvent {
     /// configuration and input events return `None`.
     pub const fn request_id(&self) -> Option<RequestId> {
         match self {
-            Self::WindowCreated { request_id, .. } | Self::RequestFailed { request_id, .. } => {
-                Some(*request_id)
-            }
+            Self::WindowCreated { request_id, .. }
+            | Self::ClipboardText { request_id, .. }
+            | Self::RequestFailed { request_id, .. } => Some(*request_id),
             Self::BufferReleased {
                 present_request_id, ..
             } => Some(*present_request_id),
@@ -72,7 +74,9 @@ impl WireEvent {
             Self::RequestFailed { .. } => {
                 RpcFlags::from_bits_retain(RpcFlags::RESPONSE.bits() | RpcFlags::ERROR.bits())
             }
-            Self::WindowCreated { .. } | Self::BufferReleased { .. } => RpcFlags::RESPONSE,
+            Self::WindowCreated { .. }
+            | Self::BufferReleased { .. }
+            | Self::ClipboardText { .. } => RpcFlags::RESPONSE,
             Self::Configured(_)
             | Self::Redraw { .. }
             | Self::Pointer { .. }
@@ -303,6 +307,15 @@ mod tests {
                 buffer_id: BufferId::new(0),
                 damage: Vec::new(),
             },
+            WireRequest::SetClipboardText {
+                request_id: id,
+                window_id: window,
+                text: String::from("copied"),
+            },
+            WireRequest::RequestClipboardText {
+                request_id: id,
+                window_id: window,
+            },
         ];
 
         assert!(requests.iter().all(|request| request.request_id() == id));
@@ -365,11 +378,15 @@ mod tests {
             request_id: request_id(12),
             code: ServerErrorCode::InvalidRequest,
         };
+        let clipboard = WireEvent::ClipboardText {
+            request_id: request_id(13),
+            text: String::from("copied"),
+        };
         let one_way = WireEvent::CloseRequested {
             window_id: window_id(7),
         };
 
-        for event in [response, error, one_way] {
+        for event in [response, error, clipboard, one_way] {
             let bytes = encode_event(&event).unwrap();
             assert_eq!(decode_event(&bytes, 0).unwrap(), event);
         }

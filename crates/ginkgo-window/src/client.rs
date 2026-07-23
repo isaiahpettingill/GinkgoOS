@@ -1,11 +1,11 @@
-use alloc::{vec, vec::Vec};
+use alloc::{string::String, vec, vec::Vec};
 
 use ginkgo_graphics::{PixelSurface, SurfaceError};
 
 use crate::{
     BufferId, ConfigurationError, Configured, Event, Generation, Rect, RequestId,
     RequestValidationError, Size, SurfaceConfiguration, WindowId, WindowOptions,
-    WindowOptionsError, WireEvent, WireRequest, PROTOCOL_VERSION,
+    WindowOptionsError, WireEvent, WireRequest, MAX_CLIPBOARD_BYTES, PROTOCOL_VERSION,
 };
 
 /// One received protocol event and its transport-provided surface attachments.
@@ -86,6 +86,7 @@ pub enum ProtocolError {
         received: RequestId,
     },
     RequestIdExhausted,
+    ClipboardTooLarge,
 }
 
 #[derive(Debug)]
@@ -270,6 +271,28 @@ impl<T: Transport> WindowClient<T> {
         })
     }
 
+    /// Replaces the shared desktop clipboard with bounded UTF-8 text.
+    pub fn set_clipboard_text(&mut self, text: String) -> Result<RequestId, ClientError<T::Error>> {
+        if text.len() > MAX_CLIPBOARD_BYTES {
+            return Err(ClientError::InvalidRequest(
+                RequestValidationError::ClipboardTooLarge,
+            ));
+        }
+        self.send_window_request(|request_id, window_id| WireRequest::SetClipboardText {
+            request_id,
+            window_id,
+            text,
+        })
+    }
+
+    /// Requests the current shared desktop clipboard text.
+    pub fn request_clipboard_text(&mut self) -> Result<RequestId, ClientError<T::Error>> {
+        self.send_window_request(|request_id, window_id| WireRequest::RequestClipboardText {
+            request_id,
+            window_id,
+        })
+    }
+
     /// Receives and processes at most one wire event.
     pub fn poll_event(&mut self) -> Result<Option<Event>, ClientError<T::Error>> {
         let received = self.transport.receive().map_err(ClientError::Transport)?;
@@ -356,6 +379,12 @@ impl<T: Transport> WindowClient<T> {
             WireEvent::FocusChanged { window_id, focused } => {
                 self.validate_window(window_id)?;
                 Ok(Event::FocusChanged { window_id, focused })
+            }
+            WireEvent::ClipboardText { request_id, text } => {
+                if text.len() > MAX_CLIPBOARD_BYTES {
+                    return Err(ProtocolError::ClipboardTooLarge.into());
+                }
+                Ok(Event::ClipboardText { request_id, text })
             }
             WireEvent::RequestFailed { request_id, code } => {
                 if self.pending_create == Some(request_id) {

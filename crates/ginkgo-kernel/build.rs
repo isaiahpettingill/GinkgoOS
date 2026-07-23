@@ -55,12 +55,14 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GINKGO_DESKTOP_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_MINIMAL_CLIENT_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_FILE_NAVIGATOR_ELF");
+    println!("cargo:rerun-if-env-changed=GINKGO_TEXT_EDITOR_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_TERMINAL_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_PREEMPTION_SMOKE");
     println!("cargo:rerun-if-env-changed=GINKGO_FRAME_RECLAIM_STRESS");
     println!("cargo:rerun-if-env-changed=GINKGO_FILESYSTEM_HIERARCHY_SMOKE");
     println!("cargo:rerun-if-env-changed=GINKGO_PROCESS_CAPABILITY_SMOKE");
     println!("cargo:rerun-if-env-changed=GINKGO_POWER_SMOKE");
+    println!("cargo:rerun-if-env-changed=GINKGO_TEXT_EDITOR_SMOKE");
     println!("cargo:rerun-if-env-changed=GINKGO_PROCESS_CAPABILITY_SMOKE_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_TRUST_SIGNING_KEY_HEX");
     println!("cargo:rustc-link-arg-bin=ginkgo-os=-T{}", linker.display());
@@ -110,6 +112,8 @@ fn main() {
         .unwrap_or_else(build_userspace_smoke_elf);
     let file_navigator = read_userspace_artifact("GINKGO_FILE_NAVIGATOR_ELF")
         .unwrap_or_else(build_userspace_smoke_elf);
+    let text_editor =
+        read_userspace_artifact("GINKGO_TEXT_EDITOR_ELF").unwrap_or_else(build_userspace_smoke_elf);
     let terminal =
         read_userspace_artifact("GINKGO_TERMINAL_ELF").unwrap_or_else(build_userspace_smoke_elf);
     let registry = build_program_registry();
@@ -117,6 +121,7 @@ fn main() {
         ("/system/desktop.elf", desktop.as_slice()),
         ("/system/minimal-client.elf", minimal_client.as_slice()),
         ("/system/file-navigator.elf", file_navigator.as_slice()),
+        ("/system/text-editor.elf", text_editor.as_slice()),
         ("/system/terminal.elf", terminal.as_slice()),
         ("/system/programs.gkr", registry.as_slice()),
     ];
@@ -126,6 +131,8 @@ fn main() {
         .expect("write Ginkgo minimal client ELF");
     fs::write(out_dir.join("ginkgo-file-navigator.elf"), file_navigator)
         .expect("write Ginkgo file navigator ELF");
+    fs::write(out_dir.join("ginkgo-text-editor.elf"), text_editor)
+        .expect("write Ginkgo text editor ELF");
     fs::write(out_dir.join("ginkgo-terminal.elf"), terminal).expect("write Ginkgo terminal ELF");
     fs::write(out_dir.join("programs.gkr"), registry).expect("write Ginkgo program registry");
     fs::write(out_dir.join("system-trust.manifest"), manifest).expect("write trust manifest");
@@ -782,6 +789,12 @@ fn build_program_registry() -> Vec<u8> {
             app_id: "file-navigator",
             display_name: "Files",
             executable_path: "/system/file-navigator.elf",
+            flags: EntryFlags::FILESYSTEM,
+        },
+        EncodeEntry {
+            app_id: "text-editor",
+            display_name: "Text Editor",
+            executable_path: "/system/text-editor.elf",
             flags: EntryFlags::FILESYSTEM,
         },
         EncodeEntry {

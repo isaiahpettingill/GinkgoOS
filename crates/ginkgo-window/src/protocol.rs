@@ -8,7 +8,9 @@ use crate::{Point, Rect, ScaleFactor, Size};
 /// Current version of the window protocol.
 ///
 /// Existing enum variants and fields are append-only within a protocol version.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
+/// Maximum UTF-8 payload carried by one clipboard protocol message.
+pub const MAX_CLIPBOARD_BYTES: usize = 4 * 1024;
 /// Minimum number of buffers in a configured surface pool.
 pub const MIN_BUFFER_SLOTS: u8 = 2;
 
@@ -310,6 +312,7 @@ pub enum RequestValidationError {
     EmptyPreferredSize,
     EmptyMinimumSize,
     EmptyMaximumSize,
+    ClipboardTooLarge,
 }
 
 /// A transport attachment reference carried only by a wire `Configured` event.
@@ -362,6 +365,15 @@ pub enum WireRequest {
         generation: Generation,
         buffer_id: BufferId,
         damage: Vec<Rect>,
+    },
+    SetClipboardText {
+        request_id: RequestId,
+        window_id: WindowId,
+        text: String,
+    },
+    RequestClipboardText {
+        request_id: RequestId,
+        window_id: WindowId,
     },
 }
 
@@ -458,6 +470,10 @@ pub enum WireEvent {
         window_id: WindowId,
         focused: bool,
     },
+    ClipboardText {
+        request_id: RequestId,
+        text: String,
+    },
     RequestFailed {
         request_id: RequestId,
         code: ServerErrorCode,
@@ -508,6 +524,10 @@ pub enum Event {
     FocusChanged {
         window_id: WindowId,
         focused: bool,
+    },
+    ClipboardText {
+        request_id: RequestId,
+        text: String,
     },
     RequestFailed {
         request_id: RequestId,

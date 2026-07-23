@@ -3,7 +3,7 @@
 
 extern crate alloc;
 
-use alloc::{collections::VecDeque, vec::Vec};
+use alloc::{collections::VecDeque, string::String, vec::Vec};
 use core::mem::MaybeUninit;
 
 use ginkgo_desktop::{
@@ -185,6 +185,7 @@ struct IncomingMessage {
 
 enum ClientOutbound {
     Event(Vec<u8>),
+    Clipboard(Vec<u8>),
     Configured {
         bytes: Vec<u8>,
         surface: OwnedHandle,
@@ -222,6 +223,7 @@ struct Service {
     clients: Vec<ClientConnection>,
     broker_outbound: VecDeque<BrokerOutbound>,
     launcher_visible: bool,
+    clipboard: String,
 }
 
 impl Service {
@@ -238,6 +240,7 @@ impl Service {
             clients: Vec::new(),
             broker_outbound: VecDeque::new(),
             launcher_visible: false,
+            clipboard: String::new(),
         })
     }
 
@@ -481,9 +484,62 @@ impl Service {
                         continue;
                     }
                 }
-                let actions = self.desktop.handle_request(client_id, request);
-                self.execute_actions(actions)?;
-                self.flush_broker()?;
+                match request {
+                    WireRequest::SetClipboardText {
+                        request_id,
+                        window_id,
+                        text,
+                    } => {
+                        if !self.client_owns_window(client_id, window_id)
+                            || text.len() > ginkgo_window::MAX_CLIPBOARD_BYTES
+                        {
+                            self.queue_client_event(
+                                client_id,
+                                WireEvent::RequestFailed {
+                                    request_id,
+                                    code: ServerErrorCode::InvalidRequest,
+                                },
+                            )?;
+                        } else {
+                            self.clipboard = text;
+                        }
+                    }
+                    WireRequest::RequestClipboardText {
+                        request_id,
+                        window_id,
+                    } => {
+                        if !self.client_owns_window(client_id, window_id) {
+                            self.queue_client_event(
+                                client_id,
+                                WireEvent::RequestFailed {
+                                    request_id,
+                                    code: ServerErrorCode::InvalidRequest,
+                                },
+                            )?;
+                        } else if self.client_has_clipboard_response(client_id) {
+                            self.queue_client_event(
+                                client_id,
+                                WireEvent::RequestFailed {
+                                    request_id,
+                                    code: ServerErrorCode::OutOfResources,
+                                },
+                            )?;
+                        } else {
+                            self.queue_client_event(
+                                client_id,
+                                WireEvent::ClipboardText {
+                                    request_id,
+                                    text: self.clipboard.clone(),
+                                },
+                            )?;
+                        }
+                    }
+                    request => {
+                        let actions = self.desktop.handle_request(client_id, request);
+                        self.execute_actions(actions)?;
+                        self.flush_broker()?;
+                    }
+                }
                 if self.broker_outbound.len() >= BROKER_BACKPRESSURE_THRESHOLD {
                     broker_backpressured = true;
                     break;
@@ -636,12 +692,17 @@ impl Service {
         client_id: ClientId,
         event: WireEvent,
     ) -> Result<(), ServiceError> {
+        let is_clipboard = matches!(event, WireEvent::ClipboardText { .. });
         let bytes = encode_event(&event).map_err(|_| ServiceError::Codec)?;
         let client = self.client_mut(client_id)?;
         if client.outbound.len() >= MAX_CLIENT_QUEUE {
             return Err(ServiceError::Capacity);
         }
-        client.outbound.push_back(ClientOutbound::Event(bytes));
+        client.outbound.push_back(if is_clipboard {
+            ClientOutbound::Clipboard(bytes)
+        } else {
+            ClientOutbound::Event(bytes)
+        });
         Ok(())
     }
 
@@ -706,7 +767,9 @@ impl Service {
                 break;
             };
             let result = match outbound {
-                ClientOutbound::Event(bytes) => channel_write(channel, bytes, &[]),
+                ClientOutbound::Event(bytes) | ClientOutbound::Clipboard(bytes) => {
+                    channel_write(channel, bytes, &[])
+                }
                 ClientOutbound::Configured { bytes, surface } => {
                     let disposition =
                         HandleDisposition::move_handle(surface.get(), SURFACE_CLIENT_RIGHTS);
@@ -726,6 +789,21 @@ impl Service {
             }
         }
         Ok(())
+    }
+
+    fn client_has_clipboard_response(&self, client_id: ClientId) -> bool {
+        self.client_index(client_id).is_some_and(|index| {
+            self.clients[index]
+                .outbound
+                .iter()
+                .any(|message| matches!(message, ClientOutbound::Clipboard(_)))
+        })
+    }
+
+    fn client_owns_window(&self, client_id: ClientId, window_id: ginkgo_window::WindowId) -> bool {
+        self.desktop
+            .window(window_id)
+            .is_some_and(|window| window.owner == client_id)
     }
 
     fn client_index(&self, client_id: ClientId) -> Option<usize> {

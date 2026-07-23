@@ -67,6 +67,7 @@ extern "C" fn process_main(channel_raw: u64, _arg1: u64, _arg2: u64, _random_raw
                 | Event::Pointer { .. }
                 | Event::Keyboard { .. }
                 | Event::FocusChanged { .. }
+                | Event::ClipboardText { .. }
                 | Event::RequestFailed { .. } => {}
             }
         }

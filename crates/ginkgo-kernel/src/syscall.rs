@@ -1497,6 +1497,7 @@ fn is_protected_system_file(name: &str) -> bool {
         || name == "desktop.elf"
         || name == "minimal-client.elf"
         || name == "file-navigator.elf"
+        || name == "text-editor.elf"
         || name == "terminal.elf"
         || name == "programs.gkr"
         || name == "system.log"

@@ -315,6 +315,50 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_requests_validate_bounds_and_translate_responses() {
+        let mut client = connected_client();
+        let set_id = client
+            .set_clipboard_text(String::from("shared text"))
+            .unwrap();
+        assert!(matches!(
+            client.transport().sent.last(),
+            Some(WireRequest::SetClipboardText {
+                request_id,
+                window_id: received_window,
+                text,
+            }) if *request_id == set_id
+                && *received_window == window_id(9)
+                && text == "shared text"
+        ));
+
+        let request_id = client.request_clipboard_text().unwrap();
+        let event = client
+            .process_received(Received::new(
+                WireEvent::ClipboardText {
+                    request_id,
+                    text: String::from("response"),
+                },
+                Vec::new(),
+            ))
+            .unwrap();
+        assert_eq!(
+            event,
+            Event::ClipboardText {
+                request_id,
+                text: String::from("response"),
+            }
+        );
+
+        let oversized = String::from_utf8(vec![b'x'; MAX_CLIPBOARD_BYTES + 1]).unwrap();
+        assert!(matches!(
+            client.set_clipboard_text(oversized),
+            Err(ClientError::InvalidRequest(
+                RequestValidationError::ClipboardTooLarge
+            ))
+        ));
+    }
+
+    #[test]
     fn allocates_monotonic_request_ids_and_validates_create_reply() {
         let mut client = WindowClient::new(MockTransport::default());
         let create_id = client.create_window(WindowOptions::default()).unwrap();

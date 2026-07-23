@@ -77,6 +77,7 @@ extern "C" fn process_main(
                 | Event::Pointer { .. }
                 | Event::Keyboard { .. }
                 | Event::FocusChanged { .. }
+                | Event::ClipboardText { .. }
                 | Event::RequestFailed { .. } => {}
             }
         }

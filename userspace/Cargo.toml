@@ -4,6 +4,7 @@ members = [
     "ginkgo-desktop-service",
     "ginkgo-minimal-client",
     "ginkgo-file-navigator",
+    "ginkgo-text-editor",
     "ginkgo-terminal",
     "ginkgo-process-capability-smoke",
 ]
@@ -22,6 +23,7 @@ ginkgo-desktop = { path = "../crates/ginkgo-desktop" }
 ginkgo-graphics = { path = "../crates/ginkgo-graphics" }
 ginkgo-runtime = { path = "ginkgo-runtime" }
 ginkgo-terminal-protocol = { path = "../crates/ginkgo-terminal-protocol" }
+ginkgo-text-editor-core = { path = "../crates/ginkgo-text-editor-core" }
 ginkgo-userspace = { path = "../crates/ginkgo-userspace" }
 ginkgo-window = { path = "../crates/ginkgo-window" }
 rhai = { version = "1.25.1", default-features = false, features = ["no_std"] }

@@ -316,6 +316,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ginkgo-text-editor"
+version = "0.1.0"
+dependencies = [
+ "ginkgo-graphics",
+ "ginkgo-runtime",
+ "ginkgo-text-editor-core",
+ "ginkgo-userspace",
+ "ginkgo-window",
+]
+
+[[package]]
+name = "ginkgo-text-editor-core"
+version = "0.1.0"
+
+[[package]]
 name = "ginkgo-userspace"
 version = "0.1.0"
 dependencies = [
