@@ -14,7 +14,7 @@ use crate::{
     io::{IoError, MmioRegion},
     memory::{
         FrameAllocatorError, PhysAddr, PhysFrame, UsableFrameAllocator, VirtAddr, VirtPage,
-        PAGE_SIZE,
+        DMA_32BIT_ADDRESS_LIMIT, PAGE_SIZE,
     },
     paging::{ActivePageTable, MapError, PageTableFlags},
     pci::{PciBar, PciConfig, PciError},
@@ -112,13 +112,13 @@ impl DmaPage {
         hhdm: u64,
         supports_64_bit: bool,
     ) -> Result<Self, AudioError> {
-        let frame = frames.allocate_frame()?.ok_or(AudioError::OutOfFrames)?;
-        let physical = frame.start_address().as_u64();
-        if !supports_64_bit
-            && physical.checked_add(PAGE_SIZE - 1).unwrap_or(u64::MAX) > u64::from(u32::MAX)
-        {
-            return Err(AudioError::UnsupportedDmaAddress);
+        let frame = if supports_64_bit {
+            frames.allocate_frame()?
+        } else {
+            frames.allocate_frame_below(DMA_32BIT_ADDRESS_LIMIT)?
         }
+        .ok_or(AudioError::OutOfFrames)?;
+        let physical = frame.start_address().as_u64();
         let virtual_address = hhdm
             .checked_add(physical)
             .ok_or(AudioError::AddressOverflow)?;

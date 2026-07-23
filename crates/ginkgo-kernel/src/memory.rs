@@ -14,6 +14,7 @@ pub use x86_64::{PhysAddr, VirtAddr};
 pub type PhysFrame = GenericPhysFrame<Size4KiB>;
 pub type VirtPage = Page<Size4KiB>;
 pub const PAGE_SIZE: u64 = 4096;
+pub const DMA_32BIT_ADDRESS_LIMIT: u64 = 1_u64 << 32;
 
 const fn physical_address_space_size(bits: u8) -> Option<u64> {
     if bits < 12 || bits > MAX_PHYSICAL_ADDRESS_BITS {
@@ -116,15 +117,57 @@ impl OwnershipLedger {
     }
 
     /// Reclaimed addresses are always preferred over fresh addresses.
+    #[cfg(test)]
     fn claim_reclaimed(&mut self) -> Option<u64> {
-        let address = self.free.pop()?;
+        self.claim_reclaimed_below(u64::MAX)
+    }
+
+    fn claim_reclaimed_below(&mut self, max_address_exclusive: u64) -> Option<u64> {
+        let free_index = self.free.iter().rposition(|address| {
+            address
+                .checked_add(PAGE_SIZE)
+                .is_some_and(|end| end <= max_address_exclusive)
+        })?;
+        let address = self.free.swap_remove(free_index);
+        self.mark_reclaimed_allocated(address);
+        Some(address)
+    }
+
+    fn claim_reclaimed_range_below(
+        &mut self,
+        pages: usize,
+        max_address_exclusive: u64,
+    ) -> Option<u64> {
+        let byte_len = u64::try_from(pages).ok()?.checked_mul(PAGE_SIZE)?;
+        let start = self.free.iter().copied().find(|start| {
+            start
+                .checked_add(byte_len)
+                .is_some_and(|end| end <= max_address_exclusive)
+                && (0..pages).all(|index| {
+                    let address = *start + index as u64 * PAGE_SIZE;
+                    self.free.contains(&address)
+                })
+        })?;
+        for index in 0..pages {
+            let address = start + index as u64 * PAGE_SIZE;
+            let free_index = self
+                .free
+                .iter()
+                .position(|candidate| *candidate == address)
+                .expect("reclaimed range was completely preflighted");
+            self.free.swap_remove(free_index);
+            self.mark_reclaimed_allocated(address);
+        }
+        Some(start)
+    }
+
+    fn mark_reclaimed_allocated(&mut self, address: u64) {
         let index = self
             .find(address)
             .expect("free-list address must have an ownership record");
         debug_assert_eq!(self.records[index].state, OwnershipState::Free);
         self.records[index].state = OwnershipState::Allocated;
         self.live_allocated += 1;
-        Some(address)
     }
 
     fn reserve(&mut self, address: u64) -> Result<bool, FrameAllocatorError> {
@@ -331,16 +374,53 @@ impl<'a> UsableFrameAllocator<'a> {
     }
 
     pub fn allocate_frame(&mut self) -> Result<Option<PhysFrame>, FrameAllocatorError> {
+        self.allocate_frame_below(self.physical_address_space_size)
+    }
+
+    /// Allocates one frame whose complete byte range is below the exclusive limit.
+    ///
+    /// A bounded request never consumes a frame that the device cannot address.
+    /// If the current Limine range begins above the limit it is retained for a
+    /// later unrestricted request.
+    pub fn allocate_frame_below(
+        &mut self,
+        max_address_exclusive: u64,
+    ) -> Result<Option<PhysFrame>, FrameAllocatorError> {
+        self.allocate_frame_below_inner(max_address_exclusive, true)
+    }
+
+    fn allocate_frame_below_inner(
+        &mut self,
+        max_address_exclusive: u64,
+        allow_reclaimed: bool,
+    ) -> Result<Option<PhysFrame>, FrameAllocatorError> {
         if let Some(error) = self.error {
             return Err(error);
         }
+        if max_address_exclusive == 0 || max_address_exclusive > self.physical_address_space_size {
+            return Err(FrameAllocatorError::PhysicalAddressTooLarge {
+                base: max_address_exclusive,
+                length: 0,
+            });
+        }
 
-        if let Some(address) = self.ownership.claim_reclaimed() {
-            return Ok(Some(Self::frame_from_address(address)?));
+        if allow_reclaimed {
+            if let Some(address) = self.ownership.claim_reclaimed_below(max_address_exclusive) {
+                return Ok(Some(Self::frame_from_address(address)?));
+            }
         }
 
         loop {
             if self.next < self.current_end {
+                let Some(frame_end) = self.next.checked_add(PAGE_SIZE) else {
+                    return self.fail(FrameAllocatorError::UsableRegionOverflow {
+                        base: self.next,
+                        length: PAGE_SIZE,
+                    });
+                };
+                if frame_end > max_address_exclusive {
+                    return Ok(None);
+                }
                 let address = self.next;
                 match self.ownership.claim_fresh(address) {
                     Ok(claimed) => {
@@ -400,6 +480,71 @@ impl<'a> UsableFrameAllocator<'a> {
         }
     }
 
+    pub fn allocate_contiguous_frames(
+        &mut self,
+        pages: usize,
+    ) -> Result<Option<Vec<PhysFrame>>, FrameAllocatorError> {
+        self.allocate_contiguous_frames_below(pages, self.physical_address_space_size)
+    }
+
+    /// Attempts one atomic contiguous allocation below an exclusive address limit.
+    /// Partial, exhausted, or fragmented runs are returned to the allocator.
+    pub fn allocate_contiguous_frames_below(
+        &mut self,
+        pages: usize,
+        max_address_exclusive: u64,
+    ) -> Result<Option<Vec<PhysFrame>>, FrameAllocatorError> {
+        if pages == 0 {
+            return Ok(None);
+        }
+        let mut frames = Vec::new();
+        frames
+            .try_reserve_exact(pages)
+            .map_err(|_| FrameAllocatorError::OwnershipTrackingAllocationFailed)?;
+        if let Some(start) = self
+            .ownership
+            .claim_reclaimed_range_below(pages, max_address_exclusive)
+        {
+            for index in 0..pages {
+                frames.push(Self::frame_from_address(start + index as u64 * PAGE_SIZE)?);
+            }
+            return Ok(Some(frames));
+        }
+        let mut expected = None;
+        for _ in 0..pages {
+            let frame = match self.allocate_frame_below_inner(max_address_exclusive, false) {
+                Ok(Some(frame)) => frame,
+                Ok(None) => {
+                    self.deallocate_frames(&frames)?;
+                    return Ok(None);
+                }
+                Err(error) => {
+                    if !frames.is_empty() {
+                        self.deallocate_frames(&frames)?;
+                    }
+                    return Err(error);
+                }
+            };
+            let address = frame.start_address().as_u64();
+            if expected.is_some_and(|expected| expected != address) {
+                frames.push(frame);
+                self.deallocate_frames(&frames)?;
+                return Ok(None);
+            }
+            expected = address.checked_add(PAGE_SIZE);
+            if expected.is_none() {
+                frames.push(frame);
+                self.deallocate_frames(&frames)?;
+                return Err(FrameAllocatorError::UsableRegionOverflow {
+                    base: address,
+                    length: PAGE_SIZE,
+                });
+            }
+            frames.push(frame);
+        }
+        Ok(Some(frames))
+    }
+
     fn frame_from_address(address: u64) -> Result<PhysFrame, FrameAllocatorError> {
         let address = PhysAddr::try_new(address).map_err(|_| {
             FrameAllocatorError::PhysicalAddressTooLarge {
@@ -434,7 +579,7 @@ unsafe impl FrameAllocator<Size4KiB> for UsableFrameAllocator<'_> {
 mod tests {
     use super::{
         physical_address_space_size, FrameAllocatorError, OwnershipLedger, UsableFrameAllocator,
-        PAGE_SIZE,
+        DMA_32BIT_ADDRESS_LIMIT, PAGE_SIZE,
     };
 
     const A: u64 = 0x1000;
@@ -463,6 +608,57 @@ mod tests {
         let frame = allocator.allocate_frame().unwrap().unwrap();
         assert_eq!(frame.start_address().as_u64(), base);
         assert_eq!(allocator.allocate_frame(), Ok(None));
+    }
+
+    #[test]
+    fn bounded_allocation_preserves_high_frame_for_unrestricted_use() {
+        let base = DMA_32BIT_ADDRESS_LIMIT;
+        let mut allocator = unsafe { UsableFrameAllocator::from_test_region(base, PAGE_SIZE, 52) };
+        assert_eq!(
+            allocator.allocate_frame_below(DMA_32BIT_ADDRESS_LIMIT),
+            Ok(None)
+        );
+        assert_eq!(
+            allocator
+                .allocate_frame()
+                .unwrap()
+                .unwrap()
+                .start_address()
+                .as_u64(),
+            base
+        );
+    }
+
+    #[test]
+    fn bounded_allocation_can_reuse_an_eligible_reclaimed_frame() {
+        let mut allocator = unsafe {
+            UsableFrameAllocator::from_test_region(
+                DMA_32BIT_ADDRESS_LIMIT - PAGE_SIZE,
+                PAGE_SIZE * 2,
+                52,
+            )
+        };
+        let low = allocator.allocate_frame().unwrap().unwrap();
+        let high = allocator.allocate_frame().unwrap().unwrap();
+        allocator.deallocate_frames(&[low, high]).unwrap();
+        assert_eq!(
+            allocator
+                .allocate_frame_below(DMA_32BIT_ADDRESS_LIMIT)
+                .unwrap()
+                .unwrap(),
+            low
+        );
+    }
+
+    #[test]
+    fn failed_contiguous_allocation_rolls_back_every_partial_frame() {
+        let mut allocator =
+            unsafe { UsableFrameAllocator::from_test_region(0x1000, PAGE_SIZE * 2, 52) };
+        assert_eq!(allocator.allocate_contiguous_frames(3), Ok(None));
+        assert_eq!(allocator.allocated_count(), 0);
+        assert_eq!(allocator.free_count(), 2);
+        assert!(allocator.allocate_contiguous_frames(2).unwrap().is_some());
+        assert_eq!(allocator.allocated_count(), 2);
     }
 
     #[test]

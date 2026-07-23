@@ -23,6 +23,7 @@ const PCI_COMMAND_IO_SPACE: u16 = 1 << 0;
 const PCI_COMMAND_BUS_MASTER: u16 = 1 << 2;
 const PCI_BAR0: u8 = 0x10;
 const LEGACY_IO_BYTES: u16 = 0x20;
+const LEGACY_QUEUE_ADDRESS_LIMIT: u64 = 1_u64 << 44;
 
 const REG_HOST_FEATURES: u16 = 0x00;
 const REG_GUEST_FEATURES: u16 = 0x04;
@@ -76,7 +77,7 @@ pub enum VirtioBlkError {
     InvalidIoBar,
     InvalidQueueSize,
     InvalidQueueLayout,
-    NonContiguousDma,
+
     UnsupportedDmaAddress,
     AddressOverflow,
     OutOfFrames,
@@ -176,29 +177,18 @@ impl DmaRegion {
         frames: &mut UsableFrameAllocator<'_>,
         hhdm_offset: u64,
         pages: usize,
+        max_address_exclusive: Option<u64>,
     ) -> Result<Self, VirtioBlkError> {
-        if pages == 0 {
-            return Err(VirtioBlkError::AddressOverflow);
+        let allocated = match max_address_exclusive {
+            Some(limit) => frames.allocate_contiguous_frames_below(pages, limit)?,
+            None => frames.allocate_contiguous_frames(pages)?,
         }
-        let mut physical = None;
-        let mut expected = 0_u64;
-        for index in 0..pages {
-            let frame = frames
-                .allocate_frame()?
-                .ok_or(VirtioBlkError::OutOfFrames)?;
-            let address = frame.start_address().as_u64();
-            if index == 0 {
-                physical = Some(address);
-                expected = address;
-            }
-            if address != expected {
-                return Err(VirtioBlkError::NonContiguousDma);
-            }
-            expected = expected
-                .checked_add(PAGE_SIZE)
-                .ok_or(VirtioBlkError::AddressOverflow)?;
-        }
-        let physical = physical.ok_or(VirtioBlkError::OutOfFrames)?;
+        .ok_or(VirtioBlkError::OutOfFrames)?;
+        let physical = allocated
+            .first()
+            .ok_or(VirtioBlkError::AddressOverflow)?
+            .start_address()
+            .as_u64();
         let len = pages
             .checked_mul(PAGE_SIZE as usize)
             .ok_or(VirtioBlkError::AddressOverflow)?;
@@ -363,13 +353,18 @@ impl VirtioBlk {
         }
         let queue_size = io.read_u16(REG_QUEUE_SIZE)?;
         let layout = QueueLayout::new(queue_size)?;
-        let queue = DmaRegion::allocate_contiguous(frames, hhdm_offset, layout.pages)?;
+        let queue = DmaRegion::allocate_contiguous(
+            frames,
+            hhdm_offset,
+            layout.pages,
+            Some(LEGACY_QUEUE_ADDRESS_LIMIT),
+        )?;
         if queue.physical & (PAGE_SIZE - 1) != 0 || queue.physical >> 12 > u64::from(u32::MAX) {
             let _ = io.write_u8(REG_DEVICE_STATUS, feature_status | STATUS_FAILED);
             return Err(VirtioBlkError::UnsupportedDmaAddress);
         }
-        let request = DmaRegion::allocate_contiguous(frames, hhdm_offset, 1)?;
-        let data = DmaRegion::allocate_contiguous(frames, hhdm_offset, 1)?;
+        let request = DmaRegion::allocate_contiguous(frames, hhdm_offset, 1, None)?;
+        let data = DmaRegion::allocate_contiguous(frames, hhdm_offset, 1, None)?;
         io.write_u32(REG_QUEUE_PFN, (queue.physical >> 12) as u32)?;
         if io.read_u32(REG_QUEUE_PFN)? != (queue.physical >> 12) as u32 {
             let _ = io.write_u8(REG_DEVICE_STATUS, feature_status | STATUS_FAILED);

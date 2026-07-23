@@ -20,7 +20,7 @@ use crate::{
     arch::{take_xhci_interrupt_pending, XHCI_VECTOR},
     memory::{
         FrameAllocatorError, PhysAddr, PhysFrame, UsableFrameAllocator, VirtAddr, VirtPage,
-        PAGE_SIZE,
+        DMA_32BIT_ADDRESS_LIMIT, PAGE_SIZE,
     },
     paging::{ActivePageTable, MapError, PageTableFlags},
     pci::{self, PciBar, PciConfig, PciDevice, PciError},
@@ -2198,12 +2198,13 @@ impl DmaPage {
         hhdm_offset: u64,
         address_64: bool,
     ) -> Result<Self, UsbError> {
-        let frame = frames.allocate_frame()?.ok_or(UsbError::OutOfFrames)?;
-        let physical = frame.start_address().as_u64();
-        if !address_64 && physical.checked_add(PAGE_SIZE - 1).unwrap_or(u64::MAX) > u32::MAX as u64
-        {
-            return Err(UsbError::UnsupportedDmaAddress);
+        let frame = if address_64 {
+            frames.allocate_frame()?
+        } else {
+            frames.allocate_frame_below(DMA_32BIT_ADDRESS_LIMIT)?
         }
+        .ok_or(UsbError::OutOfFrames)?;
+        let physical = frame.start_address().as_u64();
         let virtual_address = hhdm_offset
             .checked_add(physical)
             .ok_or(UsbError::AddressOverflow)?;
