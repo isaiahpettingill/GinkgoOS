@@ -4,19 +4,29 @@ use alloc::vec::Vec;
 
 use x86_64::structures::paging::{FrameAllocator, Page, PhysFrame as GenericPhysFrame, Size4KiB};
 
-use crate::limine::{MemoryMapEntries, MemoryMapError, MemoryMapResponse, MEMORY_MAP_USABLE};
+use crate::{
+    arch::MAX_PHYSICAL_ADDRESS_BITS,
+    limine::{MemoryMapEntries, MemoryMapError, MemoryMapResponse, MEMORY_MAP_USABLE},
+};
 
 pub use x86_64::{PhysAddr, VirtAddr};
 
 pub type PhysFrame = GenericPhysFrame<Size4KiB>;
 pub type VirtPage = Page<Size4KiB>;
 pub const PAGE_SIZE: u64 = 4096;
-pub const MAX_PHYSICAL_ADDRESS: u64 = (1_u64 << 52) - 1;
-const PHYSICAL_ADDRESS_SPACE_SIZE: u64 = 1_u64 << 52;
+
+const fn physical_address_space_size(bits: u8) -> Option<u64> {
+    if bits < 12 || bits > MAX_PHYSICAL_ADDRESS_BITS {
+        None
+    } else {
+        Some(1_u64 << bits)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameAllocatorError {
     InvalidMemoryMap(MemoryMapError),
+    InvalidPhysicalAddressBits { bits: u8 },
     InvalidUsableRegion { base: u64, length: u64 },
     UsableRegionOverflow { base: u64, length: u64 },
     PhysicalAddressTooLarge { base: u64, length: u64 },
@@ -198,32 +208,54 @@ pub struct UsableFrameAllocator<'a> {
     entries: Option<MemoryMapEntries<'a>>,
     next: u64,
     current_end: u64,
+    physical_address_space_size: u64,
     ownership: OwnershipLedger,
     error: Option<FrameAllocatorError>,
 }
 
 impl<'a> UsableFrameAllocator<'a> {
-    pub fn new(memory_map: &'a MemoryMapResponse) -> Result<Self, MemoryMapError> {
+    /// Builds an allocator over Limine's usable regions, constrained by the
+    /// physical-address width reported by CPUID.
+    pub fn new(
+        memory_map: &'a MemoryMapResponse,
+        physical_address_bits: u8,
+    ) -> Result<Self, FrameAllocatorError> {
+        let physical_address_space_size = physical_address_space_size(physical_address_bits)
+            .ok_or(FrameAllocatorError::InvalidPhysicalAddressBits {
+                bits: physical_address_bits,
+            })?;
         Ok(Self {
-            entries: Some(memory_map.entries()?),
+            entries: Some(
+                memory_map
+                    .entries()
+                    .map_err(FrameAllocatorError::InvalidMemoryMap)?,
+            ),
             next: 0,
             current_end: 0,
+            physical_address_space_size,
             ownership: OwnershipLedger::new(),
             error: None,
         })
     }
 
     #[cfg(test)]
-    pub(crate) unsafe fn from_test_region(base: u64, length: u64) -> Self {
+    pub(crate) unsafe fn from_test_region(
+        base: u64,
+        length: u64,
+        physical_address_bits: u8,
+    ) -> Self {
+        let physical_address_space_size = physical_address_space_size(physical_address_bits)
+            .expect("test physical address width must be valid");
         assert_eq!(base % PAGE_SIZE, 0);
         assert_eq!(length % PAGE_SIZE, 0);
         assert!(base
             .checked_add(length)
-            .is_some_and(|end| end <= PHYSICAL_ADDRESS_SPACE_SIZE));
+            .is_some_and(|end| end <= physical_address_space_size));
         Self {
             entries: None,
             next: base,
             current_end: base + length,
+            physical_address_space_size,
             ownership: OwnershipLedger::new(),
             error: None,
         }
@@ -356,7 +388,7 @@ impl<'a> UsableFrameAllocator<'a> {
                     })
                 }
             };
-            if end > PHYSICAL_ADDRESS_SPACE_SIZE {
+            if end > self.physical_address_space_size {
                 return self.fail(FrameAllocatorError::PhysicalAddressTooLarge {
                     base: entry.base,
                     length: entry.length,
@@ -400,7 +432,10 @@ unsafe impl FrameAllocator<Size4KiB> for UsableFrameAllocator<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameAllocatorError, OwnershipLedger};
+    use super::{
+        physical_address_space_size, FrameAllocatorError, OwnershipLedger, UsableFrameAllocator,
+        PAGE_SIZE,
+    };
 
     const A: u64 = 0x1000;
     const B: u64 = 0x2000;
@@ -412,6 +447,22 @@ mod tests {
         assert_eq!(ledger.claim_fresh(B), Ok(true));
         assert_eq!(ledger.claim_fresh(C), Ok(true));
         ledger
+    }
+
+    #[test]
+    fn physical_address_width_limits_are_checked() {
+        assert_eq!(physical_address_space_size(11), None);
+        assert_eq!(physical_address_space_size(52), Some(1_u64 << 52));
+        assert_eq!(physical_address_space_size(53), None);
+    }
+
+    #[test]
+    fn allocator_issues_frames_above_four_gib_when_supported() {
+        let base = 0x1_0000_0000;
+        let mut allocator = unsafe { UsableFrameAllocator::from_test_region(base, PAGE_SIZE, 52) };
+        let frame = allocator.allocate_frame().unwrap().unwrap();
+        assert_eq!(frame.start_address().as_u64(), base);
+        assert_eq!(allocator.allocate_frame(), Ok(None));
     }
 
     #[test]

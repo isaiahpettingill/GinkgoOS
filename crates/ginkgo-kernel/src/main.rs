@@ -813,7 +813,10 @@ pub extern "C" fn _start() -> ! {
     let Some(hhdm) = HHDM_REQUEST.response() else {
         halt_forever();
     };
-    let Ok(mut frames) = UsableFrameAllocator::new(memory_map) else {
+    let cpu_capabilities = arch::cpu_capabilities();
+    let Ok(mut frames) =
+        UsableFrameAllocator::new(memory_map, cpu_capabilities.physical_address_bits)
+    else {
         halt_forever();
     };
     let Ok(mut page_table) = (unsafe { ActivePageTable::from_current(hhdm.offset) }) else {

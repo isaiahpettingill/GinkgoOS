@@ -6,8 +6,8 @@ A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. Gi
 
 - Nightly Rust and the built-in `x86_64-unknown-none` target
 - Limine framebuffer, memory-map, and higher-half direct-map requests
-- Reclaiming 4 KiB physical-frame allocation with exact ownership and reservation tracking
-- `x86_64`-backed address types, active page-table translation, mapping, and unmapping
+- CPUID-width-aware, reclaiming 4 KiB physical-frame allocation with exact ownership and reservation tracking
+- `x86_64`-backed address types, active four-level page-table translation, mapping, and unmapping
 - Generation-tagged processes with isolated lower-half page tables and supervisor-only shared kernel mappings
 - Strict ELF64 `ET_EXEC` compatibility plus randomized static `ET_DYN`, guarded randomized user stacks, x86-64 ring-3 entry, and contained user faults
 - `SYSCALL`/`SYSRET` dispatch plus `no_std` userspace stubs for processes, handles, channels, waits, shared memory, files, directories, and debug output
@@ -74,6 +74,7 @@ Current execution limitations are intentional and explicit:
 - SMAP is enabled when supported; one CPU-local fixup contains faults during explicitly bracketed user copies.
 - XSAVE-capable CPUs preserve enabled x87/SSE/AVX state (including AVX2's YMM state) across every userspace transition; legacy CPUs use FXSAVE, and default system images retain an SSE2 baseline.
 - Physical reclamation is single-core: process roots are recycled only after switching back to the kernel CR3; future SMP requires remote TLB shootdown before reuse.
+- CPUID physical-address width constrains usable Limine RAM; allocation can use frames above 4 GiB when the platform reports them. The kernel remains on four-level paging, so its active virtual-address contract is 48-bit even on LA57-capable CPUs.
 - Early shared-memory and capability allocation still depends on the fixed bootstrap kernel heap.
 - Dynamic linking, runtime ELF relocations, signed rollback prevention, encrypted storage, and hardware-backed key sealing are not yet provided.
 

@@ -1847,7 +1847,7 @@ mod tests {
             let layout = Layout::from_size_align(size, PAGE_SIZE as usize).unwrap();
             let pointer = NonNull::new(unsafe { alloc_zeroed(layout) }).expect("test frame region");
             let allocator = unsafe {
-                UsableFrameAllocator::from_test_region(pointer.as_ptr() as u64, size as u64)
+                UsableFrameAllocator::from_test_region(pointer.as_ptr() as u64, size as u64, 52)
             };
             (Self { pointer, layout }, allocator)
         }

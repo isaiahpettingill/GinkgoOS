@@ -367,6 +367,11 @@ pub struct CpuCapabilities {
     pub smap: bool,
     pub xsave: bool,
     pub avx: bool,
+    /// Physical-address width reported by CPUID and capped by the active paging implementation.
+    pub physical_address_bits: u8,
+    /// Linear-address width reported by CPUID. The current four-level kernel deliberately
+    /// continues to use only the low 48 bits until it implements LA57 page tables.
+    pub linear_address_bits: u8,
 }
 
 impl CpuCapabilities {
@@ -377,8 +382,18 @@ impl CpuCapabilities {
         standard_ecx: u32,
         standard_edx: u32,
         structured_ebx: u32,
+        address_widths_eax: u32,
     ) -> Self {
         let has_extended_features = maximum_extended_leaf >= EXTENDED_FEATURES_LEAF;
+        let (physical_address_bits, linear_address_bits) =
+            if maximum_extended_leaf >= ADDRESS_WIDTHS_LEAF {
+                validated_address_widths(address_widths_eax as u8, (address_widths_eax >> 8) as u8)
+            } else {
+                (
+                    DEFAULT_PHYSICAL_ADDRESS_BITS,
+                    FOUR_LEVEL_LINEAR_ADDRESS_BITS,
+                )
+            };
         Self {
             syscall_sysret: has_extended_features && extended_edx & CPUID_SYSCALL_SYSRET != 0,
             no_execute: has_extended_features && extended_edx & CPUID_NO_EXECUTE != 0,
@@ -387,8 +402,31 @@ impl CpuCapabilities {
             smap: maximum_standard_leaf >= 7 && structured_ebx & CPUID_SMAP != 0,
             xsave: standard_ecx & CPUID_XSAVE != 0,
             avx: standard_ecx & (CPUID_XSAVE | CPUID_AVX) == (CPUID_XSAVE | CPUID_AVX),
+            physical_address_bits,
+            linear_address_bits,
         }
     }
+}
+
+/// The x86-64 page-table implementation represents at most 52 physical bits.
+pub const MAX_PHYSICAL_ADDRESS_BITS: u8 = 52;
+/// Four-level page tables make bits 0 through 47 canonical; LA57 is not enabled.
+pub const FOUR_LEVEL_LINEAR_ADDRESS_BITS: u8 = 48;
+const DEFAULT_PHYSICAL_ADDRESS_BITS: u8 = 36;
+const ADDRESS_WIDTHS_LEAF: u32 = 0x8000_0008;
+
+const fn validated_address_widths(physical: u8, linear: u8) -> (u8, u8) {
+    let physical = if physical >= 12 && physical <= MAX_PHYSICAL_ADDRESS_BITS {
+        physical
+    } else {
+        DEFAULT_PHYSICAL_ADDRESS_BITS
+    };
+    let linear = if linear >= FOUR_LEVEL_LINEAR_ADDRESS_BITS && linear <= 57 {
+        linear
+    } else {
+        FOUR_LEVEL_LINEAR_ADDRESS_BITS
+    };
+    (physical, linear)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1171,6 +1209,11 @@ pub fn cpu_capabilities() -> CpuCapabilities {
         } else {
             0
         };
+        let address_widths_eax = if maximum >= ADDRESS_WIDTHS_LEAF {
+            core::arch::x86_64::__cpuid(ADDRESS_WIDTHS_LEAF).eax
+        } else {
+            0
+        };
         let standard = core::arch::x86_64::__cpuid(1);
         let standard_ecx = standard.ecx;
         let standard_edx = standard.edx;
@@ -1186,11 +1229,12 @@ pub fn cpu_capabilities() -> CpuCapabilities {
             standard_ecx,
             standard_edx,
             structured_ebx,
+            address_widths_eax,
         )
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        CpuCapabilities::from_cpuid(0, 0, 0, 0, 0, 0)
+        CpuCapabilities::from_cpuid(0, 0, 0, 0, 0, 0, 0)
     }
 }
 
@@ -2047,7 +2091,7 @@ mod tests {
 
     #[test]
     fn extended_capabilities_gate_no_execute_requests() {
-        let absent = CpuCapabilities::from_cpuid(0x8000_0000, u32::MAX, 0, 0, 0, 0);
+        let absent = CpuCapabilities::from_cpuid(0x8000_0000, u32::MAX, 0, 0, 0, 0, 0);
         assert_eq!(
             absent,
             CpuCapabilities {
@@ -2057,6 +2101,8 @@ mod tests {
                 smap: false,
                 xsave: false,
                 avx: false,
+                physical_address_bits: DEFAULT_PHYSICAL_ADDRESS_BITS,
+                linear_address_bits: FOUR_LEVEL_LINEAR_ADDRESS_BITS,
             }
         );
 
@@ -2066,6 +2112,7 @@ mod tests {
             7,
             0,
             CPUID_FPU | CPUID_FXSR | CPUID_SSE | CPUID_SSE2,
+            0,
             0,
         );
         assert!(syscall_only.syscall_sysret);
@@ -2083,6 +2130,7 @@ mod tests {
             CPUID_XSAVE | CPUID_AVX,
             CPUID_FPU | CPUID_FXSR | CPUID_SSE | CPUID_SSE2,
             CPUID_SMAP,
+            0,
         );
         assert!(complete.syscall_sysret);
         assert!(complete.no_execute);
@@ -2097,12 +2145,32 @@ mod tests {
             0,
             CPUID_FPU | CPUID_FXSR | CPUID_SSE,
             0,
+            0,
         );
         assert!(!missing_sse2.fxsave_sse);
         assert_eq!(validate_no_execute_requirement(true, complete), Ok(()));
         assert_eq!(
             EFER_SYSTEM_CALL_EXTENSIONS | EFER_NO_EXECUTE_ENABLE,
             (1 << 0) | (1 << 11)
+        );
+    }
+
+    #[test]
+    fn cpuid_address_widths_are_validated_and_preserved() {
+        let widths =
+            CpuCapabilities::from_cpuid(ADDRESS_WIDTHS_LEAF, 0, 0, 0, 0, 0, 52 | (57 << 8));
+        assert_eq!(widths.physical_address_bits, 52);
+        assert_eq!(widths.linear_address_bits, 57);
+
+        let malformed =
+            CpuCapabilities::from_cpuid(ADDRESS_WIDTHS_LEAF, 0, 0, 0, 0, 0, 53 | (47 << 8));
+        assert_eq!(
+            malformed.physical_address_bits,
+            DEFAULT_PHYSICAL_ADDRESS_BITS
+        );
+        assert_eq!(
+            malformed.linear_address_bits,
+            FOUR_LEVEL_LINEAR_ADDRESS_BITS
         );
     }
 
