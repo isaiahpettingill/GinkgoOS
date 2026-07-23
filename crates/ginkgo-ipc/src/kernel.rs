@@ -7,17 +7,9 @@
 //! cooperative scheduler; a future syscall layer can block around exposed object
 //! signals without changing these semantics.
 
-use alloc::{
-    alloc::{alloc_zeroed, dealloc, Layout},
-    collections::VecDeque,
-    string::String,
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{collections::VecDeque, string::String, sync::Arc, vec::Vec};
 use core::{
     mem,
-    ptr::NonNull,
-    slice,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -450,26 +442,74 @@ impl ProcessControl {
     }
 }
 
+/// Architecture-neutral storage owned by one shared-memory kernel object.
+///
+/// Implementations own every physical page they report and internally serialize all
+/// calls to [`Self::read`] and [`Self::write`] across every clone of the same storage.
+/// Direct userspace mappings bypass that serialization: storage implementations and
+/// mapping users must define coherent alias behavior and externally synchronize
+/// conflicting kernel/direct-mapping access.
+///
+/// # Safety
+///
+/// `mapped_len / SHARED_MEMORY_PAGE_SIZE` must be the stable, exact page count.
+/// `physical_page` must return one stable, distinct, aligned, representable physical
+/// start address for every index below that count and `None` for every other index.
+/// Every page must remain valid, exclusively owned by this storage, in bounds for a
+/// complete 4 KiB access, and suitable for coherent userspace exposure until final
+/// storage drop. `read` and `write` must bounds-check and be thread-safe even when the
+/// same storage is installed in multiple IPC objects.
+pub unsafe trait SharedMemoryStorage: Send + Sync {
+    fn logical_len(&self) -> usize;
+    fn mapped_len(&self) -> usize;
+    fn physical_page(&self, page_index: usize) -> Option<u64>;
+    fn read(&self, offset: usize, output: &mut [u8]) -> Result<(), IpcError>;
+    fn write(&self, offset: usize, input: &[u8]) -> Result<(), IpcError>;
+}
+
 struct SharedMemoryObject {
     backing: SharedMemoryBacking,
-    access: Spinlock<()>,
 }
 
 struct SharedMemoryBacking {
-    base: NonNull<u8>,
+    storage: Arc<dyn SharedMemoryStorage>,
     logical_len: usize,
-    layout: Layout,
+    mapped_len: usize,
+    physical_pages: Vec<u64>,
 }
 
 impl SharedMemoryBacking {
-    fn new(logical_len: usize) -> Result<Self, IpcError> {
-        let mapped_len = logical_len
+    fn new(storage: Arc<dyn SharedMemoryStorage>) -> Result<Self, IpcError> {
+        let logical_len = storage.logical_len();
+        if logical_len == 0 {
+            return Err(IpcError::InvalidMessage);
+        }
+        let expected_mapped_len = logical_len
             .checked_add(SHARED_MEMORY_PAGE_SIZE - 1)
             .ok_or(IpcError::InvalidMessage)?
             & !(SHARED_MEMORY_PAGE_SIZE - 1);
-        let layout = Layout::from_size_align(mapped_len, SHARED_MEMORY_PAGE_SIZE)
-            .map_err(|_| IpcError::InvalidMessage)?;
-        let base = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(IpcError::OutOfMemory)?;
+        let mapped_len = storage.mapped_len();
+        if mapped_len != expected_mapped_len {
+            return Err(IpcError::InvalidMessage);
+        }
+        let page_count = mapped_len / SHARED_MEMORY_PAGE_SIZE;
+        let mut physical_pages = Vec::new();
+        physical_pages
+            .try_reserve_exact(page_count)
+            .map_err(|_| IpcError::OutOfMemory)?;
+        for page_index in 0..page_count {
+            let physical = storage
+                .physical_page(page_index)
+                .ok_or(IpcError::InvalidMessage)?;
+            if physical % SHARED_MEMORY_PAGE_SIZE as u64 != 0 || physical_pages.contains(&physical)
+            {
+                return Err(IpcError::InvalidMessage);
+            }
+            physical_pages.push(physical);
+        }
+        if storage.physical_page(page_count).is_some() {
+            return Err(IpcError::InvalidMessage);
+        }
 
         SHARED_MEMORY_LIVE_OBJECTS.fetch_add(1, Ordering::Relaxed);
         SHARED_MEMORY_LOGICAL_BYTES.fetch_add(logical_len, Ordering::Relaxed);
@@ -477,29 +517,19 @@ impl SharedMemoryBacking {
         SHARED_MEMORY_CUMULATIVE_CREATIONS.fetch_add(1, Ordering::Relaxed);
 
         Ok(Self {
-            base,
+            storage,
             logical_len,
-            layout,
+            mapped_len,
+            physical_pages,
         })
-    }
-
-    fn mapped_len(&self) -> usize {
-        self.layout.size()
     }
 }
 
-// SAFETY: the allocation address and lengths are immutable. All safe byte access
-// is serialized by SharedMemoryObject::access; raw mapping users must provide the
-// external synchronization documented by SharedMemoryMappingLease.
-unsafe impl Send for SharedMemoryBacking {}
-unsafe impl Sync for SharedMemoryBacking {}
-
 impl Drop for SharedMemoryBacking {
     fn drop(&mut self) {
-        unsafe { dealloc(self.base.as_ptr(), self.layout) };
         SHARED_MEMORY_LIVE_OBJECTS.fetch_sub(1, Ordering::Relaxed);
         SHARED_MEMORY_LOGICAL_BYTES.fetch_sub(self.logical_len, Ordering::Relaxed);
-        SHARED_MEMORY_MAPPED_ALLOCATED_BYTES.fetch_sub(self.mapped_len(), Ordering::Relaxed);
+        SHARED_MEMORY_MAPPED_ALLOCATED_BYTES.fetch_sub(self.mapped_len, Ordering::Relaxed);
         SHARED_MEMORY_CUMULATIVE_DROPS.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -678,18 +708,15 @@ impl HandleOperationDisposition {
     }
 }
 
-/// Page-aligned kernel backing metadata retained by a mapping lease.
+/// Page-rounded backing metadata retained by a mapping lease.
 ///
-/// Direct mapped access aliases kernel read/write APIs and all writable aliases;
-/// mapping code must provide external synchronization and enforce the requested
-/// userspace protections.
+/// Physical page identities are obtained from [`SharedMemoryMappingLease`] so the
+/// lease's owning reference necessarily remains live while they are inspected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SharedMemoryMappingInfo {
-    /// Immutable base address of the page-aligned kernel allocation.
-    pub base: *const u8,
     /// API-visible byte length used by read/write and window subdivision.
     pub logical_len: usize,
-    /// Page-rounded allocation length available to a real mapping implementation.
+    /// Page-rounded frame-backed length available to process mapping code.
     pub mapped_len: usize,
 }
 
@@ -726,6 +753,16 @@ pub struct SharedMemoryMappingLease {
 impl SharedMemoryMappingLease {
     pub const fn info(&self) -> SharedMemoryMappingInfo {
         self.info
+    }
+
+    /// Returns the immutable physical start address of one owned backing page.
+    pub fn physical_page(&self, page_index: usize) -> Option<u64> {
+        shared_memory_object(&self._object)
+            .ok()?
+            .backing
+            .physical_pages
+            .get(page_index)
+            .copied()
     }
 
     pub const fn effective_rights(&self) -> Rights {
@@ -997,20 +1034,24 @@ impl HandleTable {
         }
     }
 
-    /// Creates zero-filled, heap-backed shared memory.
-    pub fn shared_memory_create(&mut self, size: usize) -> Result<Handle, IpcError> {
-        if size == 0 {
-            return Err(IpcError::InvalidMessage);
-        }
-
-        let backing = SharedMemoryBacking::new(size)?;
-        let object = Arc::try_new(KernelObject::SharedMemory(SharedMemoryObject {
-            backing,
-            access: Spinlock::new(()),
-        }))
-        .map_err(|_| IpcError::OutOfMemory)?;
+    /// Creates shared memory from externally owned, page-backed storage.
+    ///
+    /// Production storage is supplied by the kernel so this capability layer never
+    /// depends on an architecture or physical-frame allocator.
+    pub fn shared_memory_create_with_storage(
+        &mut self,
+        storage: Arc<dyn SharedMemoryStorage>,
+    ) -> Result<Handle, IpcError> {
+        let backing = SharedMemoryBacking::new(storage)?;
+        let object = Arc::try_new(KernelObject::SharedMemory(SharedMemoryObject { backing }))
+            .map_err(|_| IpcError::OutOfMemory)?;
         let slot = self.reserve_slots(1)?[0];
         Ok(self.insert_reserved(slot, object, SHARED_MEMORY_DEFAULT_RIGHTS))
+    }
+
+    #[cfg(test)]
+    fn shared_memory_create(&mut self, size: usize) -> Result<Handle, IpcError> {
+        self.shared_memory_create_with_storage(test_shared_memory_storage(size)?)
     }
 
     /// Returns the immutable allocation length of a shared-memory object.
@@ -1028,13 +1069,8 @@ impl HandleTable {
     ) -> Result<(), IpcError> {
         let object = self.object_with_rights(handle, Rights::READ)?;
         let memory = shared_memory_object(&object)?;
-        let _access = memory.access.lock();
-        let range = checked_range(offset, output.len(), memory.backing.logical_len)?;
-        let bytes = unsafe {
-            slice::from_raw_parts(memory.backing.base.as_ptr(), memory.backing.logical_len)
-        };
-        output.copy_from_slice(&bytes[range]);
-        Ok(())
+        checked_range(offset, output.len(), memory.backing.logical_len)?;
+        memory.backing.storage.read(offset, output)
     }
 
     /// Copies bytes into a checked shared-memory range.
@@ -1051,13 +1087,8 @@ impl HandleTable {
     ) -> Result<(), IpcError> {
         let object = self.object_with_rights(handle, Rights::WRITE)?;
         let memory = shared_memory_object(&object)?;
-        let _access = memory.access.lock();
-        let range = checked_range(offset, input.len(), memory.backing.logical_len)?;
-        let bytes = unsafe {
-            slice::from_raw_parts_mut(memory.backing.base.as_ptr(), memory.backing.logical_len)
-        };
-        bytes[range].copy_from_slice(input);
-        Ok(())
+        checked_range(offset, input.len(), memory.backing.logical_len)?;
+        memory.backing.storage.write(offset, input)
     }
 
     /// Acquires an owning lease for a future process mapping.
@@ -1075,9 +1106,8 @@ impl HandleTable {
         let object = self.object_with_rights(handle, effective_rights)?;
         let backing = &shared_memory_object(&object)?.backing;
         let info = SharedMemoryMappingInfo {
-            base: backing.base.as_ptr().cast_const(),
             logical_len: backing.logical_len,
-            mapped_len: backing.mapped_len(),
+            mapped_len: backing.mapped_len,
         };
         Ok(SharedMemoryMappingLease {
             _object: object,
@@ -2064,16 +2094,12 @@ fn copy_window_buffer(
     let start = buffer_start
         .checked_add(relative.start)
         .ok_or(IpcError::InvalidMessage)?;
-    let end = buffer_start
+    buffer_start
         .checked_add(relative.end)
         .ok_or(IpcError::InvalidMessage)?;
     let memory = shared_memory_object(&state.shared_memory)
         .expect("window referenced a non-shared-memory object");
-    let _access = memory.access.lock();
-    let bytes =
-        unsafe { slice::from_raw_parts(memory.backing.base.as_ptr(), memory.backing.logical_len) };
-    output.copy_from_slice(&bytes[start..end]);
-    Ok(())
+    memory.backing.storage.read(start, output)
 }
 
 fn object_reaches_channel<F>(
@@ -2137,8 +2163,107 @@ where
 }
 
 #[cfg(test)]
+fn test_shared_memory_storage(
+    logical_len: usize,
+) -> Result<Arc<dyn SharedMemoryStorage>, IpcError> {
+    if logical_len == 0 {
+        return Err(IpcError::InvalidMessage);
+    }
+    let mapped_len = logical_len
+        .checked_add(SHARED_MEMORY_PAGE_SIZE - 1)
+        .ok_or(IpcError::InvalidMessage)?
+        & !(SHARED_MEMORY_PAGE_SIZE - 1);
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(mapped_len)
+        .map_err(|_| IpcError::OutOfMemory)?;
+    bytes.resize(mapped_len, 0);
+    let storage: Arc<dyn SharedMemoryStorage> = Arc::try_new(TestSharedMemoryStorage {
+        logical_len,
+        bytes: Spinlock::new(bytes),
+    })
+    .map_err(|_| IpcError::OutOfMemory)?;
+    Ok(storage)
+}
+
+#[cfg(test)]
+struct TestSharedMemoryStorage {
+    logical_len: usize,
+    bytes: Spinlock<Vec<u8>>,
+}
+
+#[cfg(test)]
+// SAFETY: test page identities are aligned opaque values and are never installed
+// into a real address space; the byte vector remains owned until final drop.
+unsafe impl SharedMemoryStorage for TestSharedMemoryStorage {
+    fn logical_len(&self) -> usize {
+        self.logical_len
+    }
+
+    fn mapped_len(&self) -> usize {
+        self.bytes.lock().len()
+    }
+
+    fn physical_page(&self, page_index: usize) -> Option<u64> {
+        (page_index < self.mapped_len() / SHARED_MEMORY_PAGE_SIZE)
+            .then(|| (page_index as u64 + 1) * SHARED_MEMORY_PAGE_SIZE as u64)
+    }
+
+    fn read(&self, offset: usize, output: &mut [u8]) -> Result<(), IpcError> {
+        let bytes = self.bytes.lock();
+        let range = checked_range(offset, output.len(), self.logical_len)?;
+        output.copy_from_slice(&bytes[range]);
+        Ok(())
+    }
+
+    fn write(&self, offset: usize, input: &[u8]) -> Result<(), IpcError> {
+        let mut bytes = self.bytes.lock();
+        let range = checked_range(offset, input.len(), self.logical_len)?;
+        bytes[range].copy_from_slice(input);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
+
+    struct FixedPageStorage {
+        bytes: Spinlock<Vec<u8>>,
+        pages: [u64; 2],
+    }
+
+    // SAFETY: the two complete aligned opaque page identities and backing bytes
+    // remain stable and owned by the storage until its final drop.
+    unsafe impl SharedMemoryStorage for FixedPageStorage {
+        fn logical_len(&self) -> usize {
+            SHARED_MEMORY_PAGE_SIZE * 2
+        }
+
+        fn mapped_len(&self) -> usize {
+            SHARED_MEMORY_PAGE_SIZE * 2
+        }
+
+        fn physical_page(&self, page_index: usize) -> Option<u64> {
+            self.pages.get(page_index).copied()
+        }
+
+        fn read(&self, offset: usize, output: &mut [u8]) -> Result<(), IpcError> {
+            let bytes = self.bytes.lock();
+            let range = checked_range(offset, output.len(), self.logical_len())?;
+            output.copy_from_slice(&bytes[range]);
+            Ok(())
+        }
+
+        fn write(&self, offset: usize, input: &[u8]) -> Result<(), IpcError> {
+            let mut bytes = self.bytes.lock();
+            let range = checked_range(offset, input.len(), self.logical_len())?;
+            bytes[range].copy_from_slice(input);
+            Ok(())
+        }
+    }
 
     static SHARED_MEMORY_TEST_LOCK: Spinlock<()> = Spinlock::new(());
 
@@ -2357,15 +2482,23 @@ mod tests {
                 .unwrap();
             assert_eq!(lease.effective_rights(), Rights::MAP | Rights::READ);
             let info = lease.info();
-            assert_eq!(info.base as usize % SHARED_MEMORY_PAGE_SIZE, 0);
             assert_eq!(info.logical_len, logical_len);
             assert_eq!(info.mapped_len, mapped_len);
             assert_eq!(info.mapped_len % SHARED_MEMORY_PAGE_SIZE, 0);
             assert_eq!(table.shared_memory_len(handle), Ok(logical_len));
-
-            let storage = unsafe { slice::from_raw_parts(info.base, info.mapped_len) };
+            for page_index in 0..mapped_len / SHARED_MEMORY_PAGE_SIZE {
+                assert_eq!(
+                    lease.physical_page(page_index).unwrap() % SHARED_MEMORY_PAGE_SIZE as u64,
+                    0
+                );
+            }
+            assert_eq!(
+                lease.physical_page(mapped_len / SHARED_MEMORY_PAGE_SIZE),
+                None
+            );
+            let mut storage = vec![0xff; logical_len];
+            table.shared_memory_read(handle, 0, &mut storage).unwrap();
             assert!(storage.iter().all(|byte| *byte == 0));
-            assert!(storage[info.logical_len..].iter().all(|byte| *byte == 0));
         }
 
         let writable = table
@@ -2397,6 +2530,54 @@ mod tests {
             table.shared_memory_mapping_lease(mapped_read, SharedMemoryMappingAccess::ReadWrite),
             Err(IpcError::AccessDenied)
         ));
+    }
+
+    #[test]
+    fn physical_page_snapshot_is_unique_stable_and_bounds_checked() {
+        let storage: Arc<dyn SharedMemoryStorage> = Arc::new(FixedPageStorage {
+            bytes: Spinlock::new(vec![0; SHARED_MEMORY_PAGE_SIZE * 2]),
+            pages: [0x1000, 0x2000],
+        });
+        let mut table = HandleTable::new();
+        let handle = table.shared_memory_create_with_storage(storage).unwrap();
+        let lease = table
+            .shared_memory_mapping_lease(handle, SharedMemoryMappingAccess::ReadOnly)
+            .unwrap();
+        let cloned_lease = lease.clone();
+        table.handle_close(handle).unwrap();
+        for retained in [&lease, &cloned_lease] {
+            assert_eq!(retained.physical_page(0), Some(0x1000));
+            assert_eq!(retained.physical_page(1), Some(0x2000));
+            assert_eq!(retained.physical_page(2), None);
+        }
+
+        let duplicate_pages: Arc<dyn SharedMemoryStorage> = Arc::new(FixedPageStorage {
+            bytes: Spinlock::new(vec![0; SHARED_MEMORY_PAGE_SIZE * 2]),
+            pages: [0x3000, 0x3000],
+        });
+        assert!(matches!(
+            table.shared_memory_create_with_storage(duplicate_pages),
+            Err(IpcError::InvalidMessage)
+        ));
+    }
+
+    #[test]
+    fn one_storage_installed_in_multiple_objects_serializes_and_shares_bytes() {
+        let _shared_memory_test = SHARED_MEMORY_TEST_LOCK.lock();
+        let storage = test_shared_memory_storage(8).unwrap();
+        let mut table = HandleTable::new();
+        let first = table
+            .shared_memory_create_with_storage(Arc::clone(&storage))
+            .unwrap();
+        let second = table.shared_memory_create_with_storage(storage).unwrap();
+
+        table.shared_memory_write(first, 1, b"shared").unwrap();
+        let mut bytes = [0; 8];
+        table.shared_memory_read(second, 0, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"\0shared\0");
+        table.shared_memory_write(second, 0, b"!").unwrap();
+        table.shared_memory_read(first, 0, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"!shared\0");
     }
 
     #[test]
@@ -2439,8 +2620,7 @@ mod tests {
             stored_lease.effective_rights(),
             Rights::MAP | Rights::READ | Rights::WRITE
         );
-        let bytes = unsafe { slice::from_raw_parts(info.base, info.logical_len) };
-        assert_eq!(bytes, b"retained");
+        assert_eq!(stored_lease.physical_page(0), lease.physical_page(0));
         drop(lease);
         assert_eq!(stored_lease.info(), info);
         assert_eq!(
@@ -3710,9 +3890,8 @@ mod tests {
             sender.handle_rights(duplicate_source),
             Ok(duplicate_source_rights)
         );
-        let lease_bytes =
-            unsafe { slice::from_raw_parts(lease.info().base, lease.info().logical_len) };
-        assert_eq!(lease_bytes, b"shared!!");
+        assert_eq!(lease.info().logical_len, 8);
+        assert!(lease.physical_page(0).is_some());
 
         let mut bytes = [0; 5];
         let mut handles = [Handle::INVALID; 2];

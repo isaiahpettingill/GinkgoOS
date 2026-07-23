@@ -43,9 +43,12 @@ pub struct ActivePageTable {
 impl ActivePageTable {
     /// Creates exclusive access to the active four-level page tables.
     ///
-    /// The caller must ensure that four-level paging is active, the supplied
-    /// HHDM maps all page-table frames, and no other code mutates the active
-    /// page tables while this handle exists.
+    /// The caller must ensure that four-level paging is active and that the supplied
+    /// aligned HHDM coherently maps every complete physical frame that may be issued
+    /// by the kernel allocator for the entire kernel lifetime. Dropping this capability
+    /// does not revoke the HHDM authority copied into frame-backed kernel objects; the
+    /// mapping must remain valid until all such derived objects are gone. No other code
+    /// may mutate the active page tables while this handle exists.
     pub unsafe fn from_current(hhdm_offset: u64) -> Result<Self, MapError> {
         let hhdm_offset =
             VirtAddr::try_new(hhdm_offset).map_err(|_| MapError::InvalidHhdmOffset)?;

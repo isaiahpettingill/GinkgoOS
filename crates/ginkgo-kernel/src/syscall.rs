@@ -41,6 +41,7 @@ use crate::{
         DirectStartupBlock, PendingWaitMany, Process, ProcessCreateError, SharedMappingError,
         WaitDeadline, WaitManyCompletion,
     },
+    shared_memory::{SharedFrameArena, SharedMemoryFactory},
 };
 
 /// Maximum bytes accepted by one [`SyscallNumber::DebugWrite`] call.
@@ -133,6 +134,7 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
     now_ns: u64,
     kernel_page_table: &ActivePageTable,
     frame_allocator: &mut UsableFrameAllocator<'_>,
+    shared_frame_arena: &SharedFrameArena,
     filesystem: &mut RedoxFs<B>,
     audio: &mut Option<AudioDevice>,
     entropy: &mut EntropyPool,
@@ -171,6 +173,7 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
             now_ns,
             kernel_page_table,
             frame_allocator,
+            shared_frame_arena,
             filesystem,
             audio,
             entropy,
@@ -199,6 +202,7 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
     now_ns: u64,
     kernel_page_table: &ActivePageTable,
     frame_allocator: &mut UsableFrameAllocator<'_>,
+    shared_frame_arena: &SharedFrameArena,
     filesystem: &mut RedoxFs<B>,
     audio: &mut Option<AudioDevice>,
     entropy: &mut EntropyPool,
@@ -221,9 +225,14 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
         SyscallNumber::ChannelCreate => channel_create(process, context.rdi),
         SyscallNumber::ChannelWrite => channel_write(process, context.rdi, context.rsi),
         SyscallNumber::ChannelRead => channel_read(process, context.rdi, context.rsi),
-        SyscallNumber::SharedMemoryCreate => {
-            shared_memory_create(process, context.rdi, context.rsi)
-        }
+        SyscallNumber::SharedMemoryCreate => shared_memory_create(
+            process,
+            context.rdi,
+            context.rsi,
+            shared_frame_arena,
+            kernel_page_table,
+            frame_allocator,
+        ),
         SyscallNumber::SharedMemoryGetSize => {
             shared_memory_get_size(process, context.rdi, context.rsi)
         }
@@ -232,7 +241,6 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
             context.rdi,
             context.rsi,
             context.rdx,
-            kernel_page_table,
             frame_allocator,
         ),
         SyscallNumber::SharedMemoryUnmap => shared_memory_unmap(process, context.rdi, context.rsi),
@@ -772,15 +780,19 @@ fn shared_memory_create(
     process: &mut Process,
     raw_size: u64,
     output_address: u64,
+    shared_frame_arena: &SharedFrameArena,
+    kernel_page_table: &ActivePageTable,
+    frame_allocator: &mut UsableFrameAllocator<'_>,
 ) -> Result<(), Status> {
     let size = usize::try_from(raw_size).map_err(|_| Status::OutOfRange)?;
     if !process.can_allocate_shared_memory(size) {
         return Err(Status::ResourceLimit);
     }
     validate_user_output(process, output_address, HANDLE_OUTPUT_SIZE)?;
-    let handle = process
-        .handles_mut()
-        .shared_memory_create(size)
+    let mut factory =
+        SharedMemoryFactory::new(shared_frame_arena, frame_allocator, kernel_page_table);
+    let handle = factory
+        .create_handle(process.handles_mut(), size)
         .map_err(map_ipc_error)?;
     process.record_shared_memory_allocation(size);
     let output = encode_handle_output(handle);
@@ -812,7 +824,6 @@ fn shared_memory_map(
     raw_handle: u64,
     args_address: u64,
     output_address: u64,
-    kernel_page_table: &ActivePageTable,
     frame_allocator: &mut UsableFrameAllocator<'_>,
 ) -> Result<(), Status> {
     let handle = decode_handle(raw_handle)?;
@@ -821,7 +832,7 @@ fn shared_memory_map(
     validate_user_output(process, output_address, SHARED_MEMORY_MAP_OUTPUT_SIZE)?;
 
     let mapped_address = process
-        .map_shared_memory(kernel_page_table, handle, args, frame_allocator)
+        .map_shared_memory(handle, args, frame_allocator)
         .map_err(map_shared_mapping_error)?;
     if let Err(copy_status) = copy_to_user(process, output_address, &mapped_address.to_le_bytes()) {
         return match process.unmap_shared_memory(mapped_address, args.length) {
@@ -2346,10 +2357,8 @@ const fn map_shared_mapping_error(error: SharedMappingError) -> Status {
             mapping_error,
             rollback_error: _,
         } => map_address_space_error(mapping_error),
-        SharedMappingError::InvalidBackingAlignment(_)
-        | SharedMappingError::InvalidBackingLength
-        | SharedMappingError::InvalidKernelAddress(_)
-        | SharedMappingError::KernelAddressNotMapped(_)
+        SharedMappingError::InvalidBackingLength
+        | SharedMappingError::InvalidPhysicalAddress(_)
         | SharedMappingError::PhysicalAddressNotPageAligned(_)
         | SharedMappingError::UnalignedFixedAddress(_)
         | SharedMappingError::InvalidFixedAddress(_)

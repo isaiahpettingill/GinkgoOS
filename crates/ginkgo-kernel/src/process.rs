@@ -15,7 +15,7 @@ use ginkgo_sysapi::{
 };
 use x86_64::{
     structures::paging::{PhysFrame, Size4KiB},
-    VirtAddr,
+    PhysAddr, VirtAddr,
 };
 
 use crate::{
@@ -524,12 +524,10 @@ pub enum SharedMappingError {
         length: u64,
         object_length: usize,
     },
-    InvalidBackingAlignment(u64),
     InvalidBackingLength,
     OutOfMemory,
     ResourceLimit,
-    InvalidKernelAddress(u64),
-    KernelAddressNotMapped(u64),
+    InvalidPhysicalAddress(u64),
     PhysicalAddressNotPageAligned(u64),
     UnalignedFixedAddress(u64),
     InvalidFixedAddress(u64),
@@ -1548,16 +1546,10 @@ impl Process {
     ///
     /// The offset must be page aligned. The logical range need not end on a page
     /// boundary; the installed span is rounded up and remains within the backing's
-    /// page-rounded allocation. Every kernel virtual page is translated separately.
-    ///
-    /// `kernel` is used only as a read-only mapper for the stable kernel root which
-    /// maps the shared-memory allocation. That root need not be the current CR3:
-    /// syscall dispatch invokes this while this process's [`AddressSpace`] is active.
-    /// Non-syscall callers may map an inactive process, but must arrange any required
-    /// activation and TLB synchronization before exposing the mapping to userspace.
+    /// page-rounded allocation. Physical page identities come directly from the
+    /// owning lease, so no kernel heap virtual address is translated.
     pub fn map_shared_memory(
         &mut self,
-        kernel: &ActivePageTable,
         handle: Handle,
         args: SharedMemoryMapArgs,
         allocator: &mut UsableFrameAllocator<'_>,
@@ -1595,7 +1587,7 @@ impl Process {
                 protection: args.protection,
             },
         )?;
-        let frames = translate_backing_pages(kernel, lease.info(), request)?;
+        let frames = backing_pages(&lease, request)?;
         self.shared_mappings
             .as_mut()
             .expect("live process lost its mapping records")
@@ -2383,10 +2375,6 @@ fn validate_mapping_range(
     if length == 0 {
         return Err(SharedMappingError::ZeroLength);
     }
-    let base = info.base as usize as u64;
-    if base % PAGE_SIZE != 0 {
-        return Err(SharedMappingError::InvalidBackingAlignment(base));
-    }
     if info.mapped_len == 0 || info.mapped_len % PAGE_SIZE as usize != 0 {
         return Err(SharedMappingError::InvalidBackingLength);
     }
@@ -2419,33 +2407,27 @@ fn validate_mapping_range(
     })
 }
 
-fn translate_backing_pages(
-    kernel: &ActivePageTable,
-    info: SharedMemoryMappingInfo,
+fn backing_pages(
+    lease: &SharedMemoryMappingLease,
     request: ValidatedMappingRange,
 ) -> Result<Vec<PhysFrame<Size4KiB>>, SharedMappingError> {
     let page_count = request.mapped_len / PAGE_SIZE as usize;
+    let first_page = request.offset / PAGE_SIZE as usize;
     let mut frames = Vec::new();
     frames
         .try_reserve_exact(page_count)
         .map_err(|_| SharedMappingError::OutOfMemory)?;
-    let base = info.base as usize as u64;
-    for page_index in 0..page_count {
-        let page_offset = page_index
-            .checked_mul(PAGE_SIZE as usize)
-            .and_then(|offset| request.offset.checked_add(offset))
+    for relative_page in 0..page_count {
+        let page_index = first_page
+            .checked_add(relative_page)
             .ok_or(SharedMappingError::RangeOverflow)?;
-        let kernel_address = base
-            .checked_add(page_offset as u64)
-            .ok_or(SharedMappingError::RangeOverflow)?;
-        let virtual_address = VirtAddr::try_new(kernel_address)
-            .map_err(|_| SharedMappingError::InvalidKernelAddress(kernel_address))?;
-        let physical_address = kernel
-            .translate_addr(virtual_address)
-            .ok_or(SharedMappingError::KernelAddressNotMapped(kernel_address))?;
-        let frame = PhysFrame::from_start_address(physical_address).map_err(|_| {
-            SharedMappingError::PhysicalAddressNotPageAligned(physical_address.as_u64())
-        })?;
+        let physical = lease
+            .physical_page(page_index)
+            .ok_or(SharedMappingError::InvalidBackingLength)?;
+        let physical_address = PhysAddr::try_new(physical)
+            .map_err(|_| SharedMappingError::InvalidPhysicalAddress(physical))?;
+        let frame = PhysFrame::from_start_address(physical_address)
+            .map_err(|_| SharedMappingError::PhysicalAddressNotPageAligned(physical))?;
         frames.push(frame);
     }
     Ok(frames)
@@ -2800,6 +2782,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::shared_memory::test_support::TestSharedMemoryContext;
 
     static FRAME_RECLAIM_TEST_ELF: &[u8] =
         include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-frame-reclaim-exit.elf"));
@@ -2837,7 +2820,6 @@ mod tests {
 
     fn info(logical_len: usize, mapped_len: usize) -> SharedMemoryMappingInfo {
         SharedMemoryMappingInfo {
-            base: 0x1000usize as *const u8,
             logical_len,
             mapped_len,
         }
@@ -2910,6 +2892,65 @@ mod tests {
         ));
         assert_eq!(allocator.allocated_count(), 0);
         assert_eq!(allocator.free_count(), 10);
+    }
+
+    #[test]
+    fn process_maps_noncontiguous_shared_frames_and_lease_controls_lifetime() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(80);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let mut shared_memory = TestSharedMemoryContext::new(4);
+
+        let priming = shared_memory
+            .create_storage(PAGE_SIZE as usize * 3)
+            .unwrap();
+        drop(priming);
+        let handle = shared_memory
+            .factory()
+            .create_handle(process.handles_mut(), PAGE_SIZE as usize * 2)
+            .unwrap();
+        let lease = process
+            .handles()
+            .shared_memory_mapping_lease(handle, SharedMemoryMappingAccess::ReadWrite)
+            .unwrap();
+        let physical_pages = [
+            lease.physical_page(0).unwrap(),
+            lease.physical_page(1).unwrap(),
+        ];
+        assert_ne!(physical_pages[1], physical_pages[0] + PAGE_SIZE);
+        drop(lease);
+
+        let address = process
+            .map_shared_memory(
+                handle,
+                SharedMemoryMapArgs {
+                    address: 0,
+                    offset: 0,
+                    length: PAGE_SIZE * 2,
+                    protection: MapProtection::READ | MapProtection::WRITE,
+                    flags: MapFlags::empty(),
+                },
+                &mut allocator,
+            )
+            .unwrap();
+        process.handles_mut().handle_close(handle).unwrap();
+        assert_eq!(shared_memory.arena().stats().free_frames, 1);
+
+        let mapped_frames = process
+            .address_space()
+            .mappings()
+            .iter()
+            .filter(|mapping| {
+                mapping.virtual_address >= address
+                    && mapping.virtual_address < address + PAGE_SIZE * 2
+            })
+            .map(|mapping| mapping.frame.start_address().as_u64())
+            .collect::<Vec<_>>();
+        assert_eq!(mapped_frames, physical_pages);
+
+        process.unmap_shared_memory(address, PAGE_SIZE * 2).unwrap();
+        assert_eq!(shared_memory.arena().stats().free_frames, 3);
+        assert_eq!(shared_memory.reclaim_idle().unwrap(), 3);
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
     }
 
     #[test]

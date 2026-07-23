@@ -21,6 +21,7 @@ pub mod paging;
 pub mod pci;
 pub mod power;
 pub mod process;
+pub mod shared_memory;
 pub mod syscall;
 pub mod task;
 pub mod trust;

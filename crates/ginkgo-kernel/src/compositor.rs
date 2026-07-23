@@ -696,6 +696,7 @@ mod tests {
     extern crate std;
 
     use super::*;
+    use crate::shared_memory::test_support::TestSharedMemoryContext;
     use ginkgo_graphics::FramebufferConfig;
 
     fn layout(width: usize, height: usize, format: PixelFormat) -> SurfaceLayout {
@@ -717,12 +718,16 @@ mod tests {
     }
 
     fn create_window(
+        shared_memory: &mut TestSharedMemoryContext,
         handles: &mut HandleTable,
         first: &[u8],
         second: &[u8],
     ) -> (Handle, Handle, Handle) {
         assert_eq!(first.len(), second.len());
-        let memory = handles.shared_memory_create(first.len() * 2).unwrap();
+        let memory = shared_memory
+            .factory()
+            .create_handle(handles, first.len() * 2)
+            .unwrap();
         handles.shared_memory_write(memory, 0, first).unwrap();
         handles
             .shared_memory_write(memory, first.len(), second)
@@ -822,6 +827,7 @@ mod tests {
 
     #[test]
     fn clips_source_visible_and_destination_edges_and_converts_xrgb() {
+        let mut shared_memory = TestSharedMemoryContext::new(64);
         let mut handles = HandleTable::new();
         let source = pixels(&[
             0x00FF_0000,
@@ -831,7 +837,8 @@ mod tests {
             0x00FF_FF00,
             0x0000_FFFF,
         ]);
-        let (_, client, manager) = create_window(&mut handles, &source, &source);
+        let (_, client, manager) =
+            create_window(&mut shared_memory, &mut handles, &source, &source);
         handles.window_present(client, 0, 1).unwrap();
 
         let mut compositor = Compositor::new();
@@ -854,12 +861,14 @@ mod tests {
 
     #[test]
     fn blends_argb_zero_full_and_intermediate_alpha() {
+        let mut shared_memory = TestSharedMemoryContext::new(64);
         let mut handles = HandleTable::new();
         let background = pixels(&[0x00FF_0000; 3]);
         let source = pixels(&[0x00FF_FFFF, 0xFF00_FF00, 0x8000_00FF]);
         let (_, background_client, background_manager) =
-            create_window(&mut handles, &background, &background);
-        let (_, client, manager) = create_window(&mut handles, &source, &source);
+            create_window(&mut shared_memory, &mut handles, &background, &background);
+        let (_, client, manager) =
+            create_window(&mut shared_memory, &mut handles, &source, &source);
         let mut compositor = Compositor::new();
         compositor
             .register_window(full_window(
@@ -890,9 +899,11 @@ mod tests {
 
     #[test]
     fn decorations_are_drawn_only_outside_the_client_area() {
+        let mut shared_memory = TestSharedMemoryContext::new(64);
         let mut handles = HandleTable::new();
         let source = pixels(&[0x00FF_0000; 4]);
-        let (_, client, manager) = create_window(&mut handles, &source, &source);
+        let (_, client, manager) =
+            create_window(&mut shared_memory, &mut handles, &source, &source);
         handles.window_present(client, 0, 1).unwrap();
 
         let outer = Rect::new(0, 0, 6, 4);
@@ -929,9 +940,11 @@ mod tests {
 
     #[test]
     fn decoration_clipping_and_focus_change_appearance() {
+        let mut shared_memory = TestSharedMemoryContext::new(64);
         let mut handles = HandleTable::new();
         let source = pixels(&[0x0000_FF00; 4]);
-        let (_, client, manager) = create_window(&mut handles, &source, &source);
+        let (_, client, manager) =
+            create_window(&mut shared_memory, &mut handles, &source, &source);
         handles.window_present(client, 0, 1).unwrap();
 
         let placement = WindowPlacement::new(
@@ -987,9 +1000,11 @@ mod tests {
 
     #[test]
     fn client_copy_never_reaches_into_frame_sized_storage() {
+        let mut shared_memory = TestSharedMemoryContext::new(64);
         let mut handles = HandleTable::new();
         let source = pixels(&[0x0000_00FF; 2]);
-        let (_, client, manager) = create_window(&mut handles, &source, &source);
+        let (_, client, manager) =
+            create_window(&mut shared_memory, &mut handles, &source, &source);
         handles.window_present(client, 0, 1).unwrap();
 
         let outer = Rect::new(0, 0, 7, 3);
@@ -1022,9 +1037,11 @@ mod tests {
 
     #[test]
     fn undecorated_and_fullscreen_placements_draw_no_frame() {
+        let mut shared_memory = TestSharedMemoryContext::new(64);
         let mut handles = HandleTable::new();
         let transparent = pixels(&[0x0000_0000]);
-        let (_, client, manager) = create_window(&mut handles, &transparent, &transparent);
+        let (_, client, manager) =
+            create_window(&mut shared_memory, &mut handles, &transparent, &transparent);
         handles.window_present(client, 0, 1).unwrap();
 
         let outer = Rect::new(0, 0, 3, 3);
@@ -1059,11 +1076,14 @@ mod tests {
 
     #[test]
     fn z_order_controls_composition_and_client_hit_testing() {
+        let mut shared_memory = TestSharedMemoryContext::new(64);
         let mut handles = HandleTable::new();
         let red = pixels(&[0x00FF_0000]);
         let blue = pixels(&[0x0000_00FF]);
-        let (_, red_client, red_manager) = create_window(&mut handles, &red, &red);
-        let (_, blue_client, blue_manager) = create_window(&mut handles, &blue, &blue);
+        let (_, red_client, red_manager) =
+            create_window(&mut shared_memory, &mut handles, &red, &red);
+        let (_, blue_client, blue_manager) =
+            create_window(&mut shared_memory, &mut handles, &blue, &blue);
         let mut compositor = Compositor::new();
         compositor
             .register_window(full_window(
@@ -1120,10 +1140,11 @@ mod tests {
 
     #[test]
     fn successful_presents_release_only_the_previously_displayed_buffer() {
+        let mut shared_memory = TestSharedMemoryContext::new(64);
         let mut handles = HandleTable::new();
         let red = pixels(&[0x00FF_0000]);
         let green = pixels(&[0x0000_FF00]);
-        let (_, client, manager) = create_window(&mut handles, &red, &green);
+        let (_, client, manager) = create_window(&mut shared_memory, &mut handles, &red, &green);
         let mut compositor = Compositor::new();
         compositor
             .register_window(full_window(7, manager, layout(1, 1, PixelFormat::Xrgb8888)))
@@ -1159,10 +1180,11 @@ mod tests {
 
     #[test]
     fn failed_configuration_or_copy_does_not_release_pending() {
+        let mut shared_memory = TestSharedMemoryContext::new(64);
         let mut handles = HandleTable::new();
         let red = pixels(&[0x00FF_0000]);
         let green = pixels(&[0x0000_FF00]);
-        let (_, client, manager) = create_window(&mut handles, &red, &green);
+        let (_, client, manager) = create_window(&mut shared_memory, &mut handles, &red, &green);
         let mut compositor = Compositor::new();
         compositor
             .register_window(full_window(1, manager, layout(1, 1, PixelFormat::Xrgb8888)))

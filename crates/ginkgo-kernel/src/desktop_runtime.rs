@@ -23,8 +23,11 @@ use ginkgo_window::{
     RequestId, ServerErrorCode, SurfaceConfiguration, WindowId,
 };
 
-use crate::compositor::{
-    Compositor, CompositorError, Rect, WindowConfig, WindowPlacement as CompositorPlacement,
+use crate::{
+    compositor::{
+        Compositor, CompositorError, Rect, WindowConfig, WindowPlacement as CompositorPlacement,
+    },
+    shared_memory::SharedMemoryFactory,
 };
 
 /// Rights installed on a surface-memory attachment received by the desktop.
@@ -306,7 +309,10 @@ impl DesktopBroker {
     }
 
     /// Reads and processes at most one packet from the desktop service.
-    pub fn poll_desktop(&mut self) -> Result<Option<DesktopRuntimeEvent>, DesktopBrokerError> {
+    pub fn poll_desktop(
+        &mut self,
+        shared_memory: &mut SharedMemoryFactory<'_, '_>,
+    ) -> Result<Option<DesktopRuntimeEvent>, DesktopBrokerError> {
         let mut bytes = [0_u8; CHANNEL_MAX_BYTES];
         let mut attachments = [Handle::INVALID; CHANNEL_MAX_HANDLES];
         let info = match self
@@ -319,8 +325,12 @@ impl DesktopBroker {
         };
         let byte_count = info.byte_count as usize;
         let handle_count = usize::from(info.handle_count);
-        self.handle_desktop_bytes(&bytes[..byte_count], &attachments[..handle_count])
-            .map(Some)
+        self.handle_desktop_bytes(
+            &bytes[..byte_count],
+            &attachments[..handle_count],
+            shared_memory,
+        )
+        .map(Some)
     }
 
     /// Decodes, validates, and processes one desktop-service channel payload.
@@ -332,6 +342,7 @@ impl DesktopBroker {
         &mut self,
         bytes: &[u8],
         attachments: &[Handle],
+        shared_memory: &mut SharedMemoryFactory<'_, '_>,
     ) -> Result<DesktopRuntimeEvent, DesktopBrokerError> {
         let packet =
             match RuntimePacket::decode(bytes, RuntimeSender::DesktopService, attachments.len()) {
@@ -341,7 +352,7 @@ impl DesktopBroker {
                     return Err(error.into());
                 }
             };
-        self.handle_desktop_packet(packet, attachments)
+        self.handle_desktop_packet(packet, attachments, shared_memory)
     }
 
     /// Validates and processes an already-decoded desktop-service packet.
@@ -349,6 +360,7 @@ impl DesktopBroker {
         &mut self,
         packet: RuntimePacket,
         attachments: &[Handle],
+        shared_memory: &mut SharedMemoryFactory<'_, '_>,
     ) -> Result<DesktopRuntimeEvent, DesktopBrokerError> {
         if let Err(error) = packet.validate(RuntimeSender::DesktopService, attachments.len()) {
             self.close_attachments(attachments);
@@ -393,7 +405,7 @@ impl DesktopBroker {
                 client_id,
                 window_id,
                 configuration,
-            } => self.configure(client_id, window_id, configuration),
+            } => self.configure(client_id, window_id, configuration, shared_memory),
             RuntimeMessage::DestroyWindow {
                 client_id,
                 window_id,
@@ -706,6 +718,7 @@ impl DesktopBroker {
         client_id: ClientId,
         window_id: WindowId,
         configuration: SurfaceConfiguration,
+        shared_memory: &mut SharedMemoryFactory<'_, '_>,
     ) -> Result<DesktopRuntimeEvent, DesktopBrokerError> {
         if !self.clients.contains(&client_id) {
             return Err(DesktopBrokerError::UnknownClient(client_id));
@@ -755,7 +768,7 @@ impl DesktopBroker {
                 .map_err(|_| DesktopBrokerError::OutOfMemory)?;
         }
 
-        let memory = self.handles.shared_memory_create(surface_bytes)?;
+        let memory = shared_memory.create_handle(&mut self.handles, surface_bytes)?;
         let (client, manager) = match self.handles.window_create_with_generation_and_buffer_count(
             memory,
             u64::from(configuration.generation.get()),
@@ -1349,6 +1362,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::shared_memory::test_support::TestSharedMemoryContext;
 
     fn client(value: u64) -> ClientId {
         ClientId::new(value).unwrap()
@@ -1426,6 +1440,7 @@ mod tests {
         desktop_channel: Handle,
         client_handles: HandleTable,
         client_id: ClientId,
+        shared_memory: TestSharedMemoryContext,
     }
 
     impl Fixture {
@@ -1453,6 +1468,7 @@ mod tests {
                 desktop_channel,
                 client_handles,
                 client_id,
+                shared_memory: TestSharedMemoryContext::new(4096),
             }
         }
 
@@ -1464,7 +1480,23 @@ mod tests {
             self.desktop
                 .channel_write(self.desktop_channel, &bytes, &[])
                 .unwrap();
-            self.broker.poll_desktop().unwrap().unwrap()
+            let mut factory = self.shared_memory.factory();
+            self.broker.poll_desktop(&mut factory).unwrap().unwrap()
+        }
+
+        fn poll_desktop(&mut self) -> Result<Option<DesktopRuntimeEvent>, DesktopBrokerError> {
+            let mut factory = self.shared_memory.factory();
+            self.broker.poll_desktop(&mut factory)
+        }
+
+        fn handle_packet(
+            &mut self,
+            packet: RuntimePacket,
+            attachments: &[Handle],
+        ) -> Result<DesktopRuntimeEvent, DesktopBrokerError> {
+            let mut factory = self.shared_memory.factory();
+            self.broker
+                .handle_desktop_packet(packet, attachments, &mut factory)
         }
 
         fn configure(&mut self, window_id: WindowId, config: SurfaceConfiguration) -> Handle {
@@ -1831,7 +1863,7 @@ mod tests {
             configuration: configuration(3, 3, 1, 2),
         });
         assert!(matches!(
-            fixture.broker.handle_desktop_packet(next, &[]),
+            fixture.handle_packet(next, &[]),
             Err(DesktopBrokerError::PendingComposition(window_id)) if window_id == id
         ));
         assert_eq!(
@@ -1973,11 +2005,15 @@ mod tests {
             .channel_write(fixture.desktop_channel, &[0xff, 0x00], &[])
             .unwrap();
         assert!(matches!(
-            fixture.broker.poll_desktop(),
+            fixture.poll_desktop(),
             Err(DesktopBrokerError::Decode(RuntimeDecodeError::Postcard(_)))
         ));
 
-        let memory = fixture.desktop.shared_memory_create(4096).unwrap();
+        let memory = fixture
+            .shared_memory
+            .factory()
+            .create_handle(&mut fixture.desktop, 4096)
+            .unwrap();
         let overprivileged = RuntimePacket::new(RuntimeMessage::ServiceReady {
             window_protocol_version: PROTOCOL_VERSION,
         })
@@ -1988,7 +2024,7 @@ mod tests {
             .channel_write(fixture.desktop_channel, &overprivileged, &[memory])
             .unwrap();
         assert!(matches!(
-            fixture.broker.poll_desktop(),
+            fixture.poll_desktop(),
             Err(DesktopBrokerError::Decode(RuntimeDecodeError::Validation(
                 RuntimeValidationError::AttachmentCount {
                     expected: 0,
@@ -2006,7 +2042,7 @@ mod tests {
             .channel_write(fixture.desktop_channel, &wrong_direction, &[])
             .unwrap();
         assert!(matches!(
-            fixture.broker.poll_desktop(),
+            fixture.poll_desktop(),
             Err(DesktopBrokerError::Decode(RuntimeDecodeError::Validation(
                 RuntimeValidationError::UnexpectedSender { .. }
             )))
@@ -2024,7 +2060,7 @@ mod tests {
             configuration: configuration(1, 1, 1, 2),
         });
         assert!(matches!(
-            fixture.broker.handle_desktop_packet(packet, &[]),
+            fixture.handle_packet(packet, &[]),
             Err(DesktopBrokerError::UnknownClient(value)) if value == unknown
         ));
 
@@ -2036,7 +2072,7 @@ mod tests {
             configuration: configuration(3, 1, 1, 2),
         });
         assert!(matches!(
-            fixture.broker.handle_desktop_packet(skipped, &[]),
+            fixture.handle_packet(skipped, &[]),
             Err(DesktopBrokerError::UnexpectedGeneration {
                 expected: 2,
                 actual: 3,

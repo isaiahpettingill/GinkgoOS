@@ -48,6 +48,7 @@ use ginkgo_kernel::{
         Process, ProcessFault, ProcessFaultReason, ProcessId, ProcessState, ProcessTable,
         UserPageFaultResolution,
     },
+    shared_memory::{SharedFrameArena, SharedMemoryFactory},
     syscall::{self, DebugSink, SyscallOutcome},
     task::{Scheduler, TaskPoll, TaskState},
     trust::TrustedManifest,
@@ -171,10 +172,13 @@ struct FrameReclaimBaseline {
     shared_live_objects: usize,
     shared_logical_bytes: usize,
     shared_mapped_bytes: usize,
+    shared_arena_owned_frames: usize,
+    shared_arena_free_frames: usize,
 }
 
 struct FrameReclaimStress {
     current: Option<ProcessId>,
+    pending_completion: Option<(ProcessId, ProcessState)>,
     completed: u32,
     reuse_verified: u32,
     baseline: Option<FrameReclaimBaseline>,
@@ -994,9 +998,11 @@ pub extern "C" fn _start() -> ! {
         }
     });
     let power_control = SystemPowerControl::new().unwrap_or_else(|_| halt_forever());
+    let shared_frame_arena = SharedFrameArena::new().unwrap_or_else(|_| halt_forever());
 
     let mut context = KernelContext {
         frames,
+        shared_frame_arena,
         page_table,
         kernel_heap,
         hhdm_offset: hhdm.offset,
@@ -1017,6 +1023,7 @@ pub extern "C" fn _start() -> ! {
         process_capability_smoke_id: None,
         frame_reclaim_stress: frame_reclaim_stress_enabled().then_some(FrameReclaimStress {
             current: None,
+            pending_completion: None,
             completed: 0,
             reuse_verified: 0,
             baseline: None,
@@ -1426,6 +1433,7 @@ fn run_scheduler(context: &mut KernelContext) -> ! {
     loop {
         maintain_kernel_heap(context);
         scheduler.run_round(context);
+        reclaim_idle_shared_frames(context);
         if !context.processes.has_runnable()
             && context.timer.arm_one_shot(KERNEL_IDLE_POLL_NS).is_ok()
         {
@@ -1446,6 +1454,7 @@ struct ProcessClient {
 
 struct KernelContext {
     frames: UsableFrameAllocator<'static>,
+    shared_frame_arena: SharedFrameArena,
     page_table: ActivePageTable,
     kernel_heap: heap::PageBackedHeap,
     hhdm_offset: u64,
@@ -1490,6 +1499,29 @@ fn maintain_kernel_heap(context: &mut KernelContext) {
         &mut context.page_table,
         &mut context.frames,
     );
+}
+
+/// Returns shared frames released by any task in the completed scheduler round.
+///
+/// Reclaim is opportunistic: the arena retains exact ownership on failure and a
+/// later round retries it. Allocator corruption remains visible through arena and
+/// allocator diagnostics without turning an ordinary cleanup attempt into a halt.
+fn reclaim_idle_shared_frames(context: &mut KernelContext) {
+    if context
+        .shared_frame_arena
+        .reclaim_idle(&mut context.frames)
+        .is_err()
+    {
+        return;
+    }
+
+    let completion = context
+        .frame_reclaim_stress
+        .as_mut()
+        .and_then(|stress| stress.pending_completion.take());
+    if let Some((process_id, final_state)) = completion {
+        finish_frame_reclaim_stress(context, process_id, final_state);
+    }
 }
 
 const CONSOLE_BATCH_CAPACITY: usize = 256;
@@ -2196,6 +2228,7 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                                 context.timer.clock().now_ns(),
                                 &context.page_table,
                                 &mut context.frames,
+                                &context.shared_frame_arena,
                                 &mut context.fs,
                                 &mut context.audio,
                                 &mut context.entropy,
@@ -2434,7 +2467,12 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                 }
             }
             if is_frame_reclaim_stress {
-                finish_frame_reclaim_stress(context, process_id, retired_state);
+                let stress = context
+                    .frame_reclaim_stress
+                    .as_mut()
+                    .expect("frame-reclaim stress state disappeared");
+                debug_assert!(stress.pending_completion.is_none());
+                stress.pending_completion = Some((process_id, retired_state));
             }
         }
         Err(error) => {
@@ -3015,12 +3053,14 @@ fn finish_frame_reclaim_stress(
     stress.current = None;
     stress.completed += 1;
     let shared = shared_memory_backing_stats();
+    let arena = context.shared_frame_arena.stats();
     let current = FrameReclaimBaseline {
         live_frames: context.frames.allocated_count(),
-
         shared_live_objects: shared.live_objects,
         shared_logical_bytes: shared.logical_bytes,
         shared_mapped_bytes: shared.mapped_allocated_bytes,
+        shared_arena_owned_frames: arena.owned_frames,
+        shared_arena_free_frames: arena.free_frames,
     };
     match stress.baseline {
         None => stress.baseline = Some(current),
@@ -3028,7 +3068,9 @@ fn finish_frame_reclaim_stress(
             if baseline.live_frames != current.live_frames
                 || baseline.shared_live_objects != current.shared_live_objects
                 || baseline.shared_logical_bytes != current.shared_logical_bytes
-                || baseline.shared_mapped_bytes != current.shared_mapped_bytes =>
+                || baseline.shared_mapped_bytes != current.shared_mapped_bytes
+                || baseline.shared_arena_owned_frames != current.shared_arena_owned_frames
+                || baseline.shared_arena_free_frames != current.shared_arena_free_frames =>
         {
             let mut sink = SerialDebugSink::new(&mut context.serial);
             let _ = writeln!(
@@ -3096,7 +3138,16 @@ fn desktop_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
         }
     }
 
-    let event = match context.desktop.as_mut().map(DesktopBroker::poll_desktop) {
+    let mut shared_memory = SharedMemoryFactory::new(
+        &context.shared_frame_arena,
+        &mut context.frames,
+        &context.page_table,
+    );
+    let event = match context
+        .desktop
+        .as_mut()
+        .map(|desktop| desktop.poll_desktop(&mut shared_memory))
+    {
         Some(Ok(event)) => event,
         Some(Err(DesktopBrokerError::Ipc(IpcError::PeerClosed))) | None => {
             context.ui.desktop_ready = false;
