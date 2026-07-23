@@ -680,6 +680,18 @@ impl AddressSpace {
         Ok(planned)
     }
 
+    /// Returns all private frames retired by successful unmaps or failed mappings.
+    /// The complete batch remains owned by this address space if reclamation fails.
+    pub fn reclaim_retired_data_frames(
+        &mut self,
+        allocator: &mut UsableFrameAllocator<'_>,
+    ) -> Result<usize, FrameAllocatorError> {
+        let count = self.retired_data_frames.len();
+        allocator.deallocate_frames(&self.retired_data_frames)?;
+        self.retired_data_frames.clear();
+        Ok(count)
+    }
+
     /// Validates every 4 KiB page touched by a user byte range.
     ///
     /// Empty ranges are accepted without inspecting `address`. Non-empty ranges

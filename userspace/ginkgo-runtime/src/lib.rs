@@ -1,20 +1,50 @@
 #![no_std]
 
-use core::panic::PanicInfo;
+use core::{alloc::Layout, panic::PanicInfo};
 
-use ginkgo_userspace::{debug_write, process_exit, process_yield};
+use ginkgo_userspace::{
+    anonymous_map, anonymous_unmap, debug_write, process_exit, process_yield, MapProtection,
+};
 use spinning_top::RawSpinlock;
-use talc::{source::Claim, TalcLock};
+use talc::{
+    base::{binning::Binning, Talc},
+    source::Source,
+    TalcLock,
+};
 
-/// Static heap shared by production userspace executables.
-pub const HEAP_SIZE: usize = 2 * 1024 * 1024;
+const HEAP_GROWTH_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug)]
+struct ProcessHeapSource;
+
+unsafe impl Source for ProcessHeapSource {
+    fn acquire<B: Binning>(
+        talc: &mut Talc<Self, B>,
+        layout: Layout,
+    ) -> Result<(), ()> {
+        let requested = layout
+            .size()
+            .checked_add(HEAP_GROWTH_BYTES - 1)
+            .map(|size| size.max(HEAP_GROWTH_BYTES) / HEAP_GROWTH_BYTES * HEAP_GROWTH_BYTES)
+            .ok_or(())?;
+        let mapping = unsafe {
+            anonymous_map(
+                requested,
+                MapProtection::READ | MapProtection::WRITE,
+            )
+        }
+        .map_err(|_| ())?;
+        if unsafe { talc.claim(mapping.as_ptr(), requested) }.is_none() {
+            let _ = unsafe { anonymous_unmap(mapping, requested) };
+            return Err(());
+        }
+        Ok(())
+    }
+}
 
 #[global_allocator]
-static ALLOCATOR: TalcLock<RawSpinlock, Claim> = TalcLock::new(unsafe {
-    #[link_section = ".bss.userspace_heap"]
-    static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
-    Claim::array(&raw mut HEAP)
-});
+static ALLOCATOR: TalcLock<RawSpinlock, ProcessHeapSource> =
+    TalcLock::new(ProcessHeapSource);
 
 /// Defines the assembly entry shim expected by the GinkgoOS ELF loader.
 ///

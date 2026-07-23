@@ -325,6 +325,16 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
         SyscallNumber::SystemPowerGetInfo => {
             system_power_get_info(process, context.rdi, context.rsi)
         }
+        SyscallNumber::AnonymousMap => anonymous_map(
+            process,
+            context.rdi,
+            context.rsi,
+            context.rdx,
+            frame_allocator,
+        ),
+        SyscallNumber::AnonymousUnmap => {
+            anonymous_unmap(process, context.rdi, context.rsi, frame_allocator)
+        }
     };
     DispatchResult::Complete(match result {
         Ok(()) => Status::Ok,
@@ -373,6 +383,8 @@ const fn decode_syscall_number(raw: u64) -> Option<SyscallNumber> {
         36 => SyscallNumber::SystemPowerRequest,
         37 => SyscallNumber::SystemPowerCancel,
         38 => SyscallNumber::SystemPowerGetInfo,
+        39 => SyscallNumber::AnonymousMap,
+        40 => SyscallNumber::AnonymousUnmap,
         _ => return None,
     })
 }
@@ -807,6 +819,39 @@ fn shared_memory_map(
 fn shared_memory_unmap(process: &mut Process, address: u64, length: u64) -> Result<(), Status> {
     process
         .unmap_shared_memory(address, length)
+        .map_err(map_shared_mapping_error)
+}
+
+fn anonymous_map(
+    process: &mut Process,
+    length: u64,
+    raw_protection: u64,
+    output_address: u64,
+    frame_allocator: &mut UsableFrameAllocator<'_>,
+) -> Result<(), Status> {
+    let protection_bits = u32::try_from(raw_protection).map_err(|_| Status::InvalidArgument)?;
+    let protection = MapProtection::from_bits(protection_bits).ok_or(Status::InvalidArgument)?;
+    validate_user_output(process, output_address, SHARED_MEMORY_MAP_OUTPUT_SIZE)?;
+    let address = process
+        .map_anonymous(length, protection, frame_allocator)
+        .map_err(map_shared_mapping_error)?;
+    if let Err(status) = copy_to_user(process, output_address, &address.to_le_bytes()) {
+        process
+            .unmap_anonymous(address, length, frame_allocator)
+            .map_err(map_shared_mapping_error)?;
+        return Err(status);
+    }
+    Ok(())
+}
+
+fn anonymous_unmap(
+    process: &mut Process,
+    address: u64,
+    length: u64,
+    frame_allocator: &mut UsableFrameAllocator<'_>,
+) -> Result<(), Status> {
+    process
+        .unmap_anonymous(address, length, frame_allocator)
         .map_err(map_shared_mapping_error)
 }
 
@@ -2335,6 +2380,8 @@ mod tests {
             SyscallNumber::SystemPowerRequest,
             SyscallNumber::SystemPowerCancel,
             SyscallNumber::SystemPowerGetInfo,
+            SyscallNumber::AnonymousMap,
+            SyscallNumber::AnonymousUnmap,
         ];
         for number in expected {
             assert_eq!(decode_syscall_number(number as u64), Some(number));
@@ -2368,7 +2415,12 @@ mod tests {
             decode_syscall_number(38),
             Some(SyscallNumber::SystemPowerGetInfo)
         );
-        assert_eq!(decode_syscall_number(39), None);
+        assert_eq!(decode_syscall_number(39), Some(SyscallNumber::AnonymousMap));
+        assert_eq!(
+            decode_syscall_number(40),
+            Some(SyscallNumber::AnonymousUnmap)
+        );
+        assert_eq!(decode_syscall_number(41), None);
         assert_eq!(decode_syscall_number(u64::MAX), None);
     }
 

@@ -4,7 +4,7 @@ This is the production, nested `x86_64-unknown-none` workspace. It is intentiona
 
 ## Packages
 
-- `ginkgo-runtime`: shared `no_std` talc static heap, panic/exit handling, `_start` entry macro, linker script, and build-script helper.
+- `ginkgo-runtime`: shared `no_std` syscall-backed growable Talc heap, panic/exit handling, `_start` entry macro, linker script, and build-script helper.
 - `ginkgo-desktop-service`: production window-policy service using `ginkgo_desktop::Desktop`, the broker runtime protocol, per-app channels, and protected two-buffer surface pools.
 - `ginkgo-minimal-client`: production syscall-backed `WindowTransport`/`WindowClient` demo with a centered “Hello World” surface and `F11` fullscreen toggling.
 - `ginkgo-file-navigator`: keyboard-controlled `/user` workspace browser; Up/Down selects, Enter enters a directory or securely launches the text editor for a file, Backspace returns, and Delete removes entries.
@@ -175,7 +175,7 @@ Once the cancellation interval expires, the kernel rejects new launches, gives e
 
 ### Package installation
 
-`install_package(path)` accepts a bounded GKP file (currently capped at 1 MiB to fit the terminal's 2 MiB static heap), validates it with `ginkgo-app-package`, and installs or updates its registry entry. `desktop`, `file-navigator`, `terminal`, and `minimal-client` are protected system IDs and cannot be installed, updated, removed, or data-purged. `list_installed()` returns maps containing `app_id`, `display_name`, `version`, `kind`, the full immutable executable path, executable `sha256`, and package `package_sha256`.
+`install_package(path)` accepts a bounded GKP file, validates it with `ginkgo-app-package`, and installs or updates its registry entry. `desktop`, `file-navigator`, `terminal`, and `minimal-client` are protected system IDs and cannot be installed, updated, removed, or data-purged. `list_installed()` returns maps containing `app_id`, `display_name`, `version`, `kind`, the full immutable executable path, executable `sha256`, and package `package_sha256`.
 
 Trusted built-in artifacts are separate from installed packages: the desktop, file navigator, terminal, minimal client, and trusted program registry live at `/system/desktop.elf`, `/system/file-navigator.elf`, `/system/terminal.elf`, `/system/minimal-client.elf`, and `/system/programs.gkr`. Userspace may read this top-level `/system` subtree but cannot open it for writing or use it as a create, truncate, unlink, directory-mutation, or rename source/target. Legacy trusted filenames at the root remain protected. During upgrade, boot moves an existing legacy artifact into `/system` when no destination exists, or removes the obsolete root duplicate after the `/system` copy is present; this space-safe migration runs before signed artifacts are refreshed and verified.
 

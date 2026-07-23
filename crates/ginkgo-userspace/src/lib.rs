@@ -856,12 +856,57 @@ pub unsafe fn shared_memory_map(
         .expect("kernel returned a null address for a successful mapping"))
 }
 
-/// Unmaps an exact virtual-address range from the current process.
+/// Maps eager, zero-filled private memory into the current process.
 ///
 /// # Safety
 ///
-/// `address..address + length` must describe a live userspace mapping, and no
-/// references or pointers into that range may be used after a successful call.
+/// The caller must uphold Rust aliasing rules for the returned memory.
+#[inline]
+pub unsafe fn anonymous_map(
+    length: usize,
+    protection: MapProtection,
+) -> SyscallResult<NonNull<u8>> {
+    let mut output = AnonymousMapOutput::default();
+    let raw = unsafe {
+        raw_syscall6(
+            SyscallNumber::AnonymousMap,
+            length as u64,
+            u64::from(protection.bits()),
+            mut_pointer_address(&mut output),
+            0,
+            0,
+            0,
+        )
+    };
+    status_result(raw)?;
+    NonNull::new(output.address as usize as *mut u8).ok_or(Status::InvalidAddress)
+}
+
+/// Releases one exact private anonymous mapping.
+///
+/// # Safety
+///
+/// No pointer or reference into the mapping may be used after success.
+#[inline]
+pub unsafe fn anonymous_unmap(address: NonNull<u8>, length: usize) -> SyscallResult<()> {
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::AnonymousUnmap,
+            pointer_address(address.as_ptr()),
+            length as u64,
+            0,
+            0,
+            0,
+            0,
+        )
+    })
+}
+
+/// Unmaps an exact shared-memory range from the current process.
+///
+/// # Safety
+///
+/// No pointer or reference into the mapping may be used after success.
 #[inline]
 pub unsafe fn shared_memory_unmap(address: NonNull<u8>, length: usize) -> SyscallResult<()> {
     // SAFETY: The caller upholds the mapped-range and post-unmap obligations.

@@ -367,6 +367,7 @@ impl ProcessLimits {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ProcessUsage {
+    pub private_pages: u64,
     pub shared_memory_bytes: u64,
     pub mapped_shared_bytes: u64,
     pub channel_traffic_bytes: u64,
@@ -405,6 +406,14 @@ pub enum ProcessCreateError {
 ///
 /// `length` is the logical byte length supplied by the application, while
 /// `mapped_len` is the page-rounded span installed in the address space.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AnonymousMapping {
+    pub address: u64,
+    pub length: u64,
+    pub mapped_len: usize,
+    pub protection: MapProtection,
+}
+
 pub struct SharedMemoryMapping {
     address: u64,
     offset: u64,
@@ -494,6 +503,7 @@ impl From<IpcError> for SharedMappingError {
 pub struct ProcessTeardown {
     pub handles_closed: usize,
     pub mappings_released: usize,
+    pub anonymous_mappings_released: usize,
     pub retained_failed_mapping_leases_released: usize,
 }
 
@@ -642,6 +652,7 @@ pub struct Process {
     preemption_count: u64,
     blocked_syscall: Option<BlockedSyscall>,
     shared_mappings: Option<Vec<SharedMemoryMapping>>,
+    anonymous_mappings: Option<Vec<AnonymousMapping>>,
     // If a corrupt page table prevents rollback, retaining the lease is safer
     // than releasing backing which may still have a live userspace alias.
     retained_failed_mapping_leases: Option<Vec<SharedMemoryMappingLease>>,
@@ -789,6 +800,12 @@ impl Process {
             );
         }
 
+        let private_pages = image
+            .segments
+            .iter()
+            .map(|segment| segment.page_count)
+            .sum::<u64>()
+            .saturating_add(layout.stack_size() / PAGE_SIZE);
         let context = UserContext::new(image.entry, layout.stack_top);
         debug_assert_eq!(context.rsp & 0xf, 0);
 
@@ -803,6 +820,7 @@ impl Process {
             preemption_count: 0,
             blocked_syscall: None,
             shared_mappings: Some(Vec::new()),
+            anonymous_mappings: Some(Vec::new()),
             retained_failed_mapping_leases: Some(Vec::new()),
             next_mapping_cursor: SHARED_MAPPING_BASE
                 + randomness
@@ -810,7 +828,10 @@ impl Process {
                     .unwrap_or(0)
                     * PAGE_SIZE,
             limits,
-            usage: ProcessUsage::default(),
+            usage: ProcessUsage {
+                private_pages,
+                ..ProcessUsage::default()
+            },
         })
     }
 
@@ -1073,6 +1094,135 @@ impl Process {
         self.next_mapping_cursor
     }
 
+    pub fn anonymous_mappings(&self) -> &[AnonymousMapping] {
+        self.anonymous_mappings
+            .as_ref()
+            .expect("live process lost its anonymous mapping records")
+    }
+
+    /// Maps eager, zero-filled private pages at a kernel-selected address.
+    pub fn map_anonymous(
+        &mut self,
+        length: u64,
+        protection: MapProtection,
+        allocator: &mut UsableFrameAllocator<'_>,
+    ) -> Result<u64, SharedMappingError> {
+        if length == 0 {
+            return Err(SharedMappingError::ZeroLength);
+        }
+        if !protection.contains(MapProtection::READ)
+            || (protection.contains(MapProtection::WRITE)
+                && protection.contains(MapProtection::EXECUTE))
+        {
+            return Err(SharedMappingError::InvalidProtection(protection));
+        }
+        let permissions = if protection.contains(MapProtection::WRITE) {
+            UserPagePermissions::READ_WRITE
+        } else if protection.contains(MapProtection::EXECUTE) {
+            UserPagePermissions::READ_EXECUTE
+        } else {
+            UserPagePermissions::READ_ONLY
+        };
+        let mapped_len_u64 = length
+            .checked_add(PAGE_SIZE - 1)
+            .map(|rounded| rounded & !(PAGE_SIZE - 1))
+            .ok_or(SharedMappingError::RangeOverflow)?;
+        let mapped_len =
+            usize::try_from(mapped_len_u64).map_err(|_| SharedMappingError::RangeOverflow)?;
+        let pages = mapped_len_u64 / PAGE_SIZE;
+        let new_private_pages = self
+            .usage
+            .private_pages
+            .checked_add(pages)
+            .filter(|total| *total <= self.limits.private_pages)
+            .ok_or(SharedMappingError::ResourceLimit)?;
+        let occupied = self.occupied_ranges()?;
+        let address =
+            select_mapping_address(0, false, mapped_len, self.next_mapping_cursor, &occupied)?;
+        self.anonymous_mappings
+            .as_mut()
+            .expect("live process lost its anonymous mapping records")
+            .try_reserve(1)
+            .map_err(|_| SharedMappingError::OutOfMemory)?;
+
+        let mut mapped = 0_usize;
+        while mapped < mapped_len {
+            let page_address = address
+                .checked_add(mapped as u64)
+                .ok_or(SharedMappingError::RangeOverflow)?;
+            if let Err(mapping_error) =
+                self.address_space_mut()
+                    .map_zeroed_user_4k(page_address, permissions, allocator)
+            {
+                if mapped != 0 {
+                    if let Err(rollback_error) =
+                        self.address_space_mut().unmap_user_range(address, mapped)
+                    {
+                        return Err(SharedMappingError::RollbackFailed {
+                            mapping_error,
+                            rollback_error,
+                        });
+                    }
+                }
+                self.address_space_mut()
+                    .reclaim_retired_data_frames(allocator)
+                    .map_err(|error| {
+                        SharedMappingError::AddressSpace(AddressSpaceError::FrameAllocator(error))
+                    })?;
+                return Err(SharedMappingError::AddressSpace(mapping_error));
+            }
+            mapped += PAGE_SIZE as usize;
+        }
+
+        self.anonymous_mappings
+            .as_mut()
+            .expect("live process lost its anonymous mapping records")
+            .push(AnonymousMapping {
+                address,
+                length,
+                mapped_len,
+                protection,
+            });
+        self.usage.private_pages = new_private_pages;
+        self.next_mapping_cursor = address
+            .checked_add(mapped_len as u64)
+            .filter(|next| *next < self.layout.stack_guard_start)
+            .unwrap_or(SHARED_MAPPING_BASE);
+        Ok(address)
+    }
+
+    /// Unmaps one exact anonymous mapping and immediately returns its frames.
+    pub fn unmap_anonymous(
+        &mut self,
+        address: u64,
+        length: u64,
+        allocator: &mut UsableFrameAllocator<'_>,
+    ) -> Result<(), SharedMappingError> {
+        let index = self
+            .anonymous_mappings()
+            .iter()
+            .position(|mapping| mapping.address == address && mapping.length == length)
+            .ok_or(SharedMappingError::ExactMappingNotFound { address, length })?;
+        let mapped_len = self.anonymous_mappings()[index].mapped_len;
+        self.address_space_mut()
+            .unmap_user_range(address, mapped_len)
+            .map_err(SharedMappingError::AddressSpace)?;
+        self.address_space_mut()
+            .reclaim_retired_data_frames(allocator)
+            .map_err(|error| {
+                SharedMappingError::AddressSpace(AddressSpaceError::FrameAllocator(error))
+            })?;
+        self.anonymous_mappings
+            .as_mut()
+            .expect("live process lost its anonymous mapping records")
+            .swap_remove(index);
+        self.usage.private_pages = self
+            .usage
+            .private_pages
+            .saturating_sub(mapped_len as u64 / PAGE_SIZE);
+        Ok(())
+    }
+
     /// Maps an exact logical range of a shared-memory handle.
     ///
     /// The offset must be page aligned. The logical range need not end on a page
@@ -1239,6 +1389,10 @@ impl Process {
             .shared_mappings
             .take()
             .expect("live process lost its mapping records");
+        let anonymous_mappings = self
+            .anonymous_mappings
+            .take()
+            .expect("live process lost its anonymous mapping records");
         let retained_failed_mapping_leases = self
             .retained_failed_mapping_leases
             .take()
@@ -1246,10 +1400,12 @@ impl Process {
         let teardown = ProcessTeardown {
             handles_closed: handles.len(),
             mappings_released: shared_mappings.len(),
+            anonymous_mappings_released: anonymous_mappings.len(),
             retained_failed_mapping_leases_released: retained_failed_mapping_leases.len(),
         };
         let address_space = unsafe { address_space.retire() };
         drop(shared_mappings);
+        drop(anonymous_mappings);
         drop(retained_failed_mapping_leases);
         drop(handles);
 
@@ -1289,6 +1445,7 @@ impl Drop for Process {
         // resources as a fail-safe. Process::retire takes these fields first and
         // performs the normal clean teardown after the root is no longer active.
         retain_unretired_resource(&mut self.shared_mappings);
+        retain_unretired_resource(&mut self.anonymous_mappings);
         retain_unretired_resource(&mut self.retained_failed_mapping_leases);
         retain_unretired_resource(&mut self.handles);
     }
@@ -1904,6 +2061,7 @@ mod tests {
             preemption_count: 0,
             blocked_syscall: None,
             shared_mappings: None,
+            anonymous_mappings: None,
             retained_failed_mapping_leases: None,
             next_mapping_cursor: SHARED_MAPPING_BASE,
             limits: ProcessLimits::STANDARD,
@@ -1933,6 +2091,45 @@ mod tests {
         ));
         assert_eq!(allocator.allocated_count(), 0);
         assert_eq!(allocator.free_count(), 10);
+    }
+
+    #[test]
+    fn anonymous_mapping_is_zero_filled_accounted_and_immediately_reclaimed() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(64);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let baseline_frames = allocator.allocated_count();
+        let baseline_private = process.usage().private_pages;
+        let length = PAGE_SIZE * 2 + 1;
+
+        let address = process
+            .map_anonymous(
+                length,
+                MapProtection::READ | MapProtection::WRITE,
+                &mut allocator,
+            )
+            .unwrap();
+        assert_eq!(process.anonymous_mappings().len(), 1);
+        assert_eq!(process.usage().private_pages, baseline_private + 3);
+        let mapped_frames = allocator.allocated_count();
+        assert!(mapped_frames >= baseline_frames + 3);
+        assert_eq!(
+            process.address_space().validate_user_range(
+                address,
+                length as usize,
+                UserAccess::Write
+            ),
+            Ok(())
+        );
+
+        process
+            .unmap_anonymous(address, length, &mut allocator)
+            .unwrap();
+        assert!(process.anonymous_mappings().is_empty());
+        assert_eq!(process.usage().private_pages, baseline_private);
+        assert_eq!(allocator.allocated_count(), mapped_frames - 3);
+
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+        assert_eq!(allocator.allocated_count(), 0);
     }
 
     #[test]

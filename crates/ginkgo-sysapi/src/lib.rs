@@ -82,6 +82,10 @@ pub enum SyscallNumber {
     SystemPowerCancel = 37,
     /// Reads progress and failure information through a system-power capability.
     SystemPowerGetInfo = 38,
+    /// Maps zero-filled private anonymous memory into the calling process.
+    AnonymousMap = 39,
+    /// Unmaps one exact anonymous mapping and releases its resident frames.
+    AnonymousUnmap = 40,
 }
 
 /// An opaque process-local reference to a kernel object.
@@ -727,12 +731,15 @@ pub struct SharedMemoryMapArgs {
     pub flags: MapFlags,
 }
 
-/// Output block for [`SyscallNumber::SharedMemoryMap`].
+/// Output block for mapping syscalls.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SharedMemoryMapOutput {
     pub address: u64,
 }
+
+/// Output block for [`SyscallNumber::AnonymousMap`].
+pub type AnonymousMapOutput = SharedMemoryMapOutput;
 
 /// Maximum UTF-8 bytes in one filesystem path component.
 pub const FILESYSTEM_NAME_MAX: usize = 252;
