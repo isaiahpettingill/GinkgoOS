@@ -826,7 +826,30 @@ pub extern "C" fn _start() -> ! {
         ui.render_boot_log(&mut screen, "paging: failed to reserve active tables");
         halt_forever();
     }
+    if (unsafe { arch::enable_no_execute() }).is_err() {
+        ui.render_boot_log(&mut screen, "memory: execute-disable unavailable");
+        halt_forever();
+    }
+    let Ok(kernel_heap) = heap::PageBackedHeap::initialize(&mut page_table, &mut frames) else {
+        ui.render_boot_log(
+            &mut screen,
+            "memory: page-backed heap initialization failed",
+        );
+        halt_forever();
+    };
     let mut serial = unsafe { SerialPort::new(SerialPort::COM1_BASE) };
+    {
+        let mut sink = SerialDebugSink::new(&mut serial);
+        let _ = writeln!(
+            sink,
+            "memory: page-backed kernel heap online committed={} growths={} available={}\r",
+            kernel_heap.committed_bytes(),
+            kernel_heap.growth_count(),
+            kernel_heap.available_bytes(),
+        );
+    }
+    ui.render_boot_log(&mut screen, "memory: page-backed kernel heap online");
+
     let Some(tsc_frequency) = TSC_FREQUENCY_REQUEST
         .response()
         .map(|response| response.frequency)
@@ -837,6 +860,7 @@ pub extern "C" fn _start() -> ! {
         ui.render_boot_log(&mut screen, "timer: TSC frequency unavailable");
         halt_forever();
     };
+
     let entropy = match EntropyPool::initialize(
         tsc_frequency,
         hhdm.offset ^ (&frames as *const UsableFrameAllocator<'_> as usize as u64),
@@ -849,6 +873,7 @@ pub extern "C" fn _start() -> ! {
             halt_forever();
         }
     };
+
     let timer =
         match unsafe { LocalApicTimer::initialize(&mut page_table, &mut frames, tsc_frequency) } {
             Ok(timer) => timer,
@@ -859,23 +884,35 @@ pub extern "C" fn _start() -> ! {
                 halt_forever();
             }
         };
+
     usb::configure_timestamp_frequency(Some(tsc_frequency));
     let storage = match unsafe { VirtioBlk::initialize(&mut frames, hhdm.offset) } {
         Ok(disk) => {
             ui.render_boot_log(&mut screen, "storage: virtio-blk online");
             StorageDisk::Virtio(disk)
         }
-        Err(_) => match unsafe { AhciDisk::initialize(&mut page_table, &mut frames) } {
-            Ok(disk) => {
-                ui.render_boot_log(&mut screen, "storage: AHCI/SATA online");
-                StorageDisk::Ahci(disk)
+        Err(error) => {
+            let _ = writeln!(
+                SerialDebugSink::new(&mut serial),
+                "storage: virtio-blk initialization failed: {error:?}\r"
+            );
+            match unsafe { AhciDisk::initialize(&mut page_table, &mut frames) } {
+                Ok(disk) => {
+                    ui.render_boot_log(&mut screen, "storage: AHCI/SATA online");
+                    StorageDisk::Ahci(disk)
+                }
+                Err(error) => {
+                    let _ = writeln!(
+                        SerialDebugSink::new(&mut serial),
+                        "storage: AHCI initialization failed: {error:?}\r"
+                    );
+                    ui.render_boot_log(&mut screen, "storage: no virtio-blk or AHCI disk");
+                    halt_forever();
+                }
             }
-            Err(_) => {
-                ui.render_boot_log(&mut screen, "storage: no virtio-blk or AHCI disk");
-                halt_forever();
-            }
-        },
+        }
     };
+
     let Ok(mut volume) = Volume::discover(storage) else {
         ui.render_boot_log(&mut screen, "storage: invalid partition table");
         halt_forever();
@@ -958,6 +995,7 @@ pub extern "C" fn _start() -> ! {
     let mut context = KernelContext {
         frames,
         page_table,
+        kernel_heap,
         hhdm_offset: hhdm.offset,
         fs,
         serial,
@@ -1383,6 +1421,7 @@ fn run_scheduler(context: &mut KernelContext) -> ! {
     }
 
     loop {
+        maintain_kernel_heap(context);
         scheduler.run_round(context);
         if !context.processes.has_runnable()
             && context.timer.arm_one_shot(KERNEL_IDLE_POLL_NS).is_ok()
@@ -1405,6 +1444,7 @@ struct ProcessClient {
 struct KernelContext {
     frames: UsableFrameAllocator<'static>,
     page_table: ActivePageTable,
+    kernel_heap: heap::PageBackedHeap,
     hhdm_offset: u64,
     fs: RedoxFs<Volume<StorageDisk>>,
     serial: Option<SerialPort>,
@@ -1436,6 +1476,17 @@ struct KernelContext {
     pressed_keys: Vec<(ginkgo_kernel::usb::HidInterfaceId, u16)>,
     pressed_pointer_buttons: Vec<(ginkgo_kernel::usb::HidInterfaceId, u16)>,
     log_flush_deadline: u64,
+}
+
+fn maintain_kernel_heap(context: &mut KernelContext) {
+    if context.kernel_heap.failed_growth_count() != 0 {
+        return;
+    }
+    let _ = context.kernel_heap.ensure_headroom(
+        heap::MINIMUM_HEAP_HEADROOM,
+        &mut context.page_table,
+        &mut context.frames,
+    );
 }
 
 const CONSOLE_BATCH_CAPACITY: usize = 256;

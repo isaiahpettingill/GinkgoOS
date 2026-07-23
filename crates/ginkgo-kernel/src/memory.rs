@@ -397,12 +397,13 @@ impl<'a> UsableFrameAllocator<'a> {
         if let Some(error) = self.error {
             return Err(error);
         }
-        if max_address_exclusive == 0 || max_address_exclusive > self.physical_address_space_size {
+        if max_address_exclusive == 0 {
             return Err(FrameAllocatorError::PhysicalAddressTooLarge {
                 base: max_address_exclusive,
                 length: 0,
             });
         }
+        let max_address_exclusive = max_address_exclusive.min(self.physical_address_space_size);
 
         if allow_reclaimed {
             if let Some(address) = self.ownership.claim_reclaimed_below(max_address_exclusive) {
@@ -627,6 +628,16 @@ mod tests {
                 .as_u64(),
             base
         );
+    }
+
+    #[test]
+    fn address_limit_above_cpu_width_is_clamped_to_supported_memory() {
+        let mut allocator =
+            unsafe { UsableFrameAllocator::from_test_region(0x1000, PAGE_SIZE, 36) };
+        assert!(allocator
+            .allocate_frame_below(1_u64 << 44)
+            .unwrap()
+            .is_some());
     }
 
     #[test]

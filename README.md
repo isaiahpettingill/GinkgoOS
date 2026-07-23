@@ -26,7 +26,7 @@ A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. Gi
 - A transport-independent scrolling desktop policy and application window protocol
 - Packed bitmap-font rendering and a validated, versioned `.gkf` format
 - Persistent RedoxFS transactions on GPT/MBR volumes over bounded-polling virtio-blk or AHCI/SATA
-- Talc-backed dynamic allocation for RedoxFS and future kernel services
+- Talc-backed allocation that transitions from a bounded bootstrap arena to a growable page-backed kernel heap
 - Single-core round-robin userspace scheduling with local-APIC timer preemption
 - Hardware-seeded kernel CSPRNG with process-local random capabilities
 - SMAP user-copy protection with recoverable page-fault fixups
@@ -75,7 +75,7 @@ Current execution limitations are intentional and explicit:
 - XSAVE-capable CPUs preserve enabled x87/SSE/AVX state (including AVX2's YMM state) across every userspace transition; legacy CPUs use FXSAVE, and default system images retain an SSE2 baseline.
 - Physical reclamation is single-core: process roots are recycled only after switching back to the kernel CR3; future SMP requires remote TLB shootdown before reuse.
 - CPUID physical-address width constrains usable Limine RAM; allocation can use frames above 4 GiB when the platform reports them. The kernel remains on four-level paging, so its active virtual-address contract is 48-bit even on LA57-capable CPUs.
-- Early shared-memory and capability allocation still depends on the fixed bootstrap kernel heap.
+- Kernel allocations use a growable page-backed arena after early boot; the original bounded bootstrap arena remains mapped so pre-transition allocations stay valid.
 - Dynamic linking, runtime ELF relocations, signed rollback prevention, encrypted storage, and hardware-backed key sealing are not yet provided.
 
 See [`SECURITY.md`](SECURITY.md) for the threat model, trust/update policy, resource ceilings, CPU-feature audit, and unsupported hardware assumptions.

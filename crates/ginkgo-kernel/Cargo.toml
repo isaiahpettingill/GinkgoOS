@@ -31,7 +31,7 @@ ginkgo-window.workspace = true
 redoxfs = { path = "../../vendor/redoxfs", default-features = false }
 syscall = { package = "redox_syscall", version = "0.9.0", default-features = false }
 spinning_top.workspace = true
-talc.workspace = true
+talc = { workspace = true, features = ["counters"] }
 uart_16550.workspace = true
 volatile.workspace = true
 x86_64.workspace = true

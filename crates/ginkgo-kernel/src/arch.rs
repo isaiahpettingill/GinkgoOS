@@ -449,6 +449,19 @@ pub const fn validate_no_execute_requirement(
     }
 }
 
+/// Enables the architectural no-execute page-table bit before early kernel
+/// subsystems install non-executable mappings.
+///
+/// # Safety
+///
+/// The caller must run at CPL0 on the current CPU and must ensure that every
+/// existing page-table entry has a valid reserved-bit encoding once NXE is set.
+pub unsafe fn enable_no_execute() -> Result<(), NoExecuteError> {
+    validate_no_execute_requirement(true, cpu_capabilities())?;
+    unsafe { write_msr(IA32_EFER, read_msr(IA32_EFER) | EFER_NO_EXECUTE_ENABLE) };
+    Ok(())
+}
+
 /// External-interrupt resources installed into one CPU's entry state.
 ///
 /// A zero EOI address disables maskable external-interrupt entries and is used
