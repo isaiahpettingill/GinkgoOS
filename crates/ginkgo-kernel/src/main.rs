@@ -285,48 +285,61 @@ impl ProgramCatalog {
 
 fn install_and_load_system_programs<D: Disk>(
     fs: &mut RedoxFs<D>,
-) -> Option<(Vec<u8>, ProgramCatalog)> {
-    let system = ensure_system_directory(fs)?;
-    migrate_legacy_system_files(fs, system)?;
-    install_system_file(fs, DESKTOP_PATH, DESKTOP_ELF)?;
-    install_system_file(fs, MINIMAL_CLIENT_PATH, MINIMAL_CLIENT_ELF)?;
-    install_system_file(fs, FILE_NAVIGATOR_PATH, FILE_NAVIGATOR_ELF)?;
-    install_system_file(fs, TERMINAL_PATH, TERMINAL_ELF)?;
-    install_system_file(fs, PROGRAM_REGISTRY_PATH, PROGRAM_REGISTRY)?;
+) -> Result<(Vec<u8>, ProgramCatalog), &'static str> {
+    let system = ensure_system_directory(fs).ok_or("create system directory")?;
+    migrate_legacy_system_files(fs, system).ok_or("migrate legacy system files")?;
+    recover_system_installation_space(fs).map_err(|_| "recover system installation space")?;
+    install_system_file(fs, DESKTOP_PATH, DESKTOP_ELF).map_err(|_| "install desktop")?;
+    install_system_file(fs, MINIMAL_CLIENT_PATH, MINIMAL_CLIENT_ELF)
+        .map_err(|_| "install minimal client")?;
+    install_system_file(fs, FILE_NAVIGATOR_PATH, FILE_NAVIGATOR_ELF)
+        .map_err(|_| "install file navigator")?;
+    install_system_file(fs, TERMINAL_PATH, TERMINAL_ELF).map_err(|_| "install terminal")?;
+    install_system_file(fs, PROGRAM_REGISTRY_PATH, PROGRAM_REGISTRY)
+        .map_err(|_| "install program registry")?;
     if process_capability_smoke_enabled() {
         install_system_file(
             fs,
             PROCESS_CAPABILITY_SMOKE_PATH,
             PROCESS_CAPABILITY_SMOKE_ELF,
-        )?;
+        )
+        .map_err(|_| "install process-capability smoke")?;
         install_system_file(
             fs,
             PROCESS_CAPABILITY_MALFORMED_PATH,
             PROCESS_CAPABILITY_MALFORMED_ELF,
-        )?;
+        )
+        .map_err(|_| "install malformed-process smoke")?;
     }
 
-    let registry_bytes = read_trusted_system_file(fs, PROGRAM_REGISTRY_PATH, 16 * 1024)?;
-    let registry = Registry::parse(&registry_bytes).ok()?;
-    let desktop = registry.entries().find(|entry| entry.app_id == "desktop")?;
+    let registry_bytes = read_trusted_system_file(fs, PROGRAM_REGISTRY_PATH, 16 * 1024)
+        .ok_or("verify program registry")?;
+    let registry = Registry::parse(&registry_bytes).map_err(|_| "parse program registry")?;
+    let desktop = registry
+        .entries()
+        .find(|entry| entry.app_id == "desktop")
+        .ok_or("find desktop registry entry")?;
     if desktop.executable_path != DESKTOP_PATH || desktop.is_visible() {
-        return None;
+        return Err("validate desktop registry entry");
     }
 
     let mut catalog = ProgramCatalog::EMPTY;
     for entry in registry.visible_entries().take(MAX_LAUNCHER_PROGRAMS) {
         let slot = &mut catalog.programs[catalog.len];
-        slot.app_id_len = copy_program_string(&mut slot.app_id, entry.app_id)?;
-        slot.name_len = copy_program_string(&mut slot.name, entry.display_name)?;
-        slot.path_len = copy_program_string(&mut slot.path, entry.executable_path)?;
+        slot.app_id_len =
+            copy_program_string(&mut slot.app_id, entry.app_id).ok_or("copy application id")?;
+        slot.name_len = copy_program_string(&mut slot.name, entry.display_name)
+            .ok_or("copy application name")?;
+        slot.path_len = copy_program_string(&mut slot.path, entry.executable_path)
+            .ok_or("copy executable path")?;
         slot.filesystem = entry.flags.contains(EntryFlags::FILESYSTEM);
         slot.process_launch = entry.flags.contains(EntryFlags::PROCESS_LAUNCH);
         catalog.len += 1;
     }
 
-    let desktop_image =
-        read_trusted_system_file(fs, desktop.executable_path, MAX_EXECUTABLE_BYTES)?;
-    Some((desktop_image, catalog))
+    let desktop_image = read_trusted_system_file(fs, desktop.executable_path, MAX_EXECUTABLE_BYTES)
+        .ok_or("verify desktop executable")?;
+    Ok((desktop_image, catalog))
 }
 
 fn read_trusted_system_file<D: Disk>(
@@ -395,10 +408,87 @@ fn migrate_legacy_system_files<D: Disk>(
     Some(())
 }
 
-fn install_system_file<D: Disk>(fs: &mut RedoxFs<D>, path: &str, bytes: &[u8]) -> Option<()> {
-    let file = fs.open(path).or_else(|_| fs.create(path)).ok()?;
-    fs.truncate(file, 0).ok()?;
-    (fs.write(file, 0, bytes).ok()? == bytes.len()).then_some(())
+const MIN_SYSTEM_INSTALLATION_WORKSPACE: u64 = 512 * 1024;
+
+fn recover_system_installation_space<D: Disk>(fs: &mut RedoxFs<D>) -> Result<(), FsError> {
+    if fs.filesystem_info()?.free_bytes.unwrap_or(u64::MAX) >= MIN_SYSTEM_INSTALLATION_WORKSPACE {
+        return Ok(());
+    }
+
+    let artifacts = [
+        (DESKTOP_PATH, DESKTOP_ELF),
+        (MINIMAL_CLIENT_PATH, MINIMAL_CLIENT_ELF),
+        (FILE_NAVIGATOR_PATH, FILE_NAVIGATOR_ELF),
+        (TERMINAL_PATH, TERMINAL_ELF),
+        (PROGRAM_REGISTRY_PATH, PROGRAM_REGISTRY),
+    ];
+    let mut replacement_needed = false;
+    let mut largest = None;
+    for (path, expected) in artifacts {
+        let Ok(file) = fs.open(path) else {
+            replacement_needed = true;
+            continue;
+        };
+        replacement_needed |= !system_file_matches(fs, file, expected)?;
+        let length = fs.stat(file)?.len;
+        if length != 0 && largest.is_none_or(|(_, largest_length)| length > largest_length) {
+            largest = Some((file, length));
+        }
+    }
+
+    if replacement_needed {
+        let (file, _) = largest.ok_or(FsError::NoSpace)?;
+        fs.truncate(file, 0)?;
+        fs.sync()?;
+    }
+    Ok(())
+}
+
+fn system_file_matches<D: Disk>(
+    fs: &mut RedoxFs<D>,
+    file: ginkgo_filesystem::FileHandle,
+    expected: &[u8],
+) -> Result<bool, FsError> {
+    if fs.stat(file)?.len != expected.len() as u64 {
+        return Ok(false);
+    }
+
+    let mut offset = 0;
+    let mut buffer = [0_u8; 4096];
+    while offset < expected.len() {
+        let count = (expected.len() - offset).min(buffer.len());
+        if fs.read(file, offset as u64, &mut buffer[..count])? != count
+            || buffer[..count] != expected[offset..offset + count]
+        {
+            return Ok(false);
+        }
+        offset += count;
+    }
+    Ok(true)
+}
+
+fn install_system_file<D: Disk>(
+    fs: &mut RedoxFs<D>,
+    path: &str,
+    bytes: &[u8],
+) -> Result<(), FsError> {
+    let file = match fs.open(path) {
+        Ok(file) => {
+            if system_file_matches(fs, file, bytes)? {
+                return Ok(());
+            }
+            fs.truncate(file, 0)?;
+            fs.sync()?;
+            file
+        }
+        Err(FsError::NotFound) => fs.create(path)?,
+        Err(error) => return Err(error),
+    };
+
+    if fs.write(file, 0, bytes)? != bytes.len() {
+        return Err(FsError::Io);
+    }
+    fs.sync()
 }
 
 const FILESYSTEM_SMOKE_INITIAL_CONTENT: &[u8] = b"GinkgoOS hierarchy smoke: moved\n";
@@ -752,11 +842,17 @@ pub extern "C" fn _start() -> ! {
             }
         }
     }
-    let Some((desktop_image, catalog)) = install_and_load_system_programs(&mut fs) else {
-        let mut sink = SerialDebugSink::new(&mut serial);
-        let _ = writeln!(sink, "redoxfs: system program installation failed\r");
-        ui.render_boot_log(&mut screen, "redoxfs: system program installation failed");
-        halt_forever();
+    let (desktop_image, catalog) = match install_and_load_system_programs(&mut fs) {
+        Ok(installed) => installed,
+        Err(stage) => {
+            let mut sink = SerialDebugSink::new(&mut serial);
+            let _ = writeln!(
+                sink,
+                "redoxfs: system program installation failed ({stage})\r"
+            );
+            ui.render_boot_log(&mut screen, "redoxfs: system program installation failed");
+            halt_forever();
+        }
     };
     ui.catalog = catalog;
     ui.render_boot_log(&mut screen, "redoxfs: desktop ELF and registry loaded");

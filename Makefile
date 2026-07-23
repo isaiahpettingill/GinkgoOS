@@ -19,7 +19,7 @@ FILE_NAVIGATOR_ELF := $(USERSPACE_TARGET)/ginkgo-file-navigator
 TERMINAL_ELF := $(USERSPACE_TARGET)/ginkgo-terminal
 PROCESS_CAPABILITY_SMOKE_ELF := $(USERSPACE_TARGET)/ginkgo-process-capability-smoke
 FS_IMAGE := $(BUILD_DIR)/ginkgo-redoxfs.img
-FS_IMAGE_SIZE_MB ?= 16
+FS_IMAGE_SIZE_MB ?= 32
 ISO := $(BUILD_DIR)/$(IMAGE_NAME).iso
 
 LIMINE_VERSION ?= v12.5.1
