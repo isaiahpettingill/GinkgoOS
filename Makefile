@@ -56,7 +56,7 @@ QEMU_AUDIO_FLAGS ?= -audiodev sdl,id=ginkgo-audio
 endif
 QEMU_FLAGS ?= -cpu max -m 512M -M pc,i8042=off -serial stdio -device qemu-xhci,id=xhci,msi=on,msix=off -device usb-hub,id=ginkgo-hub,bus=xhci.0,port=1 -device usb-kbd,bus=xhci.0,port=1.1 -device usb-tablet,bus=xhci.0,port=1.2 $(QEMU_AUDIO_FLAGS) -device ich9-intel-hda -device hda-output,audiodev=ginkgo-audio
 
-.PHONY: all userspace kernel iso qemu no-iso run usb-smoke frame-reclaim-smoke filesystem-smoke text-editor-smoke process-capability-smoke power-smoke check clean distclean reset-fs
+.PHONY: all userspace kernel iso qemu no-iso run usb-smoke frame-reclaim-smoke filesystem-smoke text-editor-smoke process-capability-smoke power-smoke check clean distclean reset-fs FORCE
 
 all: iso
 
@@ -92,7 +92,9 @@ $(ISO): kernel $(LIMINE_DIR)/BOOTX64.EFI limine.conf
 		-efi-boot-part --efi-boot-image --protective-msdos-label \
 		$(ISO_ROOT) -o $(ISO)
 
-$(FS_IMAGE): tools/create_gpt_disk.py
+FORCE:
+
+$(FS_IMAGE): tools/create_gpt_disk.py FORCE
 	mkdir -p $(BUILD_DIR)
 	$(PYTHON) tools/create_gpt_disk.py $(FS_IMAGE) --size-mb $(FS_IMAGE_SIZE_MB)
 

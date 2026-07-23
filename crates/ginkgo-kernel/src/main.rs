@@ -846,6 +846,18 @@ pub extern "C" fn _start() -> ! {
         ui.render_boot_log(&mut screen, "redoxfs: persistent disk mount failed");
         halt_forever();
     };
+    match fs.grow_to_disk() {
+        Ok(true) => {
+            ui.render_boot_log(&mut screen, "redoxfs: expanded to partition capacity");
+            let mut sink = SerialDebugSink::new(&mut serial);
+            let _ = writeln!(sink, "redoxfs: expanded to partition capacity\r");
+        }
+        Ok(false) => {}
+        Err(_) => {
+            ui.render_boot_log(&mut screen, "redoxfs: filesystem expansion failed");
+            halt_forever();
+        }
+    }
     if filesystem_hierarchy_smoke_enabled() {
         let result = run_filesystem_hierarchy_smoke(&mut fs);
         let mut sink = SerialDebugSink::new(&mut serial);

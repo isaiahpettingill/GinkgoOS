@@ -17,7 +17,9 @@ extern crate alloc;
 use alloc::{collections::BTreeMap, string::String, vec, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use redoxfs::{Disk, FileSystem, Node, Transaction, TreeData, TreePtr, BLOCK_SIZE};
+use redoxfs::{
+    BlockAddr, BlockMeta, Disk, FileSystem, Node, Transaction, TreeData, TreePtr, BLOCK_SIZE,
+};
 use syscall::error::{
     Error, EEXIST, EINVAL, EIO, EISDIR, ELOOP, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY,
 };
@@ -226,6 +228,55 @@ impl<D: Disk> RedoxFs<D> {
 
     pub fn image_size(&mut self) -> Result<u64, FsError> {
         self.inner.disk.size().map_err(map_error)
+    }
+
+    /// Grows the filesystem to the current backing-device size.
+    ///
+    /// Existing data and allocation state are preserved. Shrinking is never
+    /// attempted, and a device whose size is unchanged is a no-op.
+    pub fn grow_to_disk(&mut self) -> Result<bool, FsError> {
+        let disk_size = self.inner.disk.size().map_err(map_error)?;
+        let filesystem_offset = self
+            .inner
+            .block
+            .checked_mul(BLOCK_SIZE)
+            .ok_or(FsError::OffsetOverflow)?;
+        let available = disk_size
+            .checked_sub(filesystem_offset)
+            .ok_or(FsError::OffsetOverflow)?;
+        let new_size = available / BLOCK_SIZE * BLOCK_SIZE;
+        let old_size = self.inner.header.size();
+        if new_size <= old_size {
+            return Ok(false);
+        }
+
+        let old_blocks = old_size / BLOCK_SIZE;
+        let new_blocks = new_size / BLOCK_SIZE;
+        let old_allocator = self.inner.allocator().clone();
+        // SAFETY: each address is newly exposed by growth beyond the old
+        // filesystem boundary, is block-aligned, and cannot overlap an existing
+        // allocation. RedoxFS's resize utility uses the same allocator operation.
+        unsafe {
+            let allocator = self.inner.allocator_mut();
+            for index in old_blocks..new_blocks {
+                allocator.deallocate(BlockAddr::new(index, BlockMeta::default()));
+            }
+        }
+        let result = self.inner.tx(|transaction| {
+            transaction.header.size = new_size.into();
+            transaction.header_changed = true;
+            transaction.sync(true)
+        });
+        if let Err(error) = result {
+            // Do not let callers allocate beyond the old durable boundary after
+            // a failed resize. A later remount will select the newest valid
+            // RedoxFS header if the device failed after partially persisting.
+            unsafe {
+                *self.inner.allocator_mut() = old_allocator;
+            }
+            return Err(map_error(error));
+        }
+        Ok(true)
     }
 
     pub fn filesystem_info(&mut self) -> Result<FilesystemInfo, FsError> {
@@ -1142,6 +1193,30 @@ mod tests {
         assert_eq!(info.block_size, BLOCK_SIZE);
         assert!(info.free_bytes.is_some());
         assert!(info.free_bytes.unwrap() < info.capacity_bytes);
+    }
+
+    #[test]
+    fn grows_to_an_expanded_backing_disk_without_losing_data() {
+        let disk = MemoryDisk::zeroed(8 * 1024 * 1024);
+        let mut fs = RedoxFs::format_disk(disk).unwrap();
+        let file = fs.create("/preserved").unwrap();
+        fs.write(file, 0, b"before growth").unwrap();
+        fs.sync().unwrap();
+        let old_info = fs.filesystem_info().unwrap();
+
+        let mut disk = fs.into_disk();
+        disk.data.resize(16 * 1024 * 1024, 0);
+        let mut fs = RedoxFs::open_disk(disk).unwrap();
+        assert!(fs.grow_to_disk().unwrap());
+        let new_info = fs.filesystem_info().unwrap();
+        assert!(new_info.capacity_bytes > old_info.capacity_bytes);
+        assert!(new_info.free_bytes.unwrap() > old_info.free_bytes.unwrap());
+        assert!(!fs.grow_to_disk().unwrap());
+
+        let file = fs.open("/preserved").unwrap();
+        let mut bytes = [0_u8; 13];
+        assert_eq!(fs.read(file, 0, &mut bytes).unwrap(), bytes.len());
+        assert_eq!(&bytes, b"before growth");
     }
 
     #[test]
