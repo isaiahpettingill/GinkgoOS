@@ -86,7 +86,7 @@ const PROCESS_INFO_SIZE: usize = size_of::<ProcessInfo>();
 const SYSTEM_POWER_INFO_SIZE: usize = size_of::<SystemPowerInfo>();
 const SYSTEM_POWER_CANCELLATION_NS: u64 = 2_000_000_000;
 const APPLICATION_DATA_CREATE_ARGS_SIZE: usize = 32;
-const MAX_EXECUTABLE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_EXECUTABLE_BYTES: usize = 256 * 1024 * 1024;
 
 /// A bounded destination for early userspace diagnostics.
 pub trait DebugSink {

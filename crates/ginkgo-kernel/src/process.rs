@@ -357,7 +357,7 @@ pub struct ProcessLimits {
 
 impl ProcessLimits {
     pub const STANDARD: Self = Self {
-        private_pages: 20_000,
+        private_pages: 262_144,
         shared_memory_bytes: 64 * 1024 * 1024,
         mapped_shared_bytes: 64 * 1024 * 1024,
         channel_traffic_bytes: 64 * 1024 * 1024,

@@ -158,7 +158,7 @@ const TERMINAL_PATH: &str = "/system/terminal.elf";
 const PROGRAM_REGISTRY_PATH: &str = "/system/programs.gkr";
 const PROCESS_CAPABILITY_SMOKE_PATH: &str = "/system/process-capability-smoke.elf";
 const PROCESS_CAPABILITY_MALFORMED_PATH: &str = "/system/process-capability-malformed.elf";
-const MAX_EXECUTABLE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_EXECUTABLE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_LAUNCHER_PROGRAMS: usize = 6;
 const FRAME_RECLAIM_STRESS_CYCLES: u32 = 512;
 

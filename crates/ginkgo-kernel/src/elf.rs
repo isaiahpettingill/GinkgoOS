@@ -20,13 +20,10 @@ use core::cmp::{max, min};
 
 pub const PAGE_SIZE: u64 = 4096;
 pub const MAX_PROGRAM_HEADERS: usize = 128;
-/// Maximum pages mapped from all `PT_LOAD` segments: 64 MiB at 4 KiB/page.
-///
-/// The kernel eagerly allocates every image page and reclaims partial loads on
-/// construction failure. Keeping one executable below one eighth of
-/// the standard 512 MiB development machine prevents a malformed image from
-/// consuming nearly all boot memory before stacks and page tables are created.
-pub const MAX_TOTAL_LOAD_PAGES: u64 = 16_384;
+/// Hard safety ceiling for ELF metadata before per-process RAM policy is applied:
+/// 1 GiB at 4 KiB/page. Actual loading remains constrained by the process's
+/// private-page quota and cleanly rolls back on physical-memory exhaustion.
+pub const MAX_TOTAL_LOAD_PAGES: u64 = 262_144;
 pub const USER_ADDRESS_END: u64 = 0x0000_8000_0000_0000;
 
 const ELF_HEADER_SIZE: u16 = 64;
