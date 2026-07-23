@@ -3127,6 +3127,16 @@ fn audio_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll {
     TaskPoll::Pending
 }
 
+const KEY_REPEAT_DELAY_NS: u64 = 400_000_000;
+const KEY_REPEAT_INTERVAL_NS: u64 = 35_000_000;
+const KEY_REPEAT_STATE_WORD: usize = 0;
+const KEY_REPEAT_DEADLINE_WORD: usize = 7;
+const KEY_REPEAT_USAGE_BITS: usize = 17;
+const KEY_REPEAT_USAGE_MASK: usize = (1 << KEY_REPEAT_USAGE_BITS) - 1;
+const KEY_REPEAT_LAUNCHER_FLAG: usize = 1 << KEY_REPEAT_USAGE_BITS;
+const KEY_REPEAT_DEVICE_SHIFT: usize = KEY_REPEAT_USAGE_BITS + 1;
+const KEY_REPEAT_INTERFACE_SHIFT: usize = KEY_REPEAT_DEVICE_SHIFT + 32;
+
 fn input_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
     if context.input.is_none() {
         return TaskPoll::Pending;
@@ -3226,6 +3236,11 @@ fn input_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
                 .render_text_range(&mut context.screen, start, end);
         }
     }
+    if let Some((start, end)) = dispatch_key_repeat(context, state) {
+        context
+            .ui
+            .render_text_range(&mut context.screen, start, end);
+    }
     if old_cursor
         != (
             context.ui.mouse_x,
@@ -3283,6 +3298,12 @@ fn release_disconnected_input(
     context
         .pressed_keys
         .retain(|(owner, _)| *owner != interface);
+    let active_repeat = key_repeat_state(state).map(|(owner, usage, _)| (owner, usage));
+    if active_repeat
+        .is_some_and(|(owner, usage)| owner == interface && released_keys.contains(&usage))
+    {
+        cancel_key_repeat(state);
+    }
     refresh_modifier_state(context, state);
     let modifiers = current_modifiers(state);
     if let Some(desktop) = context.desktop.as_mut() {
@@ -3344,6 +3365,102 @@ fn pointer_button(button: u16) -> Option<PointerButton> {
     })
 }
 
+fn key_repeat_state(state: &TaskState) -> Option<(ginkgo_kernel::usb::HidInterfaceId, u16, bool)> {
+    let encoded = state.get(KEY_REPEAT_STATE_WORD).unwrap_or(0);
+    let usage = (encoded & KEY_REPEAT_USAGE_MASK)
+        .checked_sub(1)
+        .and_then(|usage| u16::try_from(usage).ok())?;
+    let device = u32::try_from((encoded >> KEY_REPEAT_DEVICE_SHIFT) & u32::MAX as usize).ok()?;
+    let interface = ((encoded >> KEY_REPEAT_INTERFACE_SHIFT) & u8::MAX as usize) as u8;
+    Some((
+        ginkgo_kernel::usb::HidInterfaceId { device, interface },
+        usage,
+        encoded & KEY_REPEAT_LAUNCHER_FLAG != 0,
+    ))
+}
+
+fn arm_key_repeat(
+    context: &KernelContext,
+    state: &mut TaskState,
+    interface: ginkgo_kernel::usb::HidInterfaceId,
+    usage: u16,
+) {
+    let deadline = context
+        .timer
+        .clock()
+        .now_ns()
+        .saturating_add(KEY_REPEAT_DELAY_NS);
+    let encoded = usize::from(usage) + 1
+        | usize::from(context.ui.launcher_visible) * KEY_REPEAT_LAUNCHER_FLAG
+        | (interface.device as usize) << KEY_REPEAT_DEVICE_SHIFT
+        | (usize::from(interface.interface)) << KEY_REPEAT_INTERFACE_SHIFT;
+    state.set(KEY_REPEAT_STATE_WORD, encoded);
+    state.set(KEY_REPEAT_DEADLINE_WORD, deadline as usize);
+}
+
+fn cancel_key_repeat(state: &mut TaskState) {
+    state.set(KEY_REPEAT_STATE_WORD, 0);
+    state.set(KEY_REPEAT_DEADLINE_WORD, 0);
+}
+
+fn dispatch_key_repeat(
+    context: &mut KernelContext,
+    state: &mut TaskState,
+) -> Option<(usize, usize)> {
+    let (interface, usage, launcher_visible) = key_repeat_state(state)?;
+    if launcher_visible != context.ui.launcher_visible
+        || !context.pressed_keys.contains(&(interface, usage))
+    {
+        cancel_key_repeat(state);
+        return None;
+    }
+    let now = context.timer.clock().now_ns();
+    if now < state.get(KEY_REPEAT_DEADLINE_WORD).unwrap_or(usize::MAX) as u64 {
+        return None;
+    }
+    state.set(
+        KEY_REPEAT_DEADLINE_WORD,
+        now.saturating_add(KEY_REPEAT_INTERVAL_NS) as usize,
+    );
+    dispatch_keyboard_event(context, state, usage, true, true)
+}
+
+fn dispatch_keyboard_event(
+    context: &mut KernelContext,
+    state: &TaskState,
+    usage: u16,
+    pressed: bool,
+    repeat: bool,
+) -> Option<(usize, usize)> {
+    let logo = state.get(3).unwrap_or(0) != 0;
+    if pressed && !repeat && usage == 0x11 && logo {
+        request_launcher_toggle(context);
+    } else if context.ui.launcher_visible {
+        if pressed && !repeat && usage == 0x29 && context.ui.power_confirmation.take().is_some() {
+            redraw_desktop(context);
+        } else if pressed && !repeat && usage == 0x28 && context.ui.catalog.len != 0 {
+            context.launch_requested = Some(0);
+        } else if pressed {
+            let modifiers = current_modifiers(state);
+            if let Some(byte) = keyboard_ascii(usage, modifiers.shift, modifiers.caps_lock) {
+                return context.ui.push_byte(byte);
+            }
+        }
+    } else if let Some(desktop) = context.desktop.as_mut() {
+        let _ = desktop.send_keyboard_input(KeyboardEvent {
+            usage,
+            state: if pressed {
+                ButtonState::Pressed
+            } else {
+                ButtonState::Released
+            },
+            repeat,
+            modifiers: current_modifiers(state),
+        });
+    }
+    None
+}
+
 fn handle_input_event(
     context: &mut KernelContext,
     state: &mut TaskState,
@@ -3356,45 +3473,28 @@ fn handle_input_event(
     let mut text_dirty = None;
     match device_event.event {
         InputEvent::Key { usage, pressed, .. } => {
-            update_pressed(
-                &mut context.pressed_keys,
-                (device_event.interface, usage),
-                pressed,
-            );
+            let key = (device_event.interface, usage);
+            let was_pressed = context.pressed_keys.contains(&key);
+            update_pressed(&mut context.pressed_keys, key, pressed);
             refresh_modifier_state(context, state);
-            if usage == 0x39 && pressed {
+            if usage == 0x39 && pressed && !was_pressed {
                 state.set(2, state.get(2).unwrap_or(0) ^ 1);
-            } else if usage == 0x53 && pressed {
+            } else if usage == 0x53 && pressed && !was_pressed {
                 state.set(6, state.get(6).unwrap_or(0) ^ 1);
             }
 
-            let logo = state.get(3).unwrap_or(0) != 0;
-            if pressed && usage == 0x11 && logo {
-                request_launcher_toggle(context);
-            } else if context.ui.launcher_visible {
-                if pressed && usage == 0x29 && context.ui.power_confirmation.take().is_some() {
-                    redraw_desktop(context);
-                } else if pressed && usage == 0x28 && context.ui.catalog.len != 0 {
-                    context.launch_requested = Some(0);
-                } else if pressed {
-                    let modifiers = current_modifiers(state);
-                    if let Some(byte) = keyboard_ascii(usage, modifiers.shift, modifiers.caps_lock)
-                    {
-                        text_dirty = context.ui.push_byte(byte);
-                    }
-                }
-            } else if let Some(desktop) = context.desktop.as_mut() {
-                let _ = desktop.send_keyboard_input(KeyboardEvent {
-                    usage,
-                    state: if pressed {
-                        ButtonState::Pressed
-                    } else {
-                        ButtonState::Released
-                    },
-                    repeat: false,
-                    modifiers: current_modifiers(state),
-                });
+            let active_repeat = key_repeat_state(state).map(|(owner, usage, _)| (owner, usage));
+            if !pressed && active_repeat == Some(key) {
+                cancel_key_repeat(state);
             }
+            let modifiers = current_modifiers(state);
+            if modifiers.logo {
+                cancel_key_repeat(state);
+            } else if pressed && !was_pressed && usage < 0xe0 && usage != 0x39 && usage != 0x53 {
+                arm_key_repeat(context, state, device_event.interface, usage);
+            }
+
+            text_dirty = dispatch_keyboard_event(context, state, usage, pressed, false);
         }
         InputEvent::Axis {
             axis,

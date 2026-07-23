@@ -29,6 +29,7 @@ const MAX_CLIENT_QUEUE: usize = 128;
 const CLIENT_BACKPRESSURE_THRESHOLD: usize = 96;
 const MAX_READS_PER_TURN: usize = 32;
 const MAX_WRITES_PER_TURN: usize = 32;
+const MAX_META_CAPTURES: usize = 16;
 
 const CLIENT_CHANNEL_RIGHTS: Rights =
     Rights::from_bits_retain(Rights::READ.bits() | Rights::WRITE.bits());
@@ -77,11 +78,8 @@ extern "C" fn process_main(bootstrap_raw: u64, width: u64, height: u64, _random_
     ginkgo_runtime::exit(0)
 }
 
-fn desktop_hotkey(event: ginkgo_window::KeyboardEvent) -> Option<TrustedCommand> {
-    if !event.modifiers.logo || event.state != ginkgo_window::ButtonState::Pressed || event.repeat {
-        return None;
-    }
-    Some(match event.usage {
+fn desktop_hotkey_command(usage: u16) -> Option<TrustedCommand> {
+    Some(match usage {
         0x50 => TrustedCommand::FocusLeft,
         0x4f => TrustedCommand::FocusRight,
         0x14 => TrustedCommand::CloseFocused,
@@ -223,6 +221,7 @@ struct Service {
     clients: Vec<ClientConnection>,
     broker_outbound: VecDeque<BrokerOutbound>,
     launcher_visible: bool,
+    meta_captures: Vec<u16>,
     clipboard: String,
 }
 
@@ -240,6 +239,7 @@ impl Service {
             clients: Vec::new(),
             broker_outbound: VecDeque::new(),
             launcher_visible: false,
+            meta_captures: Vec::new(),
             clipboard: String::new(),
         })
     }
@@ -277,6 +277,7 @@ impl Service {
         match packet.message {
             RuntimeMessage::ToggleLauncher => {
                 self.launcher_visible = !self.launcher_visible;
+                self.meta_captures.clear();
                 self.queue_broker(RuntimeMessage::LauncherVisibility {
                     visible: self.launcher_visible,
                 })?;
@@ -371,13 +372,7 @@ impl Service {
             }
             RuntimeMessage::KeyboardInput { event } => {
                 if !self.launcher_visible {
-                    let command =
-                        desktop_hotkey(event).unwrap_or(TrustedCommand::KeyboardInput { event });
-                    let actions = self
-                        .desktop
-                        .handle_trusted_command(command)
-                        .map_err(|_| ServiceError::Desktop)?;
-                    self.execute_actions(actions)?;
+                    self.handle_keyboard_input(event)?;
                 }
             }
             RuntimeMessage::ServiceReady { .. }
@@ -389,6 +384,47 @@ impl Service {
             | RuntimeMessage::LaunchProgram { .. } => return Err(ServiceError::InvalidMessage),
         }
         Ok(())
+    }
+
+    fn handle_keyboard_input(
+        &mut self,
+        event: ginkgo_window::KeyboardEvent,
+    ) -> Result<(), ServiceError> {
+        if let Some(index) = self
+            .meta_captures
+            .iter()
+            .position(|usage| *usage == event.usage)
+        {
+            if event.state == ginkgo_window::ButtonState::Released {
+                self.meta_captures.remove(index);
+            }
+            return Ok(());
+        }
+
+        if event.modifiers.logo {
+            if let Some(command) = desktop_hotkey_command(event.usage) {
+                if event.state == ginkgo_window::ButtonState::Pressed && !event.repeat {
+                    if self.meta_captures.len() < MAX_META_CAPTURES {
+                        self.meta_captures.push(event.usage);
+                    }
+                    let actions = self
+                        .desktop
+                        .handle_trusted_command(command)
+                        .map_err(|_| ServiceError::Desktop)?;
+                    self.execute_actions(actions)?;
+                    return Ok(());
+                }
+                if event.state == ginkgo_window::ButtonState::Pressed && event.repeat {
+                    return Ok(());
+                }
+            }
+        }
+
+        let actions = self
+            .desktop
+            .handle_trusted_command(TrustedCommand::KeyboardInput { event })
+            .map_err(|_| ServiceError::Desktop)?;
+        self.execute_actions(actions)
     }
 
     fn service_clients(&mut self) -> Result<(), ServiceError> {

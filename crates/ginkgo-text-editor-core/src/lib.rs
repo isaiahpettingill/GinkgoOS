@@ -207,6 +207,40 @@ impl Document {
             .expect("deleting text cannot exceed the document limit")
     }
 
+    /// Deletes the previous word or punctuation run, including leading whitespace.
+    pub fn delete_word_backward(&mut self) -> bool {
+        if self.delete_selection() {
+            return true;
+        }
+        if self.cursor == 0 {
+            return false;
+        }
+
+        let end = self.cursor;
+        let mut start = end;
+        while let Some((index, character)) = self.text[..start].char_indices().next_back() {
+            if !character.is_whitespace() {
+                break;
+            }
+            start = index;
+        }
+        let Some((_, previous)) = self.text[..start].char_indices().next_back() else {
+            self.selection_anchor = Some(0);
+            return self.delete_selection();
+        };
+        let previous_is_word = previous.is_alphanumeric() || previous == '_';
+        while let Some((index, character)) = self.text[..start].char_indices().next_back() {
+            let is_word = character.is_alphanumeric() || character == '_';
+            if character.is_whitespace() || is_word != previous_is_word {
+                break;
+            }
+            start = index;
+        }
+        self.cursor = end;
+        self.selection_anchor = Some(start);
+        self.delete_selection()
+    }
+
     /// Deletes the character before the cursor, or the current selection.
     pub fn backspace(&mut self) -> bool {
         if self.delete_selection() {
@@ -544,6 +578,23 @@ mod tests {
         document.move_home(false);
         assert_eq!(document.cursor(), 6);
         assert!(!document.has_selection());
+    }
+
+    #[test]
+    fn word_backspace_handles_unicode_whitespace_punctuation_and_selection() {
+        let mut document = Document::load("one  κόσμος...  next".as_bytes()).unwrap();
+        document.move_end(false);
+        assert!(document.delete_word_backward());
+        assert_eq!(document.text(), "one  κόσμος...  ");
+        assert!(document.delete_word_backward());
+        assert_eq!(document.text(), "one  κόσμος");
+        assert!(document.delete_word_backward());
+        assert_eq!(document.text(), "one  ");
+
+        document.select_all();
+        assert!(document.delete_word_backward());
+        assert!(document.is_empty());
+        assert!(!document.delete_word_backward());
     }
 
     #[test]

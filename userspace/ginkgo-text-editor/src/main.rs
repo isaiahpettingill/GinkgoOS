@@ -24,8 +24,8 @@ const MAX_PATH_BYTES: usize = 512;
 const MAX_TRANSIENT_RETRIES: usize = 64;
 const TEXT_X: usize = 16;
 const TEXT_Y: usize = 82;
-const CELL_WIDTH: usize = 8;
-const CELL_HEIGHT: usize = 16;
+const CELL_WIDTH: usize = 10;
+const CELL_HEIGHT: usize = 17;
 
 const ENTER: u16 = 0x28;
 const ESCAPE: u16 = 0x29;
@@ -454,6 +454,9 @@ fn handle_keyboard(
     client: &mut WindowClient<WindowTransport>,
     event: KeyboardEvent,
 ) -> bool {
+    if event.modifiers.logo || event.modifiers.alt {
+        return false;
+    }
     if editor.mode != Mode::Editing {
         match event.usage {
             ESCAPE if !event.repeat => editor.cancel_path(),
@@ -476,6 +479,9 @@ fn handle_keyboard(
 
     if event.modifiers.control {
         match event.usage {
+            BACKSPACE => {
+                editor.document.delete_word_backward();
+            }
             0x04 => editor.document.select_all(),
             0x06 if !event.repeat => editor.set_clipboard(client, false),
             0x11 if !event.repeat => editor.new_document(event.modifiers.shift),
@@ -586,7 +592,7 @@ fn submit_frame(client: &mut WindowClient<WindowTransport>, editor: &mut Editor)
     );
     let prompt = match editor.mode {
         Mode::Editing => {
-            String::from("Ctrl+N/O/S/Shift+S  Ctrl+X/C/V  Ctrl+Z/Y  Shift+arrows selects")
+            String::from("Ctrl+N/O/S  Ctrl+X/C/V  Ctrl+Z/Y  Ctrl+Backspace  Shift+arrows")
         }
         Mode::OpenPath => format!("Open: {}_", editor.path_input),
         Mode::SaveAsPath => format!("Save as: {}_", editor.path_input),
