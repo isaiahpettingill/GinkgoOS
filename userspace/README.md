@@ -43,7 +43,56 @@ The kernel boots `ginkgo-desktop-service` with only one bootstrap channel and th
 
 ## Terminal shell
 
-The prompt evaluates Rhai directly. Useful examples:
+The prompt preprocesses Ginkgo command syntax and then evaluates ordinary Rhai. Interactive input and `source` scripts use the same token-aware preprocessor. Registered commands support shell-style arguments, aliases, `$(...)` Rhai interpolation, and structured F#-style pipelines; registered names followed by normal Rhai call/member/index/assignment syntax remain unchanged.
+
+```text
+ls
+ls /system
+cd documents
+pwd
+cat "notes with spaces.txt"
+cp notes.txt backup.txt
+mv backup.txt archive.txt
+rm archive.txt
+mkdir drafts
+rmdir drafts
+clear
+ps
+kill 1
+print "hello from Rhai"
+
+@edit
+@files
+@minimal-client
+@tools/example.elf --verbose $(option)
+
+let extension = ".rhai";
+ls /system |> filter(extension) |> sort |> print
+```
+
+Built-in canonical names and aliases are:
+
+| Canonical name | Aliases | Result |
+| --- | --- | --- |
+| `list_files` | `ls`, `dir` | Structured directory-entry array |
+| `change_directory` | `cd`, `chdir` | Changes the terminal's capability-rooted logical directory |
+| `current_directory` | `pwd`, `cwd` | Logical directory beginning at `/` |
+| `copy` | `cp` | Copies one file without escaping the filesystem capability |
+| `move` | `mv`, `ren`, `rename` | Moves or renames without replacing an existing destination |
+| `remove` | `rm`, `del`, `delete` | Removes one or more files |
+| `make_directory` | `mkdir`, `md` | Creates one or more directories |
+| `remove_directory` | `rmdir`, `rd` | Removes one or more empty directories |
+| `show_file` | `cat`, `type` | Returns file text |
+| `clear_terminal` | `clear`, `cls` | Clears terminal scrollback |
+| `show_processes` | `ps`, `tasks` | Structured terminal-owned job array |
+| `terminate_process` | `kill`, `stop` | Terminates a terminal-owned job ID |
+| `print` | `output` | Evaluates and prints one Rhai expression |
+
+Shell arguments are literal strings unless wrapped in `$(...)`. Pipelines pass Rhai `Dynamic` values rather than formatted terminal text. For example, `ls /system` returns entry maps that `filter`, `sort`, and later stages consume directly. Unknown identifiers are left to Rhai and are never guessed to be commands.
+
+A statement-boundary `@` sigil launches executables without adding every application to the command registry. `@edit` and `@editor` launch `text-editor`; `@files` launches `file-navigator`; `@demo` launches `minimal-client`; and any other bare target is passed to the trusted graphical program registry as its application ID. Targets ending in `.elf` or containing `/` are opened beneath the terminal's filesystem capability and started as headless terminal jobs; following shell arguments become process arguments. Graphical launch arguments are rejected because the desktop launch protocol does not currently carry an argument vector. Executable launches cannot be pipeline inputs.
+
+Ordinary Rhai remains available and unchanged:
 
 ```rhai
 print("hello from Rhai");
@@ -83,11 +132,11 @@ purge_app_data("tools.paint")      // explicit recursive data removal
 run("minimal-client")
 ```
 
-Enter `source "script.rhai"` to evaluate another script by a relative path.
+Enter `source "script.rhai"` to preprocess and evaluate another script by a path relative to the filesystem-root capability.
 
 ### Filesystem functions
 
-All terminal filesystem paths are relative to the explicit filesystem-root capability supplied at startup. Nested relative paths are accepted; absolute paths, `.` and `..` components, backslashes, and ambient kernel current-working-directory state are not used. Operations that enumerate a path open and close a directory capability beneath that root.
+All terminal filesystem access remains beneath the explicit filesystem-root capability supplied at startup. Low-level Rhai filesystem functions continue to accept capability-root-relative paths and reject absolute, `.`/`..`, and backslash forms. Shell commands additionally maintain a logical current directory: `/` means the capability root, relative paths resolve beneath the logical directory, and normalization rejects attempts to ascend above that root. No ambient kernel current-working-directory state is used. Operations that enumerate a path open and close a directory capability beneath the root.
 
 - `mkdir(path)` creates one directory at `path`; parent directories must already exist.
 - `rmdir(path)` removes an empty directory.

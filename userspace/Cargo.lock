@@ -274,6 +274,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ginkgo-rhai-preprocessor"
+version = "0.1.0"
+
+[[package]]
 name = "ginkgo-runtime"
 version = "0.1.0"
 dependencies = [
@@ -300,6 +304,7 @@ version = "0.1.0"
 dependencies = [
  "ginkgo-app-package",
  "ginkgo-graphics",
+ "ginkgo-rhai-preprocessor",
  "ginkgo-runtime",
  "ginkgo-terminal-protocol",
  "ginkgo-userspace",

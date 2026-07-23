@@ -1,0 +1,12 @@
+[package]
+name = "ginkgo-rhai-preprocessor"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "A no_std, token-aware preprocessor for Ginkgo's Rhai command syntax"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

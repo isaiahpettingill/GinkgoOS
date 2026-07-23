@@ -15,6 +15,7 @@ ginkgo-app-package.workspace = true
 ginkgo-terminal-protocol.workspace = true
 ginkgo-graphics.workspace = true
 ginkgo-runtime.workspace = true
+ginkgo-rhai-preprocessor.workspace = true
 ginkgo-userspace.workspace = true
 ginkgo-window.workspace = true
 rhai.workspace = true

@@ -5,6 +5,7 @@ members = [
     "crates/ginkgo-ipc",
     "crates/ginkgo-app-package",
     "crates/ginkgo-program-registry",
+    "crates/ginkgo-rhai-preprocessor",
     "crates/ginkgo-hid",
     "crates/ginkgo-filesystem",
     "crates/ginkgo-graphics",
@@ -47,6 +48,7 @@ ginkgo-graphics = { path = "crates/ginkgo-graphics" }
 ginkgo-hid = { path = "crates/ginkgo-hid" }
 ginkgo-ipc = { path = "crates/ginkgo-ipc", default-features = false }
 ginkgo-program-registry = { path = "crates/ginkgo-program-registry" }
+ginkgo-rhai-preprocessor = { path = "crates/ginkgo-rhai-preprocessor" }
 ginkgo-scroll-layout = { path = "crates/ginkgo-scroll-layout" }
 ginkgo-sysapi = { path = "crates/ginkgo-sysapi" }
 ginkgo-terminal-protocol = { path = "crates/ginkgo-terminal-protocol" }

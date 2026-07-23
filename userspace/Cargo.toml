@@ -22,6 +22,7 @@ ginkgo-app-package = { path = "../crates/ginkgo-app-package" }
 ginkgo-desktop = { path = "../crates/ginkgo-desktop" }
 ginkgo-graphics = { path = "../crates/ginkgo-graphics" }
 ginkgo-runtime = { path = "ginkgo-runtime" }
+ginkgo-rhai-preprocessor = { path = "../crates/ginkgo-rhai-preprocessor" }
 ginkgo-terminal-protocol = { path = "../crates/ginkgo-terminal-protocol" }
 ginkgo-text-editor-core = { path = "../crates/ginkgo-text-editor-core" }
 ginkgo-userspace = { path = "../crates/ginkgo-userspace" }

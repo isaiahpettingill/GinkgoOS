@@ -14,6 +14,7 @@ use ginkgo_app_package::{
     generation_filename, sha256, ExecutableGeneration, InstalledRegistry, Package, Provenance,
     Sha256, MAX_REGISTRY_LEN,
 };
+use ginkgo_rhai_preprocessor::{CommandRegistry, CommandSpec, PreprocessedSource};
 use ginkgo_terminal_protocol::ConsoleMessage;
 use ginkgo_userspace::{
     application_data_create, channel_create, filesystem_create_directory, filesystem_get_info,
@@ -58,6 +59,22 @@ const PROTECTED_SYSTEM_IDS: &[&str] = &[
     "minimal-client",
 ];
 
+static COMMAND_SPECS: &[CommandSpec<'static>] = &[
+    CommandSpec::shell("list_files", &["ls", "dir"], 0, Some(1)),
+    CommandSpec::shell("change_directory", &["cd", "chdir"], 1, Some(1)),
+    CommandSpec::no_arguments("current_directory", &["pwd", "cwd"]),
+    CommandSpec::shell("copy", &["cp"], 2, Some(2)),
+    CommandSpec::shell("move", &["mv", "ren", "rename"], 2, Some(2)),
+    CommandSpec::shell("remove", &["rm", "del", "delete"], 1, None),
+    CommandSpec::shell("make_directory", &["mkdir", "md"], 1, None),
+    CommandSpec::shell("remove_directory", &["rmdir", "rd"], 1, None),
+    CommandSpec::shell("show_file", &["cat", "type"], 1, None),
+    CommandSpec::no_arguments("clear_terminal", &["clear", "cls"]),
+    CommandSpec::no_arguments("show_processes", &["ps", "tasks"]),
+    CommandSpec::shell("terminate_process", &["kill", "stop"], 1, Some(1)),
+    CommandSpec::expression("print", &["output"], 1, Some(1)),
+];
+
 pub struct ChildStream {
     pub app_id: String,
     pub endpoint: Handle,
@@ -77,6 +94,7 @@ pub struct HostState {
     pub children: Vec<ChildStream>,
     pub jobs: Vec<HeadlessJob>,
     next_job_id: INT,
+    current_directory: String,
 }
 
 impl HostState {
@@ -221,6 +239,7 @@ impl Shell {
             children: Vec::new(),
             jobs: Vec::new(),
             next_job_id: 1,
+            current_directory: String::new(),
         }));
         let mut engine = Engine::new();
         engine.set_max_operations(100_000);
@@ -300,9 +319,9 @@ impl Shell {
             self.history.push_back(source.clone());
         }
 
-        let script = if let Some(path) = source_command(&source) {
+        let (script, source_name) = if let Some(path) = source_command(&source) {
             match read_text(self.host.borrow().filesystem, path) {
-                Ok(script) => script,
+                Ok(script) => (script, String::from(path)),
                 Err(error) => {
                     self.host
                         .borrow_mut()
@@ -311,13 +330,37 @@ impl Shell {
                 }
             }
         } else {
-            source
+            (source, String::from("<input>"))
         };
 
-        match self.engine.eval::<Dynamic>(&script) {
+        let registry = CommandRegistry::new(COMMAND_SPECS)
+            .expect("the built-in Ginkgo command registry is valid");
+        let preprocessed = match registry.preprocess(&script) {
+            Ok(preprocessed) => preprocessed,
+            Err(error) => {
+                self.host.borrow_mut().error(format!(
+                    "{}:{}:{}: {}",
+                    source_name, error.line, error.column, error.message
+                ));
+                return;
+            }
+        };
+
+        match self.engine.eval::<Dynamic>(&preprocessed.source) {
             Ok(value) if !value.is_unit() => self.host.borrow_mut().output(value.to_string()),
             Ok(_) => {}
-            Err(error) => self.host.borrow_mut().error(format!("{}", error)),
+            Err(mut error) => {
+                let position = error.position();
+                error.clear_position();
+                self.host.borrow_mut().error(format_rhai_error(
+                    &source_name,
+                    &script,
+                    &preprocessed,
+                    position.line(),
+                    position.position(),
+                    &format!("{}", error),
+                ));
+            }
         }
     }
 
@@ -363,7 +406,454 @@ fn source_command(line: &str) -> Option<&str> {
     (!remainder.is_empty()).then_some(remainder)
 }
 
+fn source_offset(source: &str, line: usize, column: usize) -> Option<usize> {
+    let line_start = if line <= 1 {
+        0
+    } else {
+        source
+            .match_indices('\n')
+            .nth(line.saturating_sub(2))
+            .map(|(offset, _)| offset + 1)?
+    };
+    let line_text = source[line_start..].split('\n').next().unwrap_or("");
+    let column_offset = line_text
+        .char_indices()
+        .nth(column.saturating_sub(1))
+        .map_or(line_text.len(), |(offset, _)| offset);
+    Some(line_start + column_offset)
+}
+
+fn source_line_column(source: &str, offset: usize) -> (usize, usize) {
+    let safe = offset.min(source.len());
+    let prefix = &source[..safe];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix, |(_, tail)| tail)
+        .chars()
+        .count()
+        + 1;
+    (line, column)
+}
+
+fn format_rhai_error(
+    source_name: &str,
+    original: &str,
+    preprocessed: &PreprocessedSource,
+    generated_line: Option<usize>,
+    generated_column: Option<usize>,
+    message: &str,
+) -> String {
+    let sanitized = sanitize_rhai_error(message);
+    let Some(generated_offset) = generated_line
+        .and_then(|line| source_offset(&preprocessed.source, line, generated_column.unwrap_or(1)))
+    else {
+        return format!("{}: {}", source_name, sanitized);
+    };
+    let original_offset = preprocessed
+        .mappings
+        .iter()
+        .filter(|mapping| {
+            mapping.generated.start <= generated_offset && generated_offset < mapping.generated.end
+        })
+        .min_by_key(|mapping| mapping.generated.end - mapping.generated.start)
+        .map(|mapping| {
+            if mapping.generated.end - mapping.generated.start
+                == mapping.original.end - mapping.original.start
+            {
+                mapping.original.start + generated_offset - mapping.generated.start
+            } else {
+                mapping.original.start
+            }
+        })
+        .unwrap_or(generated_offset.min(original.len()));
+    let (line, column) = source_line_column(original, original_offset);
+    format!("{}:{}:{}: {}", source_name, line, column, sanitized)
+}
+
+fn sanitize_rhai_error(message: &str) -> String {
+    message
+        .replace("__ginkgo_pipe_command", "command pipeline")
+        .replace("__ginkgo_command", "command")
+        .replace("__ginkgo_execute", "executable launch")
+        .replace("__ginkgo_shell_string", "shell interpolation")
+}
+
+fn command_argument(value: &Dynamic) -> String {
+    value
+        .clone()
+        .try_cast::<ImmutableString>()
+        .map(|value| String::from(value.as_str()))
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn resolve_shell_path(current: &str, path: &str) -> Result<String, &'static str> {
+    if path.as_bytes().contains(&0) || path.contains('\\') {
+        return Err("paths may not contain NUL bytes or backslashes");
+    }
+    let mut components: Vec<&str> = if path.starts_with('/') {
+        Vec::new()
+    } else {
+        current.split('/').filter(|part| !part.is_empty()).collect()
+    };
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if components.pop().is_none() {
+                    return Err("path escapes the filesystem capability root");
+                }
+            }
+            component => components.push(component),
+        }
+    }
+    Ok(components.join("/"))
+}
+
+fn command_error(host: &mut HostState, name: &str, detail: impl core::fmt::Display) -> Dynamic {
+    host.error(format!("{}: {}", name, detail));
+    Dynamic::from(())
+}
+
+fn copy_file(root: Handle, source: &str, destination: &str) -> Result<(), Status> {
+    if source == destination || destination.is_empty() {
+        return Err(Status::InvalidArgument);
+    }
+    let source_file = filesystem_open(root, source, FilesystemOpenFlags::READ)?;
+    let reservation = match (0..16).find_map(|index| {
+        let candidate = format!("{}.ginkgo-copy-{}.tmp", destination, index);
+        match filesystem_create_directory(root, &candidate) {
+            Ok(()) => Some(Ok(candidate)),
+            Err(Status::AlreadyExists) => None,
+            Err(error) => Some(Err(error)),
+        }
+    }) {
+        Some(Ok(reservation)) => reservation,
+        Some(Err(error)) => {
+            let _ = handle_close(source_file);
+            return Err(error);
+        }
+        None => {
+            let _ = handle_close(source_file);
+            return Err(Status::ResourceLimit);
+        }
+    };
+    let temporary = format!("{}/payload", reservation);
+    let temporary_file = match filesystem_open(
+        root,
+        &temporary,
+        FilesystemOpenFlags::WRITE | FilesystemOpenFlags::CREATE | FilesystemOpenFlags::TRUNCATE,
+    ) {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = handle_close(source_file);
+            let _ = filesystem_remove_directory(root, &reservation);
+            return Err(error);
+        }
+    };
+    let copy_result = (|| {
+        let length = filesystem_stat(source_file)?.length;
+        let mut buffer = [0u8; FILE_CHUNK_BYTES];
+        let mut offset = 0u64;
+        while offset < length {
+            let count = filesystem_read(source_file, offset, &mut buffer)?;
+            if count == 0 {
+                return Err(Status::Io);
+            }
+            let mut written = 0;
+            while written < count {
+                let amount = filesystem_write(
+                    temporary_file,
+                    offset + written as u64,
+                    &buffer[written..count],
+                )?;
+                if amount == 0 {
+                    return Err(Status::Io);
+                }
+                written += amount;
+            }
+            offset = offset.checked_add(count as u64).ok_or(Status::OutOfRange)?;
+        }
+        filesystem_truncate(temporary_file, length)?;
+        filesystem_sync(temporary_file)
+    })();
+    let _ = handle_close(temporary_file);
+    let _ = handle_close(source_file);
+    if let Err(error) = copy_result {
+        let _ = filesystem_unlink(root, &temporary);
+        let _ = filesystem_remove_directory(root, &reservation);
+        return Err(error);
+    }
+    let result = filesystem_rename(
+        root,
+        &temporary,
+        root,
+        destination,
+        FilesystemRenameFlags::REPLACE,
+    );
+    if result.is_err() {
+        let _ = filesystem_unlink(root, &temporary);
+    }
+    let _ = filesystem_remove_directory(root, &reservation);
+    result
+}
+
+fn execute_target(host: &mut HostState, target: &str, arguments: Array) -> Dynamic {
+    if target.ends_with(".elf") || target.contains('/') {
+        let path = match resolve_shell_path(&host.current_directory, target) {
+            Ok(path) if !path.is_empty() => path,
+            Ok(_) => return command_error(host, target, "executable path is empty"),
+            Err(error) => return command_error(host, target, error),
+        };
+        let string_arguments = arguments
+            .into_iter()
+            .map(|value| Dynamic::from(command_argument(&value)))
+            .collect();
+        return Dynamic::from(host.spawn(&path, string_arguments));
+    }
+
+    if !arguments.is_empty() {
+        return command_error(
+            host,
+            target,
+            "graphical application arguments are not supported",
+        );
+    }
+    let app_id = match target {
+        "edit" | "editor" => "text-editor",
+        "files" => "file-navigator",
+        "demo" => "minimal-client",
+        target => target,
+    };
+    Dynamic::from(host.launch(String::from(app_id)))
+}
+
+fn dispatch_command(host: &mut HostState, name: &str, arguments: Array) -> Dynamic {
+    let Some(spec) = COMMAND_SPECS
+        .iter()
+        .find(|spec| spec.canonical_name == name && spec.canonical_name != "print")
+    else {
+        return command_error(host, name, "unknown canonical command");
+    };
+    if arguments.len() < spec.min_args {
+        return command_error(
+            host,
+            name,
+            format!(
+                "expected at least {} argument(s), received {}",
+                spec.min_args,
+                arguments.len()
+            ),
+        );
+    }
+    if spec
+        .max_args
+        .is_some_and(|maximum| arguments.len() > maximum)
+    {
+        return command_error(
+            host,
+            name,
+            format!(
+                "expected at most {} argument(s), received {}",
+                spec.max_args.unwrap_or(0),
+                arguments.len()
+            ),
+        );
+    }
+
+    let values: Vec<String> = arguments.iter().map(command_argument).collect();
+    let resolve = |path: &str| resolve_shell_path(&host.current_directory, path);
+    match name {
+        "list_files" => {
+            let path = match values.first() {
+                Some(path) => match resolve(path) {
+                    Ok(path) => path,
+                    Err(error) => return command_error(host, name, error),
+                },
+                None => host.current_directory.clone(),
+            };
+            match list_directory(host.filesystem, &path) {
+                Ok(entries) => Dynamic::from(entries),
+                Err(error) => command_error(host, name, format!("{}: {:?}", path, error)),
+            }
+        }
+        "change_directory" => {
+            let path = match resolve(&values[0]) {
+                Ok(path) => path,
+                Err(error) => return command_error(host, name, error),
+            };
+            if !path.is_empty() {
+                match filesystem_open_directory(host.filesystem, &path) {
+                    Ok(directory) => {
+                        let _ = handle_close(directory);
+                    }
+                    Err(error) => {
+                        return command_error(host, name, format!("{}: {:?}", path, error))
+                    }
+                }
+            }
+            host.current_directory = path;
+            Dynamic::from(())
+        }
+        "current_directory" => Dynamic::from(if host.current_directory.is_empty() {
+            String::from("/")
+        } else {
+            format!("/{}", host.current_directory)
+        }),
+        "copy" => {
+            let source = match resolve(&values[0]) {
+                Ok(path) => path,
+                Err(error) => return command_error(host, name, error),
+            };
+            let destination = match resolve(&values[1]) {
+                Ok(path) => path,
+                Err(error) => return command_error(host, name, error),
+            };
+            match copy_file(host.filesystem, &source, &destination) {
+                Ok(()) => Dynamic::from(true),
+                Err(error) => command_error(host, name, format!("{:?}", error)),
+            }
+        }
+        "move" => {
+            let source = match resolve(&values[0]) {
+                Ok(path) => path,
+                Err(error) => return command_error(host, name, error),
+            };
+            let destination = match resolve(&values[1]) {
+                Ok(path) => path,
+                Err(error) => return command_error(host, name, error),
+            };
+            match filesystem_rename(
+                host.filesystem,
+                &source,
+                host.filesystem,
+                &destination,
+                FilesystemRenameFlags::empty(),
+            ) {
+                Ok(()) => Dynamic::from(true),
+                Err(error) => command_error(host, name, format!("{:?}", error)),
+            }
+        }
+        "remove" | "make_directory" | "remove_directory" => {
+            let paths: Vec<String> = match values
+                .iter()
+                .map(|value| resolve(value))
+                .collect::<Result<_, _>>()
+            {
+                Ok(paths) => paths,
+                Err(error) => return command_error(host, name, error),
+            };
+            for path in paths {
+                let result = match name {
+                    "remove" => filesystem_unlink(host.filesystem, &path),
+                    "make_directory" => filesystem_create_directory(host.filesystem, &path),
+                    _ => filesystem_remove_directory(host.filesystem, &path),
+                };
+                if let Err(error) = result {
+                    return command_error(host, name, format!("{}: {:?}", path, error));
+                }
+            }
+            Dynamic::from(true)
+        }
+        "show_file" => {
+            let mut text = String::new();
+            for value in &values {
+                let path = match resolve(value) {
+                    Ok(path) => path,
+                    Err(error) => return command_error(host, name, error),
+                };
+                match read_text(host.filesystem, &path) {
+                    Ok(contents) => text.push_str(&contents),
+                    Err(error) => {
+                        return command_error(host, name, format!("{}: {:?}", path, error))
+                    }
+                }
+            }
+            Dynamic::from(text)
+        }
+        "clear_terminal" => {
+            host.emit(ConsoleMessage::Output(vec![CLEAR]));
+            Dynamic::from(())
+        }
+        "show_processes" => {
+            let mut processes = Array::new();
+            for job in &host.jobs {
+                let mut map = match process_get_info(job.process) {
+                    Ok(info) => process_map(info),
+                    Err(error) => {
+                        let mut map = Map::new();
+                        map.insert("error".into(), Dynamic::from(format!("{:?}", error)));
+                        map
+                    }
+                };
+                map.insert("job_id".into(), Dynamic::from(job.id));
+                processes.push(Dynamic::from(map));
+            }
+            Dynamic::from(processes)
+        }
+        "terminate_process" => match values[0].parse::<INT>() {
+            Ok(id) => Dynamic::from(
+                host.job_process(id)
+                    .is_some_and(|process| process_terminate(process).is_ok()),
+            ),
+            Err(_) => command_error(host, name, "job ID must be an integer"),
+        },
+        _ => command_error(host, name, "unknown canonical command"),
+    }
+}
+
+fn structured_value_text(value: &Dynamic) -> String {
+    value
+        .clone()
+        .try_cast::<Map>()
+        .and_then(|map| map.get("name").cloned())
+        .unwrap_or_else(|| value.clone())
+        .to_string()
+}
+
 fn register_functions(engine: &mut Engine, host: Rc<RefCell<HostState>>) {
+    engine.register_fn("__ginkgo_shell_string", move |value: Dynamic| -> String {
+        value.to_string()
+    });
+
+    let execute_host = host.clone();
+    engine.register_fn(
+        "__ginkgo_execute",
+        move |target: ImmutableString, arguments: Array| -> Dynamic {
+            execute_target(&mut execute_host.borrow_mut(), target.as_str(), arguments)
+        },
+    );
+
+    let command_host = host.clone();
+    engine.register_fn(
+        "__ginkgo_command",
+        move |name: ImmutableString, arguments: Array| -> Dynamic {
+            dispatch_command(&mut command_host.borrow_mut(), name.as_str(), arguments)
+        },
+    );
+    let pipe_host = host.clone();
+    engine.register_fn(
+        "__ginkgo_pipe_command",
+        move |name: ImmutableString, input: Dynamic, mut arguments: Array| -> Dynamic {
+            arguments.insert(0, input);
+            dispatch_command(&mut pipe_host.borrow_mut(), name.as_str(), arguments)
+        },
+    );
+
+    engine.register_fn(
+        "filter",
+        move |values: Array, pattern: ImmutableString| -> Array {
+            values
+                .into_iter()
+                .filter(|value| structured_value_text(value).contains(pattern.as_str()))
+                .collect()
+        },
+    );
+    engine.register_fn("sort", move |mut values: Array| -> Array {
+        values.sort_by_key(structured_value_text);
+        values
+    });
+
     for name in ["print", "output"] {
         let output_host = host.clone();
         engine.register_fn(name, move |value: Dynamic| {
