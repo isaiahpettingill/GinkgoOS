@@ -39,10 +39,14 @@ A process can request at most 4096 bytes per call and only through a non-transfe
 - NX is required and enabled; every userspace mapping enforces W^X.
 - SMAP is enabled when CPUID advertises it. User copies arm one CPU-local page-fault fixup and use `STAC`/`CLAC`; a bad pointer returns `InvalidAddress` instead of panicking the kernel. Other kernel faults still fail stop.
 - `ET_EXEC` remains fixed for compatibility. Static position-independent `ET_DYN` images receive a randomized 2 MiB-aligned load bias. Stack and automatic shared-memory regions use independent randomized inputs and preserve guard pages. Dynamic linking and runtime relocation records are not supported.
-- Each process is limited to 256 handles. Private pages, created and mapped shared memory, reserved virtual bytes, VMA count, and executable source/image size are derived from validated usable physical RAM with checked floors and ceilings. Outbound channel traffic remains bounded. Accounting is conservative and lifetime-based where resources can outlive one syscall.
+- Each process is limited to 256 handles. Private pages, created and mapped shared memory, reserved virtual bytes, VMA count, and executable source/image size are derived from validated usable physical RAM with checked floors and ceilings. Child limits are transitively capped by the caller. Outbound channel traffic remains bounded.
+- There is no swap or promise-style overcommit. Reservation consumes only virtual quota; commit allocates eagerly. Syscall OOM fails the request, stack-growth OOM terminates the faulting process, and the kernel does not select a global victim.
+- Shared frames remain owned through every object, mapping, and window lease. They return to the allocator only after aliases are unreachable. DMA32 allocation is bounded below 4 GiB; there is no current IOMMU isolation.
 - At most 32 processes may be live. Process creation remains available only through explicit launch authority and signed registry entries.
 - Each runnable process receives at most a 10 ms uninterrupted quantum per round. Total CPU time is accounted without terminating legitimate long-running emulators.
 - Channel message size, attached-handle count, queue depth, ELF size/pages, registry entries, filesystem I/O, waits, and debug writes have independent bounds.
+
+The full memory layout, accounting ABI, reclaim rules, and SMP shootdown requirement are documented in [`docs/memory.md`](docs/memory.md).
 
 ## CPU and debug-state audit
 

@@ -11,7 +11,8 @@ use ginkgo_ipc::{
 use ginkgo_sysapi::Rights;
 use ginkgo_sysapi::{
     MapFlags, MapProtection, ProcessFault as PublicProcessFault, SharedMemoryMapArgs, Status,
-    VirtualMapFileArgs, PROCESS_MAX_ARGS, PROCESS_MAX_STARTUP_BYTES, PROCESS_MAX_STARTUP_HANDLES,
+    VirtualAreaInfo, VirtualAreaKind, VirtualMapFileArgs, PROCESS_MAX_ARGS,
+    PROCESS_MAX_STARTUP_BYTES, PROCESS_MAX_STARTUP_HANDLES, VIRTUAL_AREA_INFO_VERSION,
 };
 use x86_64::{
     structures::paging::{PhysFrame, Size4KiB},
@@ -506,7 +507,7 @@ const fn bounded_policy(derived: u64, minimum: u64, maximum: u64) -> u64 {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ProcessUsage {
-    /// Committed image, stack, and anonymous private pages.
+    /// Committed image, stack, anonymous, and private file-backed pages.
     pub private_pages: u64,
     pub reserved_virtual_bytes: u64,
     pub resident_owned_frames: u64,
@@ -518,6 +519,16 @@ pub struct ProcessUsage {
     pub oom_failures: u64,
     pub channel_traffic_bytes: u64,
     pub cpu_time_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProcessMemoryObservability {
+    pub current_vma_count: u64,
+    pub page_table_frames: u64,
+    pub committed_image_pages: u64,
+    pub committed_stack_pages: u64,
+    pub committed_anonymous_pages: u64,
+    pub committed_file_backed_pages: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -564,7 +575,12 @@ pub enum VmAreaKind {
         committed: bool,
     },
     StackGuard,
-    Shared,
+    Shared {
+        /// Stable IPC shared-memory object identity; never an address.
+        object_identity: u64,
+        /// Object byte offset corresponding to this VMA's first page.
+        object_offset: u64,
+    },
     FileBacked {
         backing_id: u64,
         /// Source-file offset corresponding to this VMA's first page.
@@ -591,6 +607,39 @@ pub enum UserPageFaultResolution {
 impl VmArea {
     pub const fn length(self) -> u64 {
         self.end - self.start
+    }
+}
+
+fn virtual_area_info(area: VmArea) -> VirtualAreaInfo {
+    let reserved_bytes = area.length();
+    let (kind, committed, backing_identity, file_offset) = match area.kind {
+        VmAreaKind::Image => (VirtualAreaKind::Image, true, 0, 0),
+        VmAreaKind::Anonymous { reservation_id, committed } => {
+            (VirtualAreaKind::Anonymous, committed, reservation_id, 0)
+        }
+        VmAreaKind::Stack { committed } => (VirtualAreaKind::Stack, committed, 0, 0),
+        VmAreaKind::StackGuard => (VirtualAreaKind::Guard, false, 0, 0),
+        VmAreaKind::Shared { object_identity, .. } => {
+            (VirtualAreaKind::Shared, true, object_identity, 0)
+        }
+        VmAreaKind::FileBacked { backing_id, file_offset, committed } => {
+            (VirtualAreaKind::File, committed, backing_id, file_offset)
+        }
+    };
+    let committed_bytes = if committed { reserved_bytes } else { 0 };
+    VirtualAreaInfo {
+        version: VIRTUAL_AREA_INFO_VERSION,
+        size: VirtualAreaInfo::SIZE,
+        start: area.start,
+        end: area.end,
+        kind: kind as u32,
+        protection: area.protection.bits(),
+        committed_bytes,
+        reserved_bytes,
+        committed_pages: committed_bytes / PAGE_SIZE,
+        reserved_pages: reserved_bytes / PAGE_SIZE,
+        backing_identity,
+        file_offset,
     }
 }
 
@@ -633,6 +682,10 @@ impl SharedMemoryMapping {
 
     pub const fn length(&self) -> u64 {
         self.length
+    }
+
+    pub const fn backing_identity(&self) -> u64 {
+        self._lease.info().backing_identity
     }
 
     pub const fn mapped_len(&self) -> usize {
@@ -1227,6 +1280,47 @@ impl Process {
             .saturating_add(accounting.retired_data_frames as u64)
             .saturating_add(accounting.page_table_frames as u64);
         usage
+    }
+
+    pub fn memory_observability(&self) -> ProcessMemoryObservability {
+        let mut details = ProcessMemoryObservability {
+            current_vma_count: self.vmas().len() as u64,
+            page_table_frames: self.address_space().accounting().page_table_frames as u64,
+            ..ProcessMemoryObservability::default()
+        };
+        for area in self.vmas() {
+            let pages = area.length() / PAGE_SIZE;
+            match area.kind {
+                VmAreaKind::Image => {
+                    details.committed_image_pages = details.committed_image_pages.saturating_add(pages);
+                }
+                VmAreaKind::Anonymous { committed: true, .. } => {
+                    details.committed_anonymous_pages = details.committed_anonymous_pages.saturating_add(pages);
+                }
+                VmAreaKind::Stack { committed: true } => {
+                    details.committed_stack_pages = details.committed_stack_pages.saturating_add(pages);
+                }
+                VmAreaKind::FileBacked { committed: true, .. } => {
+                    details.committed_file_backed_pages = details.committed_file_backed_pages.saturating_add(pages);
+                }
+                VmAreaKind::Anonymous { committed: false, .. }
+                | VmAreaKind::Stack { committed: false }
+                | VmAreaKind::StackGuard
+                | VmAreaKind::Shared { .. }
+                | VmAreaKind::FileBacked { committed: false, .. } => {}
+            }
+        }
+        details
+    }
+
+    pub const fn is_user_virtual_address(address: u64) -> bool {
+        address >= PAGE_SIZE && address < USER_ADDRESS_END
+    }
+
+    pub fn virtual_query(&self, address: u64) -> Option<VirtualAreaInfo> {
+        let area = self.vmas().iter().copied()
+            .find(|area| area.start <= address && address < area.end)?;
+        Some(virtual_area_info(area))
     }
 
     pub fn record_quota_failure(&mut self) {
@@ -2330,6 +2424,7 @@ impl Process {
             &occupied,
         )?;
 
+        let object_identity = lease.info().backing_identity;
         let planned_vmas = plan_vma_insert(
             self.vmas(),
             VmArea {
@@ -2337,7 +2432,10 @@ impl Process {
                 end: address
                     .checked_add(request.mapped_len as u64)
                     .ok_or(SharedMappingError::RangeOverflow)?,
-                kind: VmAreaKind::Shared,
+                kind: VmAreaKind::Shared {
+                    object_identity,
+                    object_offset: args.offset,
+                },
                 protection: args.protection,
             },
         )?;
@@ -2449,11 +2547,16 @@ impl Process {
             .iter()
             .position(|mapping| mapping.address == address && mapping.length == length)
             .ok_or(SharedMappingError::ExactMappingNotFound { address, length })?;
-        let mapped_len = self.shared_mappings()[index].mapped_len;
+        let mapping = &self.shared_mappings()[index];
+        let mapped_len = mapping.mapped_len;
+        let kind = VmAreaKind::Shared {
+            object_identity: mapping.backing_identity(),
+            object_offset: mapping.offset,
+        };
         let end = address
             .checked_add(mapped_len as u64)
             .ok_or(SharedMappingError::RangeOverflow)?;
-        let planned_vmas = plan_vma_remove_kind(self.vmas(), address, end, VmAreaKind::Shared)?;
+        let planned_vmas = plan_vma_remove_kind(self.vmas(), address, end, kind)?;
         self.address_space_mut()
             .unmap_user_range(address, mapped_len)
             .map_err(SharedMappingError::AddressSpace)?;
@@ -2786,6 +2889,7 @@ fn vm_kinds_merge(left: VmArea, right: VmArea) -> bool {
                 && left_committed == right_committed
                 && left_offset.checked_add(left.length()) == Some(right_offset)
         }
+        (VmAreaKind::Shared { .. }, VmAreaKind::Shared { .. }) => false,
         (left, right) => left == right,
     }
 }
@@ -4024,6 +4128,7 @@ mod tests {
 
     fn info(logical_len: usize, mapped_len: usize) -> SharedMemoryMappingInfo {
         SharedMemoryMappingInfo {
+            backing_identity: 1,
             logical_len,
             mapped_len,
         }
@@ -4090,6 +4195,38 @@ mod tests {
                 frame.start_address().as_u64() as usize as *const u8,
                 PAGE_SIZE as usize,
             )
+        }
+    }
+
+    #[test]
+    fn virtual_area_info_has_stable_semantics_for_every_vma_kind() {
+        let protection = MapProtection::READ | MapProtection::WRITE;
+        let cases = [
+            (VmAreaKind::Image, VirtualAreaKind::Image, true, 0, 0),
+            (VmAreaKind::Anonymous { reservation_id: 17, committed: false }, VirtualAreaKind::Anonymous, false, 17, 0),
+            (VmAreaKind::Stack { committed: true }, VirtualAreaKind::Stack, true, 0, 0),
+            (VmAreaKind::StackGuard, VirtualAreaKind::Guard, false, 0, 0),
+            (VmAreaKind::Shared { object_identity: 29, object_offset: PAGE_SIZE }, VirtualAreaKind::Shared, true, 29, 0),
+            (VmAreaKind::FileBacked { backing_id: 41, file_offset: PAGE_SIZE * 3, committed: false }, VirtualAreaKind::File, false, 41, PAGE_SIZE * 3),
+        ];
+
+        for (kind, expected_kind, committed, backing_identity, file_offset) in cases {
+            let info = virtual_area_info(VmArea {
+                start: PAGE_SIZE * 10,
+                end: PAGE_SIZE * 12,
+                kind,
+                protection,
+            });
+            assert_eq!(info.version, VIRTUAL_AREA_INFO_VERSION);
+            assert_eq!(info.size, VirtualAreaInfo::SIZE);
+            assert_eq!(info.area_kind(), Some(expected_kind));
+            assert_eq!(info.map_protection(), protection);
+            assert_eq!(info.reserved_bytes, PAGE_SIZE * 2);
+            assert_eq!(info.reserved_pages, 2);
+            assert_eq!(info.committed_bytes, if committed { PAGE_SIZE * 2 } else { 0 });
+            assert_eq!(info.committed_pages, if committed { 2 } else { 0 });
+            assert_eq!(info.backing_identity, backing_identity);
+            assert_eq!(info.file_offset, file_offset);
         }
     }
 
@@ -4581,6 +4718,86 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_shared_mappings_keep_object_identity_scoped_bounds() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(96);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let mut shared_memory = TestSharedMemoryContext::new(4);
+        let first = shared_memory
+            .factory()
+            .create_handle(process.handles_mut(), PAGE_SIZE as usize)
+            .unwrap();
+        let second = shared_memory
+            .factory()
+            .create_handle(process.handles_mut(), PAGE_SIZE as usize)
+            .unwrap();
+        let first_identity = process
+            .handles()
+            .shared_memory_mapping_lease(first, SharedMemoryMappingAccess::ReadOnly)
+            .unwrap()
+            .info()
+            .backing_identity;
+        let second_identity = process
+            .handles()
+            .shared_memory_mapping_lease(second, SharedMemoryMappingAccess::ReadOnly)
+            .unwrap()
+            .info()
+            .backing_identity;
+        assert_ne!(first_identity, second_identity);
+
+        let base = SHARED_MAPPING_BASE + PAGE_SIZE * 128;
+        let protection = MapProtection::READ;
+        for (handle, address) in [(first, base), (second, base + PAGE_SIZE)] {
+            assert_eq!(
+                process.map_shared_memory(
+                    handle,
+                    SharedMemoryMapArgs {
+                        address,
+                        offset: 0,
+                        length: PAGE_SIZE,
+                        protection,
+                        flags: MapFlags::FIXED,
+                    },
+                    &mut allocator,
+                ),
+                Ok(address)
+            );
+        }
+
+        let infos = [base, base + PAGE_SIZE]
+            .map(|address| process.virtual_query(address).unwrap());
+        assert_eq!(infos[0].backing_identity, first_identity);
+        assert_eq!(infos[1].backing_identity, second_identity);
+        for (index, info) in infos.into_iter().enumerate() {
+            let start = base + index as u64 * PAGE_SIZE;
+            assert_eq!(info.start, start);
+            assert_eq!(info.end, start + PAGE_SIZE);
+            assert_eq!(info.area_kind(), Some(VirtualAreaKind::Shared));
+        }
+        assert_eq!(
+            process
+                .vmas()
+                .iter()
+                .filter(|area| matches!(area.kind, VmAreaKind::Shared { .. })
+                    && base <= area.start
+                    && area.end <= base + PAGE_SIZE * 2)
+                .inspect(|area| assert!(matches!(
+                    area.kind,
+                    VmAreaKind::Shared { object_offset: 0, .. }
+                )))
+                .count(),
+            2
+        );
+
+        for address in [base, base + PAGE_SIZE] {
+            process.unmap_shared_memory(address, PAGE_SIZE).unwrap();
+        }
+        process.handles_mut().handle_close(first).unwrap();
+        process.handles_mut().handle_close(second).unwrap();
+        assert_eq!(shared_memory.reclaim_idle().unwrap(), 2);
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+    }
+
+    #[test]
     fn anonymous_mapping_is_zero_filled_accounted_and_immediately_reclaimed() {
         let (_region, mut allocator) = TestFrameRegion::allocator(64);
         let mut process = construct_test_process(&mut allocator).unwrap();
@@ -4674,11 +4891,19 @@ mod tests {
             .vmas()
             .windows(2)
             .all(|pair| pair[0].end <= pair[1].start));
+        let reserved = process.virtual_query(address).unwrap();
+        assert_eq!(reserved.area_kind(), Some(VirtualAreaKind::Anonymous));
+        assert_eq!(reserved.committed_pages, 0);
+        assert_eq!(reserved.reserved_pages, 4);
 
         process
             .commit_anonymous(address + PAGE_SIZE, PAGE_SIZE * 2, &mut allocator)
             .unwrap();
         assert_eq!(process.usage().private_pages, baseline_private + 2);
+        let committed = process.virtual_query(address + PAGE_SIZE).unwrap();
+        assert_eq!(committed.start, address + PAGE_SIZE);
+        assert_eq!(committed.end, address + PAGE_SIZE * 3);
+        assert_eq!(committed.committed_pages, 2);
         process
             .protect_anonymous(
                 address,
@@ -4698,6 +4923,12 @@ mod tests {
             .decommit_anonymous(address + PAGE_SIZE * 2, PAGE_SIZE, &mut allocator)
             .unwrap();
         assert_eq!(process.usage().private_pages, baseline_private + 1);
+        let left = process.virtual_query(address + PAGE_SIZE).unwrap();
+        let decommitted = process.virtual_query(address + PAGE_SIZE * 2).unwrap();
+        assert_eq!(left.committed_pages, 1);
+        assert_eq!(decommitted.committed_pages, 0);
+        assert_eq!(decommitted.reserved_pages, 1);
+        assert_eq!(left.backing_identity, decommitted.backing_identity);
         assert!(matches!(
             process.address_space().validate_user_range(
                 address + PAGE_SIZE * 2,

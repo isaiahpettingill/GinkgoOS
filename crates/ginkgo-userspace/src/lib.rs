@@ -920,6 +920,30 @@ pub unsafe fn shared_memory_map(
         .expect("kernel returned a null address for a successful mapping"))
 }
 
+/// Returns semantic information for the VMA containing `address`.
+///
+/// The returned backing identity is opaque and is never a kernel pointer or a
+/// physical address. A valid userspace address in a gap returns [`Status::NotFound`].
+#[inline]
+pub fn virtual_query(address: NonNull<u8>) -> SyscallResult<VirtualAreaInfo> {
+    let mut output = VirtualAreaInfo::default();
+    // SAFETY: output is writable and remains alive for the call. The fixed
+    // version and size select the only supported VirtualAreaInfo layout.
+    let raw = unsafe {
+        raw_syscall6(
+            SyscallNumber::VirtualQuery,
+            pointer_address(address.as_ptr()),
+            mut_pointer_address(&mut output),
+            u64::from(VIRTUAL_AREA_INFO_VERSION),
+            u64::from(VirtualAreaInfo::SIZE),
+            0,
+            0,
+        )
+    };
+    status_result(raw)?;
+    Ok(output)
+}
+
 /// Maps an eager private snapshot of a file range.
 ///
 /// The source offset must be page aligned. The range must fit in the file. The

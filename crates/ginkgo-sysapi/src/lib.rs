@@ -108,6 +108,8 @@ pub enum SyscallNumber {
     VirtualUnmap = 50,
     /// Creates a process with an attenuated versioned memory policy.
     ProcessCreate2 = 51,
+    /// Returns the semantic VMA containing one canonical userspace address.
+    VirtualQuery = 52,
 }
 
 /// An opaque process-local reference to a kernel object.
@@ -301,8 +303,11 @@ pub struct SystemPowerInfo {
     pub deadline_ns: u64,
 }
 
-/// Current fixed-layout [`MemoryInfo`] ABI version.
-pub const MEMORY_INFO_VERSION: u32 = 1;
+/// Original fixed-layout [`MemoryInfo`] ABI version and byte size.
+pub const MEMORY_INFO_VERSION_V1: u32 = 1;
+pub const MEMORY_INFO_V1_SIZE: u32 = 288;
+/// Current append-only [`MemoryInfo`] ABI version.
+pub const MEMORY_INFO_VERSION: u32 = 2;
 
 /// Coherent system and calling-process memory checkpoint returned by
 /// [`SyscallNumber::MemoryGetInfo`]. All quantities are u64 to preserve systems
@@ -352,10 +357,95 @@ pub struct MemoryInfo {
     pub mapped_shared_bytes: u64,
     pub quota_failures: u64,
     pub oom_failures: u64,
+    /// Number of entries in the caller's current semantic VMA table.
+    pub current_vma_count: u64,
+    /// Caller-owned P4 root and lower-half page-table frames.
+    pub page_table_frames: u64,
+    pub committed_image_pages: u64,
+    pub committed_stack_pages: u64,
+    pub committed_anonymous_pages: u64,
+    pub committed_file_backed_pages: u64,
+    pub shared_arena_owned_frames: u64,
+    pub shared_arena_free_frames: u64,
+    pub shared_arena_returned_frames: u64,
+    pub shared_arena_reclaimed_frames: u64,
+    pub shared_arena_reclaim_failures: u64,
+    pub system_shared_live_objects: u64,
+    pub system_shared_logical_bytes: u64,
+    pub system_shared_backing_bytes: u64,
 }
 
 impl MemoryInfo {
     pub const SIZE: u32 = core::mem::size_of::<Self>() as u32;
+}
+
+/// Current fixed-layout [`VirtualAreaInfo`] ABI version.
+pub const VIRTUAL_AREA_INFO_VERSION: u32 = 1;
+
+/// Stable semantic VMA kinds returned by [`SyscallNumber::VirtualQuery`].
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VirtualAreaKind {
+    Image = 1,
+    Anonymous = 2,
+    Stack = 3,
+    Guard = 4,
+    Shared = 5,
+    File = 6,
+}
+
+impl VirtualAreaKind {
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            1 => Some(Self::Image),
+            2 => Some(Self::Anonymous),
+            3 => Some(Self::Stack),
+            4 => Some(Self::Guard),
+            5 => Some(Self::Shared),
+            6 => Some(Self::File),
+            _ => None,
+        }
+    }
+}
+
+/// Semantic information for the VMA containing a queried userspace address.
+///
+/// `backing_identity` is opaque and never a pointer or physical address. For a
+/// shared VMA it identifies one shared kernel object across duplicated/transferred
+/// handles and mapping leases; two kernel objects may have different identities
+/// even when they use the same underlying storage. Anonymous and file identities
+/// are process-local reservation/backing-record identities. The value is zero when
+/// the VMA has no separately observable backing. `file_offset` is nonzero-capable
+/// only for [`VirtualAreaKind::File`] and corresponds to `start`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq,
+)]
+pub struct VirtualAreaInfo {
+    pub version: u32,
+    pub size: u32,
+    pub start: u64,
+    pub end: u64,
+    pub kind: u32,
+    pub protection: u32,
+    pub committed_bytes: u64,
+    pub reserved_bytes: u64,
+    pub committed_pages: u64,
+    pub reserved_pages: u64,
+    pub backing_identity: u64,
+    pub file_offset: u64,
+}
+
+impl VirtualAreaInfo {
+    pub const SIZE: u32 = core::mem::size_of::<Self>() as u32;
+
+    pub const fn area_kind(self) -> Option<VirtualAreaKind> {
+        VirtualAreaKind::from_raw(self.kind)
+    }
+
+    pub const fn map_protection(self) -> MapProtection {
+        MapProtection::from_bits_retain(self.protection)
+    }
 }
 
 impl SystemPowerInfo {
@@ -1209,7 +1299,9 @@ const _: () = {
     assert!(core::mem::size_of::<ProcessCreateArgs2>() == 80);
     assert!(core::mem::size_of::<ProcessInfo>() == 32);
     assert!(core::mem::size_of::<SystemPowerInfo>() == 32);
-    assert!(core::mem::size_of::<MemoryInfo>() == 288);
+    assert!(MEMORY_INFO_V1_SIZE == 288);
+    assert!(core::mem::size_of::<MemoryInfo>() == 400);
+    assert!(core::mem::size_of::<VirtualAreaInfo>() == 80);
     assert!(core::mem::size_of::<ReceivedHandle>() == 16);
     assert!(core::mem::size_of::<ChannelCreateOutput>() == 8);
     assert!(core::mem::size_of::<ChannelWriteArgs>() == 40);
@@ -1298,6 +1390,7 @@ mod tests {
         assert_eq!(SyscallNumber::VirtualProtect as u64, 49);
         assert_eq!(SyscallNumber::VirtualUnmap as u64, 50);
         assert_eq!(SyscallNumber::ProcessCreate2 as u64, 51);
+        assert_eq!(SyscallNumber::VirtualQuery as u64, 52);
     }
 
     #[test]
@@ -1387,6 +1480,21 @@ mod tests {
         assert_eq!(ProcessFault::ResourceLimit as u32, 5);
         assert_eq!(ProcessFault::Other as u32, 6);
         assert_eq!(ProcessFault::OutOfMemory as u32, 7);
+
+        assert_eq!(VirtualAreaKind::Image as u32, 1);
+        assert_eq!(VirtualAreaKind::Anonymous as u32, 2);
+        assert_eq!(VirtualAreaKind::Stack as u32, 3);
+        assert_eq!(VirtualAreaKind::Guard as u32, 4);
+        assert_eq!(VirtualAreaKind::Shared as u32, 5);
+        assert_eq!(VirtualAreaKind::File as u32, 6);
+        for raw in 1..=6 {
+            assert_eq!(
+                VirtualAreaKind::from_raw(raw).map(|kind| kind as u32),
+                Some(raw)
+            );
+        }
+        assert_eq!(VirtualAreaKind::from_raw(0), None);
+        assert_eq!(VirtualAreaKind::from_raw(7), None);
     }
 
     #[test]
@@ -1395,7 +1503,8 @@ mod tests {
         assert_eq!(offset_of!(WaitManyArgs, deadline_ns), 16);
         assert_eq!(size_of::<MonotonicTimeOutput>(), 8);
         assert_eq!(offset_of!(MonotonicTimeOutput, now_ns), 0);
-        assert_eq!(size_of::<MemoryInfo>(), 288);
+        assert_eq!(MEMORY_INFO_V1_SIZE, 288);
+        assert_eq!(size_of::<MemoryInfo>(), 400);
         assert_eq!(align_of::<MemoryInfo>(), 8);
         assert_eq!(offset_of!(MemoryInfo, version), 0);
         assert_eq!(offset_of!(MemoryInfo, size), 4);
@@ -1406,6 +1515,31 @@ mod tests {
         assert_eq!(offset_of!(MemoryInfo, private_page_limit), 168);
         assert_eq!(offset_of!(MemoryInfo, reserved_virtual_bytes), 224);
         assert_eq!(offset_of!(MemoryInfo, oom_failures), 280);
+        assert_eq!(offset_of!(MemoryInfo, current_vma_count), 288);
+        assert_eq!(offset_of!(MemoryInfo, page_table_frames), 296);
+        assert_eq!(offset_of!(MemoryInfo, committed_image_pages), 304);
+        assert_eq!(offset_of!(MemoryInfo, committed_stack_pages), 312);
+        assert_eq!(offset_of!(MemoryInfo, committed_anonymous_pages), 320);
+        assert_eq!(offset_of!(MemoryInfo, committed_file_backed_pages), 328);
+        assert_eq!(offset_of!(MemoryInfo, shared_arena_owned_frames), 336);
+        assert_eq!(offset_of!(MemoryInfo, shared_arena_reclaim_failures), 368);
+        assert_eq!(offset_of!(MemoryInfo, system_shared_live_objects), 376);
+        assert_eq!(offset_of!(MemoryInfo, system_shared_backing_bytes), 392);
+
+        assert_eq!(size_of::<VirtualAreaInfo>(), 80);
+        assert_eq!(align_of::<VirtualAreaInfo>(), 8);
+        assert_eq!(offset_of!(VirtualAreaInfo, version), 0);
+        assert_eq!(offset_of!(VirtualAreaInfo, size), 4);
+        assert_eq!(offset_of!(VirtualAreaInfo, start), 8);
+        assert_eq!(offset_of!(VirtualAreaInfo, end), 16);
+        assert_eq!(offset_of!(VirtualAreaInfo, kind), 24);
+        assert_eq!(offset_of!(VirtualAreaInfo, protection), 28);
+        assert_eq!(offset_of!(VirtualAreaInfo, committed_bytes), 32);
+        assert_eq!(offset_of!(VirtualAreaInfo, reserved_bytes), 40);
+        assert_eq!(offset_of!(VirtualAreaInfo, committed_pages), 48);
+        assert_eq!(offset_of!(VirtualAreaInfo, reserved_pages), 56);
+        assert_eq!(offset_of!(VirtualAreaInfo, backing_identity), 64);
+        assert_eq!(offset_of!(VirtualAreaInfo, file_offset), 72);
 
         assert_eq!(size_of::<ChannelWriteArgs>(), 40);
         assert_eq!(align_of::<ChannelWriteArgs>(), 8);

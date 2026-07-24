@@ -39,6 +39,7 @@ const HANDLE_GENERATION_MASK: u32 = (1 << (32 - HANDLE_INDEX_BITS)) - 1;
 // Serializes queue-edge additions while cycle detection traverses other channel
 // states. Reads and endpoint teardown only remove edges and need no graph lock.
 static CHANNEL_GRAPH_LOCK: Spinlock<()> = Spinlock::new(());
+static SHARED_MEMORY_NEXT_IDENTITY: Spinlock<u64> = Spinlock::new(1);
 
 static SHARED_MEMORY_LIVE_OBJECTS: AtomicUsize = AtomicUsize::new(0);
 static SHARED_MEMORY_LOGICAL_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -472,6 +473,7 @@ struct SharedMemoryObject {
 }
 
 struct SharedMemoryBacking {
+    identity: u64,
     storage: Arc<dyn SharedMemoryStorage>,
     logical_len: usize,
     mapped_len: usize,
@@ -511,12 +513,20 @@ impl SharedMemoryBacking {
             return Err(IpcError::InvalidMessage);
         }
 
+        let identity = {
+            let mut next = SHARED_MEMORY_NEXT_IDENTITY.lock();
+            let identity = *next;
+            *next = next.checked_add(1).ok_or(IpcError::OutOfMemory)?;
+            identity
+        };
+
         SHARED_MEMORY_LIVE_OBJECTS.fetch_add(1, Ordering::Relaxed);
         SHARED_MEMORY_LOGICAL_BYTES.fetch_add(logical_len, Ordering::Relaxed);
         SHARED_MEMORY_MAPPED_ALLOCATED_BYTES.fetch_add(mapped_len, Ordering::Relaxed);
         SHARED_MEMORY_CUMULATIVE_CREATIONS.fetch_add(1, Ordering::Relaxed);
 
         Ok(Self {
+            identity,
             storage,
             logical_len,
             mapped_len,
@@ -714,6 +724,10 @@ impl HandleOperationDisposition {
 /// lease's owning reference necessarily remains live while they are inspected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SharedMemoryMappingInfo {
+    /// Opaque identity of one shared kernel object. This is never an address.
+    /// Handle duplication, transfer, and mapping leases retain it; separately
+    /// created objects receive distinct identities even if they share storage.
+    pub backing_identity: u64,
     /// API-visible byte length used by read/write and window subdivision.
     pub logical_len: usize,
     /// Page-rounded frame-backed length available to process mapping code.
@@ -1106,6 +1120,7 @@ impl HandleTable {
         let object = self.object_with_rights(handle, effective_rights)?;
         let backing = &shared_memory_object(&object)?.backing;
         let info = SharedMemoryMappingInfo {
+            backing_identity: backing.identity,
             logical_len: backing.logical_len,
             mapped_len: backing.mapped_len,
         };
@@ -2570,6 +2585,48 @@ mod tests {
             .shared_memory_create_with_storage(Arc::clone(&storage))
             .unwrap();
         let second = table.shared_memory_create_with_storage(storage).unwrap();
+
+        let first_identity = table
+            .shared_memory_mapping_lease(first, SharedMemoryMappingAccess::ReadOnly)
+            .unwrap()
+            .info()
+            .backing_identity;
+        let second_identity = table
+            .shared_memory_mapping_lease(second, SharedMemoryMappingAccess::ReadOnly)
+            .unwrap()
+            .info()
+            .backing_identity;
+        assert_ne!(first_identity, second_identity);
+
+        let duplicate = table
+            .handle_duplicate(first, SHARED_MEMORY_DEFAULT_RIGHTS)
+            .unwrap();
+        assert_eq!(
+            table
+                .shared_memory_mapping_lease(duplicate, SharedMemoryMappingAccess::ReadOnly)
+                .unwrap()
+                .info()
+                .backing_identity,
+            first_identity
+        );
+        let mut destination = HandleTable::new();
+        let transferred = handle_transfer_batch_between(
+            &mut table,
+            &mut destination,
+            &[HandleOperationDisposition::move_handle(
+                duplicate,
+                SHARED_MEMORY_DEFAULT_RIGHTS,
+            )],
+        )
+        .unwrap()[0];
+        assert_eq!(
+            destination
+                .shared_memory_mapping_lease(transferred, SharedMemoryMappingAccess::ReadOnly)
+                .unwrap()
+                .info()
+                .backing_identity,
+            first_identity
+        );
 
         table.shared_memory_write(first, 1, b"shared").unwrap();
         let mut bytes = [0; 8];

@@ -16,16 +16,18 @@ use ginkgo_filesystem::{
     DirectoryHandle, FsError, NodeKind, NodeMetadata, RedoxFs, RenameMode, MAX_TRAVERSAL_DEPTH,
 };
 use ginkgo_ipc::{
-    handle_transfer_batch_between, HandleOperation, HandleOperationDisposition, HandleTable,
-    IpcError, MessageInfo, ObjectType, Rights, Signals, WaitItem, APPLICATION_DATA_MAX_APP_ID_LEN,
+    handle_transfer_batch_between, shared_memory_backing_stats, HandleOperation,
+    HandleOperationDisposition, HandleTable, IpcError, MessageInfo, ObjectType, Rights, Signals,
+    WaitItem, APPLICATION_DATA_MAX_APP_ID_LEN,
 };
 use ginkgo_sysapi::{
     FilesystemDirectoryEntry, FilesystemOpenFlags, FilesystemRenameFlags, Handle, MapFlags,
     MapProtection, MemoryInfo, ProcessInfo, ProcessMemoryPolicy, SharedMemoryMapArgs, Status,
-    SyscallNumber, SystemPowerAction, SystemPowerFlags, SystemPowerInfo, VirtualMapFileArgs,
-    CHANNEL_MAX_BYTES, CHANNEL_MAX_HANDLES, DEADLINE_INFINITE, FILESYSTEM_NAME_MAX,
-    FILESYSTEM_READ_MAX_BYTES, MEMORY_INFO_VERSION, PROCESS_MAX_STARTUP_BYTES,
-    PROCESS_MAX_STARTUP_HANDLES, PROCESS_MEMORY_POLICY_VERSION, RANDOM_MAX_BYTES,
+    SyscallNumber, SystemPowerAction, SystemPowerFlags, SystemPowerInfo, VirtualAreaInfo,
+    VirtualMapFileArgs, CHANNEL_MAX_BYTES, CHANNEL_MAX_HANDLES, DEADLINE_INFINITE,
+    FILESYSTEM_NAME_MAX, FILESYSTEM_READ_MAX_BYTES, MEMORY_INFO_V1_SIZE, MEMORY_INFO_VERSION,
+    MEMORY_INFO_VERSION_V1, PROCESS_MAX_STARTUP_BYTES, PROCESS_MAX_STARTUP_HANDLES,
+    PROCESS_MEMORY_POLICY_VERSION, RANDOM_MAX_BYTES, VIRTUAL_AREA_INFO_VERSION,
 };
 use redoxfs::Disk;
 use zerocopy::IntoBytes;
@@ -90,7 +92,7 @@ const PROCESS_CREATE_ARGS2_SIZE: usize = 80;
 const PROCESS_MEMORY_POLICY_SIZE: usize = size_of::<ProcessMemoryPolicy>();
 const PROCESS_INFO_SIZE: usize = size_of::<ProcessInfo>();
 const SYSTEM_POWER_INFO_SIZE: usize = size_of::<SystemPowerInfo>();
-const MEMORY_INFO_SIZE: usize = size_of::<MemoryInfo>();
+const VIRTUAL_AREA_INFO_SIZE: usize = size_of::<VirtualAreaInfo>();
 const SYSTEM_POWER_CANCELLATION_NS: u64 = 2_000_000_000;
 const APPLICATION_DATA_CREATE_ARGS_SIZE: usize = 32;
 /// Heap values captured immediately before syscall dispatch.
@@ -384,6 +386,7 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
             context.rdx,
             frame_allocator,
             kernel_heap,
+            shared_frame_arena,
         ),
         SyscallNumber::VirtualMapFile => virtual_map_file(
             process,
@@ -409,6 +412,9 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
         SyscallNumber::VirtualUnmap => process
             .unmap_file_backed(context.rdi, context.rsi, frame_allocator)
             .map_err(map_shared_mapping_error),
+        SyscallNumber::VirtualQuery => {
+            virtual_query(process, context.rdi, context.rsi, context.rdx, context.r10)
+        }
         SyscallNumber::ProcessCreate2 => {
             return match process_create(
                 process,
@@ -541,6 +547,7 @@ const fn decode_syscall_number(raw: u64) -> Option<SyscallNumber> {
         49 => SyscallNumber::VirtualProtect,
         50 => SyscallNumber::VirtualUnmap,
         51 => SyscallNumber::ProcessCreate2,
+        52 => SyscallNumber::VirtualQuery,
         _ => return None,
     })
 }
@@ -772,16 +779,20 @@ fn memory_get_info(
     raw_version: u64,
     frame_allocator: &UsableFrameAllocator<'_>,
     kernel_heap: KernelHeapStats,
+    shared_frame_arena: &SharedFrameArena,
 ) -> Result<(), Status> {
-    validate_memory_info_query(raw_version, raw_size)?;
-    validate_user_output(process, output_address, MEMORY_INFO_SIZE)?;
+    let output_size = validate_memory_info_query(raw_version, raw_size)?;
+    validate_user_output(process, output_address, output_size)?;
 
     let frames = frame_allocator.stats();
     let limits = process.limits();
     let usage = process.usage();
+    let details = process.memory_observability();
+    let arena = shared_frame_arena.stats();
+    let shared = shared_memory_backing_stats();
     let info = MemoryInfo {
-        version: MEMORY_INFO_VERSION,
-        size: MemoryInfo::SIZE,
+        version: raw_version as u32,
+        size: output_size as u32,
         total_eligible_frames: frames.total_eligible_frames,
         total_eligible_bytes: frames.total_eligible_bytes,
         below_4g_frames: frames.below_4g_frames,
@@ -817,19 +828,64 @@ fn memory_get_info(
         mapped_shared_bytes: usage.mapped_shared_bytes,
         quota_failures: usage.quota_failures,
         oom_failures: usage.oom_failures,
+        current_vma_count: details.current_vma_count,
+        page_table_frames: details.page_table_frames,
+        committed_image_pages: details.committed_image_pages,
+        committed_stack_pages: details.committed_stack_pages,
+        committed_anonymous_pages: details.committed_anonymous_pages,
+        committed_file_backed_pages: details.committed_file_backed_pages,
+        shared_arena_owned_frames: arena.owned_frames as u64,
+        shared_arena_free_frames: arena.free_frames as u64,
+        shared_arena_returned_frames: arena.returned_frames as u64,
+        shared_arena_reclaimed_frames: arena.reclaimed_frames as u64,
+        shared_arena_reclaim_failures: arena.reclaim_failures as u64,
+        system_shared_live_objects: shared.live_objects as u64,
+        system_shared_logical_bytes: shared.logical_bytes as u64,
+        system_shared_backing_bytes: shared.mapped_allocated_bytes as u64,
     };
+    copy_to_user(process, output_address, &info.as_bytes()[..output_size])
+}
+
+const fn validate_memory_info_query(raw_version: u64, raw_size: u64) -> Result<usize, Status> {
+    let expected = match raw_version {
+        version if version == MEMORY_INFO_VERSION_V1 as u64 => MEMORY_INFO_V1_SIZE as u64,
+        version if version == MEMORY_INFO_VERSION as u64 => MemoryInfo::SIZE as u64,
+        _ => return Err(Status::InvalidArgument),
+    };
+    if raw_size < expected {
+        return Err(Status::BufferTooSmall);
+    }
+    if raw_size != expected {
+        return Err(Status::InvalidArgument);
+    }
+    Ok(expected as usize)
+}
+
+fn virtual_query(
+    process: &Process,
+    address: u64,
+    output_address: u64,
+    raw_version: u64,
+    raw_size: u64,
+) -> Result<(), Status> {
+    validate_virtual_query(raw_version, raw_size, address)?;
+    validate_user_output(process, output_address, VIRTUAL_AREA_INFO_SIZE)?;
+    let info = process.virtual_query(address).ok_or(Status::NotFound)?;
     copy_to_user(process, output_address, info.as_bytes())
 }
 
-const fn validate_memory_info_query(raw_version: u64, raw_size: u64) -> Result<(), Status> {
-    if raw_version != MEMORY_INFO_VERSION as u64 {
+const fn validate_virtual_query(raw_version: u64, raw_size: u64, address: u64) -> Result<(), Status> {
+    if raw_version != VIRTUAL_AREA_INFO_VERSION as u64 {
         return Err(Status::InvalidArgument);
     }
-    if raw_size < MemoryInfo::SIZE as u64 {
+    if raw_size < VirtualAreaInfo::SIZE as u64 {
         return Err(Status::BufferTooSmall);
     }
-    if raw_size != MemoryInfo::SIZE as u64 {
+    if raw_size != VirtualAreaInfo::SIZE as u64 {
         return Err(Status::InvalidArgument);
+    }
+    if !Process::is_user_virtual_address(address) {
+        return Err(Status::InvalidAddress);
     }
     Ok(())
 }
@@ -2852,6 +2908,7 @@ mod tests {
             SyscallNumber::VirtualProtect,
             SyscallNumber::VirtualUnmap,
             SyscallNumber::ProcessCreate2,
+            SyscallNumber::VirtualQuery,
         ];
         for number in expected {
             assert_eq!(decode_syscall_number(number as u64), Some(number));
@@ -2918,7 +2975,8 @@ mod tests {
             decode_syscall_number(51),
             Some(SyscallNumber::ProcessCreate2)
         );
-        assert_eq!(decode_syscall_number(52), None);
+        assert_eq!(decode_syscall_number(52), Some(SyscallNumber::VirtualQuery));
+        assert_eq!(decode_syscall_number(53), None);
         assert_eq!(decode_syscall_number(u64::MAX), None);
     }
 
@@ -2993,23 +3051,25 @@ mod tests {
 
 
     #[test]
-    fn memory_info_query_requires_exact_version_and_layout_size() {
-        assert_eq!(
-            validate_memory_info_query(MEMORY_INFO_VERSION as u64, MemoryInfo::SIZE as u64),
-            Ok(())
-        );
-        assert_eq!(
-            validate_memory_info_query(0, MemoryInfo::SIZE as u64),
-            Err(Status::InvalidArgument)
-        );
-        assert_eq!(
-            validate_memory_info_query(MEMORY_INFO_VERSION as u64, MemoryInfo::SIZE as u64 - 1,),
-            Err(Status::BufferTooSmall)
-        );
-        assert_eq!(
-            validate_memory_info_query(MEMORY_INFO_VERSION as u64, MemoryInfo::SIZE as u64 + 8,),
-            Err(Status::InvalidArgument)
-        );
+    fn memory_info_query_requires_an_exact_supported_version_size_pair() {
+        assert_eq!(validate_memory_info_query(MEMORY_INFO_VERSION_V1 as u64, MEMORY_INFO_V1_SIZE as u64), Ok(MEMORY_INFO_V1_SIZE as usize));
+        assert_eq!(validate_memory_info_query(MEMORY_INFO_VERSION as u64, MemoryInfo::SIZE as u64), Ok(MemoryInfo::SIZE as usize));
+        assert_eq!(validate_memory_info_query(0, MemoryInfo::SIZE as u64), Err(Status::InvalidArgument));
+        assert_eq!(validate_memory_info_query(MEMORY_INFO_VERSION as u64, MemoryInfo::SIZE as u64 - 1), Err(Status::BufferTooSmall));
+        assert_eq!(validate_memory_info_query(MEMORY_INFO_VERSION_V1 as u64, MemoryInfo::SIZE as u64), Err(Status::InvalidArgument));
+        assert_eq!(validate_memory_info_query(MEMORY_INFO_VERSION as u64, MemoryInfo::SIZE as u64 + 8), Err(Status::InvalidArgument));
+    }
+
+    #[test]
+    fn virtual_query_rejects_malformed_layouts_and_non_user_addresses() {
+        let valid_address = crate::memory::PAGE_SIZE;
+        assert_eq!(validate_virtual_query(VIRTUAL_AREA_INFO_VERSION as u64, VirtualAreaInfo::SIZE as u64, valid_address), Ok(()));
+        assert_eq!(validate_virtual_query(0, VirtualAreaInfo::SIZE as u64, valid_address), Err(Status::InvalidArgument));
+        assert_eq!(validate_virtual_query(VIRTUAL_AREA_INFO_VERSION as u64, VirtualAreaInfo::SIZE as u64 - 1, valid_address), Err(Status::BufferTooSmall));
+        assert_eq!(validate_virtual_query(VIRTUAL_AREA_INFO_VERSION as u64, VirtualAreaInfo::SIZE as u64 + 8, valid_address), Err(Status::InvalidArgument));
+        for address in [0, 0x0000_8000_0000_0000, u64::MAX] {
+            assert_eq!(validate_virtual_query(VIRTUAL_AREA_INFO_VERSION as u64, VirtualAreaInfo::SIZE as u64, address), Err(Status::InvalidAddress));
+        }
     }
 
     #[test]
