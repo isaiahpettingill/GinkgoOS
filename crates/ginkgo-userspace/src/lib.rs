@@ -505,6 +505,39 @@ pub fn thread_detach(thread: ThreadId) -> SyscallResult<()> {
     status_result(unsafe { raw_syscall6(SyscallNumber::ThreadDetach, thread.0, 0, 0, 0, 0, 0) })
 }
 
+pub fn thread_set_scheduling_class(
+    thread: ThreadId,
+    class: ThreadSchedulingClass,
+) -> SyscallResult<()> {
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::ThreadSetSchedulingClass,
+            thread.0,
+            class as u64,
+            0,
+            0,
+            0,
+            0,
+        )
+    })
+}
+
+pub fn thread_get_scheduling_info(thread: ThreadId) -> SyscallResult<ThreadSchedulingInfo> {
+    let mut info = ThreadSchedulingInfo::default();
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::ThreadGetSchedulingInfo,
+            thread.0,
+            mut_pointer_address(&mut info),
+            ThreadSchedulingInfo::SIZE as u64,
+            THREAD_SCHEDULING_INFO_VERSION as u64,
+            0,
+            0,
+        )
+    })?;
+    Ok(info)
+}
+
 /// Writes bytes to the kernel's initial bounded serial debug sink.
 ///
 /// The kernel defines and enforces the maximum accepted length. This wrapper

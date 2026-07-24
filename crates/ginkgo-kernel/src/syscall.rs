@@ -24,11 +24,12 @@ use ginkgo_sysapi::{
     FilesystemDirectoryEntry, FilesystemOpenFlags, FilesystemRenameFlags, Handle, MapFlags,
     MapProtection, MemoryInfo, ProcessInfo, ProcessMemoryPolicy, SharedMemoryMapArgs, Status,
     SyscallNumber, SystemPowerAction, SystemPowerFlags, SystemPowerInfo, ThreadInfo,
-    ThreadState as PublicThreadState, VirtualAreaInfo, VirtualMapFileArgs, CHANNEL_MAX_BYTES,
-    CHANNEL_MAX_HANDLES, DEADLINE_INFINITE, FILESYSTEM_NAME_MAX, FILESYSTEM_READ_MAX_BYTES,
-    MEMORY_INFO_V1_SIZE, MEMORY_INFO_VERSION, MEMORY_INFO_VERSION_V1, PROCESS_MAX_STARTUP_BYTES,
-    PROCESS_MAX_STARTUP_HANDLES, PROCESS_MEMORY_POLICY_VERSION, RANDOM_MAX_BYTES,
-    THREAD_INFO_VERSION, VIRTUAL_AREA_INFO_VERSION,
+    ThreadSchedulingClass, ThreadSchedulingInfo, ThreadState as PublicThreadState, VirtualAreaInfo,
+    VirtualMapFileArgs, CHANNEL_MAX_BYTES, CHANNEL_MAX_HANDLES, DEADLINE_INFINITE,
+    FILESYSTEM_NAME_MAX, FILESYSTEM_READ_MAX_BYTES, MEMORY_INFO_V1_SIZE, MEMORY_INFO_VERSION,
+    MEMORY_INFO_VERSION_V1, PROCESS_MAX_STARTUP_BYTES, PROCESS_MAX_STARTUP_HANDLES,
+    PROCESS_MEMORY_POLICY_VERSION, RANDOM_MAX_BYTES, THREAD_CREATE_ARGS_VERSION,
+    THREAD_INFO_VERSION, THREAD_SCHEDULING_INFO_VERSION, VIRTUAL_AREA_INFO_VERSION,
 };
 use redoxfs::Disk;
 use zerocopy::IntoBytes;
@@ -43,9 +44,10 @@ use crate::{
         ActivePageTable, MapError,
     },
     process::{
-        file_max_protection, select_child_process_limits, DirectStartupBlock, ElfPageLoadError,
-        PendingWaitMany, Process, ProcessCreateError, ProcessLimits, SharedMappingError, ThreadId,
-        ThreadState, WaitDeadline, WaitManyCompletion,
+        file_max_protection, select_child_process_limits, BlockedKind, DirectStartupBlock,
+        ElfPageLoadError, PendingWaitMany, Process, ProcessCreateError, ProcessLimits,
+        SharedMappingError, ThreadCreateError, ThreadId, ThreadState, WaitDeadline,
+        WaitManyCompletion,
     },
     shared_memory::{SharedFrameArena, SharedMemoryFactory},
 };
@@ -93,6 +95,8 @@ const PROCESS_CREATE_ARGS2_SIZE: usize = 80;
 const PROCESS_MEMORY_POLICY_SIZE: usize = size_of::<ProcessMemoryPolicy>();
 const PROCESS_INFO_SIZE: usize = size_of::<ProcessInfo>();
 const THREAD_INFO_SIZE: usize = size_of::<ThreadInfo>();
+const THREAD_CREATE_ARGS_SIZE: usize = 56;
+const THREAD_SCHEDULING_INFO_SIZE: usize = size_of::<ThreadSchedulingInfo>();
 const SYSTEM_POWER_INFO_SIZE: usize = size_of::<SystemPowerInfo>();
 const VIRTUAL_AREA_INFO_SIZE: usize = size_of::<VirtualAreaInfo>();
 const SYSTEM_POWER_CANCELLATION_NS: u64 = 2_000_000_000;
@@ -119,6 +123,8 @@ pub enum SyscallOutcome {
     Blocked,
     /// The process requested termination with this code.
     Exit(i32),
+    /// Only the calling thread exited; sibling threads may remain runnable.
+    ThreadExited(i32),
     /// A fully initialized child whose scheduler slot was reserved before dispatch.
     ChildCreated(Box<Process>),
 }
@@ -174,9 +180,13 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
         SyscallNumber::ProcessExit | SyscallNumber::ThreadExit
     ) {
         return match decode_exit_code(context.rdi) {
-            Ok(code) => {
-                process.mark_exited(code);
+            Ok(code) if number == SyscallNumber::ProcessExit => {
+                process.exit_process(thread_id, code);
                 SyscallOutcome::Exit(code)
+            }
+            Ok(code) => {
+                process.exit_thread(thread_id, code);
+                SyscallOutcome::ThreadExited(code)
             }
             Err(status) => {
                 set_status(context, status);
@@ -194,6 +204,7 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
         dispatch_non_exit(
             number,
             process,
+            thread_id,
             context,
             now_ns,
             kernel_page_table,
@@ -224,6 +235,7 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
 fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
     number: SyscallNumber,
     process: &mut Process,
+    thread_id: ThreadId,
     context: &UserContext,
     now_ns: u64,
     kernel_page_table: &ActivePageTable,
@@ -238,7 +250,7 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
     debug_sink: &mut D,
 ) -> DispatchResult {
     if number == SyscallNumber::WaitMany {
-        return wait_many(process, context.rdi, context.rsi, now_ns);
+        return wait_many(process, thread_id, context.rdi, context.rsi, now_ns);
     }
 
     let memory_failures_before = process.usage();
@@ -427,18 +439,46 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
         SyscallNumber::VirtualQuery => {
             virtual_query(process, context.rdi, context.rsi, context.rdx, context.r10)
         }
-        SyscallNumber::ThreadCreate => Err(Status::ResourceLimit),
-        SyscallNumber::ThreadSleepUntil => thread_sleep_until(context.rdi, now_ns),
+        SyscallNumber::ThreadCreate => thread_create(process, context.rdi, frame_allocator),
+        SyscallNumber::ThreadSleepUntil => {
+            return match thread_sleep_until(process, thread_id, context.rdi, now_ns) {
+                Ok(true) => DispatchResult::Blocked,
+                Ok(false) => DispatchResult::Complete(Status::Ok),
+                Err(status) => DispatchResult::Complete(status),
+            };
+        }
         SyscallNumber::ThreadWake => thread_wake(process, context.rdi),
         SyscallNumber::ThreadTerminate => thread_terminate(process, context.rdi),
         SyscallNumber::ThreadGetInfo => {
             thread_get_info(process, context.rdi, context.rsi, context.rdx, context.r10)
         }
-        SyscallNumber::ThreadJoin => thread_join(process, context.rdi),
-        SyscallNumber::ThreadDetach => thread_detach(process, context.rdi),
+        SyscallNumber::ThreadJoin => {
+            return match thread_join(
+                process,
+                thread_id,
+                context.rdi,
+                context.rsi,
+                context.rdx,
+                context.r10,
+                context.r8,
+                now_ns,
+                frame_allocator,
+            ) {
+                Ok(true) => DispatchResult::Blocked,
+                Ok(false) => DispatchResult::Complete(Status::Ok),
+                Err(status) => DispatchResult::Complete(status),
+            };
+        }
+        SyscallNumber::ThreadDetach => thread_detach(process, context.rdi, frame_allocator),
         SyscallNumber::ThreadGetCurrent => {
-            let id = ginkgo_sysapi::ThreadId(process.main_thread_id().raw());
+            let id = ginkgo_sysapi::ThreadId(thread_id.raw());
             copy_to_user(process, context.rdi, id.as_bytes())
+        }
+        SyscallNumber::ThreadSetSchedulingClass => {
+            thread_set_scheduling_class(process, context.rdi, context.rsi)
+        }
+        SyscallNumber::ThreadGetSchedulingInfo => {
+            thread_get_scheduling_info(process, context.rdi, context.rsi, context.rdx, context.r10)
         }
         SyscallNumber::ProcessCreate2 => {
             return match process_create(
@@ -587,6 +627,8 @@ const fn decode_syscall_number(raw: u64) -> Option<SyscallNumber> {
         60 => SyscallNumber::ThreadJoin,
         61 => SyscallNumber::ThreadDetach,
         62 => SyscallNumber::ThreadGetCurrent,
+        63 => SyscallNumber::ThreadSetSchedulingClass,
+        64 => SyscallNumber::ThreadGetSchedulingInfo,
         _ => return None,
     })
 }
@@ -599,46 +641,128 @@ fn decode_exit_code(raw: u64) -> Result<i32, Status> {
     i32::try_from(raw as i64).map_err(|_| Status::InvalidArgument)
 }
 
-fn thread_sleep_until(raw_deadline: u64, now_ns: u64) -> Result<(), Status> {
+fn thread_create(
+    process: &mut Process,
+    args_address: u64,
+    allocator: &mut UsableFrameAllocator<'_>,
+) -> Result<(), Status> {
+    let raw = copy_block_from_user::<THREAD_CREATE_ARGS_SIZE>(process, args_address)?;
+    let version = read_u32(&raw, 0);
+    let size = read_u32(&raw, 4);
+    let entry = read_u64(&raw, 8);
+    let argument = read_u64(&raw, 16);
+    let stack_size = read_u64(&raw, 24);
+    let tls_base = read_u64(&raw, 32);
+    let flags = read_u32(&raw, 40);
+    let reserved = read_u32(&raw, 44);
+    let output_address = read_u64(&raw, 48);
+    if version != THREAD_CREATE_ARGS_VERSION
+        || size != THREAD_CREATE_ARGS_SIZE as u32
+        || flags != 0
+        || reserved != 0
+    {
+        return Err(Status::InvalidArgument);
+    }
+    validate_user_output(
+        process,
+        output_address,
+        size_of::<ginkgo_sysapi::ThreadId>(),
+    )?;
+    let id = process
+        .create_thread(entry, argument, stack_size, tls_base, allocator)
+        .map_err(map_thread_create_error)?;
+    let public_id = ginkgo_sysapi::ThreadId(id.raw());
+    if let Err(status) = copy_to_user(process, output_address, public_id.as_bytes()) {
+        process
+            .abort_thread_create(id, allocator)
+            .map_err(map_thread_create_error)?;
+        return Err(status);
+    }
+    Ok(())
+}
+
+fn map_thread_create_error(error: ThreadCreateError) -> Status {
+    match error {
+        ThreadCreateError::InvalidEntry
+        | ThreadCreateError::InvalidStack
+        | ThreadCreateError::InvalidTls => Status::InvalidArgument,
+        ThreadCreateError::ResourceLimit => Status::ResourceLimit,
+        ThreadCreateError::OutOfMemory => Status::OutOfMemory,
+        ThreadCreateError::AddressSpace(AddressSpaceError::OutOfMemory)
+        | ThreadCreateError::AddressSpace(AddressSpaceError::OutOfFrames) => Status::OutOfMemory,
+        ThreadCreateError::AddressSpace(_) | ThreadCreateError::RollbackFailed => {
+            Status::InvalidAddress
+        }
+    }
+}
+
+fn thread_sleep_until(
+    process: &mut Process,
+    thread_id: ThreadId,
+    raw_deadline: u64,
+    now_ns: u64,
+) -> Result<bool, Status> {
     let deadline = raw_deadline as i64;
     if deadline < 0 {
         return Err(Status::InvalidArgument);
     }
-    if deadline as u64 <= now_ns {
-        Ok(())
-    } else {
-        // The first milestone has one live thread, so blocking it on a dedicated
-        // sleep continuation is not enabled until wake authority can be delegated.
-        Err(Status::ResourceLimit)
-    }
+    process.sleep_thread(thread_id, deadline as u64, now_ns)
 }
 
-fn thread_wake(process: &Process, raw_id: u64) -> Result<(), Status> {
-    let id = ThreadId::from_raw(raw_id);
-    process.thread(id).ok_or(Status::InvalidHandle).map(|_| ())
+fn thread_wake(process: &mut Process, raw_id: u64) -> Result<(), Status> {
+    process.wake_thread(ThreadId::from_raw(raw_id))
 }
 
 fn thread_terminate(process: &mut Process, raw_id: u64) -> Result<(), Status> {
+    process
+        .terminate_thread(ThreadId::from_raw(raw_id))
+        .map(|_| ())
+}
+
+fn thread_detach(
+    process: &mut Process,
+    raw_id: u64,
+    allocator: &mut UsableFrameAllocator<'_>,
+) -> Result<(), Status> {
     let id = ThreadId::from_raw(raw_id);
-    if process.thread(id).is_none() {
-        return Err(Status::InvalidHandle);
+    if process.detach_thread(id)? {
+        process.reap_thread(id, allocator)?;
     }
-    process.mark_terminated();
     Ok(())
 }
 
-fn thread_detach(process: &Process, raw_id: u64) -> Result<(), Status> {
-    thread_wake(process, raw_id)
-}
-
-fn thread_join(process: &Process, raw_id: u64) -> Result<(), Status> {
-    let id = ThreadId::from_raw(raw_id);
-    process.thread(id).ok_or(Status::InvalidHandle)?;
-    if id == process.main_thread_id() {
-        Err(Status::InvalidArgument)
-    } else {
-        Err(Status::ResourceLimit)
+#[allow(clippy::too_many_arguments)]
+fn thread_join(
+    process: &mut Process,
+    caller: ThreadId,
+    raw_target: u64,
+    raw_deadline: u64,
+    output_address: u64,
+    output_size: u64,
+    version: u64,
+    now_ns: u64,
+    allocator: &mut UsableFrameAllocator<'_>,
+) -> Result<bool, Status> {
+    if version != THREAD_INFO_VERSION as u64 || output_size != THREAD_INFO_SIZE as u64 {
+        return Err(Status::InvalidArgument);
     }
+    validate_user_output(process, output_address, THREAD_INFO_SIZE)?;
+    let deadline_ns = raw_deadline as i64;
+    if deadline_ns < 0 {
+        return Err(Status::InvalidArgument);
+    }
+    let deadline = if deadline_ns == DEADLINE_INFINITE {
+        WaitDeadline::Infinite
+    } else {
+        WaitDeadline::At(deadline_ns as u64)
+    };
+    let target = ThreadId::from_raw(raw_target);
+    if process.start_join(caller, target, deadline, output_address, now_ns)? {
+        return Ok(true);
+    }
+    thread_get_info(process, raw_target, output_address, output_size, version)?;
+    process.reap_thread(target, allocator)?;
+    Ok(false)
 }
 
 fn thread_get_info(
@@ -682,7 +806,70 @@ fn thread_get_info(
     copy_to_user(process, output_address, info.as_bytes())
 }
 
-const fn public_thread_fault(reason: crate::process::ProcessFaultReason) -> u32 {
+fn thread_set_scheduling_class(
+    process: &mut Process,
+    raw_id: u64,
+    raw_class: u64,
+) -> Result<(), Status> {
+    let public = ThreadSchedulingClass::from_raw(
+        u32::try_from(raw_class).map_err(|_| Status::InvalidArgument)?,
+    )
+    .ok_or(Status::InvalidArgument)?;
+    let class = match public {
+        ThreadSchedulingClass::Critical => crate::thread_scheduler::SchedulingClass::Critical,
+        ThreadSchedulingClass::Audio => crate::thread_scheduler::SchedulingClass::Audio,
+        ThreadSchedulingClass::Interactive => crate::thread_scheduler::SchedulingClass::Interactive,
+        ThreadSchedulingClass::Normal => crate::thread_scheduler::SchedulingClass::Normal,
+        ThreadSchedulingClass::Background => crate::thread_scheduler::SchedulingClass::Background,
+    };
+    process.set_thread_scheduling_class(ThreadId::from_raw(raw_id), class)
+}
+
+fn thread_get_scheduling_info(
+    process: &Process,
+    raw_id: u64,
+    output_address: u64,
+    output_size: u64,
+    version: u64,
+) -> Result<(), Status> {
+    if version != THREAD_SCHEDULING_INFO_VERSION as u64
+        || output_size != THREAD_SCHEDULING_INFO_SIZE as u64
+    {
+        return Err(Status::InvalidArgument);
+    }
+    let (base, effective, budget, metrics, state) = process
+        .thread_scheduler_data(ThreadId::from_raw(raw_id))
+        .ok_or(Status::InvalidHandle)?;
+    let state = match state {
+        ThreadState::Ready => PublicThreadState::Running,
+        ThreadState::Blocked => PublicThreadState::Blocked,
+        ThreadState::Exited(_) => PublicThreadState::Exited,
+        ThreadState::Faulted(_) => PublicThreadState::Faulted,
+        ThreadState::Terminated => PublicThreadState::Terminated,
+    };
+    let info = ThreadSchedulingInfo {
+        version: THREAD_SCHEDULING_INFO_VERSION,
+        size: THREAD_SCHEDULING_INFO_SIZE as u32,
+        base_class: base as u32,
+        effective_class: effective as u32,
+        state: state as u32,
+        reserved: 0,
+        budget_remaining_ns: budget,
+        cpu_time_ns: metrics.cpu_time_ns,
+        runnable_wait_ns: metrics.runnable_wait_ns,
+        wake_latency_ns: metrics.wake_latency_ns,
+        maximum_wake_latency_ns: metrics.maximum_wake_latency_ns,
+        wake_latency_samples: metrics.wake_latency_samples,
+        wake_latency_target_misses: metrics.wake_latency_target_misses,
+        context_switches: metrics.context_switches,
+        deadline_misses: metrics.deadline_misses,
+        throttling_events: metrics.throttling_events,
+        throttled_time_ns: metrics.throttled_time_ns,
+    };
+    copy_to_user(process, output_address, info.as_bytes())
+}
+
+fn public_thread_fault(reason: crate::process::ProcessFaultReason) -> u32 {
     use crate::process::ProcessFaultReason;
     match reason {
         ProcessFaultReason::PageFault => ginkgo_sysapi::ProcessFault::PageFault as u32,
@@ -731,11 +918,12 @@ fn handle_duplicate(
 
 fn wait_many(
     process: &mut Process,
+    thread_id: ThreadId,
     args_address: u64,
     output_address: u64,
     now_ns: u64,
 ) -> DispatchResult {
-    match submit_wait_many(process, args_address, output_address, now_ns) {
+    match submit_wait_many(process, thread_id, args_address, output_address, now_ns) {
         Ok(result) => result,
         Err(status) => DispatchResult::Complete(status),
     }
@@ -743,6 +931,7 @@ fn wait_many(
 
 fn submit_wait_many(
     process: &mut Process,
+    thread_id: ThreadId,
     args_address: u64,
     output_address: u64,
     now_ns: u64,
@@ -800,14 +989,17 @@ fn submit_wait_many(
         };
     }
 
-    process.block_wait_many(PendingWaitMany {
-        items,
-        encoded_items,
-        items_address,
-        output_address,
-        deadline,
-        completion: None,
-    });
+    process.block_thread_wait_many(
+        thread_id,
+        PendingWaitMany {
+            items,
+            encoded_items,
+            items_address,
+            output_address,
+            deadline,
+            completion: None,
+        },
+    );
     Ok(DispatchResult::Blocked)
 }
 
@@ -828,8 +1020,26 @@ fn resolve_wait_completion(
 /// A [`BlockedPoll::Complete`] result leaves the completion staged in `process`.
 /// The scheduler must activate that process's address space and immediately call
 /// [`complete_blocked`] before scheduling the process again.
-pub fn poll_blocked(process: &mut Process, now_ns: u64) -> BlockedPoll {
-    let (handles, wait) = process.blocked_wait_many_parts();
+pub fn poll_blocked(process: &mut Process, thread_id: ThreadId, now_ns: u64) -> BlockedPoll {
+    match process.blocked_kind(thread_id) {
+        Some(BlockedKind::Sleep) => {
+            return if process.poll_sleep(thread_id, now_ns) == Some(true) {
+                BlockedPoll::Complete
+            } else {
+                BlockedPoll::Pending
+            };
+        }
+        Some(BlockedKind::Join) => {
+            return if process.poll_join(thread_id, now_ns) == Some(true) {
+                BlockedPoll::Complete
+            } else {
+                BlockedPoll::Pending
+            };
+        }
+        Some(BlockedKind::WaitMany) => {}
+        None => return BlockedPoll::Pending,
+    }
+    let (handles, wait) = process.blocked_thread_wait_many_parts(thread_id);
     if wait.completion.is_some() {
         return BlockedPoll::Complete;
     }
@@ -854,8 +1064,46 @@ pub fn poll_blocked(process: &mut Process, now_ns: u64) -> BlockedPoll {
 /// The process address space must be active. If it is not, the wait is aborted
 /// with [`Status::InvalidAddress`] so the process cannot remain permanently
 /// blocked because of a scheduler integration error.
-pub fn complete_blocked(process: &mut Process) -> Status {
-    let mut wait = process.take_blocked_wait_many();
+pub fn complete_blocked(
+    process: &mut Process,
+    thread_id: ThreadId,
+    allocator: &mut UsableFrameAllocator<'_>,
+) -> Status {
+    if process.blocked_kind(thread_id) == Some(BlockedKind::Sleep) {
+        return process
+            .complete_sleep(thread_id)
+            .err()
+            .unwrap_or(Status::Ok);
+    }
+    if process.blocked_kind(thread_id) == Some(BlockedKind::Join) {
+        let join = match process.take_completed_join(thread_id) {
+            Ok(join) => join,
+            Err(status) => return status,
+        };
+        let mut status = join.completion.unwrap_or(Status::ShouldWait);
+        if status == Status::Ok {
+            status = thread_get_info(
+                process,
+                join.target.raw(),
+                join.output_address,
+                THREAD_INFO_SIZE as u64,
+                THREAD_INFO_VERSION as u64,
+            )
+            .and_then(|()| process.reap_thread(join.target, allocator))
+            .err()
+            .unwrap_or(Status::Ok);
+        }
+        process.release_join_claim(join.target, thread_id);
+        let _ = process.finish_join(thread_id);
+        set_status(
+            process
+                .thread_context_mut(thread_id)
+                .expect("joining thread disappeared before completion"),
+            status,
+        );
+        return status;
+    }
+    let mut wait = process.take_blocked_thread_wait_many(thread_id);
     let completion = wait
         .completion
         .expect("blocked syscall completion was not staged by poll_blocked");
@@ -877,8 +1125,13 @@ pub fn complete_blocked(process: &mut Process) -> Status {
         .unwrap_or(Status::Ok)
     };
 
-    set_status(process.context_mut(), status);
-    process.resume_from_block();
+    set_status(
+        process
+            .thread_context_mut(thread_id)
+            .expect("blocked thread disappeared before completion"),
+        status,
+    );
+    process.resume_thread_from_block(thread_id);
     status
 }
 
@@ -3074,6 +3327,8 @@ mod tests {
             SyscallNumber::ThreadJoin,
             SyscallNumber::ThreadDetach,
             SyscallNumber::ThreadGetCurrent,
+            SyscallNumber::ThreadSetSchedulingClass,
+            SyscallNumber::ThreadGetSchedulingInfo,
         ];
         for number in expected {
             assert_eq!(decode_syscall_number(number as u64), Some(number));
@@ -3141,7 +3396,7 @@ mod tests {
             Some(SyscallNumber::ProcessCreate2)
         );
         assert_eq!(decode_syscall_number(52), Some(SyscallNumber::VirtualQuery));
-        assert_eq!(decode_syscall_number(63), None);
+        assert_eq!(decode_syscall_number(65), None);
         assert_eq!(decode_syscall_number(u64::MAX), None);
     }
 

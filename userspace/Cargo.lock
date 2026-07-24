@@ -338,6 +338,14 @@ name = "ginkgo-text-editor-core"
 version = "0.1.0"
 
 [[package]]
+name = "ginkgo-thread-smoke"
+version = "0.1.0"
+dependencies = [
+ "ginkgo-runtime",
+ "ginkgo-userspace",
+]
+
+[[package]]
 name = "ginkgo-userspace"
 version = "0.1.0"
 dependencies = [

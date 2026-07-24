@@ -30,6 +30,7 @@ use crate::{
         },
         ActivePageTable,
     },
+    thread_scheduler::{SchedulingClass, ThreadMetrics as SchedulerMetrics, ThreadSnapshot},
 };
 
 pub const USER_STACK_INITIAL_SIZE: u64 = 64 * 1024;
@@ -43,6 +44,9 @@ pub const SHARED_MAPPING_BASE: u64 = 0x0000_0001_0000_0000;
 /// Architectural/metadata ceiling for one process's sorted semantic VMAs.
 /// The lower RAM-derived `ProcessLimits::vma_count` is the controlling policy.
 pub const MAX_VMAS: usize = 4096;
+pub const MAX_THREADS_PER_PROCESS: usize = 64;
+pub const KERNEL_ENTRY_STACK_SIZE: usize = 64 * 1024;
+const MAIN_THREAD_ID: ThreadId = ThreadId::from_parts(0, 1);
 const MIB: u64 = 1024 * 1024;
 /// Default maximum executable payload accepted by the package format.
 pub const PACKAGE_DEFAULT_EXECUTABLE_BYTES: u64 = 16 * MIB;
@@ -144,7 +148,7 @@ impl ThreadId {
 }
 
 /// Generation-checked scheduler identity for one thread in one process.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ThreadRef {
     pub process_id: ProcessId,
     pub thread_id: ThreadId,
@@ -227,16 +231,6 @@ impl ThreadState {
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Exited(_) | Self::Faulted(_) | Self::Terminated)
     }
-
-    const fn process_state(self) -> ProcessState {
-        match self {
-            Self::Ready => ProcessState::Ready,
-            Self::Blocked => ProcessState::Blocked,
-            Self::Exited(code) => ProcessState::Exited(code),
-            Self::Faulted(fault) => ProcessState::Faulted(fault),
-            Self::Terminated => ProcessState::Terminated,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -270,8 +264,28 @@ pub(crate) struct PendingWaitMany {
     pub(crate) completion: Option<WaitManyCompletion>,
 }
 
+pub(crate) struct PendingSleep {
+    pub(crate) deadline_ns: u64,
+}
+
+pub(crate) struct PendingJoin {
+    pub(crate) target: ThreadId,
+    pub(crate) deadline: WaitDeadline,
+    pub(crate) output_address: u64,
+    pub(crate) completion: Option<Status>,
+}
+
 pub(crate) enum BlockedSyscall {
     WaitMany(PendingWaitMany),
+    Sleep(PendingSleep),
+    Join(PendingJoin),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BlockedKind {
+    WaitMany,
+    Sleep,
+    Join,
 }
 
 /// Fully allocated direct-process startup bytes awaiting child-local handles.
@@ -425,6 +439,21 @@ impl ProcessLayout {
 
     pub const fn initial_stack_size(self) -> u64 {
         self.stack_top - self.stack_initial_bottom
+    }
+
+    pub const fn for_stack(stack_top: u64, stack_size: u64) -> Self {
+        let stack_bottom = stack_top - stack_size;
+        let initial_size = if stack_size < USER_STACK_INITIAL_SIZE {
+            stack_size
+        } else {
+            USER_STACK_INITIAL_SIZE
+        };
+        Self {
+            stack_guard_start: stack_bottom - PAGE_SIZE,
+            stack_bottom,
+            stack_initial_bottom: stack_top - initial_size,
+            stack_top,
+        }
     }
 
     pub const fn randomized(random: u64) -> Self {
@@ -624,6 +653,17 @@ pub enum ElfPageLoadError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThreadCreateError {
+    InvalidEntry,
+    InvalidStack,
+    InvalidTls,
+    ResourceLimit,
+    OutOfMemory,
+    AddressSpace(AddressSpaceError),
+    RollbackFailed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessCreateError {
     AddressSpace(AddressSpaceError),
     Elf(ElfError),
@@ -651,9 +691,12 @@ pub enum VmAreaKind {
         committed: bool,
     },
     Stack {
+        owner: ThreadId,
         committed: bool,
     },
-    StackGuard,
+    StackGuard {
+        owner: ThreadId,
+    },
     Shared {
         /// Stable IPC shared-memory object identity; never an address.
         object_identity: u64,
@@ -697,8 +740,8 @@ fn virtual_area_info(area: VmArea) -> VirtualAreaInfo {
             reservation_id,
             committed,
         } => (VirtualAreaKind::Anonymous, committed, reservation_id, 0),
-        VmAreaKind::Stack { committed } => (VirtualAreaKind::Stack, committed, 0, 0),
-        VmAreaKind::StackGuard => (VirtualAreaKind::Guard, false, 0, 0),
+        VmAreaKind::Stack { committed, .. } => (VirtualAreaKind::Stack, committed, 0, 0),
+        VmAreaKind::StackGuard { .. } => (VirtualAreaKind::Guard, false, 0, 0),
         VmAreaKind::Shared {
             object_identity, ..
         } => (VirtualAreaKind::Shared, true, object_identity, 0),
@@ -973,11 +1016,54 @@ impl fmt::Debug for ProcessRetireError {
     }
 }
 
+/// Dedicated supervisor-only entry stacks retained for a thread's whole lifetime.
+pub struct KernelEntryStacks {
+    rsp0: Vec<u8>,
+    syscall: Vec<u8>,
+}
+
+impl KernelEntryStacks {
+    fn try_new() -> Result<Self, ()> {
+        fn stack() -> Result<Vec<u8>, ()> {
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(KERNEL_ENTRY_STACK_SIZE + 64)
+                .map_err(|_| ())?;
+            bytes.resize(KERNEL_ENTRY_STACK_SIZE + 64, 0);
+            Ok(bytes)
+        }
+        Ok(Self {
+            rsp0: stack()?,
+            syscall: stack()?,
+        })
+    }
+
+    fn aligned_top(bytes: &[u8]) -> u64 {
+        let end = bytes.as_ptr() as usize + bytes.len();
+        (end & !0x3f) as u64
+    }
+
+    pub fn tops(&self) -> crate::arch::UserEntryStackTops {
+        crate::arch::UserEntryStackTops {
+            rsp0: Self::aligned_top(&self.rsp0),
+            syscall: Self::aligned_top(&self.syscall),
+        }
+    }
+}
+
 /// CPU, stack, blocking, and scheduler state for one independently identified thread.
 pub struct Thread {
     context: UserContext,
     layout: ProcessLayout,
+    entry_stacks: KernelEntryStacks,
     state: ThreadState,
+    detached: bool,
+    join_claimed_by: Option<ThreadId>,
+    wake_permit: bool,
+    scheduling_class: SchedulingClass,
+    effective_class: SchedulingClass,
+    scheduler_budget_remaining_ns: u64,
+    scheduler_metrics: SchedulerMetrics,
     preemption_count: u64,
     cpu_time_ns: u64,
     blocked_syscall: Option<BlockedSyscall>,
@@ -995,6 +1081,18 @@ impl Thread {
     pub const fn preemption_count(&self) -> u64 {
         self.preemption_count
     }
+
+    pub const fn scheduling_class(&self) -> SchedulingClass {
+        self.scheduling_class
+    }
+
+    pub const fn scheduler_metrics(&self) -> SchedulerMetrics {
+        self.scheduler_metrics
+    }
+
+    pub fn entry_stack_tops(&self) -> crate::arch::UserEntryStackTops {
+        self.entry_stacks.tops()
+    }
 }
 
 struct ThreadSlot {
@@ -1002,23 +1100,87 @@ struct ThreadSlot {
     thread: Option<Thread>,
 }
 
-/// Process-owned generation table. The first milestone deliberately limits a process
-/// to one live thread while making thread identity and scheduler ownership explicit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreparedThreadSlot {
+    id: ThreadId,
+    append: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThreadTableError {
+    Full,
+    OutOfMemory,
+}
+
+/// Process-owned generation table for live and joinable terminal threads.
 struct ThreadTable {
-    slots: [ThreadSlot; 1],
+    slots: Vec<ThreadSlot>,
+    next_slot: usize,
+    len: usize,
+    live: usize,
 }
 
 impl ThreadTable {
     fn with_main(thread: Thread) -> (Self, ThreadId) {
+        let mut slots = Vec::new();
+        slots.push(ThreadSlot {
+            generation: 1,
+            thread: Some(thread),
+        });
         (
             Self {
-                slots: [ThreadSlot {
-                    generation: 1,
-                    thread: Some(thread),
-                }],
+                slots,
+                next_slot: 0,
+                len: 1,
+                live: 1,
             },
-            ThreadId::from_parts(0, 1),
+            MAIN_THREAD_ID,
         )
+    }
+
+    fn prepare_insert(&mut self) -> Result<PreparedThreadSlot, ThreadTableError> {
+        if self.len >= MAX_THREADS_PER_PROCESS {
+            return Err(ThreadTableError::Full);
+        }
+        if let Some((index, slot)) = self
+            .slots
+            .iter()
+            .enumerate()
+            .find(|(_, slot)| slot.generation != 0 && slot.thread.is_none())
+        {
+            return Ok(PreparedThreadSlot {
+                id: ThreadId::from_parts(index as u32, slot.generation),
+                append: false,
+            });
+        }
+        if self.slots.len() > u32::MAX as usize {
+            return Err(ThreadTableError::Full);
+        }
+        self.slots
+            .try_reserve(1)
+            .map_err(|_| ThreadTableError::OutOfMemory)?;
+        Ok(PreparedThreadSlot {
+            id: ThreadId::from_parts(self.slots.len() as u32, 1),
+            append: true,
+        })
+    }
+
+    fn insert_prepared(&mut self, prepared: PreparedThreadSlot, thread: Thread) -> ThreadId {
+        if prepared.append {
+            debug_assert_eq!(prepared.id.slot() as usize, self.slots.len());
+            self.slots.push(ThreadSlot {
+                generation: prepared.id.generation(),
+                thread: Some(thread),
+            });
+        } else {
+            let slot = &mut self.slots[prepared.id.slot() as usize];
+            assert_eq!(slot.generation, prepared.id.generation());
+            assert!(slot.thread.is_none());
+            slot.thread = Some(thread);
+        }
+        self.len += 1;
+        self.live += 1;
+        prepared.id
     }
 
     fn get(&self, id: ThreadId) -> Option<&Thread> {
@@ -1034,6 +1196,58 @@ impl ThreadTable {
             .then(|| slot.thread.as_mut())
             .flatten()
     }
+
+    fn mark_terminal(&mut self, id: ThreadId) -> bool {
+        let Some(thread) = self.get(id) else {
+            return false;
+        };
+        if !thread.state.is_terminal() {
+            self.live = self.live.saturating_sub(1);
+        }
+        true
+    }
+
+    fn remove(&mut self, id: ThreadId) -> Option<Thread> {
+        let slot = self.slots.get_mut(id.slot() as usize)?;
+        if !id.is_valid() || slot.generation != id.generation() {
+            return None;
+        }
+        let thread = slot.thread.take()?;
+        self.len -= 1;
+        if !thread.state.is_terminal() {
+            self.live = self.live.saturating_sub(1);
+        }
+        slot.generation = slot.generation.checked_add(1).unwrap_or(0);
+        Some(thread)
+    }
+
+    fn next_schedulable(&mut self) -> Option<ThreadId> {
+        if self.live == 0 || self.slots.is_empty() {
+            return None;
+        }
+        self.next_slot %= self.slots.len();
+        for _ in 0..self.slots.len() {
+            let index = self.next_slot;
+            self.next_slot = (index + 1) % self.slots.len();
+            let slot = &self.slots[index];
+            if slot
+                .thread
+                .as_ref()
+                .is_some_and(|thread| !thread.state.is_terminal())
+            {
+                return Some(ThreadId::from_parts(index as u32, slot.generation));
+            }
+        }
+        None
+    }
+
+    fn any_runnable(&self) -> bool {
+        self.slots.iter().any(|slot| {
+            slot.thread
+                .as_ref()
+                .is_some_and(|thread| thread.state.is_runnable())
+        })
+    }
 }
 
 /// Process-wide protection, authority, resource, and thread ownership state.
@@ -1041,6 +1255,9 @@ pub struct Process {
     address_space: Option<AddressSpace>,
     threads: ThreadTable,
     main_thread_id: ThreadId,
+    main_layout: ProcessLayout,
+    retirement_context: UserContext,
+    terminal_state: Option<ProcessState>,
     handles: Option<HandleTable>,
     application_data: Option<Handle>,
     control: Option<ProcessControl>,
@@ -1051,6 +1268,7 @@ pub struct Process {
     // than releasing backing which may still have a live userspace alias.
     retained_failed_mapping_leases: Option<Vec<SharedMemoryMappingLease>>,
     next_mapping_cursor: u64,
+    next_thread_stack_cursor: u64,
     next_anonymous_reservation_id: u64,
     next_file_backing_id: u64,
     #[cfg(test)]
@@ -1305,10 +1523,28 @@ impl Process {
             .saturating_add(layout.initial_stack_size() / PAGE_SIZE);
         let context = UserContext::new(image.entry, layout.stack_top);
         debug_assert_eq!(context.rsp & 0xf, 0);
+        let entry_stacks = match KernelEntryStacks::try_new() {
+            Ok(stacks) => stacks,
+            Err(()) => {
+                return reclaim_failed_construction(
+                    address_space,
+                    allocator,
+                    ProcessCreateError::OutOfMemory,
+                )
+            }
+        };
         let (threads, main_thread_id) = ThreadTable::with_main(Thread {
             context,
             layout,
+            entry_stacks,
             state: ThreadState::Ready,
+            detached: false,
+            join_claimed_by: None,
+            wake_permit: false,
+            scheduling_class: SchedulingClass::Normal,
+            effective_class: SchedulingClass::Normal,
+            scheduler_budget_remaining_ns: 0,
+            scheduler_metrics: SchedulerMetrics::default(),
             preemption_count: 0,
             cpu_time_ns: 0,
             blocked_syscall: None,
@@ -1318,6 +1554,9 @@ impl Process {
             address_space: Some(address_space),
             threads,
             main_thread_id,
+            main_layout: layout,
+            retirement_context: context,
+            terminal_state: None,
             handles: Some(HandleTable::new()),
             application_data: None,
             control: None,
@@ -1330,6 +1569,7 @@ impl Process {
                     .map(|values| values[2] % MAPPING_ASLR_SLOTS)
                     .unwrap_or(0)
                     * PAGE_SIZE,
+            next_thread_stack_cursor: layout.stack_guard_start,
             next_anonymous_reservation_id: 1,
             next_file_backing_id: 1,
             #[cfg(test)]
@@ -1343,12 +1583,19 @@ impl Process {
         })
     }
 
-    pub fn layout(&self) -> ProcessLayout {
-        self.main_thread().layout
+    pub const fn layout(&self) -> ProcessLayout {
+        self.main_layout
     }
 
     pub fn state(&self) -> ProcessState {
-        self.main_thread().state.process_state()
+        if let Some(state) = self.terminal_state {
+            return state;
+        }
+        if self.threads.any_runnable() {
+            ProcessState::Ready
+        } else {
+            ProcessState::Blocked
+        }
     }
 
     pub const fn main_thread_id(&self) -> ThreadId {
@@ -1371,8 +1618,30 @@ impl Process {
         self.thread(id).map(|thread| &thread.context)
     }
 
+    pub fn thread_entry_stack_tops(&self, id: ThreadId) -> Option<crate::arch::UserEntryStackTops> {
+        self.thread(id).map(Thread::entry_stack_tops)
+    }
+
     pub fn thread_context_mut(&mut self, id: ThreadId) -> Option<&mut UserContext> {
         self.thread_mut(id).map(|thread| &mut thread.context)
+    }
+
+    pub fn record_retirement_context(&mut self, id: ThreadId, context: UserContext) {
+        if id == self.main_thread_id {
+            self.retirement_context = context;
+        }
+    }
+
+    pub fn thread_ids(&self) -> impl Iterator<Item = ThreadId> + '_ {
+        self.threads
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                slot.thread
+                    .as_ref()
+                    .map(|_| ThreadId::from_parts(index as u32, slot.generation))
+            })
     }
 
     pub fn record_thread_cpu_time(&mut self, id: ThreadId, elapsed_ns: u64) -> bool {
@@ -1384,12 +1653,281 @@ impl Process {
         true
     }
 
+    pub fn thread_scheduling_class(&self, id: ThreadId) -> Option<SchedulingClass> {
+        self.thread(id).map(Thread::scheduling_class)
+    }
+
+    pub fn thread_scheduler_data(
+        &self,
+        id: ThreadId,
+    ) -> Option<(
+        SchedulingClass,
+        SchedulingClass,
+        u64,
+        SchedulerMetrics,
+        ThreadState,
+    )> {
+        self.thread(id).map(|thread| {
+            (
+                thread.scheduling_class,
+                thread.effective_class,
+                thread.scheduler_budget_remaining_ns,
+                thread.scheduler_metrics,
+                thread.state,
+            )
+        })
+    }
+
+    pub fn set_thread_scheduling_class(
+        &mut self,
+        id: ThreadId,
+        class: SchedulingClass,
+    ) -> Result<(), Status> {
+        if !matches!(class, SchedulingClass::Normal | SchedulingClass::Background) {
+            return Err(Status::AccessDenied);
+        }
+        self.thread_mut(id)
+            .ok_or(Status::InvalidHandle)?
+            .scheduling_class = class;
+        Ok(())
+    }
+
+    pub fn set_thread_scheduling_class_by_kernel(
+        &mut self,
+        id: ThreadId,
+        class: SchedulingClass,
+    ) -> Result<(), Status> {
+        self.thread_mut(id)
+            .ok_or(Status::InvalidHandle)?
+            .scheduling_class = class;
+        Ok(())
+    }
+
+    pub fn record_scheduler_snapshot(&mut self, id: ThreadId, snapshot: ThreadSnapshot) {
+        if let Some(thread) = self.thread_mut(id) {
+            thread.effective_class = snapshot.effective_class;
+            thread.scheduler_budget_remaining_ns = snapshot.budget_remaining_ns;
+            thread.scheduler_metrics = snapshot.metrics;
+        }
+    }
+
     pub fn record_thread_preemption(&mut self, id: ThreadId) -> bool {
         let Some(thread) = self.thread_mut(id) else {
             return false;
         };
         thread.preemption_count = thread.preemption_count.saturating_add(1);
         true
+    }
+
+    fn find_thread_stack_top(&self, stack_size: u64) -> Option<u64> {
+        let extent = stack_size.checked_add(PAGE_SIZE)?;
+        let mut top = self.main_layout.stack_guard_start;
+        loop {
+            let bottom = top.checked_sub(extent)?;
+            if bottom < SHARED_MAPPING_BASE {
+                return None;
+            }
+            let overlap = self
+                .vmas()
+                .iter()
+                .rev()
+                .find(|area| area.start < top && area.end > bottom);
+            match overlap {
+                Some(area) => top = area.start,
+                None => return Some(top),
+            }
+        }
+    }
+
+    pub fn create_thread(
+        &mut self,
+        entry: u64,
+        argument: u64,
+        requested_stack_size: u64,
+        tls_base: u64,
+        allocator: &mut UsableFrameAllocator<'_>,
+    ) -> Result<ThreadId, ThreadCreateError> {
+        if self.terminal_state.is_some() {
+            return Err(ThreadCreateError::ResourceLimit);
+        }
+        self.address_space()
+            .validate_user_range(entry, 1, UserAccess::Execute)
+            .map_err(|_| ThreadCreateError::InvalidEntry)?;
+        if tls_base != 0 && !Self::is_user_virtual_address(tls_base) {
+            return Err(ThreadCreateError::InvalidTls);
+        }
+        let stack_size = if requested_stack_size == 0 {
+            USER_STACK_MAX_SIZE
+        } else {
+            align_up(requested_stack_size, PAGE_SIZE).ok_or(ThreadCreateError::InvalidStack)?
+        };
+        if !(USER_STACK_INITIAL_SIZE..=USER_STACK_MAX_SIZE).contains(&stack_size) {
+            return Err(ThreadCreateError::InvalidStack);
+        }
+        let prepared = self.threads.prepare_insert().map_err(|error| match error {
+            ThreadTableError::Full => ThreadCreateError::ResourceLimit,
+            ThreadTableError::OutOfMemory => ThreadCreateError::OutOfMemory,
+        })?;
+        let stack_top = self
+            .find_thread_stack_top(stack_size)
+            .ok_or(ThreadCreateError::ResourceLimit)?;
+        let layout = ProcessLayout::for_stack(stack_top, stack_size);
+        let committed_pages = layout.initial_stack_size() / PAGE_SIZE;
+        let new_private_pages = self
+            .usage
+            .private_pages
+            .checked_add(committed_pages)
+            .filter(|pages| *pages <= self.limits.private_pages)
+            .ok_or(ThreadCreateError::ResourceLimit)?;
+        let reserved = stack_size
+            .checked_add(PAGE_SIZE)
+            .and_then(|bytes| self.usage.reserved_virtual_bytes.checked_add(bytes))
+            .filter(|bytes| *bytes <= self.limits.reserved_virtual_bytes)
+            .ok_or(ThreadCreateError::ResourceLimit)?;
+        let mut planned = plan_vma_insert(
+            self.vmas(),
+            VmArea {
+                start: layout.stack_guard_start,
+                end: layout.stack_bottom,
+                kind: VmAreaKind::StackGuard { owner: prepared.id },
+                protection: MapProtection::empty(),
+            },
+        )
+        .map_err(map_thread_vma_error)?;
+        if layout.stack_bottom < layout.stack_initial_bottom {
+            planned = plan_vma_insert(
+                &planned,
+                VmArea {
+                    start: layout.stack_bottom,
+                    end: layout.stack_initial_bottom,
+                    kind: VmAreaKind::Stack {
+                        owner: prepared.id,
+                        committed: false,
+                    },
+                    protection: MapProtection::READ | MapProtection::WRITE,
+                },
+            )
+            .map_err(map_thread_vma_error)?;
+        }
+        planned = plan_vma_insert(
+            &planned,
+            VmArea {
+                start: layout.stack_initial_bottom,
+                end: layout.stack_top,
+                kind: VmAreaKind::Stack {
+                    owner: prepared.id,
+                    committed: true,
+                },
+                protection: MapProtection::READ | MapProtection::WRITE,
+            },
+        )
+        .map_err(map_thread_vma_error)?;
+        if planned.len() as u64 > self.limits.vma_count {
+            return Err(ThreadCreateError::ResourceLimit);
+        }
+        let entry_stacks =
+            KernelEntryStacks::try_new().map_err(|_| ThreadCreateError::OutOfMemory)?;
+        self.address_space_mut()
+            .preflight_owned_user_mappings(committed_pages as usize)
+            .map_err(ThreadCreateError::AddressSpace)?;
+        let mut mapped = 0usize;
+        let mapped_len = layout.initial_stack_size() as usize;
+        while mapped < mapped_len {
+            let address = layout.stack_initial_bottom + mapped as u64;
+            if let Err(error) = self.address_space_mut().map_zeroed_user_4k(
+                address,
+                UserPagePermissions::READ_WRITE,
+                allocator,
+            ) {
+                if mapped != 0
+                    && self
+                        .address_space_mut()
+                        .unmap_user_range(layout.stack_initial_bottom, mapped)
+                        .is_err()
+                {
+                    return Err(ThreadCreateError::RollbackFailed);
+                }
+                if self
+                    .address_space_mut()
+                    .reclaim_retired_data_frames(allocator)
+                    .is_err()
+                {
+                    return Err(ThreadCreateError::RollbackFailed);
+                }
+                return Err(ThreadCreateError::AddressSpace(error));
+            }
+            mapped += PAGE_SIZE as usize;
+        }
+        let initial_rsp = layout
+            .stack_top
+            .checked_sub(8)
+            .ok_or(ThreadCreateError::InvalidStack)?;
+        // Every newly mapped stack page is zero-filled, so the synthetic return
+        // address at `initial_rsp` is already zero without requiring the child CR3.
+        let mut context = UserContext::new(entry, initial_rsp);
+        context.fs_base = tls_base;
+        context.rdi = argument;
+        let id = self.threads.insert_prepared(
+            prepared,
+            Thread {
+                context,
+                layout,
+                entry_stacks,
+                state: ThreadState::Ready,
+                detached: false,
+                join_claimed_by: None,
+                wake_permit: false,
+                scheduling_class: SchedulingClass::Normal,
+                effective_class: SchedulingClass::Normal,
+                scheduler_budget_remaining_ns: 0,
+                scheduler_metrics: SchedulerMetrics::default(),
+                preemption_count: 0,
+                cpu_time_ns: 0,
+                blocked_syscall: None,
+            },
+        );
+        *self.vmas.as_mut().expect("live process lost its VMA table") = planned;
+        self.usage.private_pages = new_private_pages;
+        self.usage.reserved_virtual_bytes = reserved;
+        self.next_thread_stack_cursor = self.next_thread_stack_cursor.min(layout.stack_guard_start);
+        Ok(id)
+    }
+
+    pub fn abort_thread_create(
+        &mut self,
+        id: ThreadId,
+        allocator: &mut UsableFrameAllocator<'_>,
+    ) -> Result<(), ThreadCreateError> {
+        let layout = self
+            .thread(id)
+            .map(|thread| thread.layout)
+            .ok_or(ThreadCreateError::InvalidStack)?;
+        let planned = plan_thread_stack_remove(self.vmas(), id).map_err(map_thread_vma_error)?;
+        self.address_space_mut()
+            .unmap_user_range(
+                layout.stack_initial_bottom,
+                layout.initial_stack_size() as usize,
+            )
+            .map_err(|_| ThreadCreateError::RollbackFailed)?;
+        self.address_space_mut()
+            .reclaim_retired_data_frames(allocator)
+            .map_err(|_| ThreadCreateError::RollbackFailed)?;
+        self.threads
+            .remove(id)
+            .ok_or(ThreadCreateError::InvalidStack)?;
+        *self.vmas.as_mut().expect("live process lost its VMA table") = planned;
+        self.usage.private_pages = self
+            .usage
+            .private_pages
+            .saturating_sub(layout.initial_stack_size() / PAGE_SIZE);
+        self.usage.reserved_virtual_bytes = self
+            .usage
+            .reserved_virtual_bytes
+            .saturating_sub(layout.stack_size().saturating_add(PAGE_SIZE));
+        if self.next_thread_stack_cursor == layout.stack_guard_start {
+            self.next_thread_stack_cursor = layout.stack_top;
+        }
+        Ok(())
     }
 
     fn main_thread(&self) -> &Thread {
@@ -1436,9 +1974,20 @@ impl Process {
     }
 
     pub fn mark_terminated(&mut self) {
-        let thread = self.main_thread_mut();
-        thread.blocked_syscall = None;
-        thread.state = ThreadState::Terminated;
+        if self.terminal_state.is_some() {
+            return;
+        }
+        for slot in &mut self.threads.slots {
+            let Some(thread) = slot.thread.as_mut() else {
+                continue;
+            };
+            if !thread.state.is_terminal() {
+                thread.blocked_syscall = None;
+                thread.state = ThreadState::Terminated;
+            }
+        }
+        self.threads.live = 0;
+        self.terminal_state = Some(ProcessState::Terminated);
         if let Some(control) = &self.control {
             control.mark_terminated();
         }
@@ -1467,7 +2016,7 @@ impl Process {
     }
 
     pub fn is_runnable(&self) -> bool {
-        self.main_thread().state.is_runnable()
+        self.terminal_state.is_none() && self.threads.any_runnable()
     }
 
     pub const fn limits(&self) -> ProcessLimits {
@@ -1502,7 +2051,9 @@ impl Process {
                     details.committed_anonymous_pages =
                         details.committed_anonymous_pages.saturating_add(pages);
                 }
-                VmAreaKind::Stack { committed: true } => {
+                VmAreaKind::Stack {
+                    committed: true, ..
+                } => {
                     details.committed_stack_pages =
                         details.committed_stack_pages.saturating_add(pages);
                 }
@@ -1515,8 +2066,10 @@ impl Process {
                 VmAreaKind::Anonymous {
                     committed: false, ..
                 }
-                | VmAreaKind::Stack { committed: false }
-                | VmAreaKind::StackGuard
+                | VmAreaKind::Stack {
+                    committed: false, ..
+                }
+                | VmAreaKind::StackGuard { .. }
                 | VmAreaKind::Shared { .. }
                 | VmAreaKind::FileBacked {
                     committed: false, ..
@@ -1554,8 +2107,9 @@ impl Process {
     /// their original page-fault code and address. Resource exhaustion is attributed
     /// only to this process; allocator invariants and rollback failures quarantine it
     /// with a stable `Other` fault rather than panicking the kernel.
-    pub fn resolve_user_page_fault(
+    pub fn resolve_thread_user_page_fault(
         &mut self,
+        thread_id: ThreadId,
         fault_address: u64,
         error_code: u64,
         user_rsp: u64,
@@ -1578,10 +2132,13 @@ impl Process {
         }
 
         let fault_page = fault_address & !(PAGE_SIZE - 1);
-        let Some(committed_bottom) = self.stack_committed_bottom() else {
+        let Some(committed_bottom) = self.stack_committed_bottom(thread_id) else {
             return self.stack_growth_invariant_fault(fault_address);
         };
-        if fault_page < self.layout().stack_bottom || fault_page >= committed_bottom {
+        let Some(layout) = self.thread(thread_id).map(|thread| thread.layout) else {
+            return page_fault();
+        };
+        if fault_page < layout.stack_bottom || fault_page >= committed_bottom {
             return page_fault();
         }
 
@@ -1602,12 +2159,13 @@ impl Process {
                 fault_address,
             ));
         }
-        let planned_vmas = match plan_stack_growth(self.vmas(), fault_page, committed_bottom) {
-            Ok(planned) => planned,
-            Err(error) => {
-                return stack_growth_planning_fault(error, error_code, fault_address);
-            }
-        };
+        let planned_vmas =
+            match plan_stack_growth(self.vmas(), thread_id, fault_page, committed_bottom) {
+                Ok(planned) => planned,
+                Err(error) => {
+                    return stack_growth_planning_fault(error, error_code, fault_address);
+                }
+            };
 
         let mut mapped = 0usize;
         let mapped_len = (committed_bottom - fault_page) as usize;
@@ -1670,11 +2228,14 @@ impl Process {
         UserPageFaultResolution::Resolved { pages }
     }
 
-    fn stack_committed_bottom(&self) -> Option<u64> {
+    fn stack_committed_bottom(&self, thread_id: ThreadId) -> Option<u64> {
         self.vmas()
             .iter()
             .filter_map(|vma| match vma.kind {
-                VmAreaKind::Stack { committed: true } => Some(vma.start),
+                VmAreaKind::Stack {
+                    owner,
+                    committed: true,
+                } if owner == thread_id => Some(vma.start),
                 _ => None,
             })
             .min()
@@ -1738,8 +2299,10 @@ impl Process {
         thread.preemption_count = thread.preemption_count.saturating_add(1);
     }
 
-    pub(crate) fn block_wait_many(&mut self, wait: PendingWaitMany) {
-        let thread = self.main_thread_mut();
+    pub(crate) fn block_thread_wait_many(&mut self, thread_id: ThreadId, wait: PendingWaitMany) {
+        let thread = self
+            .thread_mut(thread_id)
+            .expect("wait caller thread disappeared");
         assert_eq!(
             thread.state,
             ThreadState::Ready,
@@ -1753,15 +2316,18 @@ impl Process {
         thread.state = ThreadState::Blocked;
     }
 
-    pub(crate) fn blocked_wait_many_parts(&mut self) -> (&HandleTable, &mut PendingWaitMany) {
+    pub(crate) fn blocked_thread_wait_many_parts(
+        &mut self,
+        thread_id: ThreadId,
+    ) -> (&HandleTable, &mut PendingWaitMany) {
         let handles =
             self.handles
                 .as_ref()
                 .expect("live process lost its handle table") as *const HandleTable;
         let thread = self
             .threads
-            .get_mut(self.main_thread_id)
-            .expect("live process lost its main thread");
+            .get_mut(thread_id)
+            .expect("blocked thread disappeared");
         assert_eq!(thread.state, ThreadState::Blocked, "thread is not blocked");
         let wait = match thread
             .blocked_syscall
@@ -1769,14 +2335,19 @@ impl Process {
             .expect("blocked thread lost its syscall continuation")
         {
             BlockedSyscall::WaitMany(wait) => wait,
+            BlockedSyscall::Sleep(_) | BlockedSyscall::Join(_) => {
+                panic!("blocked thread does not own a wait-many continuation")
+            }
         };
         // SAFETY: `handles` and `threads` are disjoint fields and neither is moved
         // while the returned borrows are live.
         (unsafe { &*handles }, wait)
     }
 
-    pub(crate) fn take_blocked_wait_many(&mut self) -> PendingWaitMany {
-        let thread = self.main_thread_mut();
+    pub(crate) fn take_blocked_thread_wait_many(&mut self, thread_id: ThreadId) -> PendingWaitMany {
+        let thread = self
+            .thread_mut(thread_id)
+            .expect("blocked thread disappeared");
         assert_eq!(thread.state, ThreadState::Blocked, "thread is not blocked");
         match thread
             .blocked_syscall
@@ -1784,11 +2355,16 @@ impl Process {
             .expect("blocked thread lost its syscall continuation")
         {
             BlockedSyscall::WaitMany(wait) => wait,
+            BlockedSyscall::Sleep(_) | BlockedSyscall::Join(_) => {
+                panic!("blocked thread does not own a wait-many continuation")
+            }
         }
     }
 
-    pub(crate) fn resume_from_block(&mut self) {
-        let thread = self.main_thread_mut();
+    pub(crate) fn resume_thread_from_block(&mut self, thread_id: ThreadId) {
+        let thread = self
+            .thread_mut(thread_id)
+            .expect("blocked thread disappeared");
         assert_eq!(thread.state, ThreadState::Blocked, "thread is not blocked");
         assert!(
             thread.blocked_syscall.is_none(),
@@ -1797,18 +2373,399 @@ impl Process {
         thread.state = ThreadState::Ready;
     }
 
-    pub fn mark_exited(&mut self, code: i32) {
-        let thread = self.main_thread_mut();
-        thread.blocked_syscall = None;
+    #[cfg(test)]
+    pub(crate) fn block_wait_many(&mut self, wait: PendingWaitMany) {
+        self.block_thread_wait_many(self.main_thread_id, wait);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_blocked_wait_many(&mut self) -> PendingWaitMany {
+        self.take_blocked_thread_wait_many(self.main_thread_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resume_from_block(&mut self) {
+        self.resume_thread_from_block(self.main_thread_id);
+    }
+
+    #[cfg(test)]
+    pub fn resolve_user_page_fault(
+        &mut self,
+        fault_address: u64,
+        error_code: u64,
+        user_rsp: u64,
+        allocator: &mut UsableFrameAllocator<'_>,
+    ) -> UserPageFaultResolution {
+        self.resolve_thread_user_page_fault(
+            self.main_thread_id,
+            fault_address,
+            error_code,
+            user_rsp,
+            allocator,
+        )
+    }
+
+    pub fn exit_thread(&mut self, thread_id: ThreadId, code: i32) -> bool {
+        if self.terminal_state.is_some() || !self.threads.mark_terminal(thread_id) {
+            return false;
+        }
+        self.cancel_blocked_syscall(thread_id);
+        let thread = self
+            .thread_mut(thread_id)
+            .expect("validated thread disappeared during exit");
         thread.state = ThreadState::Exited(code);
+        if self.threads.live == 0 {
+            self.terminal_state = Some(ProcessState::Exited(code));
+            self.publish_terminal_status();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn sleep_thread(
+        &mut self,
+        thread_id: ThreadId,
+        deadline_ns: u64,
+        now_ns: u64,
+    ) -> Result<bool, Status> {
+        let thread = self.thread_mut(thread_id).ok_or(Status::InvalidHandle)?;
+        if thread.state.is_terminal() {
+            return Err(Status::InvalidHandle);
+        }
+        if deadline_ns <= now_ns {
+            return Ok(false);
+        }
+        if thread.wake_permit {
+            thread.wake_permit = false;
+            return Ok(false);
+        }
+        if thread.state != ThreadState::Ready || thread.blocked_syscall.is_some() {
+            return Err(Status::InvalidArgument);
+        }
+        thread.blocked_syscall = Some(BlockedSyscall::Sleep(PendingSleep { deadline_ns }));
+        thread.state = ThreadState::Blocked;
+        Ok(true)
+    }
+
+    pub fn wake_thread(&mut self, thread_id: ThreadId) -> Result<(), Status> {
+        let thread = self.thread_mut(thread_id).ok_or(Status::InvalidHandle)?;
+        if thread.state.is_terminal() {
+            return Err(Status::InvalidHandle);
+        }
+        if matches!(thread.blocked_syscall, Some(BlockedSyscall::Sleep(_))) {
+            thread.blocked_syscall = None;
+            thread
+                .context
+                .set_syscall_return(Status::Ok.raw() as i64 as u64);
+            thread.state = ThreadState::Ready;
+        } else {
+            thread.wake_permit = true;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn blocked_kind(&self, thread_id: ThreadId) -> Option<BlockedKind> {
+        match self.thread(thread_id)?.blocked_syscall.as_ref()? {
+            BlockedSyscall::WaitMany(_) => Some(BlockedKind::WaitMany),
+            BlockedSyscall::Sleep(_) => Some(BlockedKind::Sleep),
+            BlockedSyscall::Join(_) => Some(BlockedKind::Join),
+        }
+    }
+
+    pub fn poll_sleep(&mut self, thread_id: ThreadId, now_ns: u64) -> Option<bool> {
+        let thread = self.thread_mut(thread_id)?;
+        match thread.blocked_syscall.as_ref()? {
+            BlockedSyscall::Sleep(sleep) => Some(now_ns >= sleep.deadline_ns),
+            BlockedSyscall::WaitMany(_) | BlockedSyscall::Join(_) => None,
+        }
+    }
+
+    pub fn complete_sleep(&mut self, thread_id: ThreadId) -> Result<(), Status> {
+        let thread = self.thread_mut(thread_id).ok_or(Status::InvalidHandle)?;
+        if !matches!(thread.blocked_syscall, Some(BlockedSyscall::Sleep(_))) {
+            return Err(Status::InvalidArgument);
+        }
+        thread.blocked_syscall = None;
+        thread
+            .context
+            .set_syscall_return(Status::Ok.raw() as i64 as u64);
+        thread.state = ThreadState::Ready;
+        Ok(())
+    }
+
+    pub(crate) fn start_join(
+        &mut self,
+        caller: ThreadId,
+        target: ThreadId,
+        deadline: WaitDeadline,
+        output_address: u64,
+        now_ns: u64,
+    ) -> Result<bool, Status> {
+        if caller == target {
+            return Err(Status::InvalidArgument);
+        }
+        let target_thread = self.thread(target).ok_or(Status::InvalidHandle)?;
+        if target_thread.detached {
+            return Err(Status::InvalidArgument);
+        }
+        if target_thread.join_claimed_by.is_some() {
+            return Err(Status::AlreadyExists);
+        }
+        if target_thread.state.is_terminal() {
+            return Ok(false);
+        }
+        if deadline.is_expired(now_ns) {
+            return Err(Status::TimedOut);
+        }
+        self.thread_mut(target)
+            .expect("join target disappeared")
+            .join_claimed_by = Some(caller);
+        let caller_thread = self.thread_mut(caller).ok_or(Status::InvalidHandle)?;
+        if caller_thread.state != ThreadState::Ready || caller_thread.blocked_syscall.is_some() {
+            self.thread_mut(target)
+                .expect("join target disappeared during rollback")
+                .join_claimed_by = None;
+            return Err(Status::InvalidArgument);
+        }
+        caller_thread.blocked_syscall = Some(BlockedSyscall::Join(PendingJoin {
+            target,
+            deadline,
+            output_address,
+            completion: None,
+        }));
+        caller_thread.state = ThreadState::Blocked;
+        Ok(true)
+    }
+
+    pub(crate) fn poll_join(&mut self, caller: ThreadId, now_ns: u64) -> Option<bool> {
+        let (target, deadline, already_complete) = {
+            let thread = self.thread(caller)?;
+            let BlockedSyscall::Join(join) = thread.blocked_syscall.as_ref()? else {
+                return None;
+            };
+            (join.target, join.deadline, join.completion.is_some())
+        };
+        if already_complete {
+            return Some(true);
+        }
+        let completion = if self
+            .thread(target)
+            .is_some_and(|thread| thread.state.is_terminal())
+        {
+            Some(Status::Ok)
+        } else if deadline.is_expired(now_ns) {
+            Some(Status::TimedOut)
+        } else {
+            None
+        };
+        if let Some(status) = completion {
+            if status != Status::Ok {
+                if let Some(target_thread) = self.thread_mut(target) {
+                    if target_thread.join_claimed_by == Some(caller) {
+                        target_thread.join_claimed_by = None;
+                    }
+                }
+            }
+            let caller_thread = self.thread_mut(caller)?;
+            let BlockedSyscall::Join(join) = caller_thread.blocked_syscall.as_mut()? else {
+                return None;
+            };
+            join.completion = Some(status);
+            Some(true)
+        } else {
+            Some(false)
+        }
+    }
+
+    pub(crate) fn take_completed_join(&mut self, caller: ThreadId) -> Result<PendingJoin, Status> {
+        let thread = self.thread_mut(caller).ok_or(Status::InvalidHandle)?;
+        let Some(BlockedSyscall::Join(join)) = thread.blocked_syscall.take() else {
+            return Err(Status::InvalidArgument);
+        };
+        if join.completion.is_none() {
+            thread.blocked_syscall = Some(BlockedSyscall::Join(join));
+            return Err(Status::ShouldWait);
+        }
+        Ok(join)
+    }
+
+    pub(crate) fn release_join_claim(&mut self, target: ThreadId, caller: ThreadId) {
+        if let Some(thread) = self.thread_mut(target) {
+            if thread.join_claimed_by == Some(caller) {
+                thread.join_claimed_by = None;
+            }
+        }
+    }
+
+    fn cancel_blocked_syscall(&mut self, thread_id: ThreadId) {
+        let blocked = self
+            .thread_mut(thread_id)
+            .and_then(|thread| thread.blocked_syscall.take());
+        if let Some(BlockedSyscall::Join(join)) = blocked {
+            self.release_join_claim(join.target, thread_id);
+        }
+    }
+
+    pub(crate) fn finish_join(&mut self, caller: ThreadId) -> Result<(), Status> {
+        let thread = self.thread_mut(caller).ok_or(Status::InvalidHandle)?;
+        thread.state = ThreadState::Ready;
+        Ok(())
+    }
+
+    pub fn thread_is_detached_terminal(&self, target: ThreadId) -> bool {
+        self.thread(target)
+            .is_some_and(|thread| thread.detached && thread.state.is_terminal())
+    }
+
+    pub fn next_detached_terminal_thread(&self) -> Option<ThreadId> {
+        self.threads
+            .slots
+            .iter()
+            .enumerate()
+            .find_map(|(index, slot)| {
+                let thread = slot.thread.as_ref()?;
+                (thread.detached && thread.state.is_terminal())
+                    .then(|| ThreadId::from_parts(index as u32, slot.generation))
+            })
+    }
+
+    pub fn detach_thread(&mut self, target: ThreadId) -> Result<bool, Status> {
+        let thread = self.thread_mut(target).ok_or(Status::InvalidHandle)?;
+        if thread.join_claimed_by.is_some() {
+            return Err(Status::AlreadyExists);
+        }
+        thread.detached = true;
+        Ok(thread.state.is_terminal())
+    }
+
+    pub fn reap_thread(
+        &mut self,
+        target: ThreadId,
+        allocator: &mut UsableFrameAllocator<'_>,
+    ) -> Result<(), Status> {
+        let layout = self
+            .thread(target)
+            .filter(|thread| thread.state.is_terminal())
+            .map(|thread| thread.layout)
+            .ok_or(Status::InvalidHandle)?;
+        let planned =
+            plan_thread_stack_remove(self.vmas(), target).map_err(|_| Status::OutOfMemory)?;
+        let mut committed_ranges = [None; 2];
+        let mut committed_count = 0usize;
+        for area in self.vmas() {
+            if matches!(
+                area.kind,
+                VmAreaKind::Stack {
+                    owner,
+                    committed: true,
+                } if owner == target
+            ) {
+                let Some(slot) = committed_ranges.get_mut(committed_count) else {
+                    return Err(Status::InvalidAddress);
+                };
+                *slot = Some((area.start, area.length() as usize));
+                committed_count += 1;
+            }
+        }
+        for (start, length) in committed_ranges[..committed_count]
+            .iter()
+            .flatten()
+            .copied()
+        {
+            self.address_space_mut()
+                .unmap_user_range(start, length)
+                .map_err(|_| Status::InvalidAddress)?;
+        }
+        self.address_space_mut()
+            .reclaim_retired_data_frames(allocator)
+            .map_err(|_| Status::InvalidAddress)?;
+        self.threads.remove(target).ok_or(Status::InvalidHandle)?;
+        *self.vmas.as_mut().expect("live process lost its VMA table") = planned;
+        let committed_pages = committed_ranges[..committed_count]
+            .iter()
+            .flatten()
+            .fold(0u64, |total, (_, length)| {
+                total.saturating_add(*length as u64 / PAGE_SIZE)
+            });
+        self.usage.private_pages = self.usage.private_pages.saturating_sub(committed_pages);
+        self.usage.reserved_virtual_bytes = self
+            .usage
+            .reserved_virtual_bytes
+            .saturating_sub(layout.stack_size().saturating_add(PAGE_SIZE));
+        Ok(())
+    }
+
+    pub fn terminate_thread(&mut self, thread_id: ThreadId) -> Result<bool, Status> {
+        if self.terminal_state.is_some() || !self.threads.mark_terminal(thread_id) {
+            return Err(Status::InvalidHandle);
+        }
+        self.cancel_blocked_syscall(thread_id);
+        let thread = self
+            .thread_mut(thread_id)
+            .expect("validated thread disappeared during termination");
+        thread.state = ThreadState::Terminated;
+        if self.threads.live == 0 {
+            self.terminal_state = Some(ProcessState::Terminated);
+            self.publish_terminal_status();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn exit_process(&mut self, caller_id: ThreadId, code: i32) {
+        if self.terminal_state.is_some() {
+            return;
+        }
+        for slot in &mut self.threads.slots {
+            if let Some(thread) = slot.thread.as_mut() {
+                thread.blocked_syscall = None;
+                thread.join_claimed_by = None;
+                thread.state = if thread.state.is_terminal() {
+                    thread.state
+                } else {
+                    ThreadState::Terminated
+                };
+            }
+        }
+        if let Some(caller) = self.threads.get_mut(caller_id) {
+            caller.state = ThreadState::Exited(code);
+        }
+        self.threads.live = 0;
+        self.terminal_state = Some(ProcessState::Exited(code));
+        self.publish_terminal_status();
+    }
+
+    pub fn mark_exited(&mut self, code: i32) {
+        self.exit_process(self.main_thread_id, code);
+    }
+
+    pub fn fault_process(&mut self, thread_id: ThreadId, reason: ProcessFault) {
+        if self.terminal_state.is_some() {
+            return;
+        }
+        for slot in &mut self.threads.slots {
+            if let Some(thread) = slot.thread.as_mut() {
+                thread.blocked_syscall = None;
+                thread.join_claimed_by = None;
+                thread.state = if thread.state.is_terminal() {
+                    thread.state
+                } else {
+                    ThreadState::Terminated
+                };
+            }
+        }
+        if let Some(faulting) = self.threads.get_mut(thread_id) {
+            faulting.state = ThreadState::Faulted(reason);
+        }
+        self.threads.live = 0;
+        self.terminal_state = Some(ProcessState::Faulted(reason));
         self.publish_terminal_status();
     }
 
     pub fn mark_faulted(&mut self, reason: ProcessFault) {
-        let thread = self.main_thread_mut();
-        thread.blocked_syscall = None;
-        thread.state = ThreadState::Faulted(reason);
-        self.publish_terminal_status();
+        self.fault_process(self.main_thread_id, reason);
     }
 
     pub fn address_space(&self) -> &AddressSpace {
@@ -1821,6 +2778,30 @@ impl Process {
         self.address_space
             .as_mut()
             .expect("live process lost its address space")
+    }
+
+    pub fn next_schedulable_thread(&mut self) -> Option<ThreadId> {
+        self.threads.next_schedulable()
+    }
+
+    pub fn next_blocked_thread(&mut self) -> Option<ThreadId> {
+        if self.threads.slots.is_empty() {
+            return None;
+        }
+        self.threads.next_slot %= self.threads.slots.len();
+        for _ in 0..self.threads.slots.len() {
+            let index = self.threads.next_slot;
+            self.threads.next_slot = (index + 1) % self.threads.slots.len();
+            let slot = &self.threads.slots[index];
+            if slot
+                .thread
+                .as_ref()
+                .is_some_and(|thread| thread.state == ThreadState::Blocked)
+            {
+                return Some(ThreadId::from_parts(index as u32, slot.generation));
+            }
+        }
+        None
     }
 
     pub fn context(&self) -> &UserContext {
@@ -2842,7 +3823,7 @@ impl Process {
         }
 
         let final_state = self.state();
-        let context = *self.context();
+        let context = self.retirement_context;
         let address_space = self
             .address_space
             .take()
@@ -3041,7 +4022,9 @@ fn initial_vmas(
         VmArea {
             start: layout.stack_guard_start,
             end: layout.stack_bottom,
-            kind: VmAreaKind::StackGuard,
+            kind: VmAreaKind::StackGuard {
+                owner: MAIN_THREAD_ID,
+            },
             protection: MapProtection::empty(),
         },
     )
@@ -3051,7 +4034,10 @@ fn initial_vmas(
         VmArea {
             start: layout.stack_bottom,
             end: layout.stack_initial_bottom,
-            kind: VmAreaKind::Stack { committed: false },
+            kind: VmAreaKind::Stack {
+                owner: MAIN_THREAD_ID,
+                committed: false,
+            },
             protection: MapProtection::READ | MapProtection::WRITE,
         },
     )
@@ -3061,7 +4047,10 @@ fn initial_vmas(
         VmArea {
             start: layout.stack_initial_bottom,
             end: layout.stack_top,
-            kind: VmAreaKind::Stack { committed: true },
+            kind: VmAreaKind::Stack {
+                owner: MAIN_THREAD_ID,
+                committed: true,
+            },
             protection: MapProtection::READ | MapProtection::WRITE,
         },
     )
@@ -3108,6 +4097,38 @@ struct FileSegment {
     backing_id: u64,
     file_offset: u64,
     protection: MapProtection,
+}
+
+fn map_thread_vma_error(error: SharedMappingError) -> ThreadCreateError {
+    match error {
+        SharedMappingError::OutOfMemory => ThreadCreateError::OutOfMemory,
+        SharedMappingError::ResourceLimit | SharedMappingError::AlreadyMapped(_) => {
+            ThreadCreateError::ResourceLimit
+        }
+        _ => ThreadCreateError::InvalidStack,
+    }
+}
+
+fn plan_thread_stack_remove(
+    vmas: &[VmArea],
+    owner: ThreadId,
+) -> Result<Vec<VmArea>, SharedMappingError> {
+    let mut planned = Vec::new();
+    planned
+        .try_reserve_exact(vmas.len())
+        .map_err(|_| SharedMappingError::OutOfMemory)?;
+    for area in vmas.iter().copied() {
+        let belongs = matches!(
+            area.kind,
+            VmAreaKind::Stack { owner: area_owner, .. }
+                | VmAreaKind::StackGuard { owner: area_owner }
+                if area_owner == owner
+        );
+        if !belongs {
+            planned.push(area);
+        }
+    }
+    Ok(planned)
 }
 
 fn clone_vma_plan(vmas: &[VmArea]) -> Result<Vec<VmArea>, SharedMappingError> {
@@ -3204,6 +4225,7 @@ fn stack_growth_planning_fault(
 
 fn plan_stack_growth(
     vmas: &[VmArea],
+    owner: ThreadId,
     start: u64,
     end: u64,
 ) -> Result<Vec<VmArea>, SharedMappingError> {
@@ -3218,7 +4240,13 @@ fn plan_stack_growth(
             push_merged_vma(&mut planned, area)?;
             continue;
         }
-        if area.start > covered || area.kind != (VmAreaKind::Stack { committed: false }) {
+        if area.start > covered
+            || area.kind
+                != (VmAreaKind::Stack {
+                    owner,
+                    committed: false,
+                })
+        {
             return Err(SharedMappingError::ExactMappingNotFound {
                 address: start,
                 length: end - start,
@@ -3240,7 +4268,10 @@ fn plan_stack_growth(
             VmArea {
                 start: middle_start,
                 end: middle_end,
-                kind: VmAreaKind::Stack { committed: true },
+                kind: VmAreaKind::Stack {
+                    owner,
+                    committed: true,
+                },
                 ..area
             },
         )?;
@@ -3998,6 +5029,7 @@ fn align_up(value: u64, alignment: u64) -> Option<u64> {
 }
 
 pub const PROCESS_TABLE_CAPACITY: usize = 32;
+pub const USER_SCHEDULER_CAPACITY: usize = PROCESS_TABLE_CAPACITY * MAX_THREADS_PER_PROCESS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessTableError {
@@ -4193,6 +5225,30 @@ impl ProcessTable {
         self.inner.get_mut(id)
     }
 
+    pub fn thread_refs(&self) -> impl Iterator<Item = ThreadRef> + '_ {
+        self.inner
+            .slots
+            .iter()
+            .enumerate()
+            .flat_map(|(process_index, process_slot)| {
+                let process_id =
+                    ProcessId::from_parts(process_index as u32, process_slot.generation);
+                process_slot.value.iter().flat_map(move |process| {
+                    process.threads.slots.iter().enumerate().filter_map(
+                        move |(thread_index, thread_slot)| {
+                            thread_slot.thread.as_ref().map(|_| ThreadRef {
+                                process_id,
+                                thread_id: ThreadId::from_parts(
+                                    thread_index as u32,
+                                    thread_slot.generation,
+                                ),
+                            })
+                        },
+                    )
+                })
+            })
+    }
+
     /// Selects the next live thread in deterministic process-slot order.
     ///
     /// Selection includes blocked and terminal threads so the permanent runner can
@@ -4200,12 +5256,46 @@ impl ProcessTable {
     /// carried by the scheduler reference, so stale process or thread identities
     /// cannot alias replacements.
     pub fn next_thread(&mut self) -> Option<ThreadRef> {
-        let process_id = self.inner.next_id()?;
-        let thread_id = self.inner.get(process_id)?.main_thread_id();
-        Some(ThreadRef {
-            process_id,
-            thread_id,
-        })
+        let process_count = self.inner.len;
+        for _ in 0..process_count {
+            let process_id = self.inner.next_id()?;
+            let process = self.inner.get_mut(process_id)?;
+            if let Some(thread_id) = process.next_schedulable_thread() {
+                return Some(ThreadRef {
+                    process_id,
+                    thread_id,
+                });
+            }
+            if process.state().is_terminal() {
+                return Some(ThreadRef {
+                    process_id,
+                    thread_id: process.main_thread_id(),
+                });
+            }
+        }
+        None
+    }
+
+    pub fn next_blocked_or_terminal_thread(&mut self) -> Option<ThreadRef> {
+        let process_count = self.inner.len;
+        for _ in 0..process_count {
+            let process_id = self.inner.next_id()?;
+            let process = self.inner.get_mut(process_id)?;
+            if let Some(thread_id) = process.next_blocked_thread() {
+                return Some(ThreadRef {
+                    process_id,
+                    thread_id,
+                });
+            }
+            if process.state().is_terminal() {
+                let thread_id = process.thread_ids().next()?;
+                return Some(ThreadRef {
+                    process_id,
+                    thread_id,
+                });
+            }
+        }
+        None
     }
 
     /// Compatibility selector for process-inspection code and existing host tests.
@@ -4441,18 +5531,33 @@ mod tests {
             ProcessState::Faulted(fault) => ThreadState::Faulted(fault),
             ProcessState::Terminated => ThreadState::Terminated,
         };
-        let (threads, main_thread_id) = ThreadTable::with_main(Thread {
+        let (mut threads, main_thread_id) = ThreadTable::with_main(Thread {
             context: UserContext::new(0x1000, USER_STACK_TOP),
             layout: ProcessLayout::STANDARD,
+            entry_stacks: KernelEntryStacks::try_new().unwrap(),
             state: thread_state,
+            detached: false,
+            join_claimed_by: None,
+            wake_permit: false,
+            scheduling_class: SchedulingClass::Normal,
+            effective_class: SchedulingClass::Normal,
+            scheduler_budget_remaining_ns: 0,
+            scheduler_metrics: SchedulerMetrics::default(),
             preemption_count: 0,
             cpu_time_ns: 0,
             blocked_syscall: None,
         });
+        let terminal_state = state.is_terminal().then_some(state);
+        if terminal_state.is_some() {
+            threads.live = 0;
+        }
         Process {
             address_space: None,
             threads,
             main_thread_id,
+            main_layout: ProcessLayout::STANDARD,
+            retirement_context: UserContext::new(0x1000, USER_STACK_TOP),
+            terminal_state,
             handles: None,
             application_data: None,
             control: None,
@@ -4461,6 +5566,7 @@ mod tests {
             vmas: None,
             retained_failed_mapping_leases: None,
             next_mapping_cursor: SHARED_MAPPING_BASE,
+            next_thread_stack_cursor: USER_STACK_GUARD_START,
             next_anonymous_reservation_id: 1,
             next_file_backing_id: 1,
             fail_file_rollback_for_test: false,
@@ -4501,13 +5607,24 @@ mod tests {
                 0,
             ),
             (
-                VmAreaKind::Stack { committed: true },
+                VmAreaKind::Stack {
+                    owner: MAIN_THREAD_ID,
+                    committed: true,
+                },
                 VirtualAreaKind::Stack,
                 true,
                 0,
                 0,
             ),
-            (VmAreaKind::StackGuard, VirtualAreaKind::Guard, false, 0, 0),
+            (
+                VmAreaKind::StackGuard {
+                    owner: MAIN_THREAD_ID,
+                },
+                VirtualAreaKind::Guard,
+                false,
+                0,
+                0,
+            ),
             (
                 VmAreaKind::Shared {
                     object_identity: 29,
@@ -5891,6 +7008,176 @@ mod tests {
     }
 
     #[test]
+    fn real_threads_have_independent_contexts_stacks_and_round_robin_selection() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(512);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let entry = process.context().rip;
+        let first = process
+            .create_thread(entry, 11, USER_STACK_INITIAL_SIZE, 0x4000, &mut allocator)
+            .unwrap();
+        let second = process
+            .create_thread(entry, 22, USER_STACK_INITIAL_SIZE, 0x8000, &mut allocator)
+            .unwrap();
+
+        assert_ne!(first, second);
+        assert_ne!(
+            process.thread(first).unwrap().layout,
+            process.thread(second).unwrap().layout
+        );
+        assert_eq!(process.thread_context(first).unwrap().rdi, 11);
+        assert_eq!(process.thread_context(second).unwrap().rdi, 22);
+        assert_eq!(process.thread_context(first).unwrap().fs_base, 0x4000);
+        assert_eq!(process.thread_context(second).unwrap().fs_base, 0x8000);
+        assert_ne!(
+            process.thread_entry_stack_tops(first),
+            process.thread_entry_stack_tops(second)
+        );
+
+        let selected = [
+            process.next_schedulable_thread().unwrap(),
+            process.next_schedulable_thread().unwrap(),
+            process.next_schedulable_thread().unwrap(),
+        ];
+        assert!(selected.contains(&process.main_thread_id()));
+        assert!(selected.contains(&first));
+        assert!(selected.contains(&second));
+    }
+
+    #[test]
+    fn fatal_sibling_fault_terminates_the_complete_process() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(384);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let main = process.main_thread_id();
+        let sibling = process
+            .create_thread(
+                process.context().rip,
+                0,
+                USER_STACK_INITIAL_SIZE,
+                0,
+                &mut allocator,
+            )
+            .unwrap();
+        let fault = ProcessFault::new(ProcessFaultReason::InvalidOpcode, 6);
+        process.fault_process(sibling, fault);
+        assert_eq!(process.state(), ProcessState::Faulted(fault));
+        assert_eq!(
+            process.thread_state(sibling),
+            Some(ThreadState::Faulted(fault))
+        );
+        assert_eq!(process.thread_state(main), Some(ThreadState::Terminated));
+    }
+
+    #[test]
+    fn reaping_reuses_stack_space_and_invalidates_stale_thread_id() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(384);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let entry = process.context().rip;
+        let first = process
+            .create_thread(entry, 0, USER_STACK_INITIAL_SIZE, 0, &mut allocator)
+            .unwrap();
+        let first_layout = process.thread(first).unwrap().layout;
+        assert!(!process.exit_thread(first, 0));
+        process.reap_thread(first, &mut allocator).unwrap();
+        assert!(process.thread(first).is_none());
+
+        let replacement = process
+            .create_thread(entry, 0, USER_STACK_INITIAL_SIZE, 0, &mut allocator)
+            .unwrap();
+        assert_eq!(replacement.slot(), first.slot());
+        assert_ne!(replacement.generation(), first.generation());
+        assert_eq!(process.thread(replacement).unwrap().layout, first_layout);
+    }
+
+    #[test]
+    fn sleep_wake_and_last_thread_exit_are_thread_scoped() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(384);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let main = process.main_thread_id();
+        let sibling = process
+            .create_thread(
+                process.context().rip,
+                0,
+                USER_STACK_INITIAL_SIZE,
+                0,
+                &mut allocator,
+            )
+            .unwrap();
+
+        assert!(process.sleep_thread(sibling, 100, 10).unwrap());
+        assert_eq!(process.thread_state(sibling), Some(ThreadState::Blocked));
+        process.wake_thread(sibling).unwrap();
+        assert_eq!(process.thread_state(sibling), Some(ThreadState::Ready));
+
+        assert!(!process.exit_thread(main, 3));
+        assert_eq!(process.state(), ProcessState::Ready);
+        assert_eq!(process.thread_state(main), Some(ThreadState::Exited(3)));
+        assert!(process.exit_thread(sibling, 7));
+        assert_eq!(process.state(), ProcessState::Exited(7));
+    }
+
+    #[test]
+    fn terminating_joiner_releases_target_claim() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(384);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let caller = process.main_thread_id();
+        let target = process
+            .create_thread(
+                process.context().rip,
+                0,
+                USER_STACK_INITIAL_SIZE,
+                0,
+                &mut allocator,
+            )
+            .unwrap();
+        assert!(process
+            .start_join(caller, target, WaitDeadline::Infinite, 0x1000, 0)
+            .unwrap());
+        assert_eq!(
+            process.thread(target).unwrap().join_claimed_by,
+            Some(caller)
+        );
+        assert!(!process.terminate_thread(caller).unwrap());
+        assert_eq!(process.thread(target).unwrap().join_claimed_by, None);
+    }
+
+    #[test]
+    fn reaped_main_thread_does_not_break_final_retirement() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(384);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let main = process.main_thread_id();
+        let sibling = process
+            .create_thread(
+                process.context().rip,
+                0,
+                USER_STACK_INITIAL_SIZE,
+                0,
+                &mut allocator,
+            )
+            .unwrap();
+        assert!(!process.exit_thread(main, 1));
+        process.reap_thread(main, &mut allocator).unwrap();
+        assert!(process.thread(main).is_none());
+        assert!(process.exit_thread(sibling, 2));
+        let retired = process.retire().unwrap();
+        assert_eq!(retired.final_state(), ProcessState::Exited(2));
+        retired.reclaim(&mut allocator).unwrap();
+    }
+
+    #[test]
+    fn wake_before_sleep_banks_one_permit() {
+        let mut process = test_process(ProcessState::Ready);
+        let main = process.main_thread_id();
+        process.wake_thread(main).unwrap();
+        assert!(!process.sleep_thread(main, 100, 0).unwrap());
+        assert!(process.sleep_thread(main, 100, 0).unwrap());
+        assert_eq!(process.thread_state(main), Some(ThreadState::Blocked));
+        assert_eq!(process.poll_sleep(main, 99), Some(false));
+        assert_eq!(process.poll_sleep(main, 100), Some(true));
+        process.complete_sleep(main).unwrap();
+        assert_eq!(process.thread_state(main), Some(ThreadState::Ready));
+    }
+
+    #[test]
     fn main_thread_has_a_generation_tagged_process_local_identity() {
         let process = test_process(ProcessState::Ready);
         let id = process.main_thread_id();
@@ -6252,17 +7539,28 @@ mod tests {
         assert!(process.vmas().iter().any(|vma| {
             vma.start == layout.stack_guard_start
                 && vma.end == layout.stack_bottom
-                && vma.kind == VmAreaKind::StackGuard
+                && vma.kind
+                    == (VmAreaKind::StackGuard {
+                        owner: MAIN_THREAD_ID,
+                    })
         }));
         assert!(process.vmas().iter().any(|vma| {
             vma.start == layout.stack_bottom
                 && vma.end == layout.stack_initial_bottom
-                && vma.kind == (VmAreaKind::Stack { committed: false })
+                && vma.kind
+                    == (VmAreaKind::Stack {
+                        owner: MAIN_THREAD_ID,
+                        committed: false,
+                    })
         }));
         assert!(process.vmas().iter().any(|vma| {
             vma.start == layout.stack_initial_bottom
                 && vma.end == layout.stack_top
-                && vma.kind == (VmAreaKind::Stack { committed: true })
+                && vma.kind
+                    == (VmAreaKind::Stack {
+                        owner: MAIN_THREAD_ID,
+                        committed: true,
+                    })
         }));
         assert_eq!(
             plan_vma_insert(
@@ -6301,7 +7599,10 @@ mod tests {
             UserPageFaultResolution::Resolved { pages: 2 }
         );
         assert_eq!(process.usage().private_pages, baseline_private + 2);
-        assert_eq!(process.stack_committed_bottom(), Some(fault_page));
+        assert_eq!(
+            process.stack_committed_bottom(process.main_thread_id()),
+            Some(fault_page)
+        );
         assert_eq!(
             process.address_space().validate_user_range(
                 fault_page,
@@ -6546,11 +7847,15 @@ mod tests {
     fn malformed_stack_vma_returns_other_process_fault_without_panicking() {
         let (_region, mut allocator) = TestFrameRegion::allocator(80);
         let mut process = construct_test_process(&mut allocator).unwrap();
-        process
-            .vmas
-            .as_mut()
-            .unwrap()
-            .retain(|vma| !matches!(vma.kind, VmAreaKind::Stack { committed: true }));
+        process.vmas.as_mut().unwrap().retain(|vma| {
+            !matches!(
+                vma.kind,
+                VmAreaKind::Stack {
+                    committed: true,
+                    ..
+                }
+            )
+        });
         let fault_address = process.layout().stack_initial_bottom - 8;
         assert_eq!(
             process.resolve_user_page_fault(

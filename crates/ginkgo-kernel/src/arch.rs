@@ -79,6 +79,7 @@ const IA32_STAR: u32 = 0xc000_0081;
 const IA32_LSTAR: u32 = 0xc000_0082;
 const IA32_FMASK: u32 = 0xc000_0084;
 const IA32_GS_BASE: u32 = 0xc000_0101;
+const IA32_FS_BASE: u32 = 0xc000_0100;
 const IA32_KERNEL_GS_BASE: u32 = 0xc000_0102;
 
 const EFER_SYSTEM_CALL_EXTENSIONS: u64 = 1;
@@ -98,6 +99,7 @@ const CR0_TASK_SWITCHED: u64 = 1 << 3;
 const CR0_NUMERIC_ERROR: u64 = 1 << 5;
 const CR4_OSFXSR: u64 = 1 << 9;
 const CR4_OSXMMEXCPT: u64 = 1 << 10;
+const CR4_FSGSBASE: u64 = 1 << 16;
 const CR4_OSXSAVE: u64 = 1 << 18;
 const CR4_SMAP: u64 = 1 << 21;
 const CPUID_SMAP: u32 = 1 << 20;
@@ -245,6 +247,7 @@ pub struct UserContext {
     pub rip: u64,
     pub rsp: u64,
     pub rflags: u64,
+    pub fs_base: u64,
     pub fx_state: FxState,
 }
 
@@ -269,6 +272,7 @@ impl UserContext {
             rip,
             rsp,
             rflags: USER_RFLAGS_DEFAULT,
+            fs_base: 0,
             fx_state: FxState::initial(),
         }
     }
@@ -295,6 +299,9 @@ impl UserContext {
         {
             return Err(ContextValidationError::InvalidFlags);
         }
+        if self.fs_base != 0 && !is_user_canonical_address(self.fs_base) {
+            return Err(ContextValidationError::InvalidTlsBase);
+        }
         if !self.fx_state.is_valid() {
             return Err(ContextValidationError::InvalidFloatingPointState);
         }
@@ -307,6 +314,7 @@ pub enum ContextValidationError {
     InvalidInstructionPointer,
     InvalidStackPointer,
     InvalidFlags,
+    InvalidTlsBase,
     InvalidFloatingPointState,
 }
 
@@ -1110,6 +1118,70 @@ pub unsafe fn initialize_cpu_with_external_interrupts(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserEntryStackTops {
+    pub rsp0: u64,
+    pub syscall: u64,
+}
+
+impl UserEntryStackTops {
+    const fn is_valid(self) -> bool {
+        self.rsp0 >= 0xffff_8000_0000_0000
+            && self.syscall >= 0xffff_8000_0000_0000
+            && self.rsp0 & 0x3f == 0
+            && self.syscall & 0x3f == 0
+            && self.rsp0 != self.syscall
+    }
+}
+
+/// Selects dedicated protected entry stacks for one user-thread dispatch.
+/// The previous per-CPU fallback pointers are restored before this returns.
+///
+/// # Safety
+///
+/// `stacks` must remain mapped, supervisor-only, writable, and exclusively owned
+/// for the complete user run. The caller must have interrupts disabled.
+pub unsafe fn enter_user_on_stacks(
+    context: &mut UserContext,
+    stacks: UserEntryStackTops,
+) -> Result<KernelExit, EnterUserError> {
+    if !stacks.is_valid() {
+        return Err(EnterUserError::InvalidContext(
+            ContextValidationError::InvalidStackPointer,
+        ));
+    }
+    let old_rsp0: u64;
+    let old_syscall: u64;
+    unsafe {
+        asm!(
+            "mov {old_rsp0}, qword ptr gs:[{rsp0_offset}]",
+            "mov {old_syscall}, qword ptr gs:[{syscall_offset}]",
+            "mov qword ptr gs:[{rsp0_offset}], {new_rsp0}",
+            "mov qword ptr gs:[{syscall_offset}], {new_syscall}",
+            old_rsp0 = out(reg) old_rsp0,
+            old_syscall = out(reg) old_syscall,
+            new_rsp0 = in(reg) stacks.rsp0,
+            new_syscall = in(reg) stacks.syscall,
+            rsp0_offset = const STATE_TSS_RSP0,
+            syscall_offset = const STATE_SYSCALL_STACK_TOP,
+            options(nostack, preserves_flags),
+        );
+    }
+    let result = unsafe { enter_user(context) };
+    unsafe {
+        asm!(
+            "mov qword ptr gs:[{rsp0_offset}], {old_rsp0}",
+            "mov qword ptr gs:[{syscall_offset}], {old_syscall}",
+            old_rsp0 = in(reg) old_rsp0,
+            old_syscall = in(reg) old_syscall,
+            rsp0_offset = const STATE_TSS_RSP0,
+            syscall_offset = const STATE_SYSCALL_STACK_TOP,
+            options(nostack, preserves_flags),
+        );
+    }
+    result
+}
+
 /// Enters a validated user context and returns only when its dispatcher yields
 /// or exits to the scheduler.
 ///
@@ -1130,8 +1202,12 @@ pub unsafe fn enter_user(context: &mut UserContext) -> Result<KernelExit, EnterU
     // Do not leak a previous thread's user GS base across scheduler entries.
     // During kernel execution GS_BASE is per-CPU and KERNEL_GS_BASE is the value
     // that SWAPGS will install immediately before IRETQ.
-    unsafe { write_msr(IA32_KERNEL_GS_BASE, 0) };
+    unsafe {
+        write_msr(IA32_KERNEL_GS_BASE, 0);
+        write_msr(IA32_FS_BASE, context.fs_base);
+    }
     let action = unsafe { ginkgo_x86_enter_user(context) };
+    unsafe { write_msr(IA32_FS_BASE, 0) };
     Ok(match action {
         action if action == DispatchAction::YieldToKernel as u64 => KernelExit::YieldToKernel,
         action if action == DispatchAction::ExitToKernel as u64 => KernelExit::ExitToKernel,
@@ -1257,10 +1333,11 @@ const fn fxsave_cr0(current: u64) -> u64 {
 
 const fn fxsave_cr4(current: u64, xsave: bool) -> u64 {
     let required = CR4_OSFXSR | CR4_OSXMMEXCPT;
+    let secured = current & !CR4_FSGSBASE;
     if xsave {
-        current | required | CR4_OSXSAVE
+        secured | required | CR4_OSXSAVE
     } else {
-        current | required
+        secured | required
     }
 }
 
@@ -1398,6 +1475,8 @@ const fn tss_descriptor(base: u64, limit: u32) -> (u64, u64) {
 const STATE_KERNEL_FX: usize = offset_of!(CpuPrivilegeState, kernel_fx_state);
 const STATE_SYSCALL_STACK_TOP: usize =
     offset_of!(CpuPrivilegeState, syscall) + offset_of!(SyscallCpuState, syscall_stack_top);
+const STATE_TSS_RSP0: usize =
+    offset_of!(CpuPrivilegeState, tss) + offset_of!(TaskStateSegment, rsp);
 const STATE_KERNEL_RSP: usize =
     offset_of!(CpuPrivilegeState, syscall) + offset_of!(SyscallCpuState, kernel_rsp);
 const STATE_USER_RSP: usize =
@@ -1901,6 +1980,11 @@ ginkgo_x86_syscall_entry:
     movq %r11, {ctx_rflags}(%rsp)
     movq %gs:{state_user_rsp}, %rax
     movq %rax, {ctx_rsp}(%rsp)
+    movl ${ia32_fs_base}, %ecx
+    rdmsr
+    shlq $32, %rdx
+    orq %rdx, %rax
+    movq %rax, {ctx_fs_base}(%rsp)
     cmpq $0, %gs:{state_xsave_enabled}
     je .Lginkgo_syscall_fxsave_user
     movl %gs:{state_xsave_mask_low}, %eax
@@ -2049,6 +2133,7 @@ ginkgo_x86_syscall_entry:
     exit_action = const DispatchAction::ExitToKernel as u64,
     fault_action = const KERNEL_EXIT_FAULT,
     preempted_action = const KERNEL_EXIT_PREEMPTED,
+    ia32_fs_base = const IA32_FS_BASE,
     user_data_selector = const USER_DATA_SELECTOR,
     user_code_selector = const USER_CODE_SELECTOR,
     ctx_rax = const offset_of!(UserContext, rax),
@@ -2069,6 +2154,7 @@ ginkgo_x86_syscall_entry:
     ctx_rip = const offset_of!(UserContext, rip),
     ctx_rsp = const offset_of!(UserContext, rsp),
     ctx_rflags = const offset_of!(UserContext, rflags),
+    ctx_fs_base = const offset_of!(UserContext, fs_base),
     ctx_fx_state = const offset_of!(UserContext, fx_state),
     options(att_syntax),
 );
@@ -2598,6 +2684,16 @@ mod tests {
             syscall: 0xffff_8000_0005_0000,
         };
         assert_eq!(valid.validate(), Ok(()));
+        assert!(UserEntryStackTops {
+            rsp0: valid.rsp0,
+            syscall: valid.syscall,
+        }
+        .is_valid());
+        assert!(!UserEntryStackTops {
+            rsp0: valid.rsp0 + 16,
+            syscall: valid.syscall,
+        }
+        .is_valid());
 
         assert_eq!(
             PrivilegeStackTops {

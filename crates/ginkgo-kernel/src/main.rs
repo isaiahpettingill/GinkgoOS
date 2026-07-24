@@ -50,11 +50,15 @@ use ginkgo_kernel::{
     power::AcpiPower,
     process::{
         Process, ProcessFault, ProcessFaultReason, ProcessId, ProcessState, ProcessTable,
-        ThreadRef, ThreadState, UserPageFaultResolution,
+        ThreadRef, ThreadState, UserPageFaultResolution, USER_SCHEDULER_CAPACITY,
     },
     shared_memory::{SharedFrameArena, SharedMemoryFactory},
     syscall::{self, DebugSink, SyscallOutcome},
     task::{Scheduler, TaskPoll, TaskState},
+    thread_scheduler::{
+        Authority as SchedulerAuthority, RunDisposition, SchedulingClass, ThreadScheduler,
+        ThreadState as SchedulerThreadState,
+    },
     trust::TrustedManifest,
     usb::{self, UsbError},
     virtio_blk::{VirtioBlk, VirtioBlkError},
@@ -130,6 +134,8 @@ static PROCESS_CAPABILITY_MALFORMED_ELF: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/ginkgo-process-capability-malformed.elf"
 ));
+static THREAD_SMOKE_ELF: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-thread-smoke.elf"));
 #[cfg(ginkgo_memory_policy_smoke)]
 static MEMORY_POLICY_SUCCESS_ELF: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
@@ -155,6 +161,10 @@ static GINKGO_SPLASH_RGBA: &[u8; 256 * 256 * 4] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-splash.rgba"));
 fn preemption_smoke_enabled() -> bool {
     option_env!("GINKGO_PREEMPTION_SMOKE") == Some("1")
+}
+
+fn thread_smoke_enabled() -> bool {
+    option_env!("GINKGO_THREAD_SMOKE") == Some("1")
 }
 
 fn frame_reclaim_stress_enabled() -> bool {
@@ -1131,6 +1141,8 @@ pub extern "C" fn _start() -> ! {
         #[cfg(ginkgo_memory_policy_smoke)]
         memory_policy_smoke: None,
         processes: ProcessTable::new(),
+        user_scheduler: ThreadScheduler::try_with_default_policy(USER_SCHEDULER_CAPACITY)
+            .unwrap_or_else(|_| halt_forever()),
         desktop: None,
         desktop_process_id: None,
         process_clients: Vec::new(),
@@ -1372,6 +1384,12 @@ pub extern "C" fn _start() -> ! {
         }
     };
     context.desktop_process_id = Some(process_id);
+    if let Some(process) = context.processes.get_mut(process_id) {
+        let _ = process.set_thread_scheduling_class_by_kernel(
+            process.main_thread_id(),
+            SchedulingClass::Interactive,
+        );
+    }
     {
         let mut sink = SerialDebugSink::new(&mut context.serial);
         let _ = writeln!(
@@ -1420,6 +1438,32 @@ pub extern "C" fn _start() -> ! {
                 halt_forever();
             }
         }
+    }
+
+    if thread_smoke_enabled() {
+        let randomness = [
+            context.entropy.next_u64(),
+            context.entropy.next_u64(),
+            context.entropy.next_u64(),
+        ];
+        let smoke = Process::from_elf_randomized(
+            THREAD_SMOKE_ELF,
+            &context.page_table,
+            &mut context.frames,
+            randomness,
+        )
+        .unwrap_or_else(|error| {
+            let mut sink = SerialDebugSink::new(&mut context.serial);
+            let _ = writeln!(sink, "thread-smoke: load failed: {error:?}\r");
+            halt_forever();
+        });
+        let smoke_id = context.processes.insert(smoke).unwrap_or_else(|error| {
+            let mut sink = SerialDebugSink::new(&mut context.serial);
+            let _ = writeln!(sink, "thread-smoke: insertion failed: {error:?}\r");
+            halt_forever();
+        });
+        let mut sink = SerialDebugSink::new(&mut context.serial);
+        let _ = writeln!(sink, "thread-smoke: started pid={}\r", smoke_id.raw());
     }
 
     run_scheduler(&mut context)
@@ -1612,6 +1656,7 @@ struct KernelContext {
     #[cfg(ginkgo_memory_policy_smoke)]
     memory_policy_smoke: Option<MemoryPolicySmoke>,
     processes: ProcessTable,
+    user_scheduler: ThreadScheduler<ThreadRef>,
     desktop: Option<DesktopBroker>,
     desktop_process_id: Option<ProcessId>,
     process_clients: Vec<ProcessClient>,
@@ -2349,16 +2394,94 @@ fn verify_paging(context: &mut KernelContext) -> bool {
     verified && reclaimed && context.page_table.translate_addr(address).is_none()
 }
 
+fn scheduler_authority(class: SchedulingClass) -> SchedulerAuthority {
+    match class {
+        SchedulingClass::Critical => SchedulerAuthority::Kernel,
+        SchedulingClass::Audio | SchedulingClass::Interactive => SchedulerAuthority::System,
+        SchedulingClass::Normal | SchedulingClass::Background => SchedulerAuthority::User,
+    }
+}
+
 fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll {
-    let Some(ThreadRef {
+    let now_ns = context.timer.clock().now_ns();
+    {
+        let (processes, scheduler) = (&context.processes, &mut context.user_scheduler);
+        for thread_ref in processes.thread_refs() {
+            let process = processes.get(thread_ref.process_id);
+            let state = process.and_then(|process| process.thread_state(thread_ref.thread_id));
+            let class = process
+                .and_then(|process| process.thread_scheduling_class(thread_ref.thread_id))
+                .unwrap_or(SchedulingClass::Normal);
+            if scheduler
+                .snapshot(thread_ref)
+                .is_some_and(|snapshot| snapshot.base_class != class)
+            {
+                scheduler
+                    .set_base_class(thread_ref, class, now_ns)
+                    .unwrap_or_else(|_| halt_forever());
+            }
+            match state {
+                Some(ThreadState::Ready) => match scheduler.snapshot(thread_ref) {
+                    None => {
+                        scheduler
+                            .add_thread(thread_ref, class, scheduler_authority(class), now_ns)
+                            .unwrap_or_else(|_| halt_forever());
+                    }
+                    Some(snapshot) if snapshot.state == SchedulerThreadState::Blocked => {
+                        scheduler
+                            .wake(thread_ref, now_ns)
+                            .unwrap_or_else(|_| halt_forever());
+                    }
+                    Some(_) => {}
+                },
+                Some(ThreadState::Blocked) => match scheduler.snapshot(thread_ref) {
+                    None => {
+                        scheduler
+                            .add_thread(thread_ref, class, scheduler_authority(class), now_ns)
+                            .unwrap_or_else(|_| halt_forever());
+                        scheduler
+                            .block(thread_ref)
+                            .unwrap_or_else(|_| halt_forever());
+                    }
+                    Some(snapshot)
+                        if matches!(
+                            snapshot.state,
+                            SchedulerThreadState::Runnable | SchedulerThreadState::Running
+                        ) =>
+                    {
+                        scheduler
+                            .block(thread_ref)
+                            .unwrap_or_else(|_| halt_forever());
+                    }
+                    Some(_) => {}
+                },
+                Some(
+                    ThreadState::Exited(_) | ThreadState::Faulted(_) | ThreadState::Terminated,
+                ) => {
+                    if scheduler.snapshot(thread_ref).is_some() {
+                        let _ = scheduler.remove_thread(thread_ref, now_ns);
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    let policy_dispatch = context.user_scheduler.next_dispatch(now_ns);
+    let (selected, dispatch_quantum_ns, selected_by_policy) =
+        if let Some(dispatch) = policy_dispatch {
+            (dispatch.key, dispatch.quantum_ns, true)
+        } else if let Some(thread_ref) = context.processes.next_blocked_or_terminal_thread() {
+            (thread_ref, 0, false)
+        } else {
+            return TaskPoll::Pending;
+        };
+    let ThreadRef {
         process_id,
         thread_id,
-    }) = context.processes.next_thread()
-    else {
-        return TaskPoll::Pending;
-    };
+    } = selected;
     let child_slot_reserved = context.processes.prepare_insert().is_ok();
     let mut created_child = None;
+    let mut dispatch_elapsed_ns = 0;
     #[cfg(ginkgo_memory_policy_smoke)]
     let mut memory_policy_explicit_yield = false;
     {
@@ -2378,19 +2501,29 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
         {
             ThreadState::Ready => {
                 unsafe { process.address_space().activate() };
+                let entry_stacks = process
+                    .thread_entry_stack_tops(thread_id)
+                    .expect("selected thread lost its protected entry stacks");
                 let mut user_context = *process
                     .thread_context(thread_id)
                     .expect("selected thread lost its context");
                 let started_ns = context.timer.clock().now_ns();
                 if context
                     .timer
-                    .arm_one_shot(process.limits().cpu_quantum_ns)
+                    .arm_one_shot(if selected_by_policy {
+                        dispatch_quantum_ns
+                    } else {
+                        process.limits().cpu_quantum_ns
+                    })
                     .is_err()
                 {
-                    process
-                        .mark_faulted(ProcessFault::new(ProcessFaultReason::InvalidUserContext, 0));
+                    process.fault_process(
+                        thread_id,
+                        ProcessFault::new(ProcessFaultReason::InvalidUserContext, 0),
+                    );
                 } else {
-                    let exit = unsafe { arch::enter_user(&mut user_context) };
+                    let exit =
+                        unsafe { arch::enter_user_on_stacks(&mut user_context, entry_stacks) };
                     context.timer.disarm();
                     match exit {
                         Ok(KernelExit::YieldToKernel) => {
@@ -2426,6 +2559,7 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                                     &outcome,
                                     SyscallOutcome::Yield
                                         | SyscallOutcome::Blocked
+                                        | SyscallOutcome::ThreadExited(_)
                                         | SyscallOutcome::ChildCreated(_)
                                 ) || !process.is_runnable(),
                                 "exit syscall must update process state"
@@ -2451,7 +2585,8 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                                 let fault_address = fault
                                     .fault_address
                                     .expect("page-fault exit must include CR2");
-                                match process.resolve_user_page_fault(
+                                match process.resolve_thread_user_page_fault(
+                                    thread_id,
                                     fault_address,
                                     fault.error_code,
                                     user_context.rsp,
@@ -2459,7 +2594,7 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                                 ) {
                                     UserPageFaultResolution::Resolved { .. } => {}
                                     UserPageFaultResolution::Fault(fault) => {
-                                        process.mark_faulted(fault);
+                                        process.fault_process(thread_id, fault);
                                     }
                                 }
                             } else {
@@ -2470,11 +2605,14 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                                         u16::try_from(vector).unwrap_or(u16::MAX),
                                     ),
                                 };
-                                process.mark_faulted(ProcessFault {
-                                    reason,
-                                    code: fault.error_code,
-                                    address: fault.fault_address,
-                                });
+                                process.fault_process(
+                                    thread_id,
+                                    ProcessFault {
+                                        reason,
+                                        code: fault.error_code,
+                                        address: fault.fault_address,
+                                    },
+                                );
                             }
                         }
                         Ok(KernelExit::ExitToKernel) => {
@@ -2486,10 +2624,10 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                             user_context.rsp,
                             user_context.rflags
                         );
-                            process.mark_faulted(ProcessFault::new(
-                                ProcessFaultReason::InvalidUserContext,
-                                1,
-                            ));
+                            process.fault_process(
+                                thread_id,
+                                ProcessFault::new(ProcessFaultReason::InvalidUserContext, 1),
+                            );
                         }
                         Err(error) => {
                             let mut sink = SerialDebugSink::new(&mut context.serial);
@@ -2500,24 +2638,28 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                             user_context.rsp,
                             user_context.rflags
                         );
-                            process.mark_faulted(ProcessFault::new(
-                                ProcessFaultReason::InvalidUserContext,
-                                2,
-                            ));
+                            process.fault_process(
+                                thread_id,
+                                ProcessFault::new(ProcessFaultReason::InvalidUserContext, 2),
+                            );
                         }
                     }
                 }
+                process.record_retirement_context(thread_id, user_context);
                 *process
                     .thread_context_mut(thread_id)
                     .expect("selected thread lost its context") = user_context;
                 let elapsed_ns = context.timer.clock().now_ns().saturating_sub(started_ns);
+                dispatch_elapsed_ns = elapsed_ns;
                 assert!(process.record_thread_cpu_time(thread_id, elapsed_ns));
             }
             ThreadState::Blocked => {
                 let now_ns = context.timer.clock().now_ns();
-                if syscall::poll_blocked(process, now_ns) == syscall::BlockedPoll::Complete {
+                if syscall::poll_blocked(process, thread_id, now_ns)
+                    == syscall::BlockedPoll::Complete
+                {
                     unsafe { process.address_space().activate() };
-                    let _ = syscall::complete_blocked(process);
+                    let _ = syscall::complete_blocked(process, thread_id, &mut context.frames);
                 }
             }
             ThreadState::Exited(_) | ThreadState::Faulted(_) | ThreadState::Terminated => {}
@@ -2525,6 +2667,76 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
     }
 
     unsafe { context.page_table.activate() };
+    if selected_by_policy {
+        let thread_ref = ThreadRef {
+            process_id,
+            thread_id,
+        };
+        match context
+            .processes
+            .get(process_id)
+            .and_then(|process| process.thread_state(thread_id))
+        {
+            Some(ThreadState::Ready) => {
+                let _ = context.user_scheduler.finish_dispatch(
+                    thread_ref,
+                    dispatch_elapsed_ns,
+                    context.timer.clock().now_ns(),
+                    RunDisposition::Runnable,
+                );
+            }
+            Some(ThreadState::Blocked) => {
+                let _ = context.user_scheduler.finish_dispatch(
+                    thread_ref,
+                    dispatch_elapsed_ns,
+                    context.timer.clock().now_ns(),
+                    RunDisposition::Blocked,
+                );
+            }
+            Some(ThreadState::Exited(_) | ThreadState::Faulted(_) | ThreadState::Terminated)
+            | None => {
+                let _ = context
+                    .user_scheduler
+                    .remove_thread(thread_ref, context.timer.clock().now_ns());
+            }
+        }
+    }
+    if let Some(snapshot) = context.user_scheduler.snapshot(ThreadRef {
+        process_id,
+        thread_id,
+    }) {
+        if let Some(process) = context.processes.get_mut(process_id) {
+            process.record_scheduler_snapshot(thread_id, snapshot);
+        }
+    }
+    loop {
+        let detached = context.processes.get(process_id).and_then(|process| {
+            (!process.state().is_terminal())
+                .then(|| process.next_detached_terminal_thread())
+                .flatten()
+        });
+        let Some(detached) = detached else {
+            break;
+        };
+        let detached_ref = ThreadRef {
+            process_id,
+            thread_id: detached,
+        };
+        if context.user_scheduler.snapshot(detached_ref).is_some() {
+            let _ = context
+                .user_scheduler
+                .remove_thread(detached_ref, context.timer.clock().now_ns());
+        }
+        if context
+            .processes
+            .get_mut(process_id)
+            .expect("process disappeared before detached-thread reap")
+            .reap_thread(detached, &mut context.frames)
+            .is_err()
+        {
+            break;
+        }
+    }
     #[cfg(ginkgo_memory_policy_smoke)]
     if memory_policy_explicit_yield {
         if let Err(reason) = inspect_memory_policy_yield(context, process_id) {
@@ -2583,6 +2795,19 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
         .frame_reclaim_stress
         .as_ref()
         .is_some_and(|stress| stress.current == Some(process_id));
+    if let Some(process) = context.processes.get(process_id) {
+        for thread_id in process.thread_ids() {
+            let thread_ref = ThreadRef {
+                process_id,
+                thread_id,
+            };
+            if context.user_scheduler.snapshot(thread_ref).is_some() {
+                let _ = context
+                    .user_scheduler
+                    .remove_thread(thread_ref, context.timer.clock().now_ns());
+            }
+        }
+    }
     let Some(process) = context.processes.take_for_retirement(process_id) else {
         return TaskPoll::Pending;
     };

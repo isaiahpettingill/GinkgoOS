@@ -68,6 +68,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GINKGO_TEXT_EDITOR_SMOKE");
     println!("cargo:rerun-if-env-changed=GINKGO_MEMORY_POLICY_SMOKE");
     println!("cargo:rerun-if-env-changed=GINKGO_PROCESS_CAPABILITY_SMOKE_ELF");
+    println!("cargo:rerun-if-env-changed=GINKGO_THREAD_SMOKE");
+    println!("cargo:rerun-if-env-changed=GINKGO_THREAD_SMOKE_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_TRUST_SIGNING_KEY_HEX");
     println!("cargo:rustc-check-cfg=cfg(ginkgo_memory_policy_smoke)");
     let memory_policy_smoke =
@@ -139,6 +141,15 @@ fn main() {
         process_capability_smoke,
     )
     .expect("write Ginkgo process capability smoke ELF");
+    let thread_smoke =
+        if env::var_os("GINKGO_THREAD_SMOKE").as_deref() == Some(std::ffi::OsStr::new("1")) {
+            read_userspace_artifact("GINKGO_THREAD_SMOKE_ELF")
+                .expect("GINKGO_THREAD_SMOKE_ELF is required when the smoke is enabled")
+        } else {
+            Vec::new()
+        };
+    fs::write(out_dir.join("ginkgo-thread-smoke.elf"), thread_smoke)
+        .expect("write Ginkgo thread smoke ELF");
     fs::write(
         out_dir.join("ginkgo-process-capability-malformed.elf"),
         b"not a GinkgoOS ELF\n",

@@ -130,6 +130,10 @@ pub enum SyscallNumber {
     ThreadDetach = 61,
     /// Returns the calling thread's process-local identity.
     ThreadGetCurrent = 62,
+    /// Changes a thread's base scheduling class subject to caller authority.
+    ThreadSetSchedulingClass = 63,
+    /// Returns scheduling class, budget, latency, and throttling diagnostics.
+    ThreadGetSchedulingInfo = 64,
 }
 
 /// An opaque process-local reference to a kernel object.
@@ -764,6 +768,61 @@ pub struct ThreadCreateArgs {
 }
 
 impl ThreadCreateArgs {
+    pub const SIZE: u32 = core::mem::size_of::<Self>() as u32;
+}
+
+/// Public userspace scheduling classes. Critical is kernel-only; Audio and
+/// Interactive require delegated system authority.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThreadSchedulingClass {
+    Critical = 0,
+    Audio = 1,
+    Interactive = 2,
+    Normal = 3,
+    Background = 4,
+}
+
+impl ThreadSchedulingClass {
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Critical),
+            1 => Some(Self::Audio),
+            2 => Some(Self::Interactive),
+            3 => Some(Self::Normal),
+            4 => Some(Self::Background),
+            _ => None,
+        }
+    }
+}
+
+pub const THREAD_SCHEDULING_INFO_VERSION: u32 = 1;
+
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq,
+)]
+pub struct ThreadSchedulingInfo {
+    pub version: u32,
+    pub size: u32,
+    pub base_class: u32,
+    pub effective_class: u32,
+    pub state: u32,
+    pub reserved: u32,
+    pub budget_remaining_ns: u64,
+    pub cpu_time_ns: u64,
+    pub runnable_wait_ns: u64,
+    pub wake_latency_ns: u64,
+    pub maximum_wake_latency_ns: u64,
+    pub wake_latency_samples: u64,
+    pub wake_latency_target_misses: u64,
+    pub context_switches: u64,
+    pub deadline_misses: u64,
+    pub throttling_events: u64,
+    pub throttled_time_ns: u64,
+}
+
+impl ThreadSchedulingInfo {
     pub const SIZE: u32 = core::mem::size_of::<Self>() as u32;
 }
 
@@ -1405,6 +1464,7 @@ const _: () = {
     assert!(core::mem::size_of::<ThreadId>() == 8);
     assert!(core::mem::size_of::<ThreadCreateArgs>() == 56);
     assert!(core::mem::size_of::<ThreadInfo>() == 64);
+    assert!(core::mem::size_of::<ThreadSchedulingInfo>() == 112);
     assert!(core::mem::size_of::<ProcessCreateArgs>() == 64);
     assert!(core::mem::size_of::<ProcessMemoryPolicy>() == 64);
     assert!(core::mem::size_of::<ProcessCreateArgs2>() == 80);
@@ -1512,6 +1572,8 @@ mod tests {
         assert_eq!(SyscallNumber::ThreadJoin as u64, 60);
         assert_eq!(SyscallNumber::ThreadDetach as u64, 61);
         assert_eq!(SyscallNumber::ThreadGetCurrent as u64, 62);
+        assert_eq!(SyscallNumber::ThreadSetSchedulingClass as u64, 63);
+        assert_eq!(SyscallNumber::ThreadGetSchedulingInfo as u64, 64);
     }
 
     #[test]
@@ -1607,6 +1669,18 @@ mod tests {
         assert_eq!(ThreadState::Exited as u32, 2);
         assert_eq!(ThreadState::Faulted as u32, 3);
         assert_eq!(ThreadState::Terminated as u32, 4);
+        assert_eq!(ThreadSchedulingClass::Critical as u32, 0);
+        assert_eq!(ThreadSchedulingClass::Audio as u32, 1);
+        assert_eq!(ThreadSchedulingClass::Interactive as u32, 2);
+        assert_eq!(ThreadSchedulingClass::Normal as u32, 3);
+        assert_eq!(ThreadSchedulingClass::Background as u32, 4);
+        for raw in 0..=4 {
+            assert_eq!(
+                ThreadSchedulingClass::from_raw(raw).map(|class| class as u32),
+                Some(raw)
+            );
+        }
+        assert_eq!(ThreadSchedulingClass::from_raw(5), None);
 
         assert_eq!(VirtualAreaKind::Image as u32, 1);
         assert_eq!(VirtualAreaKind::Anonymous as u32, 2);

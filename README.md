@@ -28,7 +28,7 @@ A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. Gi
 - Packed bitmap-font rendering and a validated, versioned `.gkf` format
 - Persistent RedoxFS transactions on GPT/MBR volumes over bounded-polling virtio-blk or AHCI/SATA
 - Talc-backed allocation that transitions from a bounded bootstrap arena to a growable page-backed kernel heap
-- Single-core round-robin thread scheduling with local-APIC timer preemption
+- Single-core priority-aware thread scheduling with class budgets, aging, and local-APIC timer preemption
 - Hardware-seeded kernel CSPRNG with process-local random capabilities
 - SMAP user-copy protection with recoverable page-fault fixups
 - Ed25519-authenticated system manifests and per-process handle/memory/traffic/process-slot quotas
@@ -38,7 +38,7 @@ A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. Gi
 - Embedded-graphics draw targets for volatile hardware framebuffers and ordinary XRGB/ARGB window RAM
 - UEFI ISO and no-ISO QEMU boot targets with a 1920×1080 preferred mode and larger default UI font
 
-Kernel tasks remain deliberately stackless and cooperative: each task performs one bounded step, stores its continuation in `TaskState`, and returns to yield. Userspace is preemptive: the process task arms a calibrated local-APIC one-shot timer before entering ring 3, and a 10 ms quantum captures the complete user context before returning to the scheduler. Syscalls and interrupt returns use protected per-CPU stacks, while `IRETQ` preserves asynchronously interrupted `RCX` and `R11`. Blocked waits retain kernel-owned requests and are polled in bounded scheduler steps until a signal or absolute monotonic deadline completes them. When no process is runnable, a short interrupt-backed `HLT` replaces busy spinning. xHCI uses a dedicated MSI vector to signal its bounded task-context event drain, with a polling watchdog fallback. Intel HDA remains polling; general device IRQ routing, independent kernel-task stacks, and SMP are not yet provided.
+Kernel tasks remain deliberately stackless and cooperative: each task performs one bounded step, stores its continuation in `TaskState`, and returns to yield. Userspace is preemptive: the process task selects generation-tagged threads under critical, audio, interactive, normal, and background budgets, then arms a calibrated local-APIC one-shot timer for the selected class quantum. Each thread has protected supervisor RSP0 and syscall stacks, while `IRETQ` preserves asynchronously interrupted `RCX` and `R11`. Blocked waits retain kernel-owned requests until a signal or absolute monotonic deadline completes them. When no process is runnable, a short interrupt-backed `HLT` replaces busy spinning. xHCI uses a dedicated MSI vector to signal its bounded task-context event drain, with a polling watchdog fallback. Intel HDA remains polling; general device IRQ routing, independent kernel-task stacks, and SMP are not yet provided.
 
 ### IPC groundwork
 
@@ -69,7 +69,6 @@ The build script retains generated smoke ELFs for focused execution testing, but
 
 Current execution limitations are intentional and explicit:
 
-- The first thread milestone permits one live thread per process; the append-only thread ABI and scheduler identity are ready for later expansion.
 - Scheduling is single-core; SMP and CPU migration are not implemented.
 - The local-APIC timer and xHCI MSI have dedicated external interrupt entries; other device drivers still poll, and general I/O-APIC routing is not implemented.
 - Blocked waits use bounded scheduler polling rather than per-object kernel wait queues.
@@ -78,7 +77,7 @@ Current execution limitations are intentional and explicit:
 - Physical reclamation is single-core: process roots are recycled only after switching back to the kernel CR3; future SMP requires remote TLB shootdown before reuse.
 - Dynamic linking, runtime ELF relocations, signed rollback prevention, encrypted storage, and hardware-backed key sealing are not yet provided.
 
-See [`docs/memory.md`](docs/memory.md) for the memory architecture, VM ABI, accounting policy, failure rules, and test matrix. See [`docs/threads.md`](docs/threads.md) for thread ownership, lifecycle, ABI, fault policy, and SMP assumptions. See [`SECURITY.md`](SECURITY.md) for the threat model, trust/update policy, CPU-feature audit, and unsupported hardware assumptions.
+See [`docs/memory.md`](docs/memory.md) for the memory architecture, VM ABI, accounting policy, failure rules, and test matrix. See [`docs/threads.md`](docs/threads.md) for thread ownership, lifecycle, ABI, fault policy, and SMP assumptions. See [`docs/scheduling.md`](docs/scheduling.md) for scheduling classes, budgets, fairness, donation bounds, and diagnostics. See [`SECURITY.md`](SECURITY.md) for the threat model, trust/update policy, CPU-feature audit, and unsupported hardware assumptions.
 
 ### Window system and desktop
 

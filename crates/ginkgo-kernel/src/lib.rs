@@ -25,6 +25,7 @@ pub mod process;
 pub mod shared_memory;
 pub mod syscall;
 pub mod task;
+pub mod thread_scheduler;
 pub mod trust;
 pub mod usb;
 pub mod virtio_blk;
