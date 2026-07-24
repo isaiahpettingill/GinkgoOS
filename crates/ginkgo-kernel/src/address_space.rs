@@ -717,6 +717,26 @@ impl AddressSpace {
         }
     }
 
+    /// Copies one complete page into a currently owned private frame through the HHDM.
+    pub fn write_owned_frame(
+        &self,
+        frame: PhysFrame<Size4KiB>,
+        contents: &[u8; PAGE_SIZE as usize],
+    ) -> Result<(), AddressSpaceError> {
+        if !self.owned_data_frames.contains(&frame) {
+            return Err(AddressSpaceError::MappedFrameNotOwned(frame));
+        }
+        let address = frame_hhdm_address(self.hhdm_offset, frame)?;
+        unsafe {
+            ptr::copy_nonoverlapping(
+                contents.as_ptr(),
+                address.as_mut_ptr::<u8>(),
+                contents.len(),
+            )
+        };
+        Ok(())
+    }
+
     /// Removes one tracked user mapping and returns non-owning backing metadata.
     ///
     /// Owned private frames move to retirement accounting. Shared aliases simply

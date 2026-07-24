@@ -167,6 +167,49 @@ pub fn process_create(
     Ok(output.handle)
 }
 
+/// Creates a process with caller-selected memory ceilings. The kernel rejects
+/// every ceiling above the RAM-derived launch default.
+pub fn process_create_with_policy(
+    executable: Handle,
+    args_blob: &[u8],
+    startup_handles: &[HandleDisposition],
+    config: &[u8],
+    policy: &ProcessMemoryPolicy,
+) -> SyscallResult<Handle> {
+    if policy.version != PROCESS_MEMORY_POLICY_VERSION || policy.size != ProcessMemoryPolicy::SIZE {
+        return Err(Status::InvalidArgument);
+    }
+    let mut output = HandleOutput::default();
+    let base = process_create_args(executable, args_blob, startup_handles, config, &mut output)?;
+    let args = ProcessCreateArgs2 {
+        executable: base.executable,
+        reserved: base.reserved,
+        args_address: base.args_address,
+        args_length: base.args_length,
+        startup_handles_address: base.startup_handles_address,
+        startup_handle_count: base.startup_handle_count,
+        config_address: base.config_address,
+        config_length: base.config_length,
+        output_address: base.output_address,
+        version: ProcessCreateArgs2::VERSION,
+        size: ProcessCreateArgs2::SIZE,
+        policy_address: pointer_address(policy),
+    };
+    let raw = unsafe {
+        raw_syscall6(
+            SyscallNumber::ProcessCreate2,
+            pointer_address(&args),
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    status_result(raw)?;
+    Ok(output.handle)
+}
+
 /// Reads stable state, termination, and fault information for a process.
 pub fn process_get_info(process: Handle) -> SyscallResult<ProcessInfo> {
     let mut output = ProcessInfo::default();
@@ -875,6 +918,112 @@ pub unsafe fn shared_memory_map(
     status_result(raw)?;
     Ok(NonNull::new(output.address as usize as *mut u8)
         .expect("kernel returned a null address for a successful mapping"))
+}
+
+/// Maps an eager private snapshot of a file range.
+///
+/// The source offset must be page aligned. The range must fit in the file. The
+/// final page is zero-filled after the requested bytes. Closing `file` after a
+/// successful call does not invalidate later [`virtual_commit`] calls. Unlinking
+/// the mapped file invalidates its retained generation identity; recommit may then
+/// fail, and replacement at the same path is not treated as the original file.
+///
+/// # Safety
+///
+/// The caller must uphold Rust aliasing rules for the returned memory.
+pub unsafe fn virtual_map_file(
+    file: Handle,
+    offset: u64,
+    length: usize,
+    requested_address: Option<NonNull<u8>>,
+    protection: MapProtection,
+    flags: MapFlags,
+) -> SyscallResult<NonNull<u8>> {
+    let args = VirtualMapFileArgs {
+        address: requested_address.map_or(0, |address| pointer_address(address.as_ptr())),
+        offset,
+        length: length as u64,
+        protection,
+        flags,
+    };
+    let mut output = VirtualMapFileOutput::default();
+    let raw = unsafe {
+        raw_syscall6(
+            SyscallNumber::VirtualMapFile,
+            u64::from(file.raw()),
+            pointer_address(&args),
+            mut_pointer_address(&mut output),
+            0,
+            0,
+            0,
+        )
+    };
+    status_result(raw)?;
+    NonNull::new(output.address as usize as *mut u8).ok_or(Status::InvalidAddress)
+}
+
+/// Recommits decommitted file-backed pages from the original file range.
+pub unsafe fn virtual_commit(address: NonNull<u8>, length: usize) -> SyscallResult<()> {
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::VirtualCommit,
+            pointer_address(address.as_ptr()),
+            length as u64,
+            0,
+            0,
+            0,
+            0,
+        )
+    })
+}
+
+/// Releases file-backed frames while preserving their mapping and backing identity.
+pub unsafe fn virtual_decommit(address: NonNull<u8>, length: usize) -> SyscallResult<()> {
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::VirtualDecommit,
+            pointer_address(address.as_ptr()),
+            length as u64,
+            0,
+            0,
+            0,
+            0,
+        )
+    })
+}
+
+/// Changes protection on a page-granular file-backed subrange.
+pub unsafe fn virtual_protect(
+    address: NonNull<u8>,
+    length: usize,
+    protection: MapProtection,
+) -> SyscallResult<()> {
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::VirtualProtect,
+            pointer_address(address.as_ptr()),
+            length as u64,
+            u64::from(protection.bits()),
+            0,
+            0,
+            0,
+        )
+    })
+}
+
+/// Removes a page-granular file-backed subrange.
+pub unsafe fn virtual_unmap(address: NonNull<u8>, length: usize) -> SyscallResult<()> {
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::VirtualUnmap,
+            pointer_address(address.as_ptr()),
+            length as u64,
+            0,
+            0,
+            0,
+            0,
+        )
+    })
 }
 
 /// Maps eager, zero-filled private memory into the current process.

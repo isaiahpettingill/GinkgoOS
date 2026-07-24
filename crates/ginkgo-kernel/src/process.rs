@@ -3,15 +3,15 @@
 use alloc::vec::Vec;
 use core::{fmt, mem, ptr};
 
+use ginkgo_filesystem::FileHandle;
 use ginkgo_ipc::{
     Handle, HandleTable, IpcError, ProcessControl, SharedMemoryMappingAccess,
     SharedMemoryMappingInfo, SharedMemoryMappingLease, WaitItem,
 };
-#[cfg(test)]
 use ginkgo_sysapi::Rights;
 use ginkgo_sysapi::{
     MapFlags, MapProtection, ProcessFault as PublicProcessFault, SharedMemoryMapArgs, Status,
-    PROCESS_MAX_ARGS, PROCESS_MAX_STARTUP_BYTES, PROCESS_MAX_STARTUP_HANDLES,
+    VirtualMapFileArgs, PROCESS_MAX_ARGS, PROCESS_MAX_STARTUP_BYTES, PROCESS_MAX_STARTUP_HANDLES,
 };
 use x86_64::{
     structures::paging::{PhysFrame, Size4KiB},
@@ -386,6 +386,48 @@ pub struct ProcessLimits {
 }
 
 impl ProcessLimits {
+    /// Returns the field-by-field lower limits. Scheduling limits are capped too.
+    pub fn capped_by(self, ceiling: Self) -> Self {
+        Self {
+            private_pages: self.private_pages.min(ceiling.private_pages),
+            shared_memory_bytes: self.shared_memory_bytes.min(ceiling.shared_memory_bytes),
+            mapped_shared_bytes: self.mapped_shared_bytes.min(ceiling.mapped_shared_bytes),
+            reserved_virtual_bytes: self.reserved_virtual_bytes.min(ceiling.reserved_virtual_bytes),
+            vma_count: self.vma_count.min(ceiling.vma_count),
+            executable_image_pages: self.executable_image_pages.min(ceiling.executable_image_pages),
+            executable_source_bytes: self.executable_source_bytes.min(ceiling.executable_source_bytes),
+            channel_traffic_bytes: self.channel_traffic_bytes.min(ceiling.channel_traffic_bytes),
+            cpu_quantum_ns: self.cpu_quantum_ns.min(ceiling.cpu_quantum_ns),
+        }
+    }
+
+    /// Rejects escalation and returns these defaults with the requested memory fields applied.
+    pub const fn attenuate(self, requested: Self) -> Option<Self> {
+        if requested.private_pages > self.private_pages
+            || requested.shared_memory_bytes > self.shared_memory_bytes
+            || requested.mapped_shared_bytes > self.mapped_shared_bytes
+            || requested.reserved_virtual_bytes > self.reserved_virtual_bytes
+            || requested.vma_count > self.vma_count
+            || requested.executable_image_pages > self.executable_image_pages
+            || requested.executable_source_bytes > self.executable_source_bytes
+            || requested.channel_traffic_bytes > self.channel_traffic_bytes
+            || requested.cpu_quantum_ns > self.cpu_quantum_ns
+        {
+            return None;
+        }
+        Some(Self {
+            private_pages: requested.private_pages,
+            shared_memory_bytes: requested.shared_memory_bytes,
+            mapped_shared_bytes: requested.mapped_shared_bytes,
+            reserved_virtual_bytes: requested.reserved_virtual_bytes,
+            vma_count: requested.vma_count,
+            executable_image_pages: requested.executable_image_pages,
+            executable_source_bytes: requested.executable_source_bytes,
+            channel_traffic_bytes: requested.channel_traffic_bytes,
+            cpu_quantum_ns: requested.cpu_quantum_ns,
+        })
+    }
+
     /// Conservative package-default policy used only by isolated host fixtures.
     pub const STANDARD: Self = Self::from_available_memory_bytes(512 * MIB);
 
@@ -432,6 +474,18 @@ impl ProcessLimits {
             ),
             cpu_quantum_ns: 10_000_000,
         }
+    }
+}
+
+pub(crate) fn select_child_process_limits(
+    caller: ProcessLimits,
+    available_bytes: u64,
+    requested: Option<ProcessLimits>,
+) -> Option<ProcessLimits> {
+    let inherited = ProcessLimits::from_available_memory_bytes(available_bytes).capped_by(caller);
+    match requested {
+        Some(requested) => inherited.attenuate(requested),
+        None => Some(inherited),
     }
 }
 
@@ -511,6 +565,12 @@ pub enum VmAreaKind {
     },
     StackGuard,
     Shared,
+    FileBacked {
+        backing_id: u64,
+        /// Source-file offset corresponding to this VMA's first page.
+        file_offset: u64,
+        committed: bool,
+    },
 }
 
 /// One page-aligned, nonempty entry in a process's bounded sorted VMA table.
@@ -540,6 +600,17 @@ pub(crate) struct AnonymousReservationRollback {
     end: u64,
     reservation_id: u64,
     previous_cursor: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileBacking {
+    id: u64,
+    /// Generation-protected RedoxFS identity retained independently of the source handle slot.
+    /// Handle closure is harmless. Unlink invalidates the generation, so later recommit may fail.
+    file: FileHandle,
+    source_end: u64,
+    /// Maximum protection authorized by the source capability at map time.
+    max_protection: MapProtection,
 }
 
 pub struct SharedMemoryMapping {
@@ -600,6 +671,7 @@ pub enum SharedMappingError {
         object_length: usize,
     },
     InvalidBackingLength,
+    Io,
     OutOfMemory,
     ResourceLimit,
     InvalidPhysicalAddress(u64),
@@ -778,12 +850,16 @@ pub struct Process {
     preemption_count: u64,
     blocked_syscall: Option<BlockedSyscall>,
     shared_mappings: Option<Vec<SharedMemoryMapping>>,
+    file_backings: Option<Vec<FileBacking>>,
     vmas: Option<Vec<VmArea>>,
     // If a corrupt page table prevents rollback, retaining the lease is safer
     // than releasing backing which may still have a live userspace alias.
     retained_failed_mapping_leases: Option<Vec<SharedMemoryMappingLease>>,
     next_mapping_cursor: u64,
     next_anonymous_reservation_id: u64,
+    next_file_backing_id: u64,
+    #[cfg(test)]
+    fail_file_rollback_for_test: bool,
     limits: ProcessLimits,
     usage: ProcessUsage,
 }
@@ -799,7 +875,7 @@ impl Process {
         kernel: &ActivePageTable,
         allocator: &mut UsableFrameAllocator<'_>,
     ) -> Result<Self, ProcessCreateError> {
-        Self::from_elf_with_randomness(file, kernel, allocator, None)
+        Self::from_elf_with_randomness(file, kernel, allocator, None, None)
     }
 
     /// Builds a process with independently randomized PIE, stack, and mapping regions.
@@ -809,7 +885,17 @@ impl Process {
         allocator: &mut UsableFrameAllocator<'_>,
         randomness: [u64; 3],
     ) -> Result<Self, ProcessCreateError> {
-        Self::from_elf_with_randomness(file, kernel, allocator, Some(randomness))
+        Self::from_elf_with_randomness(file, kernel, allocator, Some(randomness), None)
+    }
+
+    pub fn from_elf_randomized_with_limits(
+        file: &[u8],
+        kernel: &ActivePageTable,
+        allocator: &mut UsableFrameAllocator<'_>,
+        randomness: [u64; 3],
+        limits: ProcessLimits,
+    ) -> Result<Self, ProcessCreateError> {
+        Self::from_elf_with_randomness(file, kernel, allocator, Some(randomness), Some(limits))
     }
 
     fn from_elf_with_randomness(
@@ -817,8 +903,15 @@ impl Process {
         kernel: &ActivePageTable,
         allocator: &mut UsableFrameAllocator<'_>,
         randomness: Option<[u64; 3]>,
+        requested_limits: Option<ProcessLimits>,
     ) -> Result<Self, ProcessCreateError> {
-        let limits = ProcessLimits::from_available_memory_bytes(allocator.available_bytes());
+        let defaults = ProcessLimits::from_available_memory_bytes(allocator.available_bytes());
+        let limits = match requested_limits {
+            Some(requested) => defaults
+                .attenuate(requested)
+                .ok_or(ProcessCreateError::MemoryPolicy)?,
+            None => defaults,
+        };
         if u64::try_from(file.len()).map_or(true, |length| {
             length == 0 || length > limits.executable_source_bytes
         }) {
@@ -1029,6 +1122,7 @@ impl Process {
             preemption_count: 0,
             blocked_syscall: None,
             shared_mappings: Some(Vec::new()),
+            file_backings: Some(Vec::new()),
             vmas: Some(vmas),
             retained_failed_mapping_leases: Some(Vec::new()),
             next_mapping_cursor: SHARED_MAPPING_BASE
@@ -1037,6 +1131,9 @@ impl Process {
                     .unwrap_or(0)
                     * PAGE_SIZE,
             next_anonymous_reservation_id: 1,
+            next_file_backing_id: 1,
+            #[cfg(test)]
+            fail_file_rollback_for_test: false,
             limits,
             usage: ProcessUsage {
                 private_pages,
@@ -1777,6 +1874,416 @@ impl Process {
         Ok(())
     }
 
+    /// Maps an eager private snapshot of a file range and retains immutable backing authority.
+    pub fn map_file_backed<F>(
+        &mut self,
+        file: FileHandle,
+        file_length: u64,
+        max_protection: MapProtection,
+        args: VirtualMapFileArgs,
+        allocator: &mut UsableFrameAllocator<'_>,
+        mut read: F,
+    ) -> Result<u64, SharedMappingError>
+    where
+        F: FnMut(u64, &mut [u8]) -> Result<usize, SharedMappingError>,
+    {
+        anonymous_permissions(max_protection)?;
+        let (_, permissions) = file_permissions(args.protection, max_protection)?;
+        validate_flags(args.flags)?;
+        if args.offset % PAGE_SIZE != 0 {
+            return Err(SharedMappingError::UnalignedOffset(args.offset));
+        }
+        let source_end = args
+            .offset
+            .checked_add(args.length)
+            .ok_or(SharedMappingError::RangeOverflow)?;
+        if args.length == 0 || source_end > file_length {
+            return Err(if args.length == 0 {
+                SharedMappingError::ZeroLength
+            } else {
+                SharedMappingError::RangeOutsideObject {
+                    offset: args.offset,
+                    length: args.length,
+                    object_length: usize::try_from(file_length).unwrap_or(usize::MAX),
+                }
+            });
+        }
+        let (_, mapped_len) = normalize_anonymous_range(PAGE_SIZE, args.length)?;
+        let pages = mapped_len as u64 / PAGE_SIZE;
+        let Some(new_private) = self
+            .usage
+            .private_pages
+            .checked_add(pages)
+            .filter(|total| *total <= self.limits.private_pages)
+        else {
+            self.record_quota_failure();
+            return Err(SharedMappingError::ResourceLimit);
+        };
+        let Some(new_reserved) = self
+            .usage
+            .reserved_virtual_bytes
+            .checked_add(mapped_len as u64)
+            .filter(|total| *total <= self.limits.reserved_virtual_bytes)
+        else {
+            self.record_quota_failure();
+            return Err(SharedMappingError::ResourceLimit);
+        };
+        let occupied = self.occupied_ranges()?;
+        let address = select_mapping_address(
+            args.address,
+            args.flags.contains(MapFlags::FIXED),
+            mapped_len,
+            self.next_mapping_cursor,
+            self.layout.stack_guard_start,
+            &occupied,
+        )?;
+        let backing_id = self.next_file_backing_id;
+        let next_backing_id = backing_id
+            .checked_add(1)
+            .ok_or(SharedMappingError::ResourceLimit)?;
+        let end = address
+            .checked_add(mapped_len as u64)
+            .ok_or(SharedMappingError::RangeOverflow)?;
+        let planned = plan_vma_insert(
+            self.vmas(),
+            VmArea {
+                start: address,
+                end,
+                kind: VmAreaKind::FileBacked {
+                    backing_id,
+                    file_offset: args.offset,
+                    committed: true,
+                },
+                protection: args.protection,
+            },
+        )?;
+        if planned.len() as u64 > self.limits.vma_count {
+            self.record_quota_failure();
+            return Err(SharedMappingError::ResourceLimit);
+        }
+        self.file_backings
+            .as_mut()
+            .expect("live process lost its file backing records")
+            .try_reserve(1)
+            .map_err(|_| SharedMappingError::OutOfMemory)?;
+        self.address_space_mut()
+            .preflight_owned_user_mappings(mapped_len / PAGE_SIZE as usize)
+            .map_err(SharedMappingError::AddressSpace)?;
+        let backing = FileBacking {
+            id: backing_id,
+            file,
+            source_end,
+            max_protection,
+        };
+        let load_result = self.load_file_pages(
+            address,
+            args.offset,
+            source_end,
+            mapped_len,
+            permissions,
+            allocator,
+            &mut read,
+        );
+        if let Err(error) = load_result {
+            if matches!(error, SharedMappingError::RollbackFailed { .. }) {
+                self.file_backings
+                    .as_mut()
+                    .expect("live process lost its file backing records")
+                    .push(backing);
+                *self.vmas.as_mut().expect("live process lost its semantic VMA table") = planned;
+                self.usage.private_pages = new_private;
+                self.usage.reserved_virtual_bytes = new_reserved;
+                self.next_file_backing_id = next_backing_id;
+            }
+            return Err(error);
+        }
+        self.file_backings
+            .as_mut()
+            .expect("live process lost its file backing records")
+            .push(backing);
+        *self
+            .vmas
+            .as_mut()
+            .expect("live process lost its semantic VMA table") = planned;
+        self.usage.private_pages = new_private;
+        self.usage.reserved_virtual_bytes = new_reserved;
+        self.next_file_backing_id = next_backing_id;
+        if !args.flags.contains(MapFlags::FIXED) {
+            self.next_mapping_cursor = if end < self.layout.stack_guard_start {
+                end
+            } else {
+                SHARED_MAPPING_BASE
+            };
+        }
+        Ok(address)
+    }
+
+    fn load_file_pages<F>(
+        &mut self,
+        address: u64,
+        file_offset: u64,
+        source_end: u64,
+        mapped_len: usize,
+        permissions: UserPagePermissions,
+        allocator: &mut UsableFrameAllocator<'_>,
+        read: &mut F,
+    ) -> Result<(), SharedMappingError>
+    where
+        F: FnMut(u64, &mut [u8]) -> Result<usize, SharedMappingError>,
+    {
+        let mut mapped = 0usize;
+        while mapped < mapped_len {
+            let page_address = address + mapped as u64;
+            let page_offset = file_offset
+                .checked_add(mapped as u64)
+                .ok_or(SharedMappingError::RangeOverflow)?;
+            let readable = usize::try_from(source_end.saturating_sub(page_offset).min(PAGE_SIZE))
+                .map_err(|_| SharedMappingError::RangeOverflow)?;
+            let mut contents = [0u8; PAGE_SIZE as usize];
+            if readable != 0 {
+                match read(page_offset, &mut contents[..readable]) {
+                    Ok(count) if count == readable => {}
+                    Ok(_) => {
+                        self.rollback_file_pages(address, mapped, allocator)?;
+                        return Err(SharedMappingError::Io);
+                    }
+                    Err(error) => {
+                        self.rollback_file_pages(address, mapped, allocator)?;
+                        return Err(error);
+                    }
+                }
+            }
+            let frame = match self.address_space_mut().map_zeroed_user_4k(
+                page_address,
+                permissions,
+                allocator,
+            ) {
+                Ok(frame) => frame,
+                Err(mapping_error) => {
+                    self.rollback_file_pages(address, mapped, allocator)?;
+                    if matches!(
+                        mapping_error,
+                        AddressSpaceError::OutOfMemory | AddressSpaceError::OutOfFrames
+                    ) {
+                        self.record_oom_failure();
+                    }
+                    return Err(SharedMappingError::AddressSpace(mapping_error));
+                }
+            };
+            if let Err(mapping_error) = self.address_space().write_owned_frame(frame, &contents) {
+                if let Err(rollback_error) = self
+                    .address_space_mut()
+                    .unmap_user_range(address, mapped + PAGE_SIZE as usize)
+                {
+                    self.fail_stop_vm_rollback(page_address);
+                    return Err(SharedMappingError::RollbackFailed {
+                        mapping_error,
+                        rollback_error,
+                    });
+                }
+                let _ = self
+                    .address_space_mut()
+                    .reclaim_retired_data_frames(allocator);
+                return Err(SharedMappingError::AddressSpace(mapping_error));
+            }
+            mapped += PAGE_SIZE as usize;
+        }
+        Ok(())
+    }
+
+    fn rollback_file_pages(
+        &mut self,
+        address: u64,
+        mapped: usize,
+        allocator: &mut UsableFrameAllocator<'_>,
+    ) -> Result<(), SharedMappingError> {
+        if mapped != 0 {
+            #[cfg(test)]
+            if self.fail_file_rollback_for_test {
+                self.fail_stop_vm_rollback(address);
+                return Err(SharedMappingError::RollbackFailed {
+                    mapping_error: AddressSpaceError::CorruptPageTable,
+                    rollback_error: AddressSpaceError::CorruptPageTable,
+                });
+            }
+            if let Err(rollback_error) = self.address_space_mut().unmap_user_range(address, mapped) {
+                self.fail_stop_vm_rollback(address);
+                return Err(SharedMappingError::RollbackFailed {
+                    mapping_error: AddressSpaceError::CorruptPageTable,
+                    rollback_error,
+                });
+            }
+        }
+        self.address_space_mut()
+            .reclaim_retired_data_frames(allocator)
+            .map_err(|error| {
+                SharedMappingError::AddressSpace(AddressSpaceError::FrameAllocator(error))
+            })?;
+        Ok(())
+    }
+
+    pub fn commit_file_backed<F>(
+        &mut self,
+        address: u64,
+        length: u64,
+        allocator: &mut UsableFrameAllocator<'_>,
+        mut read: F,
+    ) -> Result<(), SharedMappingError>
+    where
+        F: FnMut(FileHandle, u64, &mut [u8]) -> Result<usize, SharedMappingError>,
+    {
+        let (end, _) = normalize_anonymous_range(address, length)?;
+        let planned = plan_file_change(self.vmas(), address, end, FileChange::Commit)?;
+        if planned.len() as u64 > self.limits.vma_count {
+            self.record_quota_failure();
+            return Err(SharedMappingError::ResourceLimit);
+        }
+        let pages = (end - address) / PAGE_SIZE;
+        let Some(new_private) = self
+            .usage
+            .private_pages
+            .checked_add(pages)
+            .filter(|total| *total <= self.limits.private_pages)
+        else {
+            self.record_quota_failure();
+            return Err(SharedMappingError::ResourceLimit);
+        };
+        let segments = file_segments(self.vmas(), address, end, false)?;
+        self.address_space_mut()
+            .preflight_owned_user_mappings(pages as usize)
+            .map_err(SharedMappingError::AddressSpace)?;
+        let mut loaded = 0usize;
+        for segment in segments {
+            let backing = *self
+                .file_backings
+                .as_ref()
+                .expect("live process lost its file backing records")
+                .iter()
+                .find(|backing| backing.id == segment.backing_id)
+                .ok_or(SharedMappingError::InvalidBackingLength)?;
+            let (_, permissions) = file_permissions(segment.protection, backing.max_protection)?;
+            let segment_len = usize::try_from(segment.end - segment.start)
+                .map_err(|_| SharedMappingError::RangeOverflow)?;
+            let result = self.load_file_pages(
+                segment.start,
+                segment.file_offset,
+                backing.source_end,
+                segment_len,
+                permissions,
+                allocator,
+                &mut |offset, bytes| read(backing.file, offset, bytes),
+            );
+            if let Err(error) = result {
+                let failure = if loaded == 0 {
+                    error
+                } else {
+                    match self.rollback_file_pages(address, loaded, allocator) {
+                        Ok(()) => error,
+                        Err(rollback_error) => rollback_error,
+                    }
+                };
+                if matches!(failure, SharedMappingError::RollbackFailed { .. }) {
+                    // Rollback could not prove the range unmapped. The process is already
+                    // fail-stopped, so publish the prechecked full commit charge and committed
+                    // VMA plan as conservative quarantine metadata for retirement.
+                    *self.vmas.as_mut().expect("live process lost its semantic VMA table") = planned;
+                    self.usage.private_pages = new_private;
+                }
+                return Err(failure);
+            }
+            loaded += segment_len;
+        }
+        *self
+            .vmas
+            .as_mut()
+            .expect("live process lost its semantic VMA table") = planned;
+        self.usage.private_pages = new_private;
+        Ok(())
+    }
+
+    pub fn decommit_file_backed(
+        &mut self,
+        address: u64,
+        length: u64,
+        allocator: &mut UsableFrameAllocator<'_>,
+    ) -> Result<(), SharedMappingError> {
+        self.change_file_residency(address, length, allocator, FileChange::Decommit)
+    }
+
+    pub fn protect_file_backed(
+        &mut self,
+        address: u64,
+        length: u64,
+        protection: MapProtection,
+    ) -> Result<(), SharedMappingError> {
+        let (_, permissions) = anonymous_permissions(protection)?;
+        let (end, _) = normalize_anonymous_range(address, length)?;
+        authorize_file_protection(self.vmas(), self.file_backings.as_ref().expect("live process lost its file backing records"), address, end, protection)?;
+        let planned = plan_file_change(self.vmas(), address, end, FileChange::Protect(protection))?;
+        if planned.len() as u64 > self.limits.vma_count {
+            self.record_quota_failure();
+            return Err(SharedMappingError::ResourceLimit);
+        }
+        let ranges = committed_file_ranges(self.vmas(), address, end)?;
+        self.address_space_mut()
+            .protect_user_ranges(&ranges, permissions)
+            .map_err(SharedMappingError::AddressSpace)?;
+        *self
+            .vmas
+            .as_mut()
+            .expect("live process lost its semantic VMA table") = planned;
+        Ok(())
+    }
+
+    pub fn unmap_file_backed(
+        &mut self,
+        address: u64,
+        length: u64,
+        allocator: &mut UsableFrameAllocator<'_>,
+    ) -> Result<(), SharedMappingError> {
+        self.change_file_residency(address, length, allocator, FileChange::Unmap)
+    }
+
+    fn change_file_residency(
+        &mut self,
+        address: u64,
+        length: u64,
+        allocator: &mut UsableFrameAllocator<'_>,
+        change: FileChange,
+    ) -> Result<(), SharedMappingError> {
+        let (end, _) = normalize_anonymous_range(address, length)?;
+        let planned = plan_file_change(self.vmas(), address, end, change)?;
+        if planned.len() as u64 > self.limits.vma_count {
+            self.record_quota_failure();
+            return Err(SharedMappingError::ResourceLimit);
+        }
+        let ranges = committed_file_ranges(self.vmas(), address, end)?;
+        let committed_pages = ranges
+            .iter()
+            .map(|(_, len)| *len as u64 / PAGE_SIZE)
+            .sum::<u64>();
+        self.address_space_mut()
+            .unmap_user_ranges(&ranges)
+            .map_err(SharedMappingError::AddressSpace)?;
+        self.usage.private_pages = self.usage.private_pages.saturating_sub(committed_pages);
+        if matches!(change, FileChange::Unmap) {
+            self.usage.reserved_virtual_bytes = self
+                .usage
+                .reserved_virtual_bytes
+                .saturating_sub(end - address);
+            self.file_backings.as_mut().expect("live process lost its file backing records")
+                .retain(|backing| planned.iter().any(|vma| matches!(vma.kind, VmAreaKind::FileBacked { backing_id, .. } if backing_id == backing.id)));
+        }
+        *self
+            .vmas
+            .as_mut()
+            .expect("live process lost its semantic VMA table") = planned;
+        let _ = self
+            .address_space_mut()
+            .reclaim_retired_data_frames(allocator);
+        Ok(())
+    }
+
     /// Maps an exact logical range of a shared-memory handle.
     ///
     /// The offset must be page aligned. The logical range need not end on a page
@@ -1997,6 +2504,10 @@ impl Process {
             .shared_mappings
             .take()
             .expect("live process lost its mapping records");
+        let file_backings = self
+            .file_backings
+            .take()
+            .expect("live process lost its file backing records");
         let vmas = self
             .vmas
             .take()
@@ -2007,12 +2518,13 @@ impl Process {
             .expect("live process lost its retained leases");
         let teardown = ProcessTeardown {
             handles_closed: handles.len(),
-            mappings_released: shared_mappings.len(),
+            mappings_released: shared_mappings.len().saturating_add(file_backings.len()),
             anonymous_mappings_released: count_anonymous_reservations(&vmas),
             retained_failed_mapping_leases_released: retained_failed_mapping_leases.len(),
         };
         let address_space = unsafe { address_space.retire() };
         drop(shared_mappings);
+        drop(file_backings);
         drop(vmas);
         drop(retained_failed_mapping_leases);
         drop(handles);
@@ -2046,6 +2558,7 @@ impl Drop for Process {
         // resources as a fail-safe. Process::retire takes these fields first and
         // performs the normal clean teardown after the root is no longer active.
         retain_unretired_resource(&mut self.shared_mappings);
+        retain_unretired_resource(&mut self.file_backings);
         retain_unretired_resource(&mut self.vmas);
         retain_unretired_resource(&mut self.retained_failed_mapping_leases);
         retain_unretired_resource(&mut self.handles);
@@ -2208,7 +2721,7 @@ fn initial_vmas(
         let area = vmas[read_index];
         if write_index != 0
             && vmas[write_index - 1].end == area.start
-            && vmas[write_index - 1].kind == area.kind
+            && vm_kinds_merge(vmas[write_index - 1], area)
             && vmas[write_index - 1].protection == area.protection
         {
             vmas[write_index - 1].end = area.end;
@@ -2229,6 +2742,23 @@ enum AnonymousChange {
     Unmap,
 }
 
+#[derive(Clone, Copy)]
+enum FileChange {
+    Commit,
+    Decommit,
+    Protect(MapProtection),
+    Unmap,
+}
+
+#[derive(Clone, Copy)]
+struct FileSegment {
+    start: u64,
+    end: u64,
+    backing_id: u64,
+    file_offset: u64,
+    protection: MapProtection,
+}
+
 fn clone_vma_plan(vmas: &[VmArea]) -> Result<Vec<VmArea>, SharedMappingError> {
     let mut planned = Vec::new();
     planned
@@ -2238,13 +2768,35 @@ fn clone_vma_plan(vmas: &[VmArea]) -> Result<Vec<VmArea>, SharedMappingError> {
     Ok(planned)
 }
 
+fn vm_kinds_merge(left: VmArea, right: VmArea) -> bool {
+    match (left.kind, right.kind) {
+        (
+            VmAreaKind::FileBacked {
+                backing_id: left_id,
+                file_offset: left_offset,
+                committed: left_committed,
+            },
+            VmAreaKind::FileBacked {
+                backing_id: right_id,
+                file_offset: right_offset,
+                committed: right_committed,
+            },
+        ) => {
+            left_id == right_id
+                && left_committed == right_committed
+                && left_offset.checked_add(left.length()) == Some(right_offset)
+        }
+        (left, right) => left == right,
+    }
+}
+
 fn push_merged_vma(vmas: &mut Vec<VmArea>, area: VmArea) -> Result<(), SharedMappingError> {
     if area.start >= area.end {
         return Err(SharedMappingError::RangeOverflow);
     }
     if let Some(previous) = vmas.last_mut() {
         if previous.end == area.start
-            && previous.kind == area.kind
+            && vm_kinds_merge(*previous, area)
             && previous.protection == area.protection
         {
             previous.end = area.end;
@@ -2455,6 +3007,212 @@ fn plan_anonymous_change(
     Ok(planned)
 }
 
+fn plan_file_change(
+    vmas: &[VmArea],
+    start: u64,
+    end: u64,
+    change: FileChange,
+) -> Result<Vec<VmArea>, SharedMappingError> {
+    let mut planned = Vec::new();
+    planned
+        .try_reserve_exact(vmas.len().saturating_add(2).min(MAX_VMAS))
+        .map_err(|_| SharedMappingError::OutOfMemory)?;
+    let mut covered = start;
+    for area in vmas.iter().copied() {
+        if area.end <= start || area.start >= end {
+            push_merged_vma(&mut planned, area)?;
+            continue;
+        }
+        let VmAreaKind::FileBacked {
+            backing_id,
+            file_offset,
+            committed,
+        } = area.kind
+        else {
+            return Err(SharedMappingError::ExactMappingNotFound {
+                address: start,
+                length: end - start,
+            });
+        };
+        if area.start > covered || matches!(change, FileChange::Commit) && committed {
+            return Err(if area.start > covered {
+                SharedMappingError::ExactMappingNotFound {
+                    address: start,
+                    length: end - start,
+                }
+            } else {
+                SharedMappingError::AlreadyMapped(covered)
+            });
+        }
+        let middle_start = area.start.max(start);
+        let middle_end = area.end.min(end);
+        if area.start < middle_start {
+            push_merged_vma(
+                &mut planned,
+                VmArea {
+                    end: middle_start,
+                    ..area
+                },
+            )?;
+        }
+        let middle_offset = file_offset
+            .checked_add(middle_start - area.start)
+            .ok_or(SharedMappingError::RangeOverflow)?;
+        if !matches!(change, FileChange::Unmap) {
+            let (middle_committed, protection) = match change {
+                FileChange::Commit => (true, area.protection),
+                FileChange::Decommit => (false, area.protection),
+                FileChange::Protect(protection) => (committed, protection),
+                FileChange::Unmap => unreachable!(),
+            };
+            push_merged_vma(
+                &mut planned,
+                VmArea {
+                    start: middle_start,
+                    end: middle_end,
+                    kind: VmAreaKind::FileBacked {
+                        backing_id,
+                        file_offset: middle_offset,
+                        committed: middle_committed,
+                    },
+                    protection,
+                },
+            )?;
+        }
+        if middle_end < area.end {
+            let right_offset = file_offset
+                .checked_add(middle_end - area.start)
+                .ok_or(SharedMappingError::RangeOverflow)?;
+            push_merged_vma(
+                &mut planned,
+                VmArea {
+                    start: middle_end,
+                    kind: VmAreaKind::FileBacked {
+                        backing_id,
+                        file_offset: right_offset,
+                        committed,
+                    },
+                    ..area
+                },
+            )?;
+        }
+        covered = middle_end;
+    }
+    if covered != end {
+        return Err(SharedMappingError::ExactMappingNotFound {
+            address: start,
+            length: end - start,
+        });
+    }
+    Ok(planned)
+}
+
+fn file_segments(
+    vmas: &[VmArea],
+    start: u64,
+    end: u64,
+    committed_expected: bool,
+) -> Result<Vec<FileSegment>, SharedMappingError> {
+    let mut segments = Vec::new();
+    segments
+        .try_reserve_exact(vmas.len())
+        .map_err(|_| SharedMappingError::OutOfMemory)?;
+    let mut covered = start;
+    for area in vmas.iter().copied() {
+        if area.end <= start || area.start >= end {
+            continue;
+        }
+        let VmAreaKind::FileBacked {
+            backing_id,
+            file_offset,
+            committed,
+        } = area.kind
+        else {
+            return Err(SharedMappingError::ExactMappingNotFound {
+                address: start,
+                length: end - start,
+            });
+        };
+        if area.start > covered || committed != committed_expected {
+            return Err(SharedMappingError::ExactMappingNotFound {
+                address: start,
+                length: end - start,
+            });
+        }
+        let segment_start = area.start.max(start);
+        let segment_end = area.end.min(end);
+        segments.push(FileSegment {
+            start: segment_start,
+            end: segment_end,
+            backing_id,
+            file_offset: file_offset
+                .checked_add(segment_start - area.start)
+                .ok_or(SharedMappingError::RangeOverflow)?,
+            protection: area.protection,
+        });
+        covered = segment_end;
+    }
+    if covered != end {
+        return Err(SharedMappingError::ExactMappingNotFound {
+            address: start,
+            length: end - start,
+        });
+    }
+    Ok(segments)
+}
+
+fn committed_file_ranges(
+    vmas: &[VmArea],
+    start: u64,
+    end: u64,
+) -> Result<Vec<(u64, usize)>, SharedMappingError> {
+    let mut ranges = Vec::new();
+    ranges
+        .try_reserve_exact(vmas.len())
+        .map_err(|_| SharedMappingError::OutOfMemory)?;
+    let mut covered = start;
+    for area in vmas {
+        if area.end <= start || area.start >= end {
+            continue;
+        }
+        let VmAreaKind::FileBacked { committed, .. } = area.kind else {
+            return Err(SharedMappingError::ExactMappingNotFound {
+                address: start,
+                length: end - start,
+            });
+        };
+        if area.start > covered {
+            return Err(SharedMappingError::ExactMappingNotFound {
+                address: start,
+                length: end - start,
+            });
+        }
+        let range_start = area.start.max(start);
+        let range_end = area.end.min(end);
+        if committed {
+            let length = usize::try_from(range_end - range_start)
+                .map_err(|_| SharedMappingError::RangeOverflow)?;
+            if let Some((previous_start, previous_length)) = ranges.last_mut() {
+                if *previous_start + *previous_length as u64 == range_start {
+                    *previous_length += length;
+                } else {
+                    ranges.push((range_start, length));
+                }
+            } else {
+                ranges.push((range_start, length));
+            }
+        }
+        covered = range_end;
+    }
+    if covered != end {
+        return Err(SharedMappingError::ExactMappingNotFound {
+            address: start,
+            length: end - start,
+        });
+    }
+    Ok(ranges)
+}
+
 fn plan_vma_remove_kind(
     vmas: &[VmArea],
     start: u64,
@@ -2604,6 +3362,62 @@ fn anonymous_permissions(
         UserPagePermissions::READ_ONLY
     };
     Ok((protection, permissions))
+}
+
+pub(crate) fn file_max_protection(rights: Rights) -> Result<MapProtection, SharedMappingError> {
+    if !rights.contains(Rights::READ)
+        || rights.contains(Rights::WRITE) && rights.contains(Rights::EXECUTE)
+    {
+        return Err(SharedMappingError::Ipc(IpcError::InvalidRights));
+    }
+    let mut maximum = MapProtection::READ;
+    if rights.contains(Rights::WRITE) {
+        maximum |= MapProtection::WRITE;
+    }
+    if rights.contains(Rights::EXECUTE) {
+        maximum |= MapProtection::EXECUTE;
+    }
+    Ok(maximum)
+}
+
+fn file_permissions(
+    protection: MapProtection,
+    maximum: MapProtection,
+) -> Result<(MapProtection, UserPagePermissions), SharedMappingError> {
+    let validated = anonymous_permissions(protection)?;
+    if protection.bits() & !maximum.bits() != 0 {
+        return Err(SharedMappingError::InvalidProtection(protection));
+    }
+    Ok(validated)
+}
+
+fn authorize_file_protection(
+    vmas: &[VmArea],
+    backings: &[FileBacking],
+    start: u64,
+    end: u64,
+    protection: MapProtection,
+) -> Result<(), SharedMappingError> {
+    let mut covered = start;
+    for area in vmas {
+        if area.end <= start || area.start >= end {
+            continue;
+        }
+        let VmAreaKind::FileBacked { backing_id, .. } = area.kind else {
+            return Err(SharedMappingError::ExactMappingNotFound { address: start, length: end - start });
+        };
+        if area.start > covered {
+            return Err(SharedMappingError::ExactMappingNotFound { address: start, length: end - start });
+        }
+        let backing = backings.iter().find(|backing| backing.id == backing_id)
+            .ok_or(SharedMappingError::InvalidBackingLength)?;
+        file_permissions(protection, backing.max_protection)?;
+        covered = area.end.min(end);
+    }
+    if covered != end {
+        return Err(SharedMappingError::ExactMappingNotFound { address: start, length: end - start });
+    }
+    Ok(())
 }
 
 fn validate_protection(
@@ -3054,6 +3868,8 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
+    use ginkgo_filesystem::{MemoryDisk, RedoxFs};
+
     use super::*;
     use crate::shared_memory::test_support::TestSharedMemoryContext;
 
@@ -3078,6 +3894,80 @@ mod tests {
         assert!(normal.executable_source_bytes < high.executable_source_bytes);
         assert!(high.executable_image_pages <= high.private_pages);
         assert!(high.vma_count <= MAX_VMAS as u64);
+    }
+
+    #[test]
+    fn memory_policy_attenuates_every_public_limit_and_rejects_escalation() {
+        let defaults = ProcessLimits::from_available_memory_bytes(512 * MIB);
+        let requested = ProcessLimits {
+            private_pages: defaults.private_pages - 1,
+            shared_memory_bytes: defaults.shared_memory_bytes - 1,
+            mapped_shared_bytes: defaults.mapped_shared_bytes - 1,
+            reserved_virtual_bytes: defaults.reserved_virtual_bytes - 1,
+            vma_count: defaults.vma_count - 1,
+            executable_image_pages: defaults.executable_image_pages - 1,
+            executable_source_bytes: defaults.executable_source_bytes - 1,
+            channel_traffic_bytes: defaults.channel_traffic_bytes,
+            cpu_quantum_ns: defaults.cpu_quantum_ns,
+        };
+        let selected = defaults.attenuate(requested).unwrap();
+        assert_eq!(selected.private_pages, requested.private_pages);
+        assert_eq!(selected.shared_memory_bytes, requested.shared_memory_bytes);
+        assert_eq!(selected.mapped_shared_bytes, requested.mapped_shared_bytes);
+        assert_eq!(
+            selected.reserved_virtual_bytes,
+            requested.reserved_virtual_bytes
+        );
+        assert_eq!(selected.vma_count, requested.vma_count);
+        assert_eq!(
+            selected.executable_image_pages,
+            requested.executable_image_pages
+        );
+        assert_eq!(
+            selected.executable_source_bytes,
+            requested.executable_source_bytes
+        );
+        assert_eq!(
+            selected.channel_traffic_bytes,
+            defaults.channel_traffic_bytes
+        );
+        assert_eq!(selected.cpu_quantum_ns, defaults.cpu_quantum_ns);
+
+        let mut escalation = requested;
+        escalation.private_pages = defaults.private_pages + 1;
+        assert_eq!(defaults.attenuate(escalation), None);
+    }
+
+    #[test]
+    fn child_policy_is_transitively_capped_for_legacy_and_versioned_creation() {
+        let ram = ProcessLimits::from_available_memory_bytes(512 * MIB);
+        let mut caller = ram;
+        caller.private_pages /= 2;
+        caller.shared_memory_bytes /= 2;
+        caller.mapped_shared_bytes /= 2;
+        caller.reserved_virtual_bytes /= 2;
+        caller.vma_count /= 2;
+        caller.executable_image_pages /= 2;
+        caller.executable_source_bytes /= 2;
+
+        let legacy = select_child_process_limits(caller, 512 * MIB, None).unwrap();
+        assert_eq!(legacy.private_pages, caller.private_pages);
+        assert_eq!(legacy.executable_source_bytes, caller.executable_source_bytes);
+
+        let lower_ram = ProcessLimits::from_available_memory_bytes(64 * MIB);
+        let low_memory_legacy = select_child_process_limits(caller, 64 * MIB, None).unwrap();
+        assert_eq!(low_memory_legacy, lower_ram.capped_by(caller));
+
+        let mut requested = legacy;
+        requested.private_pages -= 1;
+        requested.vma_count -= 1;
+        let selected = select_child_process_limits(caller, 512 * MIB, Some(requested)).unwrap();
+        assert_eq!(selected.private_pages, requested.private_pages);
+        assert_eq!(selected.vma_count, requested.vma_count);
+
+        let mut escalation = requested;
+        escalation.private_pages = caller.private_pages + 1;
+        assert_eq!(select_child_process_limits(caller, 512 * MIB, Some(escalation)), None);
     }
 
     #[test]
@@ -3175,13 +4065,436 @@ mod tests {
             preemption_count: 0,
             blocked_syscall: None,
             shared_mappings: None,
+            file_backings: None,
             vmas: None,
             retained_failed_mapping_leases: None,
             next_mapping_cursor: SHARED_MAPPING_BASE,
             next_anonymous_reservation_id: 1,
+            next_file_backing_id: 1,
+            fail_file_rollback_for_test: false,
             limits: ProcessLimits::STANDARD,
             usage: ProcessUsage::default(),
         }
+    }
+
+    fn file_fixture(bytes: &[u8]) -> (RedoxFs<MemoryDisk>, FileHandle) {
+        let mut filesystem = RedoxFs::format_disk(MemoryDisk::zeroed(8 * 1024 * 1024)).unwrap();
+        let file = filesystem.create("/mapping.bin").unwrap();
+        assert_eq!(filesystem.write(file, 0, bytes).unwrap(), bytes.len());
+        (filesystem, file)
+    }
+
+    unsafe fn frame_bytes(frame: PhysFrame<Size4KiB>) -> &'static [u8] {
+        unsafe {
+            core::slice::from_raw_parts(
+                frame.start_address().as_u64() as usize as *const u8,
+                PAGE_SIZE as usize,
+            )
+        }
+    }
+
+    #[test]
+    fn file_mapping_loads_offset_and_zero_fills_tail_then_recommits_after_handle_loss() {
+        let mut source = vec![0u8; PAGE_SIZE as usize * 2 + 1];
+        for (index, byte) in source[PAGE_SIZE as usize..PAGE_SIZE as usize * 2]
+            .iter_mut()
+            .enumerate()
+        {
+            *byte = (index as u8).wrapping_mul(17).wrapping_add(3);
+        }
+        source[PAGE_SIZE as usize * 2] = 0xa5;
+        let (mut filesystem, file) = file_fixture(&source);
+        let (_region, mut allocator) = TestFrameRegion::allocator(128);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let baseline_usage = process.usage();
+        let baseline_frames = process.address_space().owned_data_frames().len();
+        let args = VirtualMapFileArgs {
+            address: 0,
+            offset: PAGE_SIZE,
+            length: PAGE_SIZE + 1,
+            protection: MapProtection::READ,
+            flags: MapFlags::empty(),
+        };
+        let address = process
+            .map_file_backed(
+                file,
+                source.len() as u64,
+                MapProtection::READ,
+                args,
+                &mut allocator,
+                |offset, output| {
+                    filesystem
+                        .read(file, offset, output)
+                        .map_err(|_| SharedMappingError::Io)
+                },
+            )
+            .unwrap();
+        let frames = &process.address_space().owned_data_frames()[baseline_frames..];
+        assert_eq!(frames.len(), 2);
+        let first = unsafe { frame_bytes(frames[0]) };
+        let tail = unsafe { frame_bytes(frames[1]) };
+        assert_eq!(first, &source[PAGE_SIZE as usize..PAGE_SIZE as usize * 2]);
+        assert_eq!(tail[0], 0xa5);
+        assert!(tail[1..].iter().all(|byte| *byte == 0));
+        assert_eq!(
+            process.usage().private_pages,
+            baseline_usage.private_pages + 2
+        );
+
+        process
+            .decommit_file_backed(address, args.length, &mut allocator)
+            .unwrap();
+        assert_eq!(
+            process.address_space().owned_data_frames().len(),
+            baseline_frames
+        );
+        assert_eq!(process.usage().private_pages, baseline_usage.private_pages);
+        assert_eq!(process.file_backings.as_ref().unwrap().len(), 1);
+
+        process
+            .commit_file_backed(
+                address,
+                args.length,
+                &mut allocator,
+                |authority, offset, output| {
+                    filesystem
+                        .read(authority, offset, output)
+                        .map_err(|_| SharedMappingError::Io)
+                },
+            )
+            .unwrap();
+        let recommitted = &process.address_space().owned_data_frames()[baseline_frames..];
+        assert_eq!(unsafe { frame_bytes(recommitted[1]) }[0], 0xa5);
+        assert!(unsafe { frame_bytes(recommitted[1]) }[1..]
+            .iter()
+            .all(|byte| *byte == 0));
+
+        process
+            .unmap_file_backed(address, PAGE_SIZE, &mut allocator)
+            .unwrap();
+        assert_eq!(process.file_backings.as_ref().unwrap().len(), 1);
+        process
+            .unmap_file_backed(address + PAGE_SIZE, PAGE_SIZE, &mut allocator)
+            .unwrap();
+        assert!(process.file_backings.as_ref().unwrap().is_empty());
+        assert_eq!(process.usage().private_pages, baseline_usage.private_pages);
+        assert_eq!(
+            process.usage().reserved_virtual_bytes,
+            baseline_usage.reserved_virtual_bytes
+        );
+    }
+
+    #[test]
+    fn file_lifecycle_splits_remerges_and_enforces_wx() {
+        let area = VmArea {
+            start: 0x4000,
+            end: 0x7000,
+            kind: VmAreaKind::FileBacked {
+                backing_id: 9,
+                file_offset: 0x2000,
+                committed: true,
+            },
+            protection: MapProtection::READ,
+        };
+        let split = plan_file_change(
+            &[area],
+            0x5000,
+            0x6000,
+            FileChange::Protect(MapProtection::READ | MapProtection::WRITE),
+        )
+        .unwrap();
+        assert_eq!(split.len(), 3);
+        assert!(matches!(
+            split[1].kind,
+            VmAreaKind::FileBacked {
+                backing_id: 9,
+                file_offset: 0x3000,
+                committed: true
+            }
+        ));
+        let merged = plan_file_change(
+            &split,
+            0x5000,
+            0x6000,
+            FileChange::Protect(MapProtection::READ),
+        )
+        .unwrap();
+        assert_eq!(merged, vec![area]);
+        assert!(matches!(
+            anonymous_permissions(
+                MapProtection::READ | MapProtection::WRITE | MapProtection::EXECUTE
+            ),
+            Err(SharedMappingError::InvalidProtection(_))
+        ));
+    }
+
+    #[test]
+    fn retained_file_authority_limits_later_protection_changes() {
+        let source = vec![0x90u8; PAGE_SIZE as usize];
+        let (mut filesystem, file) = file_fixture(&source);
+        let (_region, mut allocator) = TestFrameRegion::allocator(128);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let mut map = |process: &mut Process, rights, protection| {
+            let source_handle = process.handles_mut().filesystem_file_create(file, rights).unwrap();
+            let retained_file = process.handles().filesystem_file(source_handle, Rights::READ).unwrap();
+            let maximum = file_max_protection(process.handles().handle_rights(source_handle).unwrap()).unwrap();
+            process.handles_mut().handle_close(source_handle).unwrap();
+            process.map_file_backed(
+                retained_file,
+                source.len() as u64,
+                maximum,
+                VirtualMapFileArgs {
+                    address: 0,
+                    offset: 0,
+                    length: PAGE_SIZE,
+                    protection,
+                    flags: MapFlags::empty(),
+                },
+                &mut allocator,
+                |offset, output| filesystem.read(file, offset, output).map_err(|_| SharedMappingError::Io),
+            ).unwrap()
+        };
+
+        let read_only = map(&mut process, Rights::READ, MapProtection::READ);
+        let executable = map(&mut process, Rights::READ | Rights::EXECUTE, MapProtection::READ);
+        let writable = map(
+            &mut process,
+            Rights::READ | Rights::WRITE,
+            MapProtection::READ | MapProtection::WRITE,
+        );
+        drop(map);
+
+        assert!(matches!(
+            process.protect_file_backed(read_only, PAGE_SIZE, MapProtection::READ | MapProtection::EXECUTE),
+            Err(SharedMappingError::InvalidProtection(_))
+        ));
+
+        process.protect_file_backed(
+            executable,
+            PAGE_SIZE,
+            MapProtection::READ | MapProtection::EXECUTE,
+        ).unwrap();
+        process.protect_file_backed(executable, PAGE_SIZE, MapProtection::READ).unwrap();
+
+        assert!(matches!(
+            process.protect_file_backed(writable, PAGE_SIZE, MapProtection::READ | MapProtection::EXECUTE),
+            Err(SharedMappingError::InvalidProtection(_))
+        ));
+        for address in [read_only, executable, writable] {
+            process.unmap_file_backed(address, PAGE_SIZE, &mut allocator).unwrap();
+        }
+    }
+
+    #[test]
+    fn file_partial_map_rollback_failure_quarantines_and_retains_retirement_owners() {
+        let source = vec![0x44u8; PAGE_SIZE as usize * 2];
+        let (_filesystem, file) = file_fixture(&source);
+        let (_region, mut allocator) = TestFrameRegion::allocator(96);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        process.fail_file_rollback_for_test = true;
+        let baseline_private = process.usage().private_pages;
+        let mut reads = 0;
+        let result = process.map_file_backed(
+            file,
+            source.len() as u64,
+            MapProtection::READ,
+            VirtualMapFileArgs {
+                address: 0,
+                offset: 0,
+                length: PAGE_SIZE * 2,
+                protection: MapProtection::READ,
+                flags: MapFlags::empty(),
+            },
+            &mut allocator,
+            |offset, output| {
+                reads += 1;
+                if reads == 2 {
+                    Err(SharedMappingError::Io)
+                } else {
+                    let start = offset as usize;
+                    output.copy_from_slice(&source[start..start + output.len()]);
+                    Ok(output.len())
+                }
+            },
+        );
+
+        assert!(matches!(result, Err(SharedMappingError::RollbackFailed { .. })));
+        assert!(process.state().is_terminal());
+        assert_eq!(process.file_backings.as_ref().unwrap().len(), 1);
+        assert_eq!(process.usage().private_pages, baseline_private + 2);
+        assert!(process.vmas().iter().any(|vma| matches!(
+            vma.kind,
+            VmAreaKind::FileBacked { backing_id: 1, .. }
+        )));
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+        assert_eq!(allocator.allocated_count(), 0);
+    }
+
+    #[test]
+    fn file_recommit_rollback_failure_publishes_conservative_quarantine_metadata() {
+        let source = vec![0x66u8; PAGE_SIZE as usize * 2];
+        let (mut filesystem, file) = file_fixture(&source);
+        let (_region, mut allocator) = TestFrameRegion::allocator(96);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let baseline_private = process.usage().private_pages;
+        let address = process.map_file_backed(
+            file,
+            source.len() as u64,
+            MapProtection::READ,
+            VirtualMapFileArgs {
+                address: 0,
+                offset: 0,
+                length: PAGE_SIZE * 2,
+                protection: MapProtection::READ,
+                flags: MapFlags::empty(),
+            },
+            &mut allocator,
+            |offset, output| filesystem.read(file, offset, output).map_err(|_| SharedMappingError::Io),
+        ).unwrap();
+        process.decommit_file_backed(address, PAGE_SIZE * 2, &mut allocator).unwrap();
+        let reserved_before = process.usage().reserved_virtual_bytes;
+        let owned_before = process.address_space().owned_data_frames().len();
+        process.fail_file_rollback_for_test = true;
+        let mut reads = 0;
+
+        let result = process.commit_file_backed(
+            address,
+            PAGE_SIZE * 2,
+            &mut allocator,
+            |authority, offset, output| {
+                reads += 1;
+                if reads == 2 {
+                    Err(SharedMappingError::Io)
+                } else {
+                    filesystem.read(authority, offset, output).map_err(|_| SharedMappingError::Io)
+                }
+            },
+        );
+
+        assert!(matches!(result, Err(SharedMappingError::RollbackFailed { .. })));
+        assert!(process.state().is_terminal());
+        assert_eq!(process.file_backings.as_ref().unwrap().len(), 1);
+        assert_eq!(process.usage().reserved_virtual_bytes, reserved_before);
+        assert_eq!(process.usage().private_pages, baseline_private + 2);
+        let quarantined = process.vmas().iter().filter(|vma| {
+            vma.start < address + PAGE_SIZE * 2 && address < vma.end
+        }).collect::<Vec<_>>();
+        assert!(!quarantined.is_empty());
+        assert_eq!(quarantined.iter().map(|vma| vma.length()).sum::<u64>(), PAGE_SIZE * 2);
+        assert!(quarantined.iter().all(|vma| matches!(
+            vma.kind,
+            VmAreaKind::FileBacked { committed: true, .. }
+        )));
+        assert_eq!(process.address_space().owned_data_frames().len(), owned_before + 1);
+        let accounting = process.address_space().accounting();
+        assert_eq!(accounting.mapped_data_frames, owned_before + 1);
+        assert_eq!(
+            process.usage().resident_owned_frames,
+            (accounting.mapped_data_frames + accounting.retired_data_frames + accounting.page_table_frames) as u64
+        );
+
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+        assert_eq!(allocator.allocated_count(), 0);
+    }
+
+    #[test]
+    fn file_mapping_read_failure_rolls_back_pages_vmas_quota_and_backing() {
+        let source = vec![0x5au8; PAGE_SIZE as usize * 2];
+        let (_filesystem, file) = file_fixture(&source);
+        let (_region, mut allocator) = TestFrameRegion::allocator(128);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let usage = process.usage();
+        let vmas = process.vmas().to_vec();
+        let frames = process.address_space().owned_data_frames().len();
+        let mut reads = 0;
+        let result = process.map_file_backed(
+            file,
+            source.len() as u64,
+            MapProtection::READ,
+            VirtualMapFileArgs {
+                address: 0,
+                offset: 0,
+                length: source.len() as u64,
+                protection: MapProtection::READ,
+                flags: MapFlags::empty(),
+            },
+            &mut allocator,
+            |offset, output| {
+                reads += 1;
+                if reads == 2 {
+                    Err(SharedMappingError::Io)
+                } else {
+                    let start = offset as usize;
+                    output.copy_from_slice(&source[start..start + output.len()]);
+                    Ok(output.len())
+                }
+            },
+        );
+        assert_eq!(result, Err(SharedMappingError::Io));
+        let after = process.usage();
+        assert_eq!(after.private_pages, usage.private_pages);
+        assert_eq!(after.reserved_virtual_bytes, usage.reserved_virtual_bytes);
+        assert_eq!(after.shared_memory_bytes, usage.shared_memory_bytes);
+        assert_eq!(after.mapped_shared_bytes, usage.mapped_shared_bytes);
+        assert_eq!(after.quota_failures, usage.quota_failures);
+        assert_eq!(after.oom_failures, usage.oom_failures);
+        assert_eq!(process.vmas(), vmas);
+        assert_eq!(process.address_space().owned_data_frames().len(), frames);
+        assert!(process.file_backings.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn partial_file_mapping_oom_reclaims_data_and_keeps_metadata_atomic() {
+        let source = vec![0x33u8; PAGE_SIZE as usize * 2];
+        let (_filesystem, file) = file_fixture(&source);
+        let (_region, mut allocator) = TestFrameRegion::allocator(80);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let mut held = Vec::new();
+        while let Some(frame) = allocator.allocate_frame().unwrap() {
+            held.push(frame);
+        }
+        for _ in 0..3 {
+            let frame = held.pop().expect("enough frames for one mapping page");
+            allocator.deallocate_frame(frame).unwrap();
+        }
+        let usage = process.usage();
+        let vmas = process.vmas().to_vec();
+        let owned_frames = process.address_space().owned_data_frames().len();
+
+        let result = process.map_file_backed(
+            file,
+            source.len() as u64,
+            MapProtection::READ,
+            VirtualMapFileArgs {
+                address: 0,
+                offset: 0,
+                length: source.len() as u64,
+                protection: MapProtection::READ,
+                flags: MapFlags::empty(),
+            },
+            &mut allocator,
+            |offset, output| {
+                let start = offset as usize;
+                output.copy_from_slice(&source[start..start + output.len()]);
+                Ok(output.len())
+            },
+        );
+        assert!(
+            matches!(
+                result,
+                Err(SharedMappingError::AddressSpace(AddressSpaceError::OutOfFrames))
+                    | Err(SharedMappingError::AddressSpace(AddressSpaceError::OutOfMemory))
+            ),
+            "unexpected file mapping result: {result:?}"
+        );
+        assert_eq!(process.usage().private_pages, usage.private_pages);
+        assert_eq!(process.usage().reserved_virtual_bytes, usage.reserved_virtual_bytes);
+        assert_eq!(process.vmas(), vmas);
+        assert_eq!(process.address_space().owned_data_frames().len(), owned_frames);
+        assert!(process.file_backings.as_ref().unwrap().is_empty());
+        allocator.reclaim_frames(&held).unwrap();
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+        assert_eq!(allocator.allocated_count(), 0);
     }
 
     #[test]

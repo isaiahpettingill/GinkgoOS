@@ -12,7 +12,7 @@ A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. Gi
 - Strict ELF64 `ET_EXEC` compatibility plus randomized static `ET_DYN`, guarded randomized user stacks, x86-64 ring-3 entry, and contained user faults
 - `SYSCALL`/`SYSRET` dispatch plus `no_std` userspace stubs for processes, handles, channels, waits, shared memory, files, directories, and debug output
 - Rights-checked shared-memory map/unmap with mapping leases that survive source-handle closure
-- Zero-filled private anonymous mappings with quota accounting, exact unmap/reclaim, and syscall-backed growable userspace Talc heaps
+- Zero-filled private anonymous mappings and eager private file snapshots with reserve/commit/decommit/protect/unmap lifecycle, quota accounting, exact frame reclaim, and syscall-backed growable userspace Talc heaps; file backing survives handle closure but unlink invalidates the retained generation identity
 - `x86_64` port I/O plus `volatile`-backed checked MMIO capabilities
 - A nonblocking serial device built on `uart_16550`
 - General PCI class discovery, interrupt-assisted xHCI with hubs/hotplug, and polling Intel HDA output

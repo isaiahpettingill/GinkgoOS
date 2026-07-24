@@ -96,6 +96,18 @@ pub enum SyscallNumber {
     AnonymousDecommit = 44,
     /// Returns one coherent system-and-caller memory accounting checkpoint.
     MemoryGetInfo = 45,
+    /// Maps an eager private snapshot of a file range.
+    VirtualMapFile = 46,
+    /// Recommits decommitted file-backed pages from their original file bytes.
+    VirtualCommit = 47,
+    /// Releases file-backed pages while retaining their backing authority.
+    VirtualDecommit = 48,
+    /// Changes protection on a file-backed page range.
+    VirtualProtect = 49,
+    /// Removes a file-backed page range and its reservation.
+    VirtualUnmap = 50,
+    /// Creates a process with an attenuated versioned memory policy.
+    ProcessCreate2 = 51,
 }
 
 /// An opaque process-local reference to a kernel object.
@@ -685,6 +697,69 @@ pub struct ProcessCreateArgs {
     pub output_address: u64,
 }
 
+/// Current [`ProcessMemoryPolicy`] ABI version.
+pub const PROCESS_MEMORY_POLICY_VERSION: u32 = 1;
+
+/// Caller-selected child memory ceilings for [`SyscallNumber::ProcessCreate2`].
+/// Every value must be no greater than the RAM-derived launch default.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProcessMemoryPolicy {
+    pub version: u32,
+    pub size: u32,
+    pub private_page_limit: u64,
+    pub shared_memory_byte_limit: u64,
+    pub mapped_shared_byte_limit: u64,
+    pub reserved_virtual_byte_limit: u64,
+    pub vma_limit: u64,
+    pub executable_image_page_limit: u64,
+    pub executable_source_byte_limit: u64,
+}
+
+impl ProcessMemoryPolicy {
+    pub const SIZE: u32 = core::mem::size_of::<Self>() as u32;
+
+    /// Copies the caller's current reported ceilings into a valid child policy.
+    pub const fn from_memory_info(info: &MemoryInfo) -> Self {
+        Self {
+            version: PROCESS_MEMORY_POLICY_VERSION,
+            size: Self::SIZE,
+            private_page_limit: info.private_page_limit,
+            shared_memory_byte_limit: info.shared_memory_byte_limit,
+            mapped_shared_byte_limit: info.mapped_shared_byte_limit,
+            reserved_virtual_byte_limit: info.reserved_virtual_byte_limit,
+            vma_limit: info.vma_limit,
+            executable_image_page_limit: info.executable_image_page_limit,
+            executable_source_byte_limit: info.executable_source_byte_limit,
+        }
+    }
+}
+
+/// Versioned process-create argument block. Its first 64 bytes exactly match
+/// [`ProcessCreateArgs`]; old callers continue to use [`SyscallNumber::ProcessCreate`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessCreateArgs2 {
+    pub executable: Handle,
+    pub reserved: u32,
+    pub args_address: u64,
+    pub args_length: u64,
+    pub startup_handles_address: u64,
+    pub startup_handle_count: u64,
+    pub config_address: u64,
+    pub config_length: u64,
+    pub output_address: u64,
+    pub version: u32,
+    pub size: u32,
+    /// Address of a readable [`ProcessMemoryPolicy`].
+    pub policy_address: u64,
+}
+
+impl ProcessCreateArgs2 {
+    pub const VERSION: u32 = 1;
+    pub const SIZE: u32 = core::mem::size_of::<Self>() as u32;
+}
+
 /// Stable process information returned by [`SyscallNumber::ProcessGetInfo`].
 ///
 /// The discriminated fields intentionally use raw integers: a kernel copying a
@@ -811,6 +886,28 @@ pub struct SharedMemoryMapOutput {
 pub type AnonymousMapOutput = SharedMemoryMapOutput;
 /// Output block for [`SyscallNumber::AnonymousReserve`].
 pub type AnonymousReserveOutput = SharedMemoryMapOutput;
+/// Output block for [`SyscallNumber::VirtualMapFile`].
+pub type VirtualMapFileOutput = SharedMemoryMapOutput;
+
+/// Argument block for [`SyscallNumber::VirtualMapFile`].
+///
+/// The mapped bytes are an eager private snapshot. Writes never update the file,
+/// and later file writes are not reflected in committed pages. Recommit reloads
+/// the original range from the retained generation-protected file identity. Closing
+/// the source handle is harmless. Unlinking the file invalidates that identity, so
+/// recommit may fail even if another file is later created at the same path.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VirtualMapFileArgs {
+    /// Requested address, or zero to let the kernel choose when not `FIXED`.
+    pub address: u64,
+    /// Page-aligned source-file offset.
+    pub offset: u64,
+    /// Nonzero byte length. The installed mapping is rounded up to whole pages.
+    pub length: u64,
+    pub protection: MapProtection,
+    pub flags: MapFlags,
+}
 
 /// Maximum UTF-8 bytes in one filesystem path component.
 pub const FILESYSTEM_NAME_MAX: usize = 252;
@@ -1108,6 +1205,8 @@ const _: () = {
     assert!(core::mem::size_of::<HandleOutput>() == 8);
     assert!(core::mem::size_of::<HandleDisposition>() == 16);
     assert!(core::mem::size_of::<ProcessCreateArgs>() == 64);
+    assert!(core::mem::size_of::<ProcessMemoryPolicy>() == 64);
+    assert!(core::mem::size_of::<ProcessCreateArgs2>() == 80);
     assert!(core::mem::size_of::<ProcessInfo>() == 32);
     assert!(core::mem::size_of::<SystemPowerInfo>() == 32);
     assert!(core::mem::size_of::<MemoryInfo>() == 288);
@@ -1118,6 +1217,7 @@ const _: () = {
     assert!(core::mem::size_of::<ChannelReadOutput>() == 8);
     assert!(core::mem::size_of::<SharedMemorySizeOutput>() == 8);
     assert!(core::mem::size_of::<SharedMemoryMapArgs>() == 32);
+    assert!(core::mem::size_of::<VirtualMapFileArgs>() == 32);
     assert!(core::mem::size_of::<SharedMemoryMapOutput>() == 8);
     assert!(core::mem::size_of::<FilesystemOpenArgs>() == 24);
     assert!(core::mem::size_of::<FilesystemReadOutput>() == 8);
@@ -1192,6 +1292,12 @@ mod tests {
         assert_eq!(SyscallNumber::AnonymousCommit as u64, 43);
         assert_eq!(SyscallNumber::AnonymousDecommit as u64, 44);
         assert_eq!(SyscallNumber::MemoryGetInfo as u64, 45);
+        assert_eq!(SyscallNumber::VirtualMapFile as u64, 46);
+        assert_eq!(SyscallNumber::VirtualCommit as u64, 47);
+        assert_eq!(SyscallNumber::VirtualDecommit as u64, 48);
+        assert_eq!(SyscallNumber::VirtualProtect as u64, 49);
+        assert_eq!(SyscallNumber::VirtualUnmap as u64, 50);
+        assert_eq!(SyscallNumber::ProcessCreate2 as u64, 51);
     }
 
     #[test]
@@ -1316,6 +1422,13 @@ mod tests {
         assert_eq!(size_of::<SharedMemoryMapArgs>(), 32);
         assert_eq!(offset_of!(SharedMemoryMapArgs, protection), 24);
         assert_eq!(offset_of!(SharedMemoryMapArgs, flags), 28);
+        assert_eq!(size_of::<VirtualMapFileArgs>(), 32);
+        assert_eq!(align_of::<VirtualMapFileArgs>(), 8);
+        assert_eq!(offset_of!(VirtualMapFileArgs, address), 0);
+        assert_eq!(offset_of!(VirtualMapFileArgs, offset), 8);
+        assert_eq!(offset_of!(VirtualMapFileArgs, length), 16);
+        assert_eq!(offset_of!(VirtualMapFileArgs, protection), 24);
+        assert_eq!(offset_of!(VirtualMapFileArgs, flags), 28);
 
         assert_eq!(size_of::<FilesystemOpenArgs>(), 24);
         assert_eq!(offset_of!(FilesystemOpenArgs, flags), 16);
@@ -1330,6 +1443,18 @@ mod tests {
         assert_eq!(offset_of!(ProcessCreateArgs, config_address), 40);
         assert_eq!(offset_of!(ProcessCreateArgs, config_length), 48);
         assert_eq!(offset_of!(ProcessCreateArgs, output_address), 56);
+        assert_eq!(size_of::<ProcessMemoryPolicy>(), 64);
+        assert_eq!(align_of::<ProcessMemoryPolicy>(), 8);
+        assert_eq!(offset_of!(ProcessMemoryPolicy, private_page_limit), 8);
+        assert_eq!(
+            offset_of!(ProcessMemoryPolicy, executable_source_byte_limit),
+            56
+        );
+        assert_eq!(size_of::<ProcessCreateArgs2>(), 80);
+        assert_eq!(align_of::<ProcessCreateArgs2>(), 8);
+        assert_eq!(offset_of!(ProcessCreateArgs2, output_address), 56);
+        assert_eq!(offset_of!(ProcessCreateArgs2, version), 64);
+        assert_eq!(offset_of!(ProcessCreateArgs2, policy_address), 72);
 
         assert_eq!(size_of::<ProcessInfo>(), 32);
         assert_eq!(align_of::<ProcessInfo>(), 8);
