@@ -13,6 +13,8 @@ TEXT_EDITOR_VERIFY_ROOT := $(BUILD_DIR)/text_editor_verify_root
 TEXT_EDITOR_SMOKE_DISK := $(BUILD_DIR)/text-editor-smoke.img
 PROCESS_CAPABILITY_SMOKE_ROOT := $(BUILD_DIR)/process_capability_smoke_root
 PROCESS_CAPABILITY_SMOKE_DISK := $(BUILD_DIR)/process-capability-smoke.img
+MEMORY_POLICY_SMOKE_ROOT := $(BUILD_DIR)/memory_policy_smoke_root
+MEMORY_POLICY_SMOKE_DISK := $(BUILD_DIR)/memory-policy-smoke.img
 POWER_SYNC_ROOT := $(BUILD_DIR)/power_sync_root
 POWER_VERIFY_ROOT := $(BUILD_DIR)/power_verify_root
 POWER_CANCEL_ROOT := $(BUILD_DIR)/power_cancel_root
@@ -56,7 +58,7 @@ QEMU_AUDIO_FLAGS ?= -audiodev sdl,id=ginkgo-audio
 endif
 QEMU_FLAGS ?= -cpu max -m 512M -M pc,i8042=off -serial stdio -device qemu-xhci,id=xhci,msi=on,msix=off -device usb-hub,id=ginkgo-hub,bus=xhci.0,port=1 -device usb-kbd,bus=xhci.0,port=1.1 -device usb-tablet,bus=xhci.0,port=1.2 $(QEMU_AUDIO_FLAGS) -device ich9-intel-hda -device hda-output,audiodev=ginkgo-audio
 
-.PHONY: all userspace kernel iso qemu no-iso run usb-smoke frame-reclaim-smoke filesystem-smoke text-editor-smoke process-capability-smoke power-smoke check clean distclean reset-fs FORCE
+.PHONY: all userspace kernel iso qemu no-iso run usb-smoke frame-reclaim-smoke filesystem-smoke text-editor-smoke process-capability-smoke memory-policy-smoke power-smoke check clean distclean reset-fs FORCE
 
 all: iso
 
@@ -154,6 +156,17 @@ process-capability-smoke: userspace $(LIMINE_DIR)/BOOTX64.EFI $(OVMF_CODE) $(FS_
 	$(PYTHON) tools/create_gpt_disk.py $(PROCESS_CAPABILITY_SMOKE_DISK) --size-mb 32
 	$(PYTHON) tools/qemu_process_capability_test.py --qemu "$(QEMU)" --ovmf $(OVMF_CODE) --disk $(PROCESS_CAPABILITY_SMOKE_DISK) --boot-root $(PROCESS_CAPABILITY_SMOKE_ROOT)
 
+memory-policy-smoke: userspace $(LIMINE_DIR)/BOOTX64.EFI $(OVMF_CODE)
+	GINKGO_MEMORY_POLICY_SMOKE=1 GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" GINKGO_TEXT_EDITOR_ELF="$(abspath $(TEXT_EDITOR_ELF))" GINKGO_TERMINAL_ELF="$(abspath $(TERMINAL_ELF))" cargo build -p ginkgo-kernel --bin ginkgo-os
+	rm -rf $(MEMORY_POLICY_SMOKE_ROOT)
+	mkdir -p $(MEMORY_POLICY_SMOKE_ROOT)/boot/limine $(MEMORY_POLICY_SMOKE_ROOT)/EFI/BOOT
+	cp $(KERNEL) $(MEMORY_POLICY_SMOKE_ROOT)/boot/kernel
+	cp limine.conf $(MEMORY_POLICY_SMOKE_ROOT)/boot/limine/limine.conf
+	cp $(LIMINE_DIR)/BOOTX64.EFI $(MEMORY_POLICY_SMOKE_ROOT)/EFI/BOOT/
+	rm -f $(MEMORY_POLICY_SMOKE_DISK)
+	$(PYTHON) tools/create_gpt_disk.py $(MEMORY_POLICY_SMOKE_DISK) --size-mb 32
+	$(PYTHON) tools/qemu_memory_policy_test.py --qemu "$(QEMU)" --ovmf $(OVMF_CODE) --disk $(MEMORY_POLICY_SMOKE_DISK) --boot-root $(MEMORY_POLICY_SMOKE_ROOT)
+
 power-smoke: userspace $(LIMINE_DIR)/BOOTX64.EFI $(OVMF_CODE)
 	GINKGO_POWER_SMOKE=sync GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" GINKGO_TEXT_EDITOR_ELF="$(abspath $(TEXT_EDITOR_ELF))" GINKGO_TERMINAL_ELF="$(abspath $(TERMINAL_ELF))" cargo build -p ginkgo-kernel --bin ginkgo-os
 	rm -rf $(POWER_SYNC_ROOT)
@@ -213,7 +226,7 @@ check: userspace
 
 clean:
 	cargo clean
-	rm -rf $(ISO_ROOT) $(NO_ISO_ROOT) $(USB_SMOKE_ROOT) $(FRAME_RECLAIM_ROOT) $(FILESYSTEM_SMOKE_ROOT) $(FILESYSTEM_SMOKE_DISK) $(TEXT_EDITOR_SAVE_ROOT) $(TEXT_EDITOR_VERIFY_ROOT) $(TEXT_EDITOR_SMOKE_DISK) $(PROCESS_CAPABILITY_SMOKE_ROOT) $(PROCESS_CAPABILITY_SMOKE_DISK) $(POWER_SYNC_ROOT) $(POWER_VERIFY_ROOT) $(POWER_CANCEL_ROOT) $(POWER_REBOOT_ROOT) $(POWER_PERSIST_DISK) $(POWER_CANCEL_DISK) $(POWER_REBOOT_DISK) $(ISO)
+	rm -rf $(ISO_ROOT) $(NO_ISO_ROOT) $(USB_SMOKE_ROOT) $(FRAME_RECLAIM_ROOT) $(FILESYSTEM_SMOKE_ROOT) $(FILESYSTEM_SMOKE_DISK) $(TEXT_EDITOR_SAVE_ROOT) $(TEXT_EDITOR_VERIFY_ROOT) $(TEXT_EDITOR_SMOKE_DISK) $(PROCESS_CAPABILITY_SMOKE_ROOT) $(PROCESS_CAPABILITY_SMOKE_DISK) $(MEMORY_POLICY_SMOKE_ROOT) $(MEMORY_POLICY_SMOKE_DISK) $(POWER_SYNC_ROOT) $(POWER_VERIFY_ROOT) $(POWER_CANCEL_ROOT) $(POWER_REBOOT_ROOT) $(POWER_PERSIST_DISK) $(POWER_CANCEL_DISK) $(POWER_REBOOT_DISK) $(ISO)
 
 reset-fs:
 	rm -f $(FS_IMAGE)

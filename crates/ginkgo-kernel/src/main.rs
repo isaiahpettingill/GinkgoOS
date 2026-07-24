@@ -27,6 +27,10 @@ use ginkgo_desktop::ClientId;
 use ginkgo_filesystem::{FsError, NodeKind, NodeMetadata, RedoxFs, RenameMode};
 use ginkgo_hid::{ApplicationKind, Axis, InputEvent, AXIS_MAX, AXIS_MIN};
 use ginkgo_ipc::{shared_memory_backing_stats, IpcError, SystemPowerControl};
+#[cfg(ginkgo_memory_policy_smoke)]
+use ginkgo_kernel::paging::address_space::{
+    UserMappingBacking, UserPageMapping, UserPagePermissions,
+};
 use ginkgo_kernel::{
     ahci::{AhciDisk, AhciError},
     arch::{self, CpuPrivilegeState, ExternalInterruptState, KernelExit, PrivilegeStackTops},
@@ -126,6 +130,27 @@ static PROCESS_CAPABILITY_MALFORMED_ELF: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/ginkgo-process-capability-malformed.elf"
 ));
+#[cfg(ginkgo_memory_policy_smoke)]
+static MEMORY_POLICY_SUCCESS_ELF: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/ginkgo-memory-policy-success.elf"
+));
+#[cfg(ginkgo_memory_policy_smoke)]
+static MEMORY_POLICY_GUARD_ELF: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-memory-policy-guard.elf"));
+#[cfg(ginkgo_memory_policy_smoke)]
+static MEMORY_POLICY_PROTECT_FAULT_ELF: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/ginkgo-memory-policy-protect-fault.elf"
+));
+#[cfg(ginkgo_memory_policy_smoke)]
+static MEMORY_POLICY_OOM_ELF: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-memory-policy-oom.elf"));
+#[cfg(ginkgo_memory_policy_smoke)]
+static MEMORY_POLICY_WITNESS_ELF: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/ginkgo-memory-policy-witness.elf"
+));
 static GINKGO_SPLASH_RGBA: &[u8; 256 * 256 * 4] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-splash.rgba"));
 fn preemption_smoke_enabled() -> bool {
@@ -181,6 +206,72 @@ struct FrameReclaimStress {
     completed: u32,
     reuse_verified: u32,
     baseline: Option<FrameReclaimBaseline>,
+}
+
+#[cfg(ginkgo_memory_policy_smoke)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MemoryPolicyPhase {
+    Success,
+    Guard,
+    ProtectFault,
+    Oom,
+    Witness,
+}
+
+#[cfg(ginkgo_memory_policy_smoke)]
+impl MemoryPolicyPhase {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Success => "Success",
+            Self::Guard => "Guard",
+            Self::ProtectFault => "ProtectFault",
+            Self::Oom => "Oom",
+            Self::Witness => "Witness",
+        }
+    }
+}
+
+#[cfg(ginkgo_memory_policy_smoke)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MemoryPolicyCase {
+    Low,
+    Normal,
+    High,
+}
+
+#[cfg(ginkgo_memory_policy_smoke)]
+impl MemoryPolicyCase {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Normal => "normal",
+            Self::High => "high",
+        }
+    }
+}
+
+#[cfg(ginkgo_memory_policy_smoke)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MemoryPolicySuccessStage {
+    SharedMapped,
+    SharedUnmapped,
+    AnonymousProtected,
+    AnonymousUnmapped,
+    Complete,
+}
+
+#[cfg(ginkgo_memory_policy_smoke)]
+struct MemoryPolicySmoke {
+    current: Option<ProcessId>,
+    phase: MemoryPolicyPhase,
+    pending_completion: Option<(ProcessId, MemoryPolicyPhase)>,
+    baseline: FrameReclaimBaseline,
+    case: MemoryPolicyCase,
+    mapping_base: u64,
+    expected_fault_address: u64,
+    success_stage: MemoryPolicySuccessStage,
+    shared_frame: Option<u64>,
+    anonymous_frame: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1037,6 +1128,8 @@ pub extern "C" fn _start() -> ! {
             reuse_verified: 0,
             baseline: None,
         }),
+        #[cfg(ginkgo_memory_policy_smoke)]
+        memory_policy_smoke: None,
         processes: ProcessTable::new(),
         desktop: None,
         desktop_process_id: None,
@@ -1062,6 +1155,16 @@ pub extern "C" fn _start() -> ! {
     context
         .ui
         .render_boot_log(&mut context.screen, "paging: mappings verified");
+
+    #[cfg(ginkgo_memory_policy_smoke)]
+    match prepare_memory_policy_smoke(&mut context) {
+        Ok(smoke) => context.memory_policy_smoke = Some(smoke),
+        Err(reason) => {
+            let mut sink = SerialDebugSink::new(&mut context.serial);
+            let _ = writeln!(sink, "ginkgo-memory-policy-smoke: FAIL {reason}\r");
+            halt_forever();
+        }
+    }
 
     if power_smoke_mode().is_some() {
         run_power_smoke(&mut context);
@@ -1198,6 +1301,8 @@ pub extern "C" fn _start() -> ! {
         .ui
         .render_boot_log(&mut context.screen, "userspace: SMAP copy fixup verified");
     context.ui.render_splash(&mut context.screen);
+
+    run_memory_policy_smoke_if_enabled(&mut context);
 
     if process_capability_smoke_enabled() {
         if spawn_process_capability_smoke(&mut context).is_err() {
@@ -1422,6 +1527,27 @@ fn run_power_smoke(context: &mut KernelContext) -> ! {
     run_scheduler(context)
 }
 
+fn run_memory_policy_smoke_if_enabled(context: &mut KernelContext) {
+    #[cfg(not(ginkgo_memory_policy_smoke))]
+    let _ = context;
+
+    #[cfg(ginkgo_memory_policy_smoke)]
+    {
+        let baseline = memory_policy_baseline(context);
+        let smoke = context
+            .memory_policy_smoke
+            .as_mut()
+            .expect("memory policy smoke was not prepared");
+        smoke.baseline = baseline;
+        if spawn_memory_policy_smoke(context).is_err() {
+            let mut sink = SerialDebugSink::new(&mut context.serial);
+            let _ = writeln!(sink, "ginkgo-memory-policy-smoke: FAIL initial launch\r");
+            halt_forever();
+        }
+        run_scheduler(context);
+    }
+}
+
 fn run_scheduler(context: &mut KernelContext) -> ! {
     let mut scheduler = Scheduler::<KernelContext, 9>::new();
     if scheduler.spawn(filesystem_task).is_err()
@@ -1483,6 +1609,8 @@ struct KernelContext {
     preemption_smoke_id: Option<ProcessId>,
     process_capability_smoke_id: Option<ProcessId>,
     frame_reclaim_stress: Option<FrameReclaimStress>,
+    #[cfg(ginkgo_memory_policy_smoke)]
+    memory_policy_smoke: Option<MemoryPolicySmoke>,
     processes: ProcessTable,
     desktop: Option<DesktopBroker>,
     desktop_process_id: Option<ProcessId>,
@@ -1530,6 +1658,15 @@ fn reclaim_idle_shared_frames(context: &mut KernelContext) {
         .and_then(|stress| stress.pending_completion.take());
     if let Some((process_id, final_state)) = completion {
         finish_frame_reclaim_stress(context, process_id, final_state);
+    }
+
+    #[cfg(ginkgo_memory_policy_smoke)]
+    if let Some((process_id, phase)) = context
+        .memory_policy_smoke
+        .as_mut()
+        .and_then(|smoke| smoke.pending_completion.take())
+    {
+        finish_memory_policy_smoke(context, process_id, phase);
     }
 }
 
@@ -2205,6 +2342,8 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
     };
     let child_slot_reserved = context.processes.prepare_insert().is_ok();
     let mut created_child = None;
+    #[cfg(ginkgo_memory_policy_smoke)]
+    let mut memory_policy_explicit_yield = false;
     {
         let Some(process) = context.processes.get_mut(process_id) else {
             return TaskPoll::Pending;
@@ -2238,6 +2377,8 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                                 available_bytes: heap_available,
                                 growth_failures: context.kernel_heap.failed_growth_count(),
                             };
+                            #[cfg(ginkgo_memory_policy_smoke)]
+                            let syscall_number = user_context.rax;
                             let mut sink = SerialDebugSink::new(&mut context.serial);
                             let outcome = syscall::dispatch(
                                 process,
@@ -2263,6 +2404,10 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                                 ) || !process.is_runnable(),
                                 "exit syscall must update process state"
                             );
+                            #[cfg(ginkgo_memory_policy_smoke)]
+                            if syscall_number == 0 && matches!(outcome, SyscallOutcome::Yield) {
+                                memory_policy_explicit_yield = true;
+                            }
                             if let SyscallOutcome::ChildCreated(child) = outcome {
                                 created_child = Some(child);
                             }
@@ -2352,6 +2497,17 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
     }
 
     unsafe { context.page_table.activate() };
+    #[cfg(ginkgo_memory_policy_smoke)]
+    if memory_policy_explicit_yield {
+        if let Err(reason) = inspect_memory_policy_yield(context, process_id) {
+            let mut sink = SerialDebugSink::new(&mut context.serial);
+            let _ = writeln!(
+                sink,
+                "ginkgo-memory-policy-smoke: FAIL yield inspection {reason}\r"
+            );
+            halt_forever();
+        }
+    }
     if let Some(child) = created_child {
         context
             .processes
@@ -2368,6 +2524,26 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
         process.publish_terminal_status();
     }
 
+    #[cfg(ginkgo_memory_policy_smoke)]
+    let memory_policy_phase = if context
+        .memory_policy_smoke
+        .as_ref()
+        .is_some_and(|smoke| smoke.current == Some(process_id))
+    {
+        match validate_memory_policy_terminal(context, process_id, final_state) {
+            Ok(phase) => Some(phase),
+            Err(reason) => {
+                let mut sink = SerialDebugSink::new(&mut context.serial);
+                let _ = writeln!(
+                    sink,
+                    "ginkgo-memory-policy-smoke: FAIL {reason} state={final_state:?}\r"
+                );
+                halt_forever();
+            }
+        }
+    } else {
+        None
+    };
     let preemption_count = context
         .processes
         .get(process_id)
@@ -2491,6 +2667,15 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                     .expect("frame-reclaim stress state disappeared");
                 debug_assert!(stress.pending_completion.is_none());
                 stress.pending_completion = Some((process_id, retired_state));
+            }
+            #[cfg(ginkgo_memory_policy_smoke)]
+            if let Some(phase) = memory_policy_phase {
+                let smoke = context
+                    .memory_policy_smoke
+                    .as_mut()
+                    .expect("memory policy smoke state disappeared");
+                debug_assert!(smoke.pending_completion.is_none());
+                smoke.pending_completion = Some((process_id, phase));
             }
         }
         Err(error) => {
@@ -2965,6 +3150,476 @@ fn launch_program(
 fn launch_registered_program(context: &mut KernelContext, program_index: usize) -> Result<(), ()> {
     let program = context.ui.catalog.get(program_index).ok_or(())?;
     launch_program(context, program, None)
+}
+
+#[cfg(ginkgo_memory_policy_smoke)]
+fn memory_policy_baseline(context: &KernelContext) -> FrameReclaimBaseline {
+    let shared = shared_memory_backing_stats();
+    let arena = context.shared_frame_arena.stats();
+    FrameReclaimBaseline {
+        live_frames: context.frames.allocated_count(),
+        shared_live_objects: shared.live_objects,
+        shared_logical_bytes: shared.logical_bytes,
+        shared_mapped_bytes: shared.mapped_allocated_bytes,
+        shared_arena_owned_frames: arena.owned_frames,
+        shared_arena_free_frames: arena.free_frames,
+    }
+}
+
+#[cfg(ginkgo_memory_policy_smoke)]
+const MEMORY_POLICY_STACK_GROWTH_DISTANCE: u64 = 64 * 1024 + 256;
+
+#[cfg(ginkgo_memory_policy_smoke)]
+fn prepare_memory_policy_smoke(
+    context: &mut KernelContext,
+) -> Result<MemoryPolicySmoke, &'static str> {
+    use ginkgo_kernel::memory::DMA_32BIT_ADDRESS_LIMIT;
+
+    const HHDM_PATTERN: u64 = 0x4849_4748_4d45_4d21;
+    context.frames.smoke_enable_high_policy();
+    let initial = context.frames.stats();
+    let case = if initial.total_eligible_bytes < 256 * 1024 * 1024 {
+        MemoryPolicyCase::Low
+    } else if initial.total_eligible_bytes < 1024 * 1024 * 1024 {
+        MemoryPolicyCase::Normal
+    } else {
+        MemoryPolicyCase::High
+    };
+    let high_memory = initial.above_4g_frames != 0;
+    if (case == MemoryPolicyCase::High) != high_memory {
+        return Err("RAM class and high-frame availability disagree");
+    }
+    if high_memory {
+        let frame = context
+            .frames
+            .allocate_frame_at_or_above(DMA_32BIT_ADDRESS_LIMIT)
+            .map_err(|_| "high allocation error")?
+            .ok_or("high allocation missing")?;
+        if frame.start_address().as_u64() < DMA_32BIT_ADDRESS_LIMIT {
+            return Err("high allocation below 4GiB");
+        }
+        let direct = context
+            .hhdm_offset
+            .checked_add(frame.start_address().as_u64())
+            .ok_or("high HHDM address overflow")?;
+        let pointer = NonNull::new(direct as *mut u64).ok_or("high HHDM null pointer")?;
+        let value = unsafe { VolatilePtr::new(pointer) };
+        value.write(HHDM_PATTERN);
+        if value.read() != HHDM_PATTERN {
+            return Err("high HHDM pattern mismatch");
+        }
+        context
+            .frames
+            .deallocate_frame(frame)
+            .map_err(|_| "high frame reclaim failed")?;
+    } else if initial.highest_usable_address >= DMA_32BIT_ADDRESS_LIMIT
+        || initial.highest_issued_address >= DMA_32BIT_ADDRESS_LIMIT
+    {
+        return Err("low boot reported high usable or issued frame");
+    }
+
+    let dma = context
+        .frames
+        .allocate_frame_below(DMA_32BIT_ADDRESS_LIMIT)
+        .map_err(|_| "DMA32 allocation error")?
+        .ok_or("DMA32 allocation missing")?;
+    if dma.start_address().as_u64() >= DMA_32BIT_ADDRESS_LIMIT {
+        return Err("DMA32 allocation reached 4GiB");
+    }
+    context
+        .frames
+        .deallocate_frame(dma)
+        .map_err(|_| "DMA32 reclaim failed")?;
+
+    let stats = context.frames.stats();
+    let mut sink = SerialDebugSink::new(&mut context.serial);
+    let _ = writeln!(
+        sink,
+        "ginkgo-memory-policy-smoke: stats class={} eligible_bytes={} above_4g_frames={} highest_usable={:#x} highest_issued={:#x} dma32={}\r",
+        case.name(),
+        stats.total_eligible_bytes,
+        stats.above_4g_frames,
+        stats.highest_usable_address,
+        stats.highest_issued_address,
+        stats.dma_low_allocations,
+    );
+    drop(sink);
+    Ok(MemoryPolicySmoke {
+        current: None,
+        phase: MemoryPolicyPhase::Success,
+        pending_completion: None,
+        baseline: memory_policy_baseline(context),
+        case,
+        mapping_base: 0,
+        expected_fault_address: 0,
+        success_stage: MemoryPolicySuccessStage::SharedMapped,
+        shared_frame: None,
+        anonymous_frame: None,
+    })
+}
+
+#[cfg(ginkgo_memory_policy_smoke)]
+fn spawn_memory_policy_smoke(context: &mut KernelContext) -> Result<(), ()> {
+    context.processes.prepare_insert().map_err(|_| ())?;
+    let phase = context.memory_policy_smoke.as_ref().ok_or(())?.phase;
+    let image = match phase {
+        MemoryPolicyPhase::Success => MEMORY_POLICY_SUCCESS_ELF,
+        MemoryPolicyPhase::Guard => MEMORY_POLICY_GUARD_ELF,
+        MemoryPolicyPhase::ProtectFault => MEMORY_POLICY_PROTECT_FAULT_ELF,
+        MemoryPolicyPhase::Oom => MEMORY_POLICY_OOM_ELF,
+        MemoryPolicyPhase::Witness => MEMORY_POLICY_WITNESS_ELF,
+    };
+    let process =
+        Process::from_elf(image, &context.page_table, &mut context.frames).map_err(|_| ())?;
+    let mapping_base = process.next_mapping_cursor();
+    let expected_fault_address = match phase {
+        MemoryPolicyPhase::Guard => process.layout().stack_guard_start,
+        MemoryPolicyPhase::ProtectFault => mapping_base,
+        MemoryPolicyPhase::Oom => process
+            .layout()
+            .stack_top
+            .saturating_sub(MEMORY_POLICY_STACK_GROWTH_DISTANCE),
+        MemoryPolicyPhase::Success | MemoryPolicyPhase::Witness => 0,
+    };
+    let process_id = context
+        .processes
+        .insert(process)
+        .expect("prepared memory policy smoke insertion must succeed");
+    if phase == MemoryPolicyPhase::Oom {
+        context.frames.smoke_fail_next_unrestricted_allocation();
+    }
+    let smoke = context
+        .memory_policy_smoke
+        .as_mut()
+        .expect("memory policy smoke state disappeared");
+    smoke.current = Some(process_id);
+    smoke.mapping_base = mapping_base;
+    smoke.expected_fault_address = expected_fault_address;
+    smoke.success_stage = MemoryPolicySuccessStage::SharedMapped;
+    smoke.shared_frame = None;
+    smoke.anonymous_frame = None;
+    let mut sink = SerialDebugSink::new(&mut context.serial);
+    let _ = writeln!(
+        sink,
+        "ginkgo-memory-policy-smoke: phase {} START pid={} expected_address={:#x}\r",
+        phase.name(),
+        process_id.raw(),
+        expected_fault_address,
+    );
+    Ok(())
+}
+
+#[cfg(ginkgo_memory_policy_smoke)]
+fn validate_smoke_mapping(
+    process: &Process,
+    address: u64,
+) -> Result<Option<UserPageMapping>, &'static str> {
+    process
+        .address_space()
+        .smoke_effective_mapping(address)
+        .map_err(|_| "PTE and mapping metadata disagree")
+}
+
+#[cfg(ginkgo_memory_policy_smoke)]
+fn inspect_memory_policy_yield(
+    context: &mut KernelContext,
+    process_id: ProcessId,
+) -> Result<(), &'static str> {
+    use ginkgo_kernel::memory::{DMA_32BIT_ADDRESS_LIMIT, PAGE_SIZE};
+
+    let smoke = context
+        .memory_policy_smoke
+        .as_ref()
+        .ok_or("state missing at explicit yield")?;
+    if smoke.current != Some(process_id) {
+        return Err("unexpected process yielded during smoke");
+    }
+    let phase = smoke.phase;
+    let stage = smoke.success_stage;
+    let mapping_base = smoke.mapping_base;
+    let case = smoke.case;
+    let process = context
+        .processes
+        .get(process_id)
+        .ok_or("yielded process missing")?;
+
+    let (next_stage, shared_frame, anonymous_frame, marker) = match (phase, stage) {
+        (MemoryPolicyPhase::Success, MemoryPolicySuccessStage::SharedMapped) => {
+            let mapping = validate_smoke_mapping(process, mapping_base)?
+                .ok_or("shared mapping missing before unmap")?;
+            if mapping.backing != UserMappingBacking::SharedAlias
+                || mapping.permissions != UserPagePermissions::READ_WRITE
+                || !context
+                    .frames
+                    .smoke_frame_is_live(mapping.frame.start_address().as_u64())
+                || (case == MemoryPolicyCase::High
+                    && mapping.frame.start_address().as_u64() < DMA_32BIT_ADDRESS_LIMIT)
+            {
+                return Err("shared mapping physical backing invalid");
+            }
+            (
+                MemoryPolicySuccessStage::SharedUnmapped,
+                Some(mapping.frame.start_address().as_u64()),
+                None,
+                "shared mapped",
+            )
+        }
+        (MemoryPolicyPhase::Success, MemoryPolicySuccessStage::SharedUnmapped) => {
+            if validate_smoke_mapping(process, mapping_base)?.is_some() {
+                return Err("shared mapping survived explicit unmap");
+            }
+            let frame = smoke.shared_frame.ok_or("shared frame identity missing")?;
+            if !context.frames.smoke_frame_is_reclaimed(frame) {
+                return Err("shared backing was not reclaimed before process retirement");
+            }
+            (
+                MemoryPolicySuccessStage::AnonymousProtected,
+                Some(frame),
+                None,
+                "shared unmapped",
+            )
+        }
+        (MemoryPolicyPhase::Success, MemoryPolicySuccessStage::AnonymousProtected) => {
+            let address = mapping_base + PAGE_SIZE;
+            let mapping = validate_smoke_mapping(process, address)?
+                .ok_or("anonymous mapping missing after protect")?;
+            if mapping.backing != UserMappingBacking::OwnedPrivate
+                || mapping.permissions != UserPagePermissions::READ_ONLY
+                || !context
+                    .frames
+                    .smoke_frame_is_live(mapping.frame.start_address().as_u64())
+                || (case == MemoryPolicyCase::High
+                    && mapping.frame.start_address().as_u64() < DMA_32BIT_ADDRESS_LIMIT)
+            {
+                return Err("anonymous mapping or protected PTE invalid");
+            }
+            (
+                MemoryPolicySuccessStage::AnonymousUnmapped,
+                None,
+                Some(mapping.frame.start_address().as_u64()),
+                "anonymous protected",
+            )
+        }
+        (MemoryPolicyPhase::Success, MemoryPolicySuccessStage::AnonymousUnmapped) => {
+            let address = mapping_base + PAGE_SIZE;
+            if validate_smoke_mapping(process, address)?.is_some() {
+                return Err("anonymous mapping survived explicit unmap");
+            }
+            let frame = smoke
+                .anonymous_frame
+                .ok_or("anonymous frame identity missing")?;
+            if !context.frames.smoke_frame_is_reclaimed(frame) {
+                return Err("anonymous backing was not reclaimed before retirement");
+            }
+            (
+                MemoryPolicySuccessStage::Complete,
+                None,
+                Some(frame),
+                "anonymous reclaimed",
+            )
+        }
+        (MemoryPolicyPhase::ProtectFault, _) => {
+            let mapping = validate_smoke_mapping(process, mapping_base)?
+                .ok_or("protect-fault mapping missing")?;
+            if mapping.backing != UserMappingBacking::OwnedPrivate
+                || mapping.permissions != UserPagePermissions::READ_ONLY
+                || !context
+                    .frames
+                    .smoke_frame_is_live(mapping.frame.start_address().as_u64())
+            {
+                return Err("protect-fault PTE is not effective read-only");
+            }
+            (stage, None, None, "protect PTE read-only")
+        }
+        _ => return Err("unexpected explicit yield for smoke phase"),
+    };
+
+    let smoke = context
+        .memory_policy_smoke
+        .as_mut()
+        .expect("smoke state disappeared after inspection");
+    smoke.success_stage = next_stage;
+    if let Some(frame) = shared_frame {
+        smoke.shared_frame = Some(frame);
+    }
+    if let Some(frame) = anonymous_frame {
+        smoke.anonymous_frame = Some(frame);
+    }
+    let frame = shared_frame.or(anonymous_frame).unwrap_or(0);
+    let mut sink = SerialDebugSink::new(&mut context.serial);
+    let address = if marker.starts_with("anonymous") {
+        mapping_base + PAGE_SIZE
+    } else {
+        mapping_base
+    };
+    let _ = writeln!(
+        sink,
+        "ginkgo-memory-policy-smoke: inspect {marker} address={address:#x} frame={frame:#x}\r"
+    );
+    if marker == "shared unmapped" {
+        let _ = writeln!(
+            sink,
+            "ginkgo-memory-policy-smoke: inspect shared reclaimed address={address:#x} frame={frame:#x}\r"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(ginkgo_memory_policy_smoke)]
+fn validate_memory_policy_terminal(
+    context: &KernelContext,
+    process_id: ProcessId,
+    state: ProcessState,
+) -> Result<MemoryPolicyPhase, &'static str> {
+    let smoke = context
+        .memory_policy_smoke
+        .as_ref()
+        .ok_or("state missing")?;
+    if smoke.current != Some(process_id) {
+        return Err("retired unexpected process");
+    }
+    let process = context.processes.get(process_id).ok_or("process missing")?;
+    let grew_stack = process.usage().private_pages
+        > ginkgo_kernel::process::USER_STACK_INITIAL_SIZE / ginkgo_kernel::memory::PAGE_SIZE + 1;
+    let exact_fault = |reason, require_write: bool| {
+        matches!(
+            state,
+            ProcessState::Faulted(ProcessFault {
+                reason: actual,
+                code,
+                address: Some(address),
+            }) if actual == reason
+                && address == smoke.expected_fault_address
+                && (!require_write || code & 0b111 == 0b111)
+        )
+    };
+    match smoke.phase {
+        MemoryPolicyPhase::Success if state != ProcessState::Exited(0) => {
+            Err("mapping process did not exit cleanly")
+        }
+        MemoryPolicyPhase::Success if !grew_stack => Err("mapping process stack did not grow"),
+        MemoryPolicyPhase::Success if smoke.success_stage != MemoryPolicySuccessStage::Complete => {
+            Err("mapping process skipped a live inspection stage")
+        }
+        MemoryPolicyPhase::Guard if !exact_fault(ProcessFaultReason::PageFault, false) => {
+            Err("guard process fault reason or address mismatch")
+        }
+        MemoryPolicyPhase::ProtectFault if !exact_fault(ProcessFaultReason::PageFault, true) => {
+            Err("protect-write fault reason, code, or address mismatch")
+        }
+        MemoryPolicyPhase::Oom if !exact_fault(ProcessFaultReason::OutOfMemory, false) => {
+            Err("OOM process fault reason or address mismatch")
+        }
+        MemoryPolicyPhase::Witness if state != ProcessState::Exited(0) => {
+            Err("witness process did not exit cleanly")
+        }
+        MemoryPolicyPhase::Witness if !grew_stack => Err("witness stack did not grow"),
+        phase => Ok(phase),
+    }
+}
+
+#[cfg(ginkgo_memory_policy_smoke)]
+fn finish_memory_policy_smoke(
+    context: &mut KernelContext,
+    process_id: ProcessId,
+    phase: MemoryPolicyPhase,
+) {
+    let current = memory_policy_baseline(context);
+    let smoke = context
+        .memory_policy_smoke
+        .as_mut()
+        .expect("memory policy smoke state disappeared");
+    if smoke.current != Some(process_id) || smoke.phase != phase {
+        let mut sink = SerialDebugSink::new(&mut context.serial);
+        let _ = writeln!(sink, "ginkgo-memory-policy-smoke: FAIL completion order\r");
+        halt_forever();
+    }
+    let warmup_complete = phase == MemoryPolicyPhase::Success;
+    if !warmup_complete
+        && (current.live_frames != smoke.baseline.live_frames
+            || current.shared_live_objects != smoke.baseline.shared_live_objects
+            || current.shared_logical_bytes != smoke.baseline.shared_logical_bytes
+            || current.shared_mapped_bytes != smoke.baseline.shared_mapped_bytes
+            || current.shared_arena_owned_frames != smoke.baseline.shared_arena_owned_frames
+            || current.shared_arena_free_frames != smoke.baseline.shared_arena_free_frames)
+    {
+        let mut sink = SerialDebugSink::new(&mut context.serial);
+        let _ = writeln!(
+            sink,
+            "ginkgo-memory-policy-smoke: FAIL reclaim invariant phase={phase:?} frames={}->{} shared={}->{} arena={}->{}\r",
+            smoke.baseline.live_frames,
+            current.live_frames,
+            smoke.baseline.shared_live_objects,
+            current.shared_live_objects,
+            smoke.baseline.shared_arena_owned_frames,
+            current.shared_arena_owned_frames,
+        );
+        halt_forever();
+    }
+    if warmup_complete {
+        smoke.baseline = current;
+    }
+    let expected_address = smoke.expected_fault_address;
+    let (reason, address) = match phase {
+        MemoryPolicyPhase::Success | MemoryPolicyPhase::Witness => ("Exited", None),
+        MemoryPolicyPhase::Guard | MemoryPolicyPhase::ProtectFault => {
+            ("PageFault", Some(expected_address))
+        }
+        MemoryPolicyPhase::Oom => ("OutOfMemory", Some(expected_address)),
+    };
+    let mut sink = SerialDebugSink::new(&mut context.serial);
+    if let Some(address) = address {
+        let _ = writeln!(
+            sink,
+            "ginkgo-memory-policy-smoke: phase {} PASS reason={} address={:#x}\r",
+            phase.name(),
+            reason,
+            address,
+        );
+    } else {
+        let _ = writeln!(
+            sink,
+            "ginkgo-memory-policy-smoke: phase {} PASS reason={} address=none\r",
+            phase.name(),
+            reason,
+        );
+    }
+    drop(sink);
+    smoke.current = None;
+    let next = match phase {
+        MemoryPolicyPhase::Success => Some(MemoryPolicyPhase::Guard),
+        MemoryPolicyPhase::Guard => Some(MemoryPolicyPhase::ProtectFault),
+        MemoryPolicyPhase::ProtectFault => Some(MemoryPolicyPhase::Oom),
+        MemoryPolicyPhase::Oom => Some(MemoryPolicyPhase::Witness),
+        MemoryPolicyPhase::Witness => None,
+    };
+    if let Some(next) = next {
+        smoke.phase = next;
+        if spawn_memory_policy_smoke(context).is_err() {
+            let mut sink = SerialDebugSink::new(&mut context.serial);
+            let _ = writeln!(sink, "ginkgo-memory-policy-smoke: FAIL phase launch\r");
+            halt_forever();
+        }
+        return;
+    }
+
+    let stats = context.frames.stats();
+    if (smoke.case != MemoryPolicyCase::High
+        && stats.highest_issued_address >= ginkgo_kernel::memory::DMA_32BIT_ADDRESS_LIMIT)
+        || (smoke.case == MemoryPolicyCase::High
+            && stats.highest_issued_address < ginkgo_kernel::memory::DMA_32BIT_ADDRESS_LIMIT)
+    {
+        let mut sink = SerialDebugSink::new(&mut context.serial);
+        let _ = writeln!(
+            sink,
+            "ginkgo-memory-policy-smoke: FAIL final high-memory policy\r"
+        );
+        halt_forever();
+    }
+    let case = smoke.case.name();
+    let mut sink = SerialDebugSink::new(&mut context.serial);
+    let _ = writeln!(sink, "ginkgo-memory-policy-smoke: {case} PASS\r");
+    halt_forever();
 }
 
 fn spawn_process_capability_smoke(context: &mut KernelContext) -> Result<(), ()> {

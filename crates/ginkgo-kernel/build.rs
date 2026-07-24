@@ -26,6 +26,9 @@ const SHARED_MEMORY_MAP: u32 = 10;
 const SHARED_MEMORY_UNMAP: u32 = 11;
 const DEBUG_WRITE: u32 = 12;
 const CLOCK_GET_MONOTONIC: u32 = 21;
+const ANONYMOUS_MAP: u32 = 39;
+const ANONYMOUS_UNMAP: u32 = 40;
+const ANONYMOUS_PROTECT: u32 = 41;
 
 const SHARED_MEMORY_SIZE: u32 = 4097;
 const MAP_PROTECTION_READ_WRITE: u32 = 3;
@@ -63,8 +66,15 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GINKGO_PROCESS_CAPABILITY_SMOKE");
     println!("cargo:rerun-if-env-changed=GINKGO_POWER_SMOKE");
     println!("cargo:rerun-if-env-changed=GINKGO_TEXT_EDITOR_SMOKE");
+    println!("cargo:rerun-if-env-changed=GINKGO_MEMORY_POLICY_SMOKE");
     println!("cargo:rerun-if-env-changed=GINKGO_PROCESS_CAPABILITY_SMOKE_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_TRUST_SIGNING_KEY_HEX");
+    println!("cargo:rustc-check-cfg=cfg(ginkgo_memory_policy_smoke)");
+    let memory_policy_smoke =
+        env::var_os("GINKGO_MEMORY_POLICY_SMOKE").as_deref() == Some(std::ffi::OsStr::new("1"));
+    if memory_policy_smoke {
+        println!("cargo:rustc-cfg=ginkgo_memory_policy_smoke");
+    }
     println!("cargo:rustc-link-arg-bin=ginkgo-os=-T{}", linker.display());
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("build output directory"));
@@ -89,6 +99,33 @@ fn main() {
         build_frame_reclaim_elf(true),
     )
     .expect("write Ginkgo frame reclaim fault ELF");
+    if memory_policy_smoke {
+        fs::write(
+            out_dir.join("ginkgo-memory-policy-success.elf"),
+            build_memory_policy_elf(MemoryPolicyProbe::Success),
+        )
+        .expect("write Ginkgo memory policy success ELF");
+        fs::write(
+            out_dir.join("ginkgo-memory-policy-guard.elf"),
+            build_memory_policy_elf(MemoryPolicyProbe::Guard),
+        )
+        .expect("write Ginkgo memory policy guard ELF");
+        fs::write(
+            out_dir.join("ginkgo-memory-policy-protect-fault.elf"),
+            build_memory_policy_elf(MemoryPolicyProbe::ProtectFault),
+        )
+        .expect("write Ginkgo memory policy protect-fault ELF");
+        fs::write(
+            out_dir.join("ginkgo-memory-policy-oom.elf"),
+            build_memory_policy_elf(MemoryPolicyProbe::Oom),
+        )
+        .expect("write Ginkgo memory policy OOM ELF");
+        fs::write(
+            out_dir.join("ginkgo-memory-policy-witness.elf"),
+            build_memory_policy_elf(MemoryPolicyProbe::Witness),
+        )
+        .expect("write Ginkgo memory policy witness ELF");
+    }
     let process_capability_smoke = if env::var_os("GINKGO_PROCESS_CAPABILITY_SMOKE").as_deref()
         == Some(std::ffi::OsStr::new("1"))
     {
@@ -468,6 +505,187 @@ fn emit_frame_reclaim_code(fault: bool) -> Vec<u8> {
     assembler.finish()
 }
 
+#[derive(Clone, Copy)]
+enum MemoryPolicyProbe {
+    Success,
+    Guard,
+    ProtectFault,
+    Oom,
+    Witness,
+}
+
+fn emit_memory_policy_code(probe: MemoryPolicyProbe) -> Vec<u8> {
+    const STACK_GROWTH_DISTANCE: u32 = 64 * 1024 + 256;
+    const STACK_GUARD_DISTANCE: u32 = 8 * 1024 * 1024 + PAGE_SIZE as u32;
+    const PROBE_SHARED_SIZE: u32 = PAGE_SIZE as u32;
+    const PATTERN: u64 = 0x4d45_4d50_4f4c_4943;
+
+    let mut assembler = Assembler::default();
+    assembler.label("entry");
+
+    if matches!(probe, MemoryPolicyProbe::Guard) {
+        assembler.debug_write("guard_attempt", 47);
+        assembler.emit(&[0x48, 0x81, 0xec]);
+        assembler.u32(STACK_GUARD_DISTANCE);
+        assembler.emit(&[0x48, 0xb8]);
+        assembler.u64(PATTERN);
+        assembler.emit(&[0x48, 0x89, 0x04, 0x24]);
+        assembler.emit(&[0x0f, 0x0b]);
+        assembler.label("failure");
+        assembler.emit(&[0xbf]);
+        assembler.u32(1);
+        assembler.emit(&[0xb8]);
+        assembler.u32(PROCESS_EXIT);
+        assembler.emit(&[0x0f, 0x05, 0x0f, 0x0b]);
+        assembler.label("guard_attempt");
+        assembler.emit(b"ginkgo-memory-policy-user: guard-write-attempt\n");
+        return assembler.finish();
+    }
+
+    if matches!(probe, MemoryPolicyProbe::Oom) {
+        assembler.debug_write("oom_attempt", 46);
+    }
+    assembler.emit(&[0x48, 0x81, 0xec]);
+    assembler.u32(STACK_GROWTH_DISTANCE);
+    assembler.emit(&[0x48, 0xb8]);
+    assembler.u64(PATTERN);
+    assembler.emit(&[0x48, 0x89, 0x04, 0x24]);
+    assembler.emit(&[0x48, 0x39, 0x04, 0x24]);
+    assembler.rel32(&[0x0f, 0x85], "failure");
+
+    if matches!(probe, MemoryPolicyProbe::Oom | MemoryPolicyProbe::Witness) {
+        if matches!(probe, MemoryPolicyProbe::Oom) {
+            assembler.rel32(&[0xe9], "failure");
+        } else {
+            assembler.debug_write("witness_grown", 47);
+            assembler.emit(&[0x31, 0xff]);
+            assembler.checked_syscall(PROCESS_EXIT);
+            assembler.emit(&[0x0f, 0x0b]);
+        }
+        assembler.label("failure");
+        assembler.emit(&[0xbf]);
+        assembler.u32(1);
+        assembler.emit(&[0xb8]);
+        assembler.u32(PROCESS_EXIT);
+        assembler.emit(&[0x0f, 0x05, 0x0f, 0x0b]);
+        assembler.label("oom_attempt");
+        assembler.emit(b"ginkgo-memory-policy-user: oom-growth-attempt\n");
+        assembler.label("witness_grown");
+        assembler.emit(b"ginkgo-memory-policy-user: witness-stack-grown\n");
+        return assembler.finish();
+    }
+
+    assembler.emit(&[0x48, 0x83, 0xec, 0x30]);
+    if matches!(probe, MemoryPolicyProbe::ProtectFault) {
+        assembler.emit(&[0xbf]);
+        assembler.u32(PAGE_SIZE as u32);
+        assembler.emit(&[0xbe]);
+        assembler.u32(MAP_PROTECTION_READ_WRITE);
+        assembler.emit(&[0x48, 0x8d, 0x54, 0x24, 0x08]);
+        assembler.checked_syscall(ANONYMOUS_MAP);
+        assembler.emit(&[0x4c, 0x8b, 0x74, 0x24, 0x08]);
+        assembler.emit(&[0x49, 0xb8]);
+        assembler.u64(PATTERN);
+        assembler.emit(&[0x4d, 0x89, 0x06]);
+        assembler.emit(&[0x4c, 0x89, 0xf7]);
+        assembler.emit(&[0xbe]);
+        assembler.u32(PAGE_SIZE as u32);
+        assembler.emit(&[0xba]);
+        assembler.u32(1);
+        assembler.checked_syscall(ANONYMOUS_PROTECT);
+        assembler.emit(&[0x4d, 0x39, 0x06]);
+        assembler.rel32(&[0x0f, 0x85], "failure");
+        assembler.debug_write("protect_ready", 45);
+        assembler.checked_syscall(PROCESS_YIELD);
+        assembler.emit(&[0x41, 0xc6, 0x06, 0x33]);
+        assembler.emit(&[0x0f, 0x0b]);
+    } else {
+        assembler.debug_write("success_stack", 47);
+        assembler.emit(&[0xbf]);
+        assembler.u32(PROBE_SHARED_SIZE);
+        assembler.emit(&[0x48, 0x8d, 0x34, 0x24]);
+        assembler.checked_syscall(SHARED_MEMORY_CREATE);
+        assembler.emit(&[0x44, 0x8b, 0x24, 0x24]);
+        assembler.emit(&[0x48, 0xc7, 0x44, 0x24, 0x10]);
+        assembler.u32(0);
+        assembler.emit(&[0x48, 0xc7, 0x44, 0x24, 0x18]);
+        assembler.u32(0);
+        assembler.emit(&[0x48, 0xc7, 0x44, 0x24, 0x20]);
+        assembler.u32(PROBE_SHARED_SIZE);
+        assembler.emit(&[0xc7, 0x44, 0x24, 0x28]);
+        assembler.u32(MAP_PROTECTION_READ_WRITE);
+        assembler.emit(&[0xc7, 0x44, 0x24, 0x2c]);
+        assembler.u32(0);
+        assembler.emit(&[0x44, 0x89, 0xe7]);
+        assembler.emit(&[0x48, 0x8d, 0x74, 0x24, 0x10]);
+        assembler.emit(&[0x48, 0x8d, 0x54, 0x24, 0x08]);
+        assembler.checked_syscall(SHARED_MEMORY_MAP);
+        assembler.emit(&[0x4c, 0x8b, 0x6c, 0x24, 0x08]);
+        assembler.emit(&[0x41, 0xc6, 0x45, 0x00, 0x5a]);
+        assembler.emit(&[0x41, 0x80, 0x7d, 0x00, 0x5a]);
+        assembler.rel32(&[0x0f, 0x85], "failure");
+        assembler.debug_write("shared_mapped", 41);
+        assembler.checked_syscall(PROCESS_YIELD);
+        assembler.emit(&[0x4c, 0x89, 0xef]);
+        assembler.emit(&[0xbe]);
+        assembler.u32(PROBE_SHARED_SIZE);
+        assembler.checked_syscall(SHARED_MEMORY_UNMAP);
+        assembler.emit(&[0x44, 0x89, 0xe7]);
+        assembler.checked_syscall(HANDLE_CLOSE);
+        assembler.debug_write("shared_unmapped", 43);
+        assembler.checked_syscall(PROCESS_YIELD);
+
+        assembler.emit(&[0xbf]);
+        assembler.u32(PAGE_SIZE as u32);
+        assembler.emit(&[0xbe]);
+        assembler.u32(MAP_PROTECTION_READ_WRITE);
+        assembler.emit(&[0x48, 0x8d, 0x54, 0x24, 0x08]);
+        assembler.checked_syscall(ANONYMOUS_MAP);
+        assembler.emit(&[0x4c, 0x8b, 0x74, 0x24, 0x08]);
+        assembler.emit(&[0x49, 0xb8]);
+        assembler.u64(PATTERN);
+        assembler.emit(&[0x4d, 0x89, 0x06]);
+        assembler.emit(&[0x4c, 0x89, 0xf7]);
+        assembler.emit(&[0xbe]);
+        assembler.u32(PAGE_SIZE as u32);
+        assembler.emit(&[0xba]);
+        assembler.u32(1);
+        assembler.checked_syscall(ANONYMOUS_PROTECT);
+        assembler.emit(&[0x4d, 0x39, 0x06]);
+        assembler.rel32(&[0x0f, 0x85], "failure");
+        assembler.debug_write("anonymous_protected", 47);
+        assembler.checked_syscall(PROCESS_YIELD);
+        assembler.emit(&[0x4c, 0x89, 0xf7]);
+        assembler.emit(&[0xbe]);
+        assembler.u32(PAGE_SIZE as u32);
+        assembler.checked_syscall(ANONYMOUS_UNMAP);
+        assembler.debug_write("anonymous_unmapped", 46);
+        assembler.checked_syscall(PROCESS_YIELD);
+        assembler.emit(&[0x31, 0xff]);
+        assembler.checked_syscall(PROCESS_EXIT);
+        assembler.emit(&[0x0f, 0x0b]);
+    }
+
+    assembler.label("failure");
+    assembler.emit(&[0x89, 0xc7]);
+    assembler.emit(&[0xb8]);
+    assembler.u32(PROCESS_EXIT);
+    assembler.emit(&[0x0f, 0x05, 0x0f, 0x0b]);
+    assembler.label("success_stack");
+    assembler.emit(b"ginkgo-memory-policy-user: success-stack-grown\n");
+    assembler.label("shared_mapped");
+    assembler.emit(b"ginkgo-memory-policy-user: shared-mapped\n");
+    assembler.label("shared_unmapped");
+    assembler.emit(b"ginkgo-memory-policy-user: shared-unmapped\n");
+    assembler.label("anonymous_protected");
+    assembler.emit(b"ginkgo-memory-policy-user: anonymous-protected\n");
+    assembler.label("anonymous_unmapped");
+    assembler.emit(b"ginkgo-memory-policy-user: anonymous-unmapped\n");
+    assembler.label("protect_ready");
+    assembler.emit(b"ginkgo-memory-policy-user: protect-read-only\n");
+    assembler.finish()
+}
+
 fn emit_preemption_smoke_code() -> Vec<u8> {
     const RCX_SENTINEL: u64 = 0x1122_3344_5566_7788;
     const R11_SENTINEL: u64 = 0x8877_6655_4433_2211;
@@ -663,6 +881,17 @@ fn emit_desktop_code() -> Vec<u8> {
 
 fn build_userspace_smoke_elf() -> Vec<u8> {
     build_userspace_elf(emit_userspace_smoke_code(), "smoke")
+}
+
+fn build_memory_policy_elf(probe: MemoryPolicyProbe) -> Vec<u8> {
+    let artifact = match probe {
+        MemoryPolicyProbe::Success => "memory-policy-success",
+        MemoryPolicyProbe::Guard => "memory-policy-guard",
+        MemoryPolicyProbe::ProtectFault => "memory-policy-protect-fault",
+        MemoryPolicyProbe::Oom => "memory-policy-oom",
+        MemoryPolicyProbe::Witness => "memory-policy-witness",
+    };
+    build_userspace_elf(emit_memory_policy_code(probe), artifact)
 }
 
 fn build_preemption_smoke_elf() -> Vec<u8> {

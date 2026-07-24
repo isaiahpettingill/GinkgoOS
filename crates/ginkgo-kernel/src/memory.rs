@@ -65,6 +65,7 @@ struct OwnershipLedger {
     live_allocated: u64,
     fresh_issued: u64,
     dma_low_live: u64,
+    above_4g_live: u64,
 }
 
 impl OwnershipLedger {
@@ -75,6 +76,7 @@ impl OwnershipLedger {
             live_allocated: 0,
             fresh_issued: 0,
             dma_low_live: 0,
+            above_4g_live: 0,
         }
     }
 
@@ -120,6 +122,9 @@ impl OwnershipLedger {
         });
         self.live_allocated = self.live_allocated.saturating_add(1);
         self.fresh_issued = self.fresh_issued.saturating_add(1);
+        if address >= DMA_32BIT_ADDRESS_LIMIT {
+            self.above_4g_live = self.above_4g_live.saturating_add(1);
+        }
         Ok(true)
     }
 
@@ -135,6 +140,16 @@ impl OwnershipLedger {
                 .checked_add(PAGE_SIZE)
                 .is_some_and(|end| end <= max_address_exclusive)
         })?;
+        let address = self.free.swap_remove(free_index);
+        self.mark_reclaimed_allocated(address);
+        Some(address)
+    }
+
+    fn claim_reclaimed_at_or_above(&mut self, min_address: u64) -> Option<u64> {
+        let free_index = self
+            .free
+            .iter()
+            .rposition(|address| *address >= min_address)?;
         let address = self.free.swap_remove(free_index);
         self.mark_reclaimed_allocated(address);
         Some(address)
@@ -176,6 +191,9 @@ impl OwnershipLedger {
         self.records[index].state = OwnershipState::Allocated;
         self.records[index].dma_low = false;
         self.live_allocated = self.live_allocated.saturating_add(1);
+        if address >= DMA_32BIT_ADDRESS_LIMIT {
+            self.above_4g_live = self.above_4g_live.saturating_add(1);
+        }
     }
 
     fn reserve(&mut self, address: u64) -> Result<bool, FrameAllocatorError> {
@@ -184,6 +202,9 @@ impl OwnershipLedger {
                 OwnershipState::Reserved => return Ok(false),
                 OwnershipState::Allocated => {
                     self.live_allocated = self.live_allocated.saturating_sub(1);
+                    if address >= DMA_32BIT_ADDRESS_LIMIT {
+                        self.above_4g_live = self.above_4g_live.saturating_sub(1);
+                    }
                     if self.records[index].dma_low {
                         self.dma_low_live = self.dma_low_live.saturating_sub(1);
                     }
@@ -248,6 +269,7 @@ impl OwnershipLedger {
             .try_reserve(count)
             .map_err(|_| FrameAllocatorError::OwnershipTrackingAllocationFailed)?;
         let mut dma_low_reclaimed = 0u64;
+        let mut above_4g_reclaimed = 0u64;
         for index in 0..count {
             let address = address_at(index);
             let record_index = self
@@ -256,12 +278,16 @@ impl OwnershipLedger {
             if self.records[record_index].dma_low {
                 dma_low_reclaimed = dma_low_reclaimed.saturating_add(1);
             }
+            if address >= DMA_32BIT_ADDRESS_LIMIT {
+                above_4g_reclaimed = above_4g_reclaimed.saturating_add(1);
+            }
             self.records[record_index].state = OwnershipState::Free;
             self.records[record_index].dma_low = false;
             self.free.push(address);
         }
         self.live_allocated = self.live_allocated.saturating_sub(count as u64);
         self.dma_low_live = self.dma_low_live.saturating_sub(dma_low_reclaimed);
+        self.above_4g_live = self.above_4g_live.saturating_sub(above_4g_reclaimed);
         Ok(())
     }
 
@@ -282,6 +308,10 @@ impl OwnershipLedger {
     const fn dma_low_live_count(&self) -> u64 {
         self.dma_low_live
     }
+
+    const fn above_4g_live_count(&self) -> u64 {
+        self.above_4g_live
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -289,6 +319,8 @@ struct UsableRegion {
     base: u64,
     end: u64,
     next: u64,
+    high_next: u64,
+    at_or_above_next: u64,
 }
 
 impl UsableRegion {
@@ -312,6 +344,7 @@ pub struct FrameAllocatorStats {
     pub available_frames: u64,
     pub available_bytes: u64,
     pub live_allocated_frames: u64,
+    pub above_4g_live_frames: u64,
     pub reclaimed_free_frames: u64,
     pub reserved_eligible_frames: u64,
     pub dma_low_allocations: u64,
@@ -381,6 +414,8 @@ fn validate_usable_regions(
             base: entry.base,
             end,
             next: entry.base,
+            high_next: entry.base.max(DMA_32BIT_ADDRESS_LIMIT),
+            at_or_above_next: entry.base,
         });
     }
     all_ranges.sort_unstable_by_key(|range| range.base);
@@ -440,6 +475,10 @@ pub struct UsableFrameAllocator<'a> {
     allocation_failures: u64,
     ownership: OwnershipLedger,
     error: Option<FrameAllocatorError>,
+    #[cfg(ginkgo_memory_policy_smoke)]
+    smoke_fail_next_unrestricted_allocation: bool,
+    #[cfg(ginkgo_memory_policy_smoke)]
+    smoke_high_policy_enabled: bool,
 }
 
 impl<'a> UsableFrameAllocator<'a> {
@@ -476,6 +515,10 @@ impl<'a> UsableFrameAllocator<'a> {
             allocation_failures: 0,
             ownership: OwnershipLedger::new(),
             error: None,
+            #[cfg(ginkgo_memory_policy_smoke)]
+            smoke_fail_next_unrestricted_allocation: false,
+            #[cfg(ginkgo_memory_policy_smoke)]
+            smoke_high_policy_enabled: false,
         })
     }
 
@@ -499,6 +542,8 @@ impl<'a> UsableFrameAllocator<'a> {
                 base,
                 end: base + length,
                 next: base,
+                high_next: base.max(DMA_32BIT_ADDRESS_LIMIT),
+                at_or_above_next: base,
             }],
             total_eligible_frames: length / PAGE_SIZE,
             below_4g_frames: frames_below_limit(base, base + length, DMA_32BIT_ADDRESS_LIMIT),
@@ -513,6 +558,10 @@ impl<'a> UsableFrameAllocator<'a> {
             allocation_failures: 0,
             ownership: OwnershipLedger::new(),
             error: None,
+            #[cfg(ginkgo_memory_policy_smoke)]
+            smoke_fail_next_unrestricted_allocation: false,
+            #[cfg(ginkgo_memory_policy_smoke)]
+            smoke_high_policy_enabled: true,
         }
     }
 
@@ -571,6 +620,7 @@ impl<'a> UsableFrameAllocator<'a> {
             available_frames,
             available_bytes: available_frames.saturating_mul(PAGE_SIZE),
             live_allocated_frames: self.ownership.live_allocated_count(),
+            above_4g_live_frames: self.ownership.above_4g_live_count(),
             reclaimed_free_frames,
             reserved_eligible_frames: self.reserved_eligible_frames,
             dma_low_allocations: self.dma_low_allocations,
@@ -647,11 +697,133 @@ impl<'a> UsableFrameAllocator<'a> {
     }
 
     pub fn allocate_frame(&mut self) -> Result<Option<PhysFrame>, FrameAllocatorError> {
-        let result = self.allocate_frame_below_inner(self.physical_address_space_size, true);
+        #[cfg(ginkgo_memory_policy_smoke)]
+        if core::mem::take(&mut self.smoke_fail_next_unrestricted_allocation) {
+            self.allocation_failures = self.allocation_failures.saturating_add(1);
+            return Ok(None);
+        }
+
+        let prefer_high = self.above_4g_frames != 0;
+        #[cfg(ginkgo_memory_policy_smoke)]
+        let prefer_high = prefer_high && self.smoke_high_policy_enabled;
+        let result = if prefer_high {
+            self.allocate_frame_at_or_above_inner(DMA_32BIT_ADDRESS_LIMIT, true)
+                .and_then(|frame| match frame {
+                    Some(frame) => Ok(Some(frame)),
+                    None => self.allocate_frame_below_inner(DMA_32BIT_ADDRESS_LIMIT, true),
+                })
+        } else {
+            self.allocate_frame_below_inner(self.physical_address_space_size, true)
+        };
         if !matches!(result, Ok(Some(_))) {
             self.allocation_failures = self.allocation_failures.saturating_add(1);
         }
         result
+    }
+
+    #[cfg(ginkgo_memory_policy_smoke)]
+    pub fn smoke_enable_high_policy(&mut self) {
+        self.smoke_high_policy_enabled = true;
+    }
+
+    #[cfg(ginkgo_memory_policy_smoke)]
+    pub fn smoke_fail_next_unrestricted_allocation(&mut self) {
+        self.smoke_fail_next_unrestricted_allocation = true;
+    }
+
+    /// Allocates one frame at or above `min_address` without consuming lower frames.
+    ///
+    /// The lower bound is rounded up to a frame boundary. If no eligible frame exists,
+    /// the allocator returns `None` without changing region cursors, ownership, or
+    /// accounting, so callers can safely fall back to another policy.
+    pub fn allocate_frame_at_or_above(
+        &mut self,
+        min_address: u64,
+    ) -> Result<Option<PhysFrame>, FrameAllocatorError> {
+        let result = self.allocate_frame_at_or_above_inner(min_address, true);
+        if !matches!(result, Ok(Some(_))) {
+            self.allocation_failures = self.allocation_failures.saturating_add(1);
+        }
+        result
+    }
+
+    fn allocate_frame_at_or_above_inner(
+        &mut self,
+        min_address: u64,
+        allow_reclaimed: bool,
+    ) -> Result<Option<PhysFrame>, FrameAllocatorError> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        let Some(min_address) = min_address.checked_add(PAGE_SIZE - 1) else {
+            return Ok(None);
+        };
+        let min_address = min_address & !(PAGE_SIZE - 1);
+        if min_address >= self.physical_address_space_size {
+            return Ok(None);
+        }
+
+        if allow_reclaimed {
+            if let Some(address) = self.ownership.claim_reclaimed_at_or_above(min_address) {
+                let frame = Self::frame_from_address(address)?;
+                self.advance_at_or_above_cursor(address);
+                return Ok(Some(frame));
+            }
+        }
+
+        let candidate = self.usable_regions.iter().find_map(|region| {
+            let lower = region.base.max(min_address);
+            if lower >= region.end {
+                return None;
+            }
+            let ordinary_hint = if min_address == DMA_32BIT_ADDRESS_LIMIT {
+                region.high_next
+            } else {
+                lower
+            };
+            let hint = region
+                .at_or_above_next
+                .max(ordinary_hint)
+                .max(lower)
+                .min(region.end);
+            let find_unowned = |start: u64, end: u64| {
+                let mut address = start;
+                while address < end {
+                    if self.ownership.find(address).is_none() {
+                        return Some(address);
+                    }
+                    address = address.checked_add(PAGE_SIZE)?;
+                }
+                None
+            };
+            find_unowned(hint, region.end).or_else(|| find_unowned(lower, hint))
+        });
+        let Some(address) = candidate else {
+            return Ok(None);
+        };
+        let frame = Self::frame_from_address(address)?;
+        match self.ownership.claim_fresh(address) {
+            Ok(true) => {}
+            Ok(false) => unreachable!("at-or-above candidate was preflighted as unowned"),
+            Err(error) => return self.fail(error),
+        }
+        self.fresh_remaining_frames = self.fresh_remaining_frames.saturating_sub(1);
+        self.advance_at_or_above_cursor(address);
+        self.highest_issued_address = self.highest_issued_address.max(address);
+        Ok(Some(frame))
+    }
+
+    fn advance_at_or_above_cursor(&mut self, address: u64) {
+        if let Some(region) = self
+            .usable_regions
+            .iter_mut()
+            .find(|region| region.contains(address))
+        {
+            region.at_or_above_next = address + PAGE_SIZE;
+            if region.high_next == address {
+                region.high_next = address + PAGE_SIZE;
+            }
+        }
     }
 
     /// Allocates one frame whose complete byte range is below the exclusive limit.
@@ -834,6 +1006,20 @@ impl<'a> UsableFrameAllocator<'a> {
         Ok(Some(frames))
     }
 
+    #[cfg(ginkgo_memory_policy_smoke)]
+    pub fn smoke_frame_is_live(&self, address: u64) -> bool {
+        self.ownership
+            .find(address)
+            .is_some_and(|index| self.ownership.records[index].state == OwnershipState::Allocated)
+    }
+
+    #[cfg(ginkgo_memory_policy_smoke)]
+    pub fn smoke_frame_is_reclaimed(&self, address: u64) -> bool {
+        self.ownership
+            .find(address)
+            .is_some_and(|index| self.ownership.records[index].state == OwnershipState::Free)
+    }
+
     #[cfg(test)]
     fn set_failure_counters_for_test(&mut self, dma_low_failures: u64, allocation_failures: u64) {
         self.dma_low_failures = dma_low_failures;
@@ -945,6 +1131,122 @@ mod tests {
     }
 
     #[test]
+    fn unrestricted_allocation_prefers_high_memory_and_preserves_dma32() {
+        let mut entries = [
+            MemoryMapEntry {
+                base: 0x20_0000,
+                length: PAGE_SIZE * 2,
+                entry_type: MEMORY_MAP_USABLE,
+            },
+            MemoryMapEntry {
+                base: DMA_32BIT_ADDRESS_LIMIT,
+                length: PAGE_SIZE * 2,
+                entry_type: MEMORY_MAP_USABLE,
+            },
+        ];
+        let (_pointers, response) = memory_map_response(&mut entries);
+        let mut allocator = UsableFrameAllocator::new(&response, 52).unwrap();
+
+        let unrestricted = allocator.allocate_frame().unwrap().unwrap();
+        assert_eq!(
+            unrestricted.start_address().as_u64(),
+            DMA_32BIT_ADDRESS_LIMIT
+        );
+        let dma = allocator
+            .allocate_frame_below(DMA_32BIT_ADDRESS_LIMIT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(dma.start_address().as_u64(), 0x20_0000);
+        assert_eq!(allocator.stats().above_4g_live_frames, 1);
+        assert_eq!(allocator.stats().dma_low_live_frames, 1);
+    }
+
+    #[test]
+    fn at_or_above_failure_is_transactional_and_fallback_keeps_low_frame() {
+        let mut allocator =
+            unsafe { UsableFrameAllocator::from_test_region(0x20_0000, PAGE_SIZE, 52) };
+        let before = allocator.stats();
+        assert_eq!(
+            allocator.allocate_frame_at_or_above(DMA_32BIT_ADDRESS_LIMIT),
+            Ok(None)
+        );
+        let after = allocator.stats();
+        assert_eq!(after.fresh_issued_frames, before.fresh_issued_frames);
+        assert_eq!(after.fresh_remaining_frames, before.fresh_remaining_frames);
+        assert_eq!(after.live_allocated_frames, before.live_allocated_frames);
+        assert_eq!(after.reclaimed_free_frames, before.reclaimed_free_frames);
+        assert_eq!(
+            allocator
+                .allocate_frame_below(DMA_32BIT_ADDRESS_LIMIT)
+                .unwrap()
+                .unwrap()
+                .start_address()
+                .as_u64(),
+            0x20_0000
+        );
+    }
+
+    #[test]
+    fn at_or_above_rounds_up_and_reuses_only_eligible_reclaimed_frames() {
+        let base = DMA_32BIT_ADDRESS_LIMIT - PAGE_SIZE;
+        let mut allocator =
+            unsafe { UsableFrameAllocator::from_test_region(base, PAGE_SIZE * 3, 52) };
+        let high0 = allocator.allocate_frame().unwrap().unwrap();
+        let high1 = allocator.allocate_frame().unwrap().unwrap();
+        let low = allocator.allocate_frame().unwrap().unwrap();
+        allocator.deallocate_frames(&[low, high0, high1]).unwrap();
+
+        let selected = allocator
+            .allocate_frame_at_or_above(DMA_32BIT_ADDRESS_LIMIT + 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            selected.start_address().as_u64(),
+            DMA_32BIT_ADDRESS_LIMIT + PAGE_SIZE
+        );
+        assert_eq!(allocator.stats().above_4g_live_frames, 1);
+    }
+
+    #[test]
+    fn at_or_above_cursor_progresses_across_jumps_without_skipping_bounded_frames() {
+        let base = 0x20_0000;
+        let mut allocator =
+            unsafe { UsableFrameAllocator::from_test_region(base, PAGE_SIZE * 16, 52) };
+
+        let jumped = allocator
+            .allocate_frame_at_or_above(base + PAGE_SIZE * 8 + 1)
+            .unwrap()
+            .unwrap();
+        let after_jump = allocator
+            .allocate_frame_at_or_above(base + PAGE_SIZE * 8)
+            .unwrap()
+            .unwrap();
+        assert_eq!(jumped.start_address().as_u64(), base + PAGE_SIZE * 9);
+        assert_eq!(after_jump.start_address().as_u64(), base + PAGE_SIZE * 10);
+
+        for index in 0..4 {
+            let bounded = allocator
+                .allocate_frame_below(base + PAGE_SIZE * 8)
+                .unwrap()
+                .unwrap();
+            assert_eq!(bounded.start_address().as_u64(), base + PAGE_SIZE * index);
+        }
+
+        let repeated = allocator
+            .allocate_frame_at_or_above(base + PAGE_SIZE * 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repeated.start_address().as_u64(), base + PAGE_SIZE * 11);
+        for index in 4..8 {
+            let bounded = allocator
+                .allocate_frame_below(base + PAGE_SIZE * 8)
+                .unwrap()
+                .unwrap();
+            assert_eq!(bounded.start_address().as_u64(), base + PAGE_SIZE * index);
+        }
+    }
+
+    #[test]
     fn address_limit_above_cpu_width_is_clamped_to_supported_memory() {
         let mut allocator =
             unsafe { UsableFrameAllocator::from_test_region(0x1000, PAGE_SIZE, 36) };
@@ -963,9 +1265,9 @@ mod tests {
                 52,
             )
         };
-        let low = allocator.allocate_frame().unwrap().unwrap();
         let high = allocator.allocate_frame().unwrap().unwrap();
-        allocator.deallocate_frames(&[low, high]).unwrap();
+        let low = allocator.allocate_frame().unwrap().unwrap();
+        allocator.deallocate_frames(&[high, low]).unwrap();
         assert_eq!(
             allocator
                 .allocate_frame_below(DMA_32BIT_ADDRESS_LIMIT)
@@ -993,10 +1295,11 @@ mod tests {
         );
 
         let frame = allocator.allocate_frame().unwrap().unwrap();
-        assert_eq!(frame.start_address().as_u64(), base);
+        assert_eq!(frame.start_address().as_u64(), DMA_32BIT_ADDRESS_LIMIT);
         let issued = allocator.stats();
-        assert_eq!(issued.highest_issued_address, base);
+        assert_eq!(issued.highest_issued_address, DMA_32BIT_ADDRESS_LIMIT);
         assert_eq!(issued.live_allocated_frames, 1);
+        assert_eq!(issued.above_4g_live_frames, 1);
         assert_eq!(issued.fresh_remaining_frames, 2);
         assert_eq!(issued.available_frames, 2);
         assert_eq!(issued.available_bytes, PAGE_SIZE * 2);

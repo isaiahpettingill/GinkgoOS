@@ -13,7 +13,9 @@ use core::{
 use crate::{
     block::{BlockDevice, SECTOR_SIZE},
     io::{IoError, PortRegion},
-    memory::{FrameAllocatorError, UsableFrameAllocator, VirtAddr, PAGE_SIZE},
+    memory::{
+        FrameAllocatorError, UsableFrameAllocator, VirtAddr, DMA_32BIT_ADDRESS_LIMIT, PAGE_SIZE,
+    },
     pci::{PciConfig, PciDevice, PciError},
 };
 
@@ -23,7 +25,6 @@ const PCI_COMMAND_IO_SPACE: u16 = 1 << 0;
 const PCI_COMMAND_BUS_MASTER: u16 = 1 << 2;
 const PCI_BAR0: u8 = 0x10;
 const LEGACY_IO_BYTES: u16 = 0x20;
-const LEGACY_QUEUE_ADDRESS_LIMIT: u64 = 1_u64 << 44;
 
 const REG_HOST_FEATURES: u16 = 0x00;
 const REG_GUEST_FEATURES: u16 = 0x04;
@@ -353,18 +354,24 @@ impl VirtioBlk {
         }
         let queue_size = io.read_u16(REG_QUEUE_SIZE)?;
         let layout = QueueLayout::new(queue_size)?;
+
         let queue = DmaRegion::allocate_contiguous(
             frames,
             hhdm_offset,
             layout.pages,
-            Some(LEGACY_QUEUE_ADDRESS_LIMIT),
+            Some(DMA_32BIT_ADDRESS_LIMIT),
         )?;
         if queue.physical & (PAGE_SIZE - 1) != 0 || queue.physical >> 12 > u64::from(u32::MAX) {
             let _ = io.write_u8(REG_DEVICE_STATUS, feature_status | STATUS_FAILED);
             return Err(VirtioBlkError::UnsupportedDmaAddress);
         }
-        let request = DmaRegion::allocate_contiguous(frames, hhdm_offset, 1, None)?;
-        let data = DmaRegion::allocate_contiguous(frames, hhdm_offset, 1, None)?;
+
+        let request =
+            DmaRegion::allocate_contiguous(frames, hhdm_offset, 1, Some(DMA_32BIT_ADDRESS_LIMIT))?;
+
+        let data =
+            DmaRegion::allocate_contiguous(frames, hhdm_offset, 1, Some(DMA_32BIT_ADDRESS_LIMIT))?;
+
         io.write_u32(REG_QUEUE_PFN, (queue.physical >> 12) as u32)?;
         if io.read_u32(REG_QUEUE_PFN)? != (queue.physical >> 12) as u32 {
             let _ = io.write_u8(REG_DEVICE_STATUS, feature_status | STATUS_FAILED);

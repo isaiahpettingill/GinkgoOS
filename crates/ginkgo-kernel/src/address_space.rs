@@ -461,6 +461,50 @@ impl AddressSpace {
         &self.mappings
     }
 
+    #[cfg(ginkgo_memory_policy_smoke)]
+    pub fn smoke_effective_mapping(
+        &self,
+        address: u64,
+    ) -> Result<Option<UserPageMapping>, AddressSpaceError> {
+        let tracked = self
+            .mappings
+            .iter()
+            .find(|mapping| mapping.virtual_address == address)
+            .copied();
+        let walked = match self.walk_user_page(address)? {
+            WalkResult::Unmapped if tracked.is_none() => return Ok(None),
+            WalkResult::Unmapped => return Err(AddressSpaceError::CorruptPageTable),
+            WalkResult::Mapped(_) if tracked.is_none() => {
+                return Err(AddressSpaceError::UntrackedMapping(address))
+            }
+            WalkResult::Mapped(mapping) => mapping,
+        };
+        let tracked = tracked.expect("mapped page had tracked smoke metadata");
+        if walked.frame != tracked.frame {
+            return Err(AddressSpaceError::CorruptPageTable);
+        }
+        self.validate_user_range(address, 1, UserAccess::Read)?;
+        let write_result = self.validate_user_range(address, 1, UserAccess::Write);
+        match tracked.permissions {
+            UserPagePermissions::READ_WRITE if write_result.is_err() => {
+                return Err(AddressSpaceError::CorruptPageTable)
+            }
+            UserPagePermissions::READ_ONLY | UserPagePermissions::READ_EXECUTE
+                if !matches!(
+                    write_result,
+                    Err(AddressSpaceError::PermissionDenied {
+                        address: denied,
+                        access: UserAccess::Write,
+                    }) if denied == address
+                ) =>
+            {
+                return Err(AddressSpaceError::CorruptPageTable)
+            }
+            _ => {}
+        }
+        Ok(Some(tracked))
+    }
+
     pub fn owned_data_frames(&self) -> &[PhysFrame<Size4KiB>] {
         &self.owned_data_frames
     }
