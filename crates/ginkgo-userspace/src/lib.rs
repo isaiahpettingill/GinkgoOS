@@ -77,6 +77,13 @@ pub fn process_yield() -> SyscallResult<()> {
     status_result(unsafe { raw_syscall6(SyscallNumber::ProcessYield, 0, 0, 0, 0, 0, 0) })
 }
 
+/// Explicit thread-named alias for [`process_yield`]. Existing binaries keep
+/// syscall zero while new code can state the scheduler entity it yields.
+#[inline]
+pub fn thread_yield() -> SyscallResult<()> {
+    status_result(unsafe { raw_syscall6(SyscallNumber::ThreadYield, 0, 0, 0, 0, 0, 0) })
+}
+
 /// Returns nanoseconds elapsed on the kernel's monotonic clock.
 #[inline]
 pub fn monotonic_time_ns() -> SyscallResult<u64> {
@@ -367,6 +374,135 @@ pub fn process_exit(exit_code: i32) -> Status {
         )
     };
     decode_status(raw)
+}
+
+/// Creates a thread in the calling process.
+///
+/// The initial one-live-thread milestone returns [`Status::ResourceLimit`] while
+/// the main thread is live; the fixed request remains the ABI for later expansion.
+pub fn thread_create(
+    entry: u64,
+    argument: u64,
+    stack_size: u64,
+    tls_base: u64,
+) -> SyscallResult<ThreadId> {
+    let mut output = ThreadId::INVALID;
+    let args = ThreadCreateArgs {
+        version: THREAD_CREATE_ARGS_VERSION,
+        size: ThreadCreateArgs::SIZE,
+        entry,
+        argument,
+        stack_size,
+        tls_base,
+        flags: 0,
+        reserved: 0,
+        output_address: mut_pointer_address(&mut output),
+    };
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::ThreadCreate,
+            pointer_address(&args),
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    })?;
+    Ok(output)
+}
+
+/// Exits the calling thread. This returns only if the kernel rejects the code.
+pub fn thread_exit(exit_code: i32) -> Status {
+    decode_status(unsafe {
+        raw_syscall6(
+            SyscallNumber::ThreadExit,
+            (i64::from(exit_code)) as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    })
+}
+
+/// Sleeps until an absolute monotonic deadline.
+///
+/// The one-live-thread milestone accepts elapsed deadlines and returns
+/// [`Status::ResourceLimit`] for future deadlines.
+pub fn thread_sleep_until(deadline_ns: i64) -> SyscallResult<()> {
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::ThreadSleepUntil,
+            deadline_ns as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    })
+}
+
+pub fn thread_wake(thread: ThreadId) -> SyscallResult<()> {
+    status_result(unsafe { raw_syscall6(SyscallNumber::ThreadWake, thread.0, 0, 0, 0, 0, 0) })
+}
+
+pub fn thread_terminate(thread: ThreadId) -> SyscallResult<()> {
+    status_result(unsafe { raw_syscall6(SyscallNumber::ThreadTerminate, thread.0, 0, 0, 0, 0, 0) })
+}
+
+pub fn thread_current() -> SyscallResult<ThreadId> {
+    let mut thread = ThreadId::INVALID;
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::ThreadGetCurrent,
+            mut_pointer_address(&mut thread),
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    })?;
+    Ok(thread)
+}
+
+pub fn thread_get_info(thread: ThreadId) -> SyscallResult<ThreadInfo> {
+    let mut info = ThreadInfo::default();
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::ThreadGetInfo,
+            thread.0,
+            mut_pointer_address(&mut info),
+            ThreadInfo::SIZE as u64,
+            THREAD_INFO_VERSION as u64,
+            0,
+            0,
+        )
+    })?;
+    Ok(info)
+}
+
+pub fn thread_join(thread: ThreadId, deadline_ns: i64) -> SyscallResult<ThreadInfo> {
+    let mut info = ThreadInfo::default();
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::ThreadJoin,
+            thread.0,
+            deadline_ns as u64,
+            mut_pointer_address(&mut info),
+            ThreadInfo::SIZE as u64,
+            THREAD_INFO_VERSION as u64,
+            0,
+        )
+    })?;
+    Ok(info)
+}
+
+pub fn thread_detach(thread: ThreadId) -> SyscallResult<()> {
+    status_result(unsafe { raw_syscall6(SyscallNumber::ThreadDetach, thread.0, 0, 0, 0, 0, 0) })
 }
 
 /// Writes bytes to the kernel's initial bounded serial debug sink.

@@ -8,7 +8,7 @@ A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. Gi
 - Limine framebuffer, memory-map, and higher-half direct-map requests
 - CPUID-width-aware, reclaiming 4 KiB physical-frame allocation with exact ownership, reservation tracking, full-width RAM statistics, and DMA-low failure accounting
 - `x86_64`-backed address types, active four-level page-table translation, mapping, and unmapping
-- Generation-tagged processes with isolated lower-half page tables and supervisor-only shared kernel mappings
+- Generation-tagged processes with isolated lower-half page tables, process-owned generation-tagged main threads, and supervisor-only shared kernel mappings
 - Strict ELF64 `ET_EXEC` compatibility plus randomized static `ET_DYN`, guarded randomized user stacks, x86-64 ring-3 entry, and contained user faults
 - `SYSCALL`/`SYSRET` dispatch plus `no_std` userspace stubs for processes, handles, channels, waits, shared memory, files, directories, and debug output
 - Rights-checked shared-memory map/unmap with mapping leases that survive source-handle closure
@@ -28,7 +28,7 @@ A `no_std` x86-64 kernel written in Rust and booted through Limine over UEFI. Gi
 - Packed bitmap-font rendering and a validated, versioned `.gkf` format
 - Persistent RedoxFS transactions on GPT/MBR volumes over bounded-polling virtio-blk or AHCI/SATA
 - Talc-backed allocation that transitions from a bounded bootstrap arena to a growable page-backed kernel heap
-- Single-core round-robin userspace scheduling with local-APIC timer preemption
+- Single-core round-robin thread scheduling with local-APIC timer preemption
 - Hardware-seeded kernel CSPRNG with process-local random capabilities
 - SMAP user-copy protection with recoverable page-fault fixups
 - Ed25519-authenticated system manifests and per-process handle/memory/traffic/process-slot quotas
@@ -54,7 +54,7 @@ Shared-memory objects own stable, distinct, page-rounded physical frames, are ze
 
 At boot, after device initialization has installed its kernel mappings, GinkgoOS ensures `/system` exists, installs `/system/desktop.elf`, `/system/file-navigator.elf`, `/system/terminal.elf`, `/system/minimal-client.elf`, and `/system/programs.gkr` into RedoxFS, and reads them back through the filesystem adapter. An Ed25519-signed manifest authenticates each `/system` path, length, and SHA-256 digest before registry parsing or executable loading. It then validates the registry and desktop ELF and creates an isolated page-table root for the desktop process. The process root starts with an empty lower half and clones only the kernel higher-half topology, clearing `USER_ACCESSIBLE` on every cloned P4 entry even when Limine supplied permissive flags. User mappings reject the zero page, noncanonical or higher-half addresses, writable-executable pages, overlaps, and permission-invalid copies.
 
-The dependency-free ELF loader accepts little-endian x86-64 `ET_EXEC` compatibility images and static position-independent `ET_DYN` images in the Ginkgo executable profile. Compatible PIE images, stacks, and automatic shared mappings receive independent randomized placement. It validates every program header, mapped range, page overlap, permission, entry point, and stack/guard collision before installing image pages. Each process owns its address space, generation-tagged identity, register and x87/SSE state, capability table, shared mappings, resource accounting, and detailed exit/fault state.
+The dependency-free ELF loader accepts little-endian x86-64 `ET_EXEC` compatibility images and static position-independent `ET_DYN` images in the Ginkgo executable profile. Compatible PIE images, stacks, and automatic shared mappings receive independent randomized placement. It validates every program header, mapped range, page overlap, permission, entry point, and stack/guard collision before installing image pages. Each process owns its address space, generation-tagged identity, capability table, shared mappings, resource accounting, detailed exit/fault state, and a generation-checked thread table. Each thread owns its register and x87/SSE/AVX state, stack layout, blocking continuation, and scheduler accounting.
 
 The x86-64 entry path installs a GDT, TSS, IDT, `STAR`/`LSTAR`/`FMASK`, and five distinct 64 KiB supervisor stacks for RSP0, syscall entry, double fault, NMI, and machine check. Synchronous user exceptions are contained and returned to the process scheduler; kernel faults and unrecoverable exception classes fail stop. Every syscall immediately switches away from the untrusted user RSP, captures the complete user context, and returns to scheduler-side dispatch. Local-APIC timer interrupts capture asynchronous ring-3 state on RSP0 and acknowledge EOI without calling Rust. Return through `IRETQ` revalidates canonical RIP/RSP, flags, and floating-point state while preserving arbitrary interrupted `RCX` and `R11` values.
 
@@ -69,6 +69,7 @@ The build script retains generated smoke ELFs for focused execution testing, but
 
 Current execution limitations are intentional and explicit:
 
+- The first thread milestone permits one live thread per process; the append-only thread ABI and scheduler identity are ready for later expansion.
 - Scheduling is single-core; SMP and CPU migration are not implemented.
 - The local-APIC timer and xHCI MSI have dedicated external interrupt entries; other device drivers still poll, and general I/O-APIC routing is not implemented.
 - Blocked waits use bounded scheduler polling rather than per-object kernel wait queues.
@@ -77,7 +78,7 @@ Current execution limitations are intentional and explicit:
 - Physical reclamation is single-core: process roots are recycled only after switching back to the kernel CR3; future SMP requires remote TLB shootdown before reuse.
 - Dynamic linking, runtime ELF relocations, signed rollback prevention, encrypted storage, and hardware-backed key sealing are not yet provided.
 
-See [`docs/memory.md`](docs/memory.md) for the memory architecture, VM ABI, accounting policy, failure rules, and test matrix. See [`SECURITY.md`](SECURITY.md) for the threat model, trust/update policy, CPU-feature audit, and unsupported hardware assumptions.
+See [`docs/memory.md`](docs/memory.md) for the memory architecture, VM ABI, accounting policy, failure rules, and test matrix. See [`docs/threads.md`](docs/threads.md) for thread ownership, lifecycle, ABI, fault policy, and SMP assumptions. See [`SECURITY.md`](SECURITY.md) for the threat model, trust/update policy, CPU-feature audit, and unsupported hardware assumptions.
 
 ### Window system and desktop
 

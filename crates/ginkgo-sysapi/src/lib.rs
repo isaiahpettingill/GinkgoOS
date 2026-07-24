@@ -110,6 +110,26 @@ pub enum SyscallNumber {
     ProcessCreate2 = 51,
     /// Returns the semantic VMA containing one canonical userspace address.
     VirtualQuery = 52,
+    /// Creates another thread in the calling process.
+    ThreadCreate = 53,
+    /// Exits only the calling thread; the last-thread exit finalizes the process.
+    ThreadExit = 54,
+    /// Compatibility-explicit alias for yielding the calling thread.
+    ThreadYield = 55,
+    /// Sleeps until an absolute monotonic deadline when thread blocking is enabled.
+    ThreadSleepUntil = 56,
+    /// Makes a sleeping thread runnable.
+    ThreadWake = 57,
+    /// Requests termination of a thread in the calling process.
+    ThreadTerminate = 58,
+    /// Returns stable information for a process-local generation-tagged thread ID.
+    ThreadGetInfo = 59,
+    /// Waits for a thread to terminate and returns its final information.
+    ThreadJoin = 60,
+    /// Releases the caller's join interest in a thread.
+    ThreadDetach = 61,
+    /// Returns the calling thread's process-local identity.
+    ThreadGetCurrent = 62,
 }
 
 /// An opaque process-local reference to a kernel object.
@@ -692,6 +712,94 @@ impl HandleDisposition {
             reserved: 0,
         }
     }
+}
+
+/// Current thread creation ABI version.
+pub const THREAD_CREATE_ARGS_VERSION: u32 = 1;
+/// Current thread information ABI version.
+pub const THREAD_INFO_VERSION: u32 = 1;
+
+/// Process-local generation-tagged thread identity.
+#[repr(transparent)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    FromBytes,
+    Hash,
+    Immutable,
+    IntoBytes,
+    KnownLayout,
+    Ord,
+    PartialEq,
+    PartialOrd,
+)]
+pub struct ThreadId(pub u64);
+
+impl ThreadId {
+    pub const INVALID: Self = Self(0);
+
+    pub const fn is_valid(self) -> bool {
+        self.0 != 0 && (self.0 >> 32) != 0
+    }
+}
+
+/// Versioned thread creation request. Stack and TLS fields are reserved now so
+/// lifting the first milestone's one-live-thread limit does not break the ABI.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ThreadCreateArgs {
+    pub version: u32,
+    pub size: u32,
+    pub entry: u64,
+    pub argument: u64,
+    pub stack_size: u64,
+    pub tls_base: u64,
+    pub flags: u32,
+    pub reserved: u32,
+    /// Address of a writable [`ThreadId`] receiving the new identity.
+    pub output_address: u64,
+}
+
+impl ThreadCreateArgs {
+    pub const SIZE: u32 = core::mem::size_of::<Self>() as u32;
+}
+
+/// Stable public thread lifecycle classes.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThreadState {
+    Running = 0,
+    Blocked = 1,
+    Exited = 2,
+    Faulted = 3,
+    Terminated = 4,
+}
+
+/// Versioned information returned by [`SyscallNumber::ThreadGetInfo`] and
+/// [`SyscallNumber::ThreadJoin`]. Raw state values preserve forward compatibility.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq,
+)]
+pub struct ThreadInfo {
+    pub version: u32,
+    pub size: u32,
+    pub state: u32,
+    pub reserved: u32,
+    pub thread_id: ThreadId,
+    pub exit_code: i32,
+    pub fault: u32,
+    pub fault_code: u64,
+    pub fault_address: u64,
+    pub cpu_time_ns: u64,
+    pub preemption_count: u64,
+}
+
+impl ThreadInfo {
+    pub const SIZE: u32 = core::mem::size_of::<Self>() as u32;
 }
 
 /// Externally visible lifecycle state of a process capability.
@@ -1294,6 +1402,9 @@ const _: () = {
     assert!(core::mem::size_of::<MonotonicTimeOutput>() == 8);
     assert!(core::mem::size_of::<HandleOutput>() == 8);
     assert!(core::mem::size_of::<HandleDisposition>() == 16);
+    assert!(core::mem::size_of::<ThreadId>() == 8);
+    assert!(core::mem::size_of::<ThreadCreateArgs>() == 56);
+    assert!(core::mem::size_of::<ThreadInfo>() == 64);
     assert!(core::mem::size_of::<ProcessCreateArgs>() == 64);
     assert!(core::mem::size_of::<ProcessMemoryPolicy>() == 64);
     assert!(core::mem::size_of::<ProcessCreateArgs2>() == 80);
@@ -1391,6 +1502,16 @@ mod tests {
         assert_eq!(SyscallNumber::VirtualUnmap as u64, 50);
         assert_eq!(SyscallNumber::ProcessCreate2 as u64, 51);
         assert_eq!(SyscallNumber::VirtualQuery as u64, 52);
+        assert_eq!(SyscallNumber::ThreadCreate as u64, 53);
+        assert_eq!(SyscallNumber::ThreadExit as u64, 54);
+        assert_eq!(SyscallNumber::ThreadYield as u64, 55);
+        assert_eq!(SyscallNumber::ThreadSleepUntil as u64, 56);
+        assert_eq!(SyscallNumber::ThreadWake as u64, 57);
+        assert_eq!(SyscallNumber::ThreadTerminate as u64, 58);
+        assert_eq!(SyscallNumber::ThreadGetInfo as u64, 59);
+        assert_eq!(SyscallNumber::ThreadJoin as u64, 60);
+        assert_eq!(SyscallNumber::ThreadDetach as u64, 61);
+        assert_eq!(SyscallNumber::ThreadGetCurrent as u64, 62);
     }
 
     #[test]
@@ -1481,6 +1602,12 @@ mod tests {
         assert_eq!(ProcessFault::Other as u32, 6);
         assert_eq!(ProcessFault::OutOfMemory as u32, 7);
 
+        assert_eq!(ThreadState::Running as u32, 0);
+        assert_eq!(ThreadState::Blocked as u32, 1);
+        assert_eq!(ThreadState::Exited as u32, 2);
+        assert_eq!(ThreadState::Faulted as u32, 3);
+        assert_eq!(ThreadState::Terminated as u32, 4);
+
         assert_eq!(VirtualAreaKind::Image as u32, 1);
         assert_eq!(VirtualAreaKind::Anonymous as u32, 2);
         assert_eq!(VirtualAreaKind::Stack as u32, 3);
@@ -1503,6 +1630,28 @@ mod tests {
         assert_eq!(offset_of!(WaitManyArgs, deadline_ns), 16);
         assert_eq!(size_of::<MonotonicTimeOutput>(), 8);
         assert_eq!(offset_of!(MonotonicTimeOutput, now_ns), 0);
+
+        assert_eq!(size_of::<ThreadCreateArgs>(), 56);
+        assert_eq!(align_of::<ThreadCreateArgs>(), 8);
+        assert_eq!(offset_of!(ThreadCreateArgs, version), 0);
+        assert_eq!(offset_of!(ThreadCreateArgs, entry), 8);
+        assert_eq!(offset_of!(ThreadCreateArgs, argument), 16);
+        assert_eq!(offset_of!(ThreadCreateArgs, stack_size), 24);
+        assert_eq!(offset_of!(ThreadCreateArgs, tls_base), 32);
+        assert_eq!(offset_of!(ThreadCreateArgs, flags), 40);
+        assert_eq!(offset_of!(ThreadCreateArgs, output_address), 48);
+
+        assert_eq!(size_of::<ThreadInfo>(), 64);
+        assert_eq!(align_of::<ThreadInfo>(), 8);
+        assert_eq!(offset_of!(ThreadInfo, version), 0);
+        assert_eq!(offset_of!(ThreadInfo, state), 8);
+        assert_eq!(offset_of!(ThreadInfo, thread_id), 16);
+        assert_eq!(offset_of!(ThreadInfo, exit_code), 24);
+        assert_eq!(offset_of!(ThreadInfo, fault_code), 32);
+        assert_eq!(offset_of!(ThreadInfo, fault_address), 40);
+        assert_eq!(offset_of!(ThreadInfo, cpu_time_ns), 48);
+        assert_eq!(offset_of!(ThreadInfo, preemption_count), 56);
+
         assert_eq!(MEMORY_INFO_V1_SIZE, 288);
         assert_eq!(size_of::<MemoryInfo>(), 400);
         assert_eq!(align_of::<MemoryInfo>(), 8);

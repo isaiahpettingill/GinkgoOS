@@ -23,11 +23,12 @@ use ginkgo_ipc::{
 use ginkgo_sysapi::{
     FilesystemDirectoryEntry, FilesystemOpenFlags, FilesystemRenameFlags, Handle, MapFlags,
     MapProtection, MemoryInfo, ProcessInfo, ProcessMemoryPolicy, SharedMemoryMapArgs, Status,
-    SyscallNumber, SystemPowerAction, SystemPowerFlags, SystemPowerInfo, VirtualAreaInfo,
-    VirtualMapFileArgs, CHANNEL_MAX_BYTES, CHANNEL_MAX_HANDLES, DEADLINE_INFINITE,
-    FILESYSTEM_NAME_MAX, FILESYSTEM_READ_MAX_BYTES, MEMORY_INFO_V1_SIZE, MEMORY_INFO_VERSION,
-    MEMORY_INFO_VERSION_V1, PROCESS_MAX_STARTUP_BYTES, PROCESS_MAX_STARTUP_HANDLES,
-    PROCESS_MEMORY_POLICY_VERSION, RANDOM_MAX_BYTES, VIRTUAL_AREA_INFO_VERSION,
+    SyscallNumber, SystemPowerAction, SystemPowerFlags, SystemPowerInfo, ThreadInfo,
+    ThreadState as PublicThreadState, VirtualAreaInfo, VirtualMapFileArgs, CHANNEL_MAX_BYTES,
+    CHANNEL_MAX_HANDLES, DEADLINE_INFINITE, FILESYSTEM_NAME_MAX, FILESYSTEM_READ_MAX_BYTES,
+    MEMORY_INFO_V1_SIZE, MEMORY_INFO_VERSION, MEMORY_INFO_VERSION_V1, PROCESS_MAX_STARTUP_BYTES,
+    PROCESS_MAX_STARTUP_HANDLES, PROCESS_MEMORY_POLICY_VERSION, RANDOM_MAX_BYTES,
+    THREAD_INFO_VERSION, VIRTUAL_AREA_INFO_VERSION,
 };
 use redoxfs::Disk;
 use zerocopy::IntoBytes;
@@ -42,9 +43,9 @@ use crate::{
         ActivePageTable, MapError,
     },
     process::{
-        DirectStartupBlock, ElfPageLoadError, PendingWaitMany, Process, ProcessCreateError,
-        file_max_protection, select_child_process_limits, ProcessLimits, SharedMappingError, WaitDeadline,
-        WaitManyCompletion,
+        file_max_protection, select_child_process_limits, DirectStartupBlock, ElfPageLoadError,
+        PendingWaitMany, Process, ProcessCreateError, ProcessLimits, SharedMappingError, ThreadId,
+        ThreadState, WaitDeadline, WaitManyCompletion,
     },
     shared_memory::{SharedFrameArena, SharedMemoryFactory},
 };
@@ -91,6 +92,7 @@ const PROCESS_CREATE_ARGS_SIZE: usize = 64;
 const PROCESS_CREATE_ARGS2_SIZE: usize = 80;
 const PROCESS_MEMORY_POLICY_SIZE: usize = size_of::<ProcessMemoryPolicy>();
 const PROCESS_INFO_SIZE: usize = size_of::<ProcessInfo>();
+const THREAD_INFO_SIZE: usize = size_of::<ThreadInfo>();
 const SYSTEM_POWER_INFO_SIZE: usize = size_of::<SystemPowerInfo>();
 const VIRTUAL_AREA_INFO_SIZE: usize = size_of::<VirtualAreaInfo>();
 const SYSTEM_POWER_CANCELLATION_NS: u64 = 2_000_000_000;
@@ -144,6 +146,7 @@ pub enum BlockedPoll {
 /// numbers are decoded without converting an arbitrary integer into a Rust enum.
 pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
     process: &mut Process,
+    thread_id: ThreadId,
     context: &mut UserContext,
     now_ns: u64,
     kernel_page_table: &ActivePageTable,
@@ -157,12 +160,19 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
     child_slot_reserved: bool,
     debug_sink: &mut D,
 ) -> SyscallOutcome {
+    assert!(
+        process.thread(thread_id).is_some(),
+        "syscall dispatch received a stale thread identity"
+    );
     let Some(number) = decode_syscall_number(context.rax) else {
         set_status(context, Status::UnknownSyscall);
         return SyscallOutcome::Yield;
     };
 
-    if number == SyscallNumber::ProcessExit {
+    if matches!(
+        number,
+        SyscallNumber::ProcessExit | SyscallNumber::ThreadExit
+    ) {
         return match decode_exit_code(context.rdi) {
             Ok(code) => {
                 process.mark_exited(code);
@@ -233,8 +243,10 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
 
     let memory_failures_before = process.usage();
     let result = match number {
-        SyscallNumber::ProcessYield => Ok(()),
-        SyscallNumber::ProcessExit => unreachable!("process exit is handled before dispatch"),
+        SyscallNumber::ProcessYield | SyscallNumber::ThreadYield => Ok(()),
+        SyscallNumber::ProcessExit | SyscallNumber::ThreadExit => {
+            unreachable!("exit syscalls are handled before dispatch")
+        }
         SyscallNumber::HandleClose => handle_close(process, context.rdi),
         SyscallNumber::HandleDuplicate => {
             handle_duplicate(process, context.rdi, context.rsi, context.rdx)
@@ -415,6 +427,19 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
         SyscallNumber::VirtualQuery => {
             virtual_query(process, context.rdi, context.rsi, context.rdx, context.r10)
         }
+        SyscallNumber::ThreadCreate => Err(Status::ResourceLimit),
+        SyscallNumber::ThreadSleepUntil => thread_sleep_until(context.rdi, now_ns),
+        SyscallNumber::ThreadWake => thread_wake(process, context.rdi),
+        SyscallNumber::ThreadTerminate => thread_terminate(process, context.rdi),
+        SyscallNumber::ThreadGetInfo => {
+            thread_get_info(process, context.rdi, context.rsi, context.rdx, context.r10)
+        }
+        SyscallNumber::ThreadJoin => thread_join(process, context.rdi),
+        SyscallNumber::ThreadDetach => thread_detach(process, context.rdi),
+        SyscallNumber::ThreadGetCurrent => {
+            let id = ginkgo_sysapi::ThreadId(process.main_thread_id().raw());
+            copy_to_user(process, context.rdi, id.as_bytes())
+        }
         SyscallNumber::ProcessCreate2 => {
             return match process_create(
                 process,
@@ -466,7 +491,11 @@ const fn missing_memory_failure_counter(
     }
 }
 
-fn record_memory_failure_once(process: &mut Process, before: crate::process::ProcessUsage, status: Status) {
+fn record_memory_failure_once(
+    process: &mut Process,
+    before: crate::process::ProcessUsage,
+    status: Status,
+) {
     match missing_memory_failure_counter(before, process.usage(), status) {
         Some(MemoryFailureCounter::Quota) => process.record_quota_failure(),
         Some(MemoryFailureCounter::Oom) => process.record_oom_failure(),
@@ -548,6 +577,16 @@ const fn decode_syscall_number(raw: u64) -> Option<SyscallNumber> {
         50 => SyscallNumber::VirtualUnmap,
         51 => SyscallNumber::ProcessCreate2,
         52 => SyscallNumber::VirtualQuery,
+        53 => SyscallNumber::ThreadCreate,
+        54 => SyscallNumber::ThreadExit,
+        55 => SyscallNumber::ThreadYield,
+        56 => SyscallNumber::ThreadSleepUntil,
+        57 => SyscallNumber::ThreadWake,
+        58 => SyscallNumber::ThreadTerminate,
+        59 => SyscallNumber::ThreadGetInfo,
+        60 => SyscallNumber::ThreadJoin,
+        61 => SyscallNumber::ThreadDetach,
+        62 => SyscallNumber::ThreadGetCurrent,
         _ => return None,
     })
 }
@@ -558,6 +597,106 @@ fn set_status(context: &mut UserContext, status: Status) {
 
 fn decode_exit_code(raw: u64) -> Result<i32, Status> {
     i32::try_from(raw as i64).map_err(|_| Status::InvalidArgument)
+}
+
+fn thread_sleep_until(raw_deadline: u64, now_ns: u64) -> Result<(), Status> {
+    let deadline = raw_deadline as i64;
+    if deadline < 0 {
+        return Err(Status::InvalidArgument);
+    }
+    if deadline as u64 <= now_ns {
+        Ok(())
+    } else {
+        // The first milestone has one live thread, so blocking it on a dedicated
+        // sleep continuation is not enabled until wake authority can be delegated.
+        Err(Status::ResourceLimit)
+    }
+}
+
+fn thread_wake(process: &Process, raw_id: u64) -> Result<(), Status> {
+    let id = ThreadId::from_raw(raw_id);
+    process.thread(id).ok_or(Status::InvalidHandle).map(|_| ())
+}
+
+fn thread_terminate(process: &mut Process, raw_id: u64) -> Result<(), Status> {
+    let id = ThreadId::from_raw(raw_id);
+    if process.thread(id).is_none() {
+        return Err(Status::InvalidHandle);
+    }
+    process.mark_terminated();
+    Ok(())
+}
+
+fn thread_detach(process: &Process, raw_id: u64) -> Result<(), Status> {
+    thread_wake(process, raw_id)
+}
+
+fn thread_join(process: &Process, raw_id: u64) -> Result<(), Status> {
+    let id = ThreadId::from_raw(raw_id);
+    process.thread(id).ok_or(Status::InvalidHandle)?;
+    if id == process.main_thread_id() {
+        Err(Status::InvalidArgument)
+    } else {
+        Err(Status::ResourceLimit)
+    }
+}
+
+fn thread_get_info(
+    process: &Process,
+    raw_id: u64,
+    output_address: u64,
+    output_size: u64,
+    version: u64,
+) -> Result<(), Status> {
+    if version != THREAD_INFO_VERSION as u64 || output_size != THREAD_INFO_SIZE as u64 {
+        return Err(Status::InvalidArgument);
+    }
+    let id = ThreadId::from_raw(raw_id);
+    let thread = process.thread(id).ok_or(Status::InvalidHandle)?;
+    let (state, exit_code, fault, fault_code, fault_address) = match thread.state() {
+        ThreadState::Ready => (PublicThreadState::Running, 0, 0, 0, 0),
+        ThreadState::Blocked => (PublicThreadState::Blocked, 0, 0, 0, 0),
+        ThreadState::Exited(code) => (PublicThreadState::Exited, code, 0, 0, 0),
+        ThreadState::Faulted(details) => (
+            PublicThreadState::Faulted,
+            0,
+            public_thread_fault(details.reason),
+            details.code,
+            details.address.unwrap_or(0),
+        ),
+        ThreadState::Terminated => (PublicThreadState::Terminated, 0, 0, 0, 0),
+    };
+    let info = ThreadInfo {
+        version: THREAD_INFO_VERSION,
+        size: THREAD_INFO_SIZE as u32,
+        state: state as u32,
+        reserved: 0,
+        thread_id: ginkgo_sysapi::ThreadId(id.raw()),
+        exit_code,
+        fault,
+        fault_code,
+        fault_address,
+        cpu_time_ns: thread.cpu_time_ns(),
+        preemption_count: thread.preemption_count(),
+    };
+    copy_to_user(process, output_address, info.as_bytes())
+}
+
+const fn public_thread_fault(reason: crate::process::ProcessFaultReason) -> u32 {
+    use crate::process::ProcessFaultReason;
+    match reason {
+        ProcessFaultReason::PageFault => ginkgo_sysapi::ProcessFault::PageFault as u32,
+        ProcessFaultReason::GeneralProtection => {
+            ginkgo_sysapi::ProcessFault::GeneralProtection as u32
+        }
+        ProcessFaultReason::InvalidOpcode => ginkgo_sysapi::ProcessFault::InvalidOpcode as u32,
+        ProcessFaultReason::InvalidUserContext => {
+            ginkgo_sysapi::ProcessFault::InvalidUserContext as u32
+        }
+        ProcessFaultReason::ResourceLimit => ginkgo_sysapi::ProcessFault::ResourceLimit as u32,
+        ProcessFaultReason::OutOfMemory => ginkgo_sysapi::ProcessFault::OutOfMemory as u32,
+        ProcessFaultReason::Other(_) => ginkgo_sysapi::ProcessFault::Other as u32,
+    }
 }
 
 fn handle_close(process: &mut Process, raw_handle: u64) -> Result<(), Status> {
@@ -874,7 +1013,11 @@ fn virtual_query(
     copy_to_user(process, output_address, info.as_bytes())
 }
 
-const fn validate_virtual_query(raw_version: u64, raw_size: u64, address: u64) -> Result<(), Status> {
+const fn validate_virtual_query(
+    raw_version: u64,
+    raw_size: u64,
+    address: u64,
+) -> Result<(), Status> {
     if raw_version != VIRTUAL_AREA_INFO_VERSION as u64 {
         return Err(Status::InvalidArgument);
     }
@@ -1227,7 +1370,10 @@ fn virtual_map_file<B: Disk>(
         flags: shared.flags,
     };
     validate_user_output(process, output_address, SHARED_MEMORY_MAP_OUTPUT_SIZE)?;
-    let rights = process.handles().handle_rights(handle).map_err(map_ipc_error)?;
+    let rights = process
+        .handles()
+        .handle_rights(handle)
+        .map_err(map_ipc_error)?;
     let mut required = Rights::READ;
     if args.protection.contains(MapProtection::WRITE) {
         required |= Rights::WRITE;
@@ -1235,15 +1381,25 @@ fn virtual_map_file<B: Disk>(
     if args.protection.contains(MapProtection::EXECUTE) {
         required |= Rights::EXECUTE;
     }
-    let file = process.handles().filesystem_file(handle, required).map_err(map_ipc_error)?;
+    let file = process
+        .handles()
+        .filesystem_file(handle, required)
+        .map_err(map_ipc_error)?;
     let max_protection = file_max_protection(rights).map_err(map_shared_mapping_error)?;
     let file_length = filesystem.stat(file).map_err(map_fs_error)?.len;
     let address = process
-        .map_file_backed(file, file_length, max_protection, args, frame_allocator, |offset, bytes| {
-            filesystem
-                .read(file, offset, bytes)
-                .map_err(|_| SharedMappingError::Io)
-        })
+        .map_file_backed(
+            file,
+            file_length,
+            max_protection,
+            args,
+            frame_allocator,
+            |offset, bytes| {
+                filesystem
+                    .read(file, offset, bytes)
+                    .map_err(|_| SharedMappingError::Io)
+            },
+        )
         .map_err(map_shared_mapping_error)?;
     if let Err(status) = copy_to_user(process, output_address, &address.to_le_bytes()) {
         process
@@ -2107,18 +2263,19 @@ fn process_create<B: Disk>(
     let inherited_limits = select_child_process_limits(process.limits(), available_bytes, None)
         .expect("legacy child limit selection cannot fail");
     let requested_limits = requested_policy.map(|values| ProcessLimits {
-            private_pages: values[0],
-            shared_memory_bytes: values[1],
-            mapped_shared_bytes: values[2],
-            reserved_virtual_bytes: values[3],
-            vma_count: values[4],
-            executable_image_pages: values[5],
-            executable_source_bytes: values[6],
+        private_pages: values[0],
+        shared_memory_bytes: values[1],
+        mapped_shared_bytes: values[2],
+        reserved_virtual_bytes: values[3],
+        vma_count: values[4],
+        executable_image_pages: values[5],
+        executable_source_bytes: values[6],
         channel_traffic_bytes: inherited_limits.channel_traffic_bytes,
         cpu_quantum_ns: inherited_limits.cpu_quantum_ns,
     });
-    let selected_limits = select_child_process_limits(process.limits(), available_bytes, requested_limits)
-        .ok_or(Status::ResourceLimit)?;
+    let selected_limits =
+        select_child_process_limits(process.limits(), available_bytes, requested_limits)
+            .ok_or(Status::ResourceLimit)?;
     if executable_length == 0 || executable_length as u64 > selected_limits.executable_source_bytes
     {
         return Err(Status::ResourceLimit);
@@ -2448,8 +2605,6 @@ fn reclaim_unstarted_process(process: Process, frame_allocator: &mut UsableFrame
         panic!("unstarted process reclaim invariant failed");
     }
 }
-
-
 
 const fn map_process_create_error(error: ProcessCreateError) -> Status {
     match error {
@@ -2909,6 +3064,16 @@ mod tests {
             SyscallNumber::VirtualUnmap,
             SyscallNumber::ProcessCreate2,
             SyscallNumber::VirtualQuery,
+            SyscallNumber::ThreadCreate,
+            SyscallNumber::ThreadExit,
+            SyscallNumber::ThreadYield,
+            SyscallNumber::ThreadSleepUntil,
+            SyscallNumber::ThreadWake,
+            SyscallNumber::ThreadTerminate,
+            SyscallNumber::ThreadGetInfo,
+            SyscallNumber::ThreadJoin,
+            SyscallNumber::ThreadDetach,
+            SyscallNumber::ThreadGetCurrent,
         ];
         for number in expected {
             assert_eq!(decode_syscall_number(number as u64), Some(number));
@@ -2976,7 +3141,7 @@ mod tests {
             Some(SyscallNumber::ProcessCreate2)
         );
         assert_eq!(decode_syscall_number(52), Some(SyscallNumber::VirtualQuery));
-        assert_eq!(decode_syscall_number(53), None);
+        assert_eq!(decode_syscall_number(63), None);
         assert_eq!(decode_syscall_number(u64::MAX), None);
     }
 
@@ -3003,7 +3168,10 @@ mod tests {
             missing_memory_failure_counter(before, oom_recorded, Status::OutOfMemory),
             None
         );
-        assert_eq!(missing_memory_failure_counter(before, before, Status::InvalidArgument), None);
+        assert_eq!(
+            missing_memory_failure_counter(before, before, Status::InvalidArgument),
+            None
+        );
     }
 
     #[test]
@@ -3048,27 +3216,74 @@ mod tests {
         );
     }
 
-
-
     #[test]
     fn memory_info_query_requires_an_exact_supported_version_size_pair() {
-        assert_eq!(validate_memory_info_query(MEMORY_INFO_VERSION_V1 as u64, MEMORY_INFO_V1_SIZE as u64), Ok(MEMORY_INFO_V1_SIZE as usize));
-        assert_eq!(validate_memory_info_query(MEMORY_INFO_VERSION as u64, MemoryInfo::SIZE as u64), Ok(MemoryInfo::SIZE as usize));
-        assert_eq!(validate_memory_info_query(0, MemoryInfo::SIZE as u64), Err(Status::InvalidArgument));
-        assert_eq!(validate_memory_info_query(MEMORY_INFO_VERSION as u64, MemoryInfo::SIZE as u64 - 1), Err(Status::BufferTooSmall));
-        assert_eq!(validate_memory_info_query(MEMORY_INFO_VERSION_V1 as u64, MemoryInfo::SIZE as u64), Err(Status::InvalidArgument));
-        assert_eq!(validate_memory_info_query(MEMORY_INFO_VERSION as u64, MemoryInfo::SIZE as u64 + 8), Err(Status::InvalidArgument));
+        assert_eq!(
+            validate_memory_info_query(MEMORY_INFO_VERSION_V1 as u64, MEMORY_INFO_V1_SIZE as u64),
+            Ok(MEMORY_INFO_V1_SIZE as usize)
+        );
+        assert_eq!(
+            validate_memory_info_query(MEMORY_INFO_VERSION as u64, MemoryInfo::SIZE as u64),
+            Ok(MemoryInfo::SIZE as usize)
+        );
+        assert_eq!(
+            validate_memory_info_query(0, MemoryInfo::SIZE as u64),
+            Err(Status::InvalidArgument)
+        );
+        assert_eq!(
+            validate_memory_info_query(MEMORY_INFO_VERSION as u64, MemoryInfo::SIZE as u64 - 1),
+            Err(Status::BufferTooSmall)
+        );
+        assert_eq!(
+            validate_memory_info_query(MEMORY_INFO_VERSION_V1 as u64, MemoryInfo::SIZE as u64),
+            Err(Status::InvalidArgument)
+        );
+        assert_eq!(
+            validate_memory_info_query(MEMORY_INFO_VERSION as u64, MemoryInfo::SIZE as u64 + 8),
+            Err(Status::InvalidArgument)
+        );
     }
 
     #[test]
     fn virtual_query_rejects_malformed_layouts_and_non_user_addresses() {
         let valid_address = crate::memory::PAGE_SIZE;
-        assert_eq!(validate_virtual_query(VIRTUAL_AREA_INFO_VERSION as u64, VirtualAreaInfo::SIZE as u64, valid_address), Ok(()));
-        assert_eq!(validate_virtual_query(0, VirtualAreaInfo::SIZE as u64, valid_address), Err(Status::InvalidArgument));
-        assert_eq!(validate_virtual_query(VIRTUAL_AREA_INFO_VERSION as u64, VirtualAreaInfo::SIZE as u64 - 1, valid_address), Err(Status::BufferTooSmall));
-        assert_eq!(validate_virtual_query(VIRTUAL_AREA_INFO_VERSION as u64, VirtualAreaInfo::SIZE as u64 + 8, valid_address), Err(Status::InvalidArgument));
+        assert_eq!(
+            validate_virtual_query(
+                VIRTUAL_AREA_INFO_VERSION as u64,
+                VirtualAreaInfo::SIZE as u64,
+                valid_address
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_virtual_query(0, VirtualAreaInfo::SIZE as u64, valid_address),
+            Err(Status::InvalidArgument)
+        );
+        assert_eq!(
+            validate_virtual_query(
+                VIRTUAL_AREA_INFO_VERSION as u64,
+                VirtualAreaInfo::SIZE as u64 - 1,
+                valid_address
+            ),
+            Err(Status::BufferTooSmall)
+        );
+        assert_eq!(
+            validate_virtual_query(
+                VIRTUAL_AREA_INFO_VERSION as u64,
+                VirtualAreaInfo::SIZE as u64 + 8,
+                valid_address
+            ),
+            Err(Status::InvalidArgument)
+        );
         for address in [0, 0x0000_8000_0000_0000, u64::MAX] {
-            assert_eq!(validate_virtual_query(VIRTUAL_AREA_INFO_VERSION as u64, VirtualAreaInfo::SIZE as u64, address), Err(Status::InvalidAddress));
+            assert_eq!(
+                validate_virtual_query(
+                    VIRTUAL_AREA_INFO_VERSION as u64,
+                    VirtualAreaInfo::SIZE as u64,
+                    address
+                ),
+                Err(Status::InvalidAddress)
+            );
         }
     }
 

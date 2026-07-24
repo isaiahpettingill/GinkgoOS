@@ -109,6 +109,47 @@ impl ProcessId {
     }
 }
 
+/// Stable process-local thread identity. Reused slots receive a new generation.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ThreadId(u64);
+
+impl ThreadId {
+    pub const INVALID: Self = Self(0);
+
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    pub const fn is_valid(self) -> bool {
+        self.0 != 0 && self.generation() != 0
+    }
+
+    pub const fn slot(self) -> u32 {
+        self.0 as u32
+    }
+
+    pub const fn generation(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+
+    const fn from_parts(slot: u32, generation: u32) -> Self {
+        debug_assert!(generation != 0);
+        Self(((generation as u64) << 32) | slot as u64)
+    }
+}
+
+/// Generation-checked scheduler identity for one thread in one process.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ThreadRef {
+    pub process_id: ProcessId,
+    pub thread_id: ThreadId,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessFaultReason {
     PageFault,
@@ -165,6 +206,36 @@ impl ProcessState {
 
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Exited(_) | Self::Faulted(_) | Self::Terminated)
+    }
+}
+
+/// Scheduler and completion state owned by an individual thread.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThreadState {
+    Ready,
+    Blocked,
+    Exited(i32),
+    Faulted(ProcessFault),
+    Terminated,
+}
+
+impl ThreadState {
+    pub const fn is_runnable(self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Exited(_) | Self::Faulted(_) | Self::Terminated)
+    }
+
+    const fn process_state(self) -> ProcessState {
+        match self {
+            Self::Ready => ProcessState::Ready,
+            Self::Blocked => ProcessState::Blocked,
+            Self::Exited(code) => ProcessState::Exited(code),
+            Self::Faulted(fault) => ProcessState::Faulted(fault),
+            Self::Terminated => ProcessState::Terminated,
+        }
     }
 }
 
@@ -393,11 +464,19 @@ impl ProcessLimits {
             private_pages: self.private_pages.min(ceiling.private_pages),
             shared_memory_bytes: self.shared_memory_bytes.min(ceiling.shared_memory_bytes),
             mapped_shared_bytes: self.mapped_shared_bytes.min(ceiling.mapped_shared_bytes),
-            reserved_virtual_bytes: self.reserved_virtual_bytes.min(ceiling.reserved_virtual_bytes),
+            reserved_virtual_bytes: self
+                .reserved_virtual_bytes
+                .min(ceiling.reserved_virtual_bytes),
             vma_count: self.vma_count.min(ceiling.vma_count),
-            executable_image_pages: self.executable_image_pages.min(ceiling.executable_image_pages),
-            executable_source_bytes: self.executable_source_bytes.min(ceiling.executable_source_bytes),
-            channel_traffic_bytes: self.channel_traffic_bytes.min(ceiling.channel_traffic_bytes),
+            executable_image_pages: self
+                .executable_image_pages
+                .min(ceiling.executable_image_pages),
+            executable_source_bytes: self
+                .executable_source_bytes
+                .min(ceiling.executable_source_bytes),
+            channel_traffic_bytes: self
+                .channel_traffic_bytes
+                .min(ceiling.channel_traffic_bytes),
             cpu_quantum_ns: self.cpu_quantum_ns.min(ceiling.cpu_quantum_ns),
         }
     }
@@ -614,17 +693,20 @@ fn virtual_area_info(area: VmArea) -> VirtualAreaInfo {
     let reserved_bytes = area.length();
     let (kind, committed, backing_identity, file_offset) = match area.kind {
         VmAreaKind::Image => (VirtualAreaKind::Image, true, 0, 0),
-        VmAreaKind::Anonymous { reservation_id, committed } => {
-            (VirtualAreaKind::Anonymous, committed, reservation_id, 0)
-        }
+        VmAreaKind::Anonymous {
+            reservation_id,
+            committed,
+        } => (VirtualAreaKind::Anonymous, committed, reservation_id, 0),
         VmAreaKind::Stack { committed } => (VirtualAreaKind::Stack, committed, 0, 0),
         VmAreaKind::StackGuard => (VirtualAreaKind::Guard, false, 0, 0),
-        VmAreaKind::Shared { object_identity, .. } => {
-            (VirtualAreaKind::Shared, true, object_identity, 0)
-        }
-        VmAreaKind::FileBacked { backing_id, file_offset, committed } => {
-            (VirtualAreaKind::File, committed, backing_id, file_offset)
-        }
+        VmAreaKind::Shared {
+            object_identity, ..
+        } => (VirtualAreaKind::Shared, true, object_identity, 0),
+        VmAreaKind::FileBacked {
+            backing_id,
+            file_offset,
+            committed,
+        } => (VirtualAreaKind::File, committed, backing_id, file_offset),
     };
     let committed_bytes = if committed { reserved_bytes } else { 0 };
     VirtualAreaInfo {
@@ -891,17 +973,77 @@ impl fmt::Debug for ProcessRetireError {
     }
 }
 
-/// All process-owned execution and capability state.
-pub struct Process {
-    address_space: Option<AddressSpace>,
+/// CPU, stack, blocking, and scheduler state for one independently identified thread.
+pub struct Thread {
     context: UserContext,
     layout: ProcessLayout,
+    state: ThreadState,
+    preemption_count: u64,
+    cpu_time_ns: u64,
+    blocked_syscall: Option<BlockedSyscall>,
+}
+
+impl Thread {
+    pub const fn state(&self) -> ThreadState {
+        self.state
+    }
+
+    pub const fn cpu_time_ns(&self) -> u64 {
+        self.cpu_time_ns
+    }
+
+    pub const fn preemption_count(&self) -> u64 {
+        self.preemption_count
+    }
+}
+
+struct ThreadSlot {
+    generation: u32,
+    thread: Option<Thread>,
+}
+
+/// Process-owned generation table. The first milestone deliberately limits a process
+/// to one live thread while making thread identity and scheduler ownership explicit.
+struct ThreadTable {
+    slots: [ThreadSlot; 1],
+}
+
+impl ThreadTable {
+    fn with_main(thread: Thread) -> (Self, ThreadId) {
+        (
+            Self {
+                slots: [ThreadSlot {
+                    generation: 1,
+                    thread: Some(thread),
+                }],
+            },
+            ThreadId::from_parts(0, 1),
+        )
+    }
+
+    fn get(&self, id: ThreadId) -> Option<&Thread> {
+        let slot = self.slots.get(id.slot() as usize)?;
+        (id.is_valid() && slot.generation == id.generation())
+            .then(|| slot.thread.as_ref())
+            .flatten()
+    }
+
+    fn get_mut(&mut self, id: ThreadId) -> Option<&mut Thread> {
+        let slot = self.slots.get_mut(id.slot() as usize)?;
+        (id.is_valid() && slot.generation == id.generation())
+            .then(|| slot.thread.as_mut())
+            .flatten()
+    }
+}
+
+/// Process-wide protection, authority, resource, and thread ownership state.
+pub struct Process {
+    address_space: Option<AddressSpace>,
+    threads: ThreadTable,
+    main_thread_id: ThreadId,
     handles: Option<HandleTable>,
     application_data: Option<Handle>,
     control: Option<ProcessControl>,
-    state: ProcessState,
-    preemption_count: u64,
-    blocked_syscall: Option<BlockedSyscall>,
     shared_mappings: Option<Vec<SharedMemoryMapping>>,
     file_backings: Option<Vec<FileBacking>>,
     vmas: Option<Vec<VmArea>>,
@@ -1163,17 +1305,22 @@ impl Process {
             .saturating_add(layout.initial_stack_size() / PAGE_SIZE);
         let context = UserContext::new(image.entry, layout.stack_top);
         debug_assert_eq!(context.rsp & 0xf, 0);
+        let (threads, main_thread_id) = ThreadTable::with_main(Thread {
+            context,
+            layout,
+            state: ThreadState::Ready,
+            preemption_count: 0,
+            cpu_time_ns: 0,
+            blocked_syscall: None,
+        });
 
         Ok(Self {
             address_space: Some(address_space),
-            context,
-            layout,
+            threads,
+            main_thread_id,
             handles: Some(HandleTable::new()),
             application_data: None,
             control: None,
-            state: ProcessState::Ready,
-            preemption_count: 0,
-            blocked_syscall: None,
             shared_mappings: Some(Vec::new()),
             file_backings: Some(Vec::new()),
             vmas: Some(vmas),
@@ -1196,12 +1343,65 @@ impl Process {
         })
     }
 
-    pub const fn layout(&self) -> ProcessLayout {
-        self.layout
+    pub fn layout(&self) -> ProcessLayout {
+        self.main_thread().layout
     }
 
-    pub const fn state(&self) -> ProcessState {
-        self.state
+    pub fn state(&self) -> ProcessState {
+        self.main_thread().state.process_state()
+    }
+
+    pub const fn main_thread_id(&self) -> ThreadId {
+        self.main_thread_id
+    }
+
+    pub fn thread(&self, id: ThreadId) -> Option<&Thread> {
+        self.threads.get(id)
+    }
+
+    pub fn thread_mut(&mut self, id: ThreadId) -> Option<&mut Thread> {
+        self.threads.get_mut(id)
+    }
+
+    pub fn thread_state(&self, id: ThreadId) -> Option<ThreadState> {
+        self.thread(id).map(Thread::state)
+    }
+
+    pub fn thread_context(&self, id: ThreadId) -> Option<&UserContext> {
+        self.thread(id).map(|thread| &thread.context)
+    }
+
+    pub fn thread_context_mut(&mut self, id: ThreadId) -> Option<&mut UserContext> {
+        self.thread_mut(id).map(|thread| &mut thread.context)
+    }
+
+    pub fn record_thread_cpu_time(&mut self, id: ThreadId, elapsed_ns: u64) -> bool {
+        let Some(thread) = self.thread_mut(id) else {
+            return false;
+        };
+        thread.cpu_time_ns = thread.cpu_time_ns.saturating_add(elapsed_ns);
+        self.usage.cpu_time_ns = self.usage.cpu_time_ns.saturating_add(elapsed_ns);
+        true
+    }
+
+    pub fn record_thread_preemption(&mut self, id: ThreadId) -> bool {
+        let Some(thread) = self.thread_mut(id) else {
+            return false;
+        };
+        thread.preemption_count = thread.preemption_count.saturating_add(1);
+        true
+    }
+
+    fn main_thread(&self) -> &Thread {
+        self.threads
+            .get(self.main_thread_id)
+            .expect("live process lost its main thread")
+    }
+
+    fn main_thread_mut(&mut self) -> &mut Thread {
+        self.threads
+            .get_mut(self.main_thread_id)
+            .expect("live process lost its main thread")
     }
 
     /// Designates a process-local application-data identity owned by this process's
@@ -1236,8 +1436,9 @@ impl Process {
     }
 
     pub fn mark_terminated(&mut self) {
-        self.blocked_syscall = None;
-        self.state = ProcessState::Terminated;
+        let thread = self.main_thread_mut();
+        thread.blocked_syscall = None;
+        thread.state = ThreadState::Terminated;
         if let Some(control) = &self.control {
             control.mark_terminated();
         }
@@ -1247,7 +1448,7 @@ impl Process {
         let Some(control) = &self.control else {
             return;
         };
-        match self.state {
+        match self.state() {
             ProcessState::Exited(code) => {
                 control.mark_exited(code);
             }
@@ -1265,8 +1466,8 @@ impl Process {
         }
     }
 
-    pub const fn is_runnable(&self) -> bool {
-        self.state.is_runnable()
+    pub fn is_runnable(&self) -> bool {
+        self.main_thread().state.is_runnable()
     }
 
     pub const fn limits(&self) -> ProcessLimits {
@@ -1292,22 +1493,34 @@ impl Process {
             let pages = area.length() / PAGE_SIZE;
             match area.kind {
                 VmAreaKind::Image => {
-                    details.committed_image_pages = details.committed_image_pages.saturating_add(pages);
+                    details.committed_image_pages =
+                        details.committed_image_pages.saturating_add(pages);
                 }
-                VmAreaKind::Anonymous { committed: true, .. } => {
-                    details.committed_anonymous_pages = details.committed_anonymous_pages.saturating_add(pages);
+                VmAreaKind::Anonymous {
+                    committed: true, ..
+                } => {
+                    details.committed_anonymous_pages =
+                        details.committed_anonymous_pages.saturating_add(pages);
                 }
                 VmAreaKind::Stack { committed: true } => {
-                    details.committed_stack_pages = details.committed_stack_pages.saturating_add(pages);
+                    details.committed_stack_pages =
+                        details.committed_stack_pages.saturating_add(pages);
                 }
-                VmAreaKind::FileBacked { committed: true, .. } => {
-                    details.committed_file_backed_pages = details.committed_file_backed_pages.saturating_add(pages);
+                VmAreaKind::FileBacked {
+                    committed: true, ..
+                } => {
+                    details.committed_file_backed_pages =
+                        details.committed_file_backed_pages.saturating_add(pages);
                 }
-                VmAreaKind::Anonymous { committed: false, .. }
+                VmAreaKind::Anonymous {
+                    committed: false, ..
+                }
                 | VmAreaKind::Stack { committed: false }
                 | VmAreaKind::StackGuard
                 | VmAreaKind::Shared { .. }
-                | VmAreaKind::FileBacked { committed: false, .. } => {}
+                | VmAreaKind::FileBacked {
+                    committed: false, ..
+                } => {}
             }
         }
         details
@@ -1318,7 +1531,10 @@ impl Process {
     }
 
     pub fn virtual_query(&self, address: u64) -> Option<VirtualAreaInfo> {
-        let area = self.vmas().iter().copied()
+        let area = self
+            .vmas()
+            .iter()
+            .copied()
             .find(|area| area.start <= address && address < area.end)?;
         Some(virtual_area_info(area))
     }
@@ -1365,7 +1581,7 @@ impl Process {
         let Some(committed_bottom) = self.stack_committed_bottom() else {
             return self.stack_growth_invariant_fault(fault_address);
         };
-        if fault_page < self.layout.stack_bottom || fault_page >= committed_bottom {
+        if fault_page < self.layout().stack_bottom || fault_page >= committed_bottom {
             return page_fault();
         }
 
@@ -1509,75 +1725,89 @@ impl Process {
 
     pub fn record_cpu_time(&mut self, elapsed_ns: u64) {
         self.usage.cpu_time_ns = self.usage.cpu_time_ns.saturating_add(elapsed_ns);
+        let thread = self.main_thread_mut();
+        thread.cpu_time_ns = thread.cpu_time_ns.saturating_add(elapsed_ns);
     }
 
-    pub const fn preemption_count(&self) -> u64 {
-        self.preemption_count
+    pub fn preemption_count(&self) -> u64 {
+        self.main_thread().preemption_count
     }
 
     pub fn record_preemption(&mut self) {
-        self.preemption_count = self.preemption_count.saturating_add(1);
+        let thread = self.main_thread_mut();
+        thread.preemption_count = thread.preemption_count.saturating_add(1);
     }
 
     pub(crate) fn block_wait_many(&mut self, wait: PendingWaitMany) {
+        let thread = self.main_thread_mut();
         assert_eq!(
-            self.state,
-            ProcessState::Ready,
-            "only a ready process can block"
+            thread.state,
+            ThreadState::Ready,
+            "only a ready thread can block"
         );
         assert!(
-            self.blocked_syscall.is_none(),
-            "ready process retained a blocked syscall"
+            thread.blocked_syscall.is_none(),
+            "ready thread retained a blocked syscall"
         );
-        self.blocked_syscall = Some(BlockedSyscall::WaitMany(wait));
-        self.state = ProcessState::Blocked;
+        thread.blocked_syscall = Some(BlockedSyscall::WaitMany(wait));
+        thread.state = ThreadState::Blocked;
     }
 
     pub(crate) fn blocked_wait_many_parts(&mut self) -> (&HandleTable, &mut PendingWaitMany) {
-        assert_eq!(self.state, ProcessState::Blocked, "process is not blocked");
-        let handles = self
-            .handles
-            .as_ref()
-            .expect("live process lost its handle table");
-        let wait = match self
+        let handles =
+            self.handles
+                .as_ref()
+                .expect("live process lost its handle table") as *const HandleTable;
+        let thread = self
+            .threads
+            .get_mut(self.main_thread_id)
+            .expect("live process lost its main thread");
+        assert_eq!(thread.state, ThreadState::Blocked, "thread is not blocked");
+        let wait = match thread
             .blocked_syscall
             .as_mut()
-            .expect("blocked process lost its syscall continuation")
+            .expect("blocked thread lost its syscall continuation")
         {
             BlockedSyscall::WaitMany(wait) => wait,
         };
-        (handles, wait)
+        // SAFETY: `handles` and `threads` are disjoint fields and neither is moved
+        // while the returned borrows are live.
+        (unsafe { &*handles }, wait)
     }
 
     pub(crate) fn take_blocked_wait_many(&mut self) -> PendingWaitMany {
-        assert_eq!(self.state, ProcessState::Blocked, "process is not blocked");
-        match self
+        let thread = self.main_thread_mut();
+        assert_eq!(thread.state, ThreadState::Blocked, "thread is not blocked");
+        match thread
             .blocked_syscall
             .take()
-            .expect("blocked process lost its syscall continuation")
+            .expect("blocked thread lost its syscall continuation")
         {
             BlockedSyscall::WaitMany(wait) => wait,
         }
     }
 
     pub(crate) fn resume_from_block(&mut self) {
-        assert_eq!(self.state, ProcessState::Blocked, "process is not blocked");
+        let thread = self.main_thread_mut();
+        assert_eq!(thread.state, ThreadState::Blocked, "thread is not blocked");
         assert!(
-            self.blocked_syscall.is_none(),
+            thread.blocked_syscall.is_none(),
             "blocked syscall must be consumed before resuming"
         );
-        self.state = ProcessState::Ready;
+        thread.state = ThreadState::Ready;
     }
 
     pub fn mark_exited(&mut self, code: i32) {
-        self.blocked_syscall = None;
-        self.state = ProcessState::Exited(code);
+        let thread = self.main_thread_mut();
+        thread.blocked_syscall = None;
+        thread.state = ThreadState::Exited(code);
         self.publish_terminal_status();
     }
 
     pub fn mark_faulted(&mut self, reason: ProcessFault) {
-        self.blocked_syscall = None;
-        self.state = ProcessState::Faulted(reason);
+        let thread = self.main_thread_mut();
+        thread.blocked_syscall = None;
+        thread.state = ThreadState::Faulted(reason);
         self.publish_terminal_status();
     }
 
@@ -1593,8 +1823,8 @@ impl Process {
             .expect("live process lost its address space")
     }
 
-    pub const fn context(&self) -> &UserContext {
-        &self.context
+    pub fn context(&self) -> &UserContext {
+        &self.main_thread().context
     }
 
     /// Installs a prepared direct-process startup block in the active child stack.
@@ -1603,7 +1833,7 @@ impl Process {
         startup: &DirectStartupBlock,
     ) -> Result<(), AddressSpaceError> {
         let block_address = self
-            .layout
+            .layout()
             .stack_top
             .checked_sub(startup.bytes.len() as u64)
             .ok_or(AddressSpaceError::AddressOverflow)?
@@ -1615,21 +1845,22 @@ impl Process {
         )?;
         self.address_space()
             .copy_to_user(block_address, &startup.bytes)?;
-        self.context.rsp = block_address;
+        self.main_thread_mut().context.rsp = block_address;
         self.set_start_arguments([block_address, startup.bytes.len() as u64, 0, 0]);
         Ok(())
     }
 
     /// Sets the first four System V AMD64 arguments for the initial user entry.
     pub fn set_start_arguments(&mut self, [rdi, rsi, rdx, rcx]: [u64; 4]) {
-        self.context.rdi = rdi;
-        self.context.rsi = rsi;
-        self.context.rdx = rdx;
-        self.context.rcx = rcx;
+        let context = &mut self.main_thread_mut().context;
+        context.rdi = rdi;
+        context.rsi = rsi;
+        context.rdx = rdx;
+        context.rcx = rcx;
     }
 
     pub fn context_mut(&mut self) -> &mut UserContext {
-        &mut self.context
+        &mut self.main_thread_mut().context
     }
 
     pub fn handles(&self) -> &HandleTable {
@@ -1688,7 +1919,7 @@ impl Process {
             false,
             mapped_len,
             previous_cursor,
-            self.layout.stack_guard_start,
+            self.layout().stack_guard_start,
             &occupied,
         )?;
         let end = address
@@ -1717,7 +1948,7 @@ impl Process {
         }
         *self.vmas.as_mut().expect("live process lost its VMA table") = planned;
         self.usage.reserved_virtual_bytes = new_reserved.expect("checked above");
-        self.next_mapping_cursor = if end < self.layout.stack_guard_start {
+        self.next_mapping_cursor = if end < self.layout().stack_guard_start {
             end
         } else {
             SHARED_MAPPING_BASE
@@ -2028,7 +2259,7 @@ impl Process {
             args.flags.contains(MapFlags::FIXED),
             mapped_len,
             self.next_mapping_cursor,
-            self.layout.stack_guard_start,
+            self.layout().stack_guard_start,
             &occupied,
         )?;
         let backing_id = self.next_file_backing_id;
@@ -2084,7 +2315,10 @@ impl Process {
                     .as_mut()
                     .expect("live process lost its file backing records")
                     .push(backing);
-                *self.vmas.as_mut().expect("live process lost its semantic VMA table") = planned;
+                *self
+                    .vmas
+                    .as_mut()
+                    .expect("live process lost its semantic VMA table") = planned;
                 self.usage.private_pages = new_private;
                 self.usage.reserved_virtual_bytes = new_reserved;
                 self.next_file_backing_id = next_backing_id;
@@ -2103,7 +2337,7 @@ impl Process {
         self.usage.reserved_virtual_bytes = new_reserved;
         self.next_file_backing_id = next_backing_id;
         if !args.flags.contains(MapFlags::FIXED) {
-            self.next_mapping_cursor = if end < self.layout.stack_guard_start {
+            self.next_mapping_cursor = if end < self.layout().stack_guard_start {
                 end
             } else {
                 SHARED_MAPPING_BASE
@@ -2200,7 +2434,8 @@ impl Process {
                     rollback_error: AddressSpaceError::CorruptPageTable,
                 });
             }
-            if let Err(rollback_error) = self.address_space_mut().unmap_user_range(address, mapped) {
+            if let Err(rollback_error) = self.address_space_mut().unmap_user_range(address, mapped)
+            {
                 self.fail_stop_vm_rollback(address);
                 return Err(SharedMappingError::RollbackFailed {
                     mapping_error: AddressSpaceError::CorruptPageTable,
@@ -2280,7 +2515,10 @@ impl Process {
                     // Rollback could not prove the range unmapped. The process is already
                     // fail-stopped, so publish the prechecked full commit charge and committed
                     // VMA plan as conservative quarantine metadata for retirement.
-                    *self.vmas.as_mut().expect("live process lost its semantic VMA table") = planned;
+                    *self
+                        .vmas
+                        .as_mut()
+                        .expect("live process lost its semantic VMA table") = planned;
                     self.usage.private_pages = new_private;
                 }
                 return Err(failure);
@@ -2312,7 +2550,15 @@ impl Process {
     ) -> Result<(), SharedMappingError> {
         let (_, permissions) = anonymous_permissions(protection)?;
         let (end, _) = normalize_anonymous_range(address, length)?;
-        authorize_file_protection(self.vmas(), self.file_backings.as_ref().expect("live process lost its file backing records"), address, end, protection)?;
+        authorize_file_protection(
+            self.vmas(),
+            self.file_backings
+                .as_ref()
+                .expect("live process lost its file backing records"),
+            address,
+            end,
+            protection,
+        )?;
         let planned = plan_file_change(self.vmas(), address, end, FileChange::Protect(protection))?;
         if planned.len() as u64 > self.limits.vma_count {
             self.record_quota_failure();
@@ -2420,7 +2666,7 @@ impl Process {
             args.flags.contains(MapFlags::FIXED),
             request.mapped_len,
             self.next_mapping_cursor,
-            self.layout.stack_guard_start,
+            self.layout().stack_guard_start,
             &occupied,
         )?;
 
@@ -2528,7 +2774,7 @@ impl Process {
         if !args.flags.contains(MapFlags::FIXED) {
             self.next_mapping_cursor = address
                 .checked_add(request.mapped_len as u64)
-                .filter(|next| *next < self.layout.stack_guard_start)
+                .filter(|next| *next < self.layout().stack_guard_start)
                 .unwrap_or(SHARED_MAPPING_BASE);
         }
         Ok(address)
@@ -2595,6 +2841,8 @@ impl Process {
             return Err(ProcessRetireError { process: self });
         }
 
+        let final_state = self.state();
+        let context = *self.context();
         let address_space = self
             .address_space
             .take()
@@ -2634,8 +2882,8 @@ impl Process {
 
         Ok(RetiredProcess {
             address_space,
-            context: self.context,
-            final_state: self.state,
+            context,
+            final_state,
             teardown,
         })
     }
@@ -3508,18 +3756,29 @@ fn authorize_file_protection(
             continue;
         }
         let VmAreaKind::FileBacked { backing_id, .. } = area.kind else {
-            return Err(SharedMappingError::ExactMappingNotFound { address: start, length: end - start });
+            return Err(SharedMappingError::ExactMappingNotFound {
+                address: start,
+                length: end - start,
+            });
         };
         if area.start > covered {
-            return Err(SharedMappingError::ExactMappingNotFound { address: start, length: end - start });
+            return Err(SharedMappingError::ExactMappingNotFound {
+                address: start,
+                length: end - start,
+            });
         }
-        let backing = backings.iter().find(|backing| backing.id == backing_id)
+        let backing = backings
+            .iter()
+            .find(|backing| backing.id == backing_id)
             .ok_or(SharedMappingError::InvalidBackingLength)?;
         file_permissions(protection, backing.max_protection)?;
         covered = area.end.min(end);
     }
     if covered != end {
-        return Err(SharedMappingError::ExactMappingNotFound { address: start, length: end - start });
+        return Err(SharedMappingError::ExactMappingNotFound {
+            address: start,
+            length: end - start,
+        });
     }
     Ok(())
 }
@@ -3934,14 +4193,24 @@ impl ProcessTable {
         self.inner.get_mut(id)
     }
 
-    /// Selects the next live process ID in deterministic round-robin slot order.
+    /// Selects the next live thread in deterministic process-slot order.
     ///
-    /// Selection includes non-runnable processes so a permanent process-runner
-    /// task can poll blocked syscalls and retire exited or faulted entries. Empty
-    /// and retired slots are skipped. Reused slots are returned with their current generation,
-    /// so an ID returned before removal never aliases its replacement.
+    /// Selection includes blocked and terminal threads so the permanent runner can
+    /// poll continuations and retire their owning processes. Both generations are
+    /// carried by the scheduler reference, so stale process or thread identities
+    /// cannot alias replacements.
+    pub fn next_thread(&mut self) -> Option<ThreadRef> {
+        let process_id = self.inner.next_id()?;
+        let thread_id = self.inner.get(process_id)?.main_thread_id();
+        Some(ThreadRef {
+            process_id,
+            thread_id,
+        })
+    }
+
+    /// Compatibility selector for process-inspection code and existing host tests.
     pub fn next_id(&mut self) -> Option<ProcessId> {
-        self.inner.next_id()
+        self.next_thread().map(|thread| thread.process_id)
     }
 
     /// Takes a process out of the table so the scheduler can restore the kernel
@@ -4056,7 +4325,10 @@ mod tests {
 
         let legacy = select_child_process_limits(caller, 512 * MIB, None).unwrap();
         assert_eq!(legacy.private_pages, caller.private_pages);
-        assert_eq!(legacy.executable_source_bytes, caller.executable_source_bytes);
+        assert_eq!(
+            legacy.executable_source_bytes,
+            caller.executable_source_bytes
+        );
 
         let lower_ram = ProcessLimits::from_available_memory_bytes(64 * MIB);
         let low_memory_legacy = select_child_process_limits(caller, 64 * MIB, None).unwrap();
@@ -4071,7 +4343,10 @@ mod tests {
 
         let mut escalation = requested;
         escalation.private_pages = caller.private_pages + 1;
-        assert_eq!(select_child_process_limits(caller, 512 * MIB, Some(escalation)), None);
+        assert_eq!(
+            select_child_process_limits(caller, 512 * MIB, Some(escalation)),
+            None
+        );
     }
 
     #[test]
@@ -4159,16 +4434,28 @@ mod tests {
     }
 
     fn test_process(state: ProcessState) -> Process {
-        Process {
-            address_space: None,
+        let thread_state = match state {
+            ProcessState::Ready => ThreadState::Ready,
+            ProcessState::Blocked => ThreadState::Blocked,
+            ProcessState::Exited(code) => ThreadState::Exited(code),
+            ProcessState::Faulted(fault) => ThreadState::Faulted(fault),
+            ProcessState::Terminated => ThreadState::Terminated,
+        };
+        let (threads, main_thread_id) = ThreadTable::with_main(Thread {
             context: UserContext::new(0x1000, USER_STACK_TOP),
             layout: ProcessLayout::STANDARD,
+            state: thread_state,
+            preemption_count: 0,
+            cpu_time_ns: 0,
+            blocked_syscall: None,
+        });
+        Process {
+            address_space: None,
+            threads,
+            main_thread_id,
             handles: None,
             application_data: None,
             control: None,
-            state,
-            preemption_count: 0,
-            blocked_syscall: None,
             shared_mappings: None,
             file_backings: None,
             vmas: None,
@@ -4203,11 +4490,45 @@ mod tests {
         let protection = MapProtection::READ | MapProtection::WRITE;
         let cases = [
             (VmAreaKind::Image, VirtualAreaKind::Image, true, 0, 0),
-            (VmAreaKind::Anonymous { reservation_id: 17, committed: false }, VirtualAreaKind::Anonymous, false, 17, 0),
-            (VmAreaKind::Stack { committed: true }, VirtualAreaKind::Stack, true, 0, 0),
+            (
+                VmAreaKind::Anonymous {
+                    reservation_id: 17,
+                    committed: false,
+                },
+                VirtualAreaKind::Anonymous,
+                false,
+                17,
+                0,
+            ),
+            (
+                VmAreaKind::Stack { committed: true },
+                VirtualAreaKind::Stack,
+                true,
+                0,
+                0,
+            ),
             (VmAreaKind::StackGuard, VirtualAreaKind::Guard, false, 0, 0),
-            (VmAreaKind::Shared { object_identity: 29, object_offset: PAGE_SIZE }, VirtualAreaKind::Shared, true, 29, 0),
-            (VmAreaKind::FileBacked { backing_id: 41, file_offset: PAGE_SIZE * 3, committed: false }, VirtualAreaKind::File, false, 41, PAGE_SIZE * 3),
+            (
+                VmAreaKind::Shared {
+                    object_identity: 29,
+                    object_offset: PAGE_SIZE,
+                },
+                VirtualAreaKind::Shared,
+                true,
+                29,
+                0,
+            ),
+            (
+                VmAreaKind::FileBacked {
+                    backing_id: 41,
+                    file_offset: PAGE_SIZE * 3,
+                    committed: false,
+                },
+                VirtualAreaKind::File,
+                false,
+                41,
+                PAGE_SIZE * 3,
+            ),
         ];
 
         for (kind, expected_kind, committed, backing_identity, file_offset) in cases {
@@ -4223,7 +4544,10 @@ mod tests {
             assert_eq!(info.map_protection(), protection);
             assert_eq!(info.reserved_bytes, PAGE_SIZE * 2);
             assert_eq!(info.reserved_pages, 2);
-            assert_eq!(info.committed_bytes, if committed { PAGE_SIZE * 2 } else { 0 });
+            assert_eq!(
+                info.committed_bytes,
+                if committed { PAGE_SIZE * 2 } else { 0 }
+            );
             assert_eq!(info.committed_pages, if committed { 2 } else { 0 });
             assert_eq!(info.backing_identity, backing_identity);
             assert_eq!(info.file_offset, file_offset);
@@ -4372,28 +4696,46 @@ mod tests {
         let (_region, mut allocator) = TestFrameRegion::allocator(128);
         let mut process = construct_test_process(&mut allocator).unwrap();
         let mut map = |process: &mut Process, rights, protection| {
-            let source_handle = process.handles_mut().filesystem_file_create(file, rights).unwrap();
-            let retained_file = process.handles().filesystem_file(source_handle, Rights::READ).unwrap();
-            let maximum = file_max_protection(process.handles().handle_rights(source_handle).unwrap()).unwrap();
+            let source_handle = process
+                .handles_mut()
+                .filesystem_file_create(file, rights)
+                .unwrap();
+            let retained_file = process
+                .handles()
+                .filesystem_file(source_handle, Rights::READ)
+                .unwrap();
+            let maximum =
+                file_max_protection(process.handles().handle_rights(source_handle).unwrap())
+                    .unwrap();
             process.handles_mut().handle_close(source_handle).unwrap();
-            process.map_file_backed(
-                retained_file,
-                source.len() as u64,
-                maximum,
-                VirtualMapFileArgs {
-                    address: 0,
-                    offset: 0,
-                    length: PAGE_SIZE,
-                    protection,
-                    flags: MapFlags::empty(),
-                },
-                &mut allocator,
-                |offset, output| filesystem.read(file, offset, output).map_err(|_| SharedMappingError::Io),
-            ).unwrap()
+            process
+                .map_file_backed(
+                    retained_file,
+                    source.len() as u64,
+                    maximum,
+                    VirtualMapFileArgs {
+                        address: 0,
+                        offset: 0,
+                        length: PAGE_SIZE,
+                        protection,
+                        flags: MapFlags::empty(),
+                    },
+                    &mut allocator,
+                    |offset, output| {
+                        filesystem
+                            .read(file, offset, output)
+                            .map_err(|_| SharedMappingError::Io)
+                    },
+                )
+                .unwrap()
         };
 
         let read_only = map(&mut process, Rights::READ, MapProtection::READ);
-        let executable = map(&mut process, Rights::READ | Rights::EXECUTE, MapProtection::READ);
+        let executable = map(
+            &mut process,
+            Rights::READ | Rights::EXECUTE,
+            MapProtection::READ,
+        );
         let writable = map(
             &mut process,
             Rights::READ | Rights::WRITE,
@@ -4402,23 +4744,37 @@ mod tests {
         drop(map);
 
         assert!(matches!(
-            process.protect_file_backed(read_only, PAGE_SIZE, MapProtection::READ | MapProtection::EXECUTE),
+            process.protect_file_backed(
+                read_only,
+                PAGE_SIZE,
+                MapProtection::READ | MapProtection::EXECUTE
+            ),
             Err(SharedMappingError::InvalidProtection(_))
         ));
 
-        process.protect_file_backed(
-            executable,
-            PAGE_SIZE,
-            MapProtection::READ | MapProtection::EXECUTE,
-        ).unwrap();
-        process.protect_file_backed(executable, PAGE_SIZE, MapProtection::READ).unwrap();
+        process
+            .protect_file_backed(
+                executable,
+                PAGE_SIZE,
+                MapProtection::READ | MapProtection::EXECUTE,
+            )
+            .unwrap();
+        process
+            .protect_file_backed(executable, PAGE_SIZE, MapProtection::READ)
+            .unwrap();
 
         assert!(matches!(
-            process.protect_file_backed(writable, PAGE_SIZE, MapProtection::READ | MapProtection::EXECUTE),
+            process.protect_file_backed(
+                writable,
+                PAGE_SIZE,
+                MapProtection::READ | MapProtection::EXECUTE
+            ),
             Err(SharedMappingError::InvalidProtection(_))
         ));
         for address in [read_only, executable, writable] {
-            process.unmap_file_backed(address, PAGE_SIZE, &mut allocator).unwrap();
+            process
+                .unmap_file_backed(address, PAGE_SIZE, &mut allocator)
+                .unwrap();
         }
     }
 
@@ -4455,14 +4811,17 @@ mod tests {
             },
         );
 
-        assert!(matches!(result, Err(SharedMappingError::RollbackFailed { .. })));
+        assert!(matches!(
+            result,
+            Err(SharedMappingError::RollbackFailed { .. })
+        ));
         assert!(process.state().is_terminal());
         assert_eq!(process.file_backings.as_ref().unwrap().len(), 1);
         assert_eq!(process.usage().private_pages, baseline_private + 2);
-        assert!(process.vmas().iter().any(|vma| matches!(
-            vma.kind,
-            VmAreaKind::FileBacked { backing_id: 1, .. }
-        )));
+        assert!(process
+            .vmas()
+            .iter()
+            .any(|vma| matches!(vma.kind, VmAreaKind::FileBacked { backing_id: 1, .. })));
         process.retire().unwrap().reclaim(&mut allocator).unwrap();
         assert_eq!(allocator.allocated_count(), 0);
     }
@@ -4474,21 +4833,29 @@ mod tests {
         let (_region, mut allocator) = TestFrameRegion::allocator(96);
         let mut process = construct_test_process(&mut allocator).unwrap();
         let baseline_private = process.usage().private_pages;
-        let address = process.map_file_backed(
-            file,
-            source.len() as u64,
-            MapProtection::READ,
-            VirtualMapFileArgs {
-                address: 0,
-                offset: 0,
-                length: PAGE_SIZE * 2,
-                protection: MapProtection::READ,
-                flags: MapFlags::empty(),
-            },
-            &mut allocator,
-            |offset, output| filesystem.read(file, offset, output).map_err(|_| SharedMappingError::Io),
-        ).unwrap();
-        process.decommit_file_backed(address, PAGE_SIZE * 2, &mut allocator).unwrap();
+        let address = process
+            .map_file_backed(
+                file,
+                source.len() as u64,
+                MapProtection::READ,
+                VirtualMapFileArgs {
+                    address: 0,
+                    offset: 0,
+                    length: PAGE_SIZE * 2,
+                    protection: MapProtection::READ,
+                    flags: MapFlags::empty(),
+                },
+                &mut allocator,
+                |offset, output| {
+                    filesystem
+                        .read(file, offset, output)
+                        .map_err(|_| SharedMappingError::Io)
+                },
+            )
+            .unwrap();
+        process
+            .decommit_file_backed(address, PAGE_SIZE * 2, &mut allocator)
+            .unwrap();
         let reserved_before = process.usage().reserved_virtual_bytes;
         let owned_before = process.address_space().owned_data_frames().len();
         process.fail_file_rollback_for_test = true;
@@ -4503,31 +4870,49 @@ mod tests {
                 if reads == 2 {
                     Err(SharedMappingError::Io)
                 } else {
-                    filesystem.read(authority, offset, output).map_err(|_| SharedMappingError::Io)
+                    filesystem
+                        .read(authority, offset, output)
+                        .map_err(|_| SharedMappingError::Io)
                 }
             },
         );
 
-        assert!(matches!(result, Err(SharedMappingError::RollbackFailed { .. })));
+        assert!(matches!(
+            result,
+            Err(SharedMappingError::RollbackFailed { .. })
+        ));
         assert!(process.state().is_terminal());
         assert_eq!(process.file_backings.as_ref().unwrap().len(), 1);
         assert_eq!(process.usage().reserved_virtual_bytes, reserved_before);
         assert_eq!(process.usage().private_pages, baseline_private + 2);
-        let quarantined = process.vmas().iter().filter(|vma| {
-            vma.start < address + PAGE_SIZE * 2 && address < vma.end
-        }).collect::<Vec<_>>();
+        let quarantined = process
+            .vmas()
+            .iter()
+            .filter(|vma| vma.start < address + PAGE_SIZE * 2 && address < vma.end)
+            .collect::<Vec<_>>();
         assert!(!quarantined.is_empty());
-        assert_eq!(quarantined.iter().map(|vma| vma.length()).sum::<u64>(), PAGE_SIZE * 2);
+        assert_eq!(
+            quarantined.iter().map(|vma| vma.length()).sum::<u64>(),
+            PAGE_SIZE * 2
+        );
         assert!(quarantined.iter().all(|vma| matches!(
             vma.kind,
-            VmAreaKind::FileBacked { committed: true, .. }
+            VmAreaKind::FileBacked {
+                committed: true,
+                ..
+            }
         )));
-        assert_eq!(process.address_space().owned_data_frames().len(), owned_before + 1);
+        assert_eq!(
+            process.address_space().owned_data_frames().len(),
+            owned_before + 1
+        );
         let accounting = process.address_space().accounting();
         assert_eq!(accounting.mapped_data_frames, owned_before + 1);
         assert_eq!(
             process.usage().resident_owned_frames,
-            (accounting.mapped_data_frames + accounting.retired_data_frames + accounting.page_table_frames) as u64
+            (accounting.mapped_data_frames
+                + accounting.retired_data_frames
+                + accounting.page_table_frames) as u64
         );
 
         process.retire().unwrap().reclaim(&mut allocator).unwrap();
@@ -4619,15 +5004,24 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(SharedMappingError::AddressSpace(AddressSpaceError::OutOfFrames))
-                    | Err(SharedMappingError::AddressSpace(AddressSpaceError::OutOfMemory))
+                Err(SharedMappingError::AddressSpace(
+                    AddressSpaceError::OutOfFrames
+                )) | Err(SharedMappingError::AddressSpace(
+                    AddressSpaceError::OutOfMemory
+                ))
             ),
             "unexpected file mapping result: {result:?}"
         );
         assert_eq!(process.usage().private_pages, usage.private_pages);
-        assert_eq!(process.usage().reserved_virtual_bytes, usage.reserved_virtual_bytes);
+        assert_eq!(
+            process.usage().reserved_virtual_bytes,
+            usage.reserved_virtual_bytes
+        );
         assert_eq!(process.vmas(), vmas);
-        assert_eq!(process.address_space().owned_data_frames().len(), owned_frames);
+        assert_eq!(
+            process.address_space().owned_data_frames().len(),
+            owned_frames
+        );
         assert!(process.file_backings.as_ref().unwrap().is_empty());
         allocator.reclaim_frames(&held).unwrap();
         process.retire().unwrap().reclaim(&mut allocator).unwrap();
@@ -4763,8 +5157,7 @@ mod tests {
             );
         }
 
-        let infos = [base, base + PAGE_SIZE]
-            .map(|address| process.virtual_query(address).unwrap());
+        let infos = [base, base + PAGE_SIZE].map(|address| process.virtual_query(address).unwrap());
         assert_eq!(infos[0].backing_identity, first_identity);
         assert_eq!(infos[1].backing_identity, second_identity);
         for (index, info) in infos.into_iter().enumerate() {
@@ -4782,7 +5175,10 @@ mod tests {
                     && area.end <= base + PAGE_SIZE * 2)
                 .inspect(|area| assert!(matches!(
                     area.kind,
-                    VmAreaKind::Shared { object_offset: 0, .. }
+                    VmAreaKind::Shared {
+                        object_offset: 0,
+                        ..
+                    }
                 )))
                 .count(),
             2
@@ -5495,6 +5891,35 @@ mod tests {
     }
 
     #[test]
+    fn main_thread_has_a_generation_tagged_process_local_identity() {
+        let process = test_process(ProcessState::Ready);
+        let id = process.main_thread_id();
+        assert!(id.is_valid());
+        assert_eq!(id.slot(), 0);
+        assert_eq!(id.generation(), 1);
+        assert!(process.thread(id).is_some());
+        assert!(process.thread(ThreadId::INVALID).is_none());
+        assert!(process
+            .thread(ThreadId::from_raw(id.slot() as u64))
+            .is_none());
+    }
+
+    #[test]
+    fn scheduler_selects_thread_references_not_bare_processes() {
+        let mut table = ProcessTable::new();
+        let process_id = table.insert(test_process(ProcessState::Ready)).unwrap();
+        let expected_thread = table.get(process_id).unwrap().main_thread_id();
+
+        assert_eq!(
+            table.next_thread(),
+            Some(ThreadRef {
+                process_id,
+                thread_id: expected_thread,
+            })
+        );
+    }
+
+    #[test]
     fn process_table_selects_live_ids_in_round_robin_order() {
         let mut table = ProcessTable::new();
         assert_eq!(table.next_id(), None);
@@ -5624,7 +6049,7 @@ mod tests {
         assert_eq!(process.preemption_count(), 0);
         process.record_preemption();
         assert_eq!(process.preemption_count(), 1);
-        process.preemption_count = u64::MAX;
+        process.main_thread_mut().preemption_count = u64::MAX;
         process.record_preemption();
         assert_eq!(process.preemption_count(), u64::MAX);
     }
@@ -5786,11 +6211,11 @@ mod tests {
         let mut process = test_process(ProcessState::Ready);
         process.block_wait_many(pending_wait(WaitDeadline::At(25)));
         assert_eq!(process.state(), ProcessState::Blocked);
-        assert!(process.blocked_syscall.is_some());
+        assert!(process.main_thread().blocked_syscall.is_some());
 
         let wait = process.take_blocked_wait_many();
         assert_eq!(wait.deadline, WaitDeadline::At(25));
-        assert!(process.blocked_syscall.is_none());
+        assert!(process.main_thread().blocked_syscall.is_none());
         process.resume_from_block();
         assert_eq!(process.state(), ProcessState::Ready);
     }
@@ -5801,14 +6226,14 @@ mod tests {
         exited.block_wait_many(pending_wait(WaitDeadline::Infinite));
         exited.mark_exited(7);
         assert_eq!(exited.state(), ProcessState::Exited(7));
-        assert!(exited.blocked_syscall.is_none());
+        assert!(exited.main_thread().blocked_syscall.is_none());
 
         let mut faulted = test_process(ProcessState::Ready);
         faulted.block_wait_many(pending_wait(WaitDeadline::Infinite));
         let fault = ProcessFault::new(ProcessFaultReason::InvalidOpcode, 6);
         faulted.mark_faulted(fault);
         assert_eq!(faulted.state(), ProcessState::Faulted(fault));
-        assert!(faulted.blocked_syscall.is_none());
+        assert!(faulted.main_thread().blocked_syscall.is_none());
     }
 
     #[test]
@@ -6191,9 +6616,9 @@ mod tests {
     #[test]
     fn start_arguments_set_abi_registers_without_changing_other_context() {
         let mut process = test_process(ProcessState::Ready);
-        process.context.rax = 4;
-        process.context.rbx = 5;
-        let mut expected = process.context;
+        process.context_mut().rax = 4;
+        process.context_mut().rbx = 5;
+        let mut expected = *process.context();
         expected.rdi = 1;
         expected.rsi = 2;
         expected.rdx = 3;
@@ -6201,7 +6626,7 @@ mod tests {
 
         process.set_start_arguments([1, 2, 3, 4]);
 
-        assert_eq!(process.context, expected);
+        assert_eq!(*process.context(), expected);
     }
 
     #[test]

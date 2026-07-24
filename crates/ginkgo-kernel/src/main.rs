@@ -50,7 +50,7 @@ use ginkgo_kernel::{
     power::AcpiPower,
     process::{
         Process, ProcessFault, ProcessFaultReason, ProcessId, ProcessState, ProcessTable,
-        UserPageFaultResolution,
+        ThreadRef, ThreadState, UserPageFaultResolution,
     },
     shared_memory::{SharedFrameArena, SharedMemoryFactory},
     syscall::{self, DebugSink, SyscallOutcome},
@@ -2350,7 +2350,11 @@ fn verify_paging(context: &mut KernelContext) -> bool {
 }
 
 fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll {
-    let Some(process_id) = context.processes.next_id() else {
+    let Some(ThreadRef {
+        process_id,
+        thread_id,
+    }) = context.processes.next_thread()
+    else {
         return TaskPoll::Pending;
     };
     let child_slot_reserved = context.processes.prepare_insert().is_ok();
@@ -2361,14 +2365,22 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
         let Some(process) = context.processes.get_mut(process_id) else {
             return TaskPoll::Pending;
         };
+        if process.thread(thread_id).is_none() {
+            return TaskPoll::Pending;
+        }
         if process.termination_requested() {
             process.mark_terminated();
         }
 
-        match process.state() {
-            ProcessState::Ready => {
+        match process
+            .thread_state(thread_id)
+            .expect("selected thread disappeared during dispatch")
+        {
+            ThreadState::Ready => {
                 unsafe { process.address_space().activate() };
-                let mut user_context = *process.context();
+                let mut user_context = *process
+                    .thread_context(thread_id)
+                    .expect("selected thread lost its context");
                 let started_ns = context.timer.clock().now_ns();
                 if context
                     .timer
@@ -2395,6 +2407,7 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                             let mut sink = SerialDebugSink::new(&mut context.serial);
                             let outcome = syscall::dispatch(
                                 process,
+                                thread_id,
                                 &mut user_context,
                                 context.timer.clock().now_ns(),
                                 &context.page_table,
@@ -2426,7 +2439,7 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                             }
                         }
                         Ok(KernelExit::Preempted) => {
-                            process.record_preemption();
+                            assert!(process.record_thread_preemption(thread_id));
                             if !context.preemption_observed {
                                 context.preemption_observed = true;
                                 let mut sink = SerialDebugSink::new(&mut context.serial);
@@ -2494,18 +2507,20 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                         }
                     }
                 }
-                *process.context_mut() = user_context;
+                *process
+                    .thread_context_mut(thread_id)
+                    .expect("selected thread lost its context") = user_context;
                 let elapsed_ns = context.timer.clock().now_ns().saturating_sub(started_ns);
-                process.record_cpu_time(elapsed_ns);
+                assert!(process.record_thread_cpu_time(thread_id, elapsed_ns));
             }
-            ProcessState::Blocked => {
+            ThreadState::Blocked => {
                 let now_ns = context.timer.clock().now_ns();
                 if syscall::poll_blocked(process, now_ns) == syscall::BlockedPoll::Complete {
                     unsafe { process.address_space().activate() };
                     let _ = syscall::complete_blocked(process);
                 }
             }
-            ProcessState::Exited(_) | ProcessState::Faulted(_) | ProcessState::Terminated => {}
+            ThreadState::Exited(_) | ThreadState::Faulted(_) | ThreadState::Terminated => {}
         }
     }
 
