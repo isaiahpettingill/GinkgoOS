@@ -851,9 +851,15 @@ impl Process {
             return Err(ProcessCreateError::StackCollision);
         }
 
+        let page_count = parsed
+            .total_load_pages()
+            .checked_add(initial_stack_pages)
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or(ProcessCreateError::OutOfMemory)?;
         let hhdm_offset = kernel.hhdm_offset();
         let address_space =
-            AddressSpace::new(kernel, allocator).map_err(ProcessCreateError::AddressSpace)?;
+            AddressSpace::new_with_private_mapping_capacity(kernel, allocator, page_count)
+                .map_err(ProcessCreateError::AddressSpace)?;
         Self::finish_construction(
             parsed,
             address_space,
@@ -874,6 +880,49 @@ impl Process {
         allocator: &mut UsableFrameAllocator<'_>,
         randomness: Option<[u64; 3]>,
     ) -> Result<Self, ProcessCreateError> {
+        let Some(page_count) = parsed
+            .total_load_pages()
+            .checked_add(layout.initial_stack_size() / PAGE_SIZE)
+            .and_then(|count| usize::try_from(count).ok())
+        else {
+            return reclaim_failed_construction(
+                address_space,
+                allocator,
+                ProcessCreateError::OutOfMemory,
+            );
+        };
+        if let Err(error) = address_space.preflight_owned_user_mappings(page_count) {
+            return reclaim_failed_construction(
+                address_space,
+                allocator,
+                ProcessCreateError::AddressSpace(error),
+            );
+        }
+        let Some(initial_vma_need) = parsed.segment_count().checked_add(3) else {
+            return reclaim_failed_construction(
+                address_space,
+                allocator,
+                ProcessCreateError::ResourceLimit,
+            );
+        };
+        let vma_capacity = usize::try_from(limits.vma_count)
+            .unwrap_or(MAX_VMAS)
+            .min(MAX_VMAS);
+        if initial_vma_need > vma_capacity {
+            return reclaim_failed_construction(
+                address_space,
+                allocator,
+                ProcessCreateError::ResourceLimit,
+            );
+        }
+        let mut initial_vma_storage = Vec::new();
+        if initial_vma_storage.try_reserve_exact(vma_capacity).is_err() {
+            return reclaim_failed_construction(
+                address_space,
+                allocator,
+                ProcessCreateError::OutOfMemory,
+            );
+        }
         let loaded = parsed.load_with(|address, permissions, contents| {
             let permissions = user_permissions(permissions);
             let frame = address_space
@@ -937,7 +986,7 @@ impl Process {
             );
         }
 
-        let vmas = match initial_vmas(&image, layout) {
+        let vmas = match initial_vmas(&image, layout, initial_vma_storage) {
             Ok(vmas) => vmas,
             Err(error) => {
                 return reclaim_failed_construction(address_space, allocator, error);
@@ -1155,6 +1204,20 @@ impl Process {
 
         let mut mapped = 0usize;
         let mapped_len = (committed_bottom - fault_page) as usize;
+        if let Err(error) = self
+            .address_space_mut()
+            .preflight_owned_user_mappings(mapped_len / PAGE_SIZE as usize)
+        {
+            if error == AddressSpaceError::OutOfMemory {
+                self.record_oom_failure();
+                return UserPageFaultResolution::Fault(ProcessFault::at_address(
+                    ProcessFaultReason::OutOfMemory,
+                    error_code,
+                    fault_address,
+                ));
+            }
+            return self.stack_growth_invariant_fault(fault_address);
+        }
         while mapped < mapped_len {
             let page_address = fault_page + mapped as u64;
             if let Err(mapping_error) = self.address_space_mut().map_zeroed_user_4k(
@@ -1178,7 +1241,7 @@ impl Process {
                     return self.stack_growth_invariant_fault(fault_address);
                 }
                 return match mapping_error {
-                    AddressSpaceError::OutOfFrames => {
+                    AddressSpaceError::OutOfMemory | AddressSpaceError::OutOfFrames => {
                         self.record_oom_failure();
                         UserPageFaultResolution::Fault(ProcessFault::at_address(
                             ProcessFaultReason::OutOfMemory,
@@ -1565,6 +1628,16 @@ impl Process {
             return Err(SharedMappingError::ResourceLimit);
         };
 
+        if let Err(error) = self
+            .address_space_mut()
+            .preflight_owned_user_mappings(mapped_len / PAGE_SIZE as usize)
+        {
+            if error == AddressSpaceError::OutOfMemory {
+                self.record_oom_failure();
+                return Err(SharedMappingError::OutOfMemory);
+            }
+            return Err(SharedMappingError::AddressSpace(error));
+        }
         let mut mapped = 0usize;
         while mapped < mapped_len {
             let page_address = address + mapped as u64;
@@ -1596,7 +1669,10 @@ impl Process {
                     .map_err(|error| {
                         SharedMappingError::AddressSpace(AddressSpaceError::FrameAllocator(error))
                     })?;
-                if matches!(mapping_error, AddressSpaceError::OutOfFrames) {
+                if matches!(
+                    mapping_error,
+                    AddressSpaceError::OutOfMemory | AddressSpaceError::OutOfFrames
+                ) {
                     self.record_oom_failure();
                 }
                 return Err(SharedMappingError::AddressSpace(mapping_error));
@@ -1773,6 +1849,17 @@ impl Process {
             .expect("live process lost its retained leases")
             .try_reserve(1)
             .map_err(|_| SharedMappingError::OutOfMemory)?;
+
+        if let Err(error) = self
+            .address_space_mut()
+            .preflight_shared_user_mappings(request.mapped_len / PAGE_SIZE as usize)
+        {
+            if error == AddressSpaceError::OutOfMemory {
+                self.record_oom_failure();
+                return Err(SharedMappingError::OutOfMemory);
+            }
+            return Err(SharedMappingError::AddressSpace(error));
+        }
 
         let permissions = if args.protection.contains(MapProtection::WRITE) {
             UserPagePermissions::READ_WRITE
@@ -1997,11 +2084,10 @@ fn reclaim_failed_construction(
     original_error: ProcessCreateError,
 ) -> Result<Process, ProcessCreateError> {
     if let Err(cleanup_error) = address_space.cleanup_inactive(allocator) {
-        // Reclamation failure is a kernel ownership-invariant violation, not the
-        // original malformed-image or exhaustion error. Preserve the exact owner
-        // for postmortem safety before entering the kernel's fail-stop path.
+        // Reclaim is allocation-free. Any failure here is an ownership invariant
+        // violation, so retain the exact owner and stop instead of continuing.
         mem::forget(cleanup_error);
-        panic!("failed to reclaim partial process construction");
+        panic!("failed process construction cleanup invariant");
     }
     Err(original_error)
 }
@@ -2064,10 +2150,9 @@ fn copy_page_through_hhdm(
 fn initial_vmas(
     image: &elf::LoadedImage,
     layout: ProcessLayout,
+    mut vmas: Vec<VmArea>,
 ) -> Result<Vec<VmArea>, ProcessCreateError> {
-    let mut vmas = Vec::new();
-    vmas.try_reserve_exact(image.segments.len().saturating_add(3).min(MAX_VMAS))
-        .map_err(|_| ProcessCreateError::OutOfMemory)?;
+    debug_assert!(vmas.capacity() >= image.segments.len().saturating_add(3));
     for segment in &image.segments {
         let mut protection = MapProtection::READ;
         if segment.permissions.is_writable() {
@@ -3633,8 +3718,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "failed to reclaim partial process construction")]
-    fn construction_cleanup_failure_is_fail_stop_not_the_original_error() {
+    #[should_panic(expected = "failed process construction cleanup invariant")]
+    fn construction_cleanup_invariant_failure_is_fail_stop() {
         let (_region, mut allocator) = TestFrameRegion::allocator(1);
         let address_space = AddressSpace::new_for_test(&mut allocator).unwrap();
         allocator.reserve_frame(address_space.root_frame()).unwrap();
@@ -3644,6 +3729,155 @@ mod tests {
             &mut allocator,
             ProcessCreateError::ResourceLimit,
         );
+    }
+
+    #[test]
+    fn low_memory_process_reserves_only_its_vma_limit() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(64);
+        let limits = ProcessLimits::from_available_memory_bytes(32 * MIB);
+        let process = construct_test_process_with_limits(&mut allocator, limits).unwrap();
+        let capacity = process.vmas.as_ref().unwrap().capacity();
+
+        assert!(capacity >= limits.vma_count as usize);
+        assert!(capacity < MAX_VMAS);
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+    }
+
+    #[test]
+    fn process_creation_metadata_oom_reclaims_partial_ownership() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(64);
+        allocator.fail_ownership_reservation_after_for_test(1);
+
+        assert!(matches!(
+            construct_test_process(&mut allocator),
+            Err(ProcessCreateError::ElfPage(
+                ElfPageLoadError::AddressSpace {
+                    error: AddressSpaceError::FrameAllocator(
+                        crate::memory::FrameAllocatorError::OwnershipTrackingAllocationFailed
+                    ),
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(allocator.allocated_count(), 0);
+        assert_eq!(allocator.free_count(), 1);
+    }
+
+    #[test]
+    fn anonymous_commit_metadata_oom_is_atomic() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(64);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let address = process
+            .reserve_anonymous(PAGE_SIZE, MapProtection::READ | MapProtection::WRITE)
+            .unwrap();
+        let vmas_before = process.vmas().to_vec();
+        let usage_before = process.usage();
+        let accounting_before = process.address_space().accounting();
+        let allocated_before = allocator.allocated_count();
+        process
+            .address_space_mut()
+            .fail_next_metadata_reservation_for_test();
+
+        assert_eq!(
+            process.commit_anonymous(address, PAGE_SIZE, &mut allocator),
+            Err(SharedMappingError::OutOfMemory),
+        );
+        assert_eq!(process.vmas(), vmas_before);
+        assert_eq!(process.address_space().accounting(), accounting_before);
+        assert_eq!(allocator.allocated_count(), allocated_before);
+        assert_eq!(process.usage().private_pages, usage_before.private_pages);
+        assert_eq!(
+            process.usage().reserved_virtual_bytes,
+            usage_before.reserved_virtual_bytes
+        );
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+    }
+
+    #[test]
+    fn shared_map_metadata_oom_is_atomic() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(80);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let mut shared_memory = TestSharedMemoryContext::new(2);
+        let handle = shared_memory
+            .factory()
+            .create_handle(process.handles_mut(), PAGE_SIZE as usize)
+            .unwrap();
+        let vmas_before = process.vmas().to_vec();
+        let usage_before = process.usage();
+        let accounting_before = process.address_space().accounting();
+        let allocated_before = allocator.allocated_count();
+        let shared_before = shared_memory.arena().stats();
+        process
+            .address_space_mut()
+            .fail_next_metadata_reservation_for_test();
+
+        assert_eq!(
+            process.map_shared_memory(
+                handle,
+                SharedMemoryMapArgs {
+                    address: 0,
+                    offset: 0,
+                    length: PAGE_SIZE,
+                    protection: MapProtection::READ,
+                    flags: MapFlags::empty(),
+                },
+                &mut allocator,
+            ),
+            Err(SharedMappingError::OutOfMemory),
+        );
+        assert_eq!(process.vmas(), vmas_before);
+        assert_eq!(process.address_space().accounting(), accounting_before);
+        assert_eq!(allocator.allocated_count(), allocated_before);
+        assert_eq!(shared_memory.arena().stats(), shared_before);
+        let usage_after = process.usage();
+        assert_eq!(usage_after.oom_failures, usage_before.oom_failures + 1);
+        assert_eq!(
+            ProcessUsage {
+                oom_failures: usage_before.oom_failures,
+                ..usage_after
+            },
+            usage_before,
+        );
+        assert!(process.shared_mappings().is_empty());
+        process.handles_mut().handle_close(handle).unwrap();
+        assert_eq!(shared_memory.reclaim_idle().unwrap(), 1);
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+    }
+
+    #[test]
+    fn anonymous_unmap_metadata_oom_is_atomic() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(64);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let address = process
+            .map_anonymous(
+                PAGE_SIZE,
+                MapProtection::READ | MapProtection::WRITE,
+                &mut allocator,
+            )
+            .unwrap();
+        let vmas_before = process.vmas().to_vec();
+        let usage_before = process.usage();
+        let accounting_before = process.address_space().accounting();
+        let allocated_before = allocator.allocated_count();
+        process
+            .address_space_mut()
+            .fail_next_metadata_reservation_for_test();
+
+        assert_eq!(
+            process.unmap_anonymous(address, PAGE_SIZE, &mut allocator),
+            Err(SharedMappingError::AddressSpace(
+                AddressSpaceError::OutOfMemory
+            )),
+        );
+        assert_eq!(process.vmas(), vmas_before);
+        assert_eq!(process.address_space().accounting(), accounting_before);
+        assert_eq!(process.usage(), usage_before);
+        assert_eq!(allocator.allocated_count(), allocated_before);
+        assert!(process
+            .address_space()
+            .validate_user_range(address, 1, UserAccess::Write)
+            .is_ok());
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
     }
 
     #[test]

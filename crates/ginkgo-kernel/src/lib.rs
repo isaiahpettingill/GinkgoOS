@@ -12,6 +12,7 @@ pub mod compositor;
 pub mod desktop_runtime;
 pub mod elf;
 pub mod entropy;
+pub mod heap_support;
 pub mod input;
 pub mod io;
 pub mod limine;

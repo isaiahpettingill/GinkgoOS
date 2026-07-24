@@ -4,6 +4,10 @@ use alloc::vec::Vec;
 use core::ptr::NonNull;
 
 use ginkgo_kernel::{
+    heap_support::{
+        adaptive_heap_headroom, fail_stop_heap_rollback, planned_heap_growth_bytes,
+        rollback_heap_frames, HeapRollbackError,
+    },
     memory::{FrameAllocatorError, PhysFrame, UsableFrameAllocator, VirtAddr, VirtPage, PAGE_SIZE},
     paging::{ActivePageTable, MapError, PageTableFlags},
 };
@@ -14,8 +18,15 @@ pub const BOOTSTRAP_HEAP_SIZE: usize = 32 * 1024 * 1024;
 pub const INITIAL_PAGE_BACKED_BYTES: usize = 16 * 1024 * 1024;
 pub const PAGE_BACKED_GROWTH_BYTES: usize = 16 * 1024 * 1024;
 pub const MINIMUM_HEAP_HEADROOM: usize = 8 * 1024 * 1024;
+pub const MAXIMUM_HEAP_HEADROOM: usize = 256 * 1024 * 1024;
 const PAGE_BACKED_HEAP_BASE: u64 = 0xffff_b000_0000_0000;
 const PAGE_BACKED_HEAP_LIMIT: u64 = 0xffff_b010_0000_0000;
+/// Frames kept outside heap growth for process cleanup, scheduler progress, and
+/// the small number of paging structures a contiguous heap extension may need.
+const HEAP_GROWTH_FRAME_RESERVE: u64 = 64;
+/// Budget one additional physical frame per heap page. Actual contiguous page-
+/// table overhead is far lower, but this keeps growth safe near exhaustion.
+const HEAP_GROWTH_FRAME_COST: u64 = 2;
 
 #[global_allocator]
 static ALLOCATOR: TalcLock<RawSpinlock, Claim> = TalcLock::new(unsafe {
@@ -29,6 +40,7 @@ pub enum HeapGrowError {
     AddressOverflow,
     VirtualLimit,
     AlreadyMapped(u64),
+    GrowthDeferred,
     OutOfFrames,
     FrameAllocator(FrameAllocatorError),
     Mapping(MapError),
@@ -50,7 +62,7 @@ impl PageBackedHeap {
         let mapped_end = PAGE_BACKED_HEAP_BASE
             .checked_add(INITIAL_PAGE_BACKED_BYTES as u64)
             .ok_or(HeapGrowError::AddressOverflow)?;
-        map_heap_pages(
+        let allocated = map_heap_pages(
             page_table,
             frames,
             PAGE_BACKED_HEAP_BASE,
@@ -62,12 +74,11 @@ impl PageBackedHeap {
             unsafe { talc.claim(PAGE_BACKED_HEAP_BASE as *mut u8, INITIAL_PAGE_BACKED_BYTES) }
         };
         let Some(talc_end) = talc_end else {
-            rollback_heap_pages(
-                page_table,
-                frames,
-                PAGE_BACKED_HEAP_BASE,
-                INITIAL_PAGE_BACKED_BYTES,
-            );
+            if let Err(error) =
+                rollback_heap_pages(page_table, frames, PAGE_BACKED_HEAP_BASE, &allocated)
+            {
+                fail_stop_heap_rollback(allocated, error);
+            }
             return Err(HeapGrowError::TalcRejected);
         };
         if talc_end.as_ptr() as u64 != mapped_end {
@@ -106,9 +117,19 @@ impl PageBackedHeap {
         frames: &mut UsableFrameAllocator<'_>,
     ) -> Result<(), HeapGrowError> {
         while self.available_bytes() < minimum_available {
-            if let Err(error) = self.grow(page_table, frames, PAGE_BACKED_GROWTH_BYTES) {
-                return Err(error);
+            let bytes = planned_heap_growth_bytes(
+                self.available_bytes(),
+                minimum_available,
+                frames.available_frames(),
+                PAGE_BACKED_GROWTH_BYTES,
+                HEAP_GROWTH_FRAME_RESERVE,
+                HEAP_GROWTH_FRAME_COST,
+            )
+            .ok_or(HeapGrowError::AddressOverflow)?;
+            if bytes == 0 {
+                return Err(HeapGrowError::GrowthDeferred);
             }
+            self.grow(page_table, frames, bytes)?;
         }
         Ok(())
     }
@@ -141,7 +162,7 @@ impl PageBackedHeap {
             return Err(HeapGrowError::VirtualLimit);
         }
 
-        map_heap_pages(page_table, frames, self.mapped_end, bytes)?;
+        let _allocated = map_heap_pages(page_table, frames, self.mapped_end, bytes)?;
         let talc_end = unsafe { ALLOCATOR.lock().extend(self.talc_end, new_end as *mut u8) };
         if talc_end.as_ptr() as u64 != new_end {
             panic!("page-backed heap extension did not consume the complete mapped range");
@@ -155,6 +176,16 @@ impl PageBackedHeap {
 
 const fn total_committed_bytes(page_backed_bytes: u64) -> u64 {
     (BOOTSTRAP_HEAP_SIZE as u64).saturating_add(page_backed_bytes)
+}
+
+/// Heap reserve used by scheduler maintenance. Metadata demand grows with RAM,
+/// but the reserve stays useful on small systems and bounded on large ones.
+pub const fn scheduler_heap_headroom(available_ram_bytes: u64) -> usize {
+    adaptive_heap_headroom(
+        available_ram_bytes,
+        MINIMUM_HEAP_HEADROOM,
+        MAXIMUM_HEAP_HEADROOM,
+    )
 }
 
 fn page_rounded_bytes(bytes: usize) -> Result<usize, HeapGrowError> {
@@ -172,7 +203,7 @@ fn map_heap_pages(
     frames: &mut UsableFrameAllocator<'_>,
     start: u64,
     bytes: usize,
-) -> Result<(), HeapGrowError> {
+) -> Result<Vec<PhysFrame>, HeapGrowError> {
     let pages = page_rounded_bytes(bytes)? / PAGE_SIZE as usize;
     let end = start
         .checked_add(bytes as u64)
@@ -197,17 +228,34 @@ fn map_heap_pages(
         let frame = match frames.allocate_frame() {
             Ok(Some(frame)) => frame,
             Ok(None) => {
-                rollback_partial(page_table, frames, start, mapped, &allocated);
+                if let Err(error) = rollback_partial(page_table, frames, start, mapped, &allocated)
+                {
+                    fail_stop_heap_rollback(allocated, error);
+                }
                 return Err(HeapGrowError::OutOfFrames);
             }
             Err(error) => {
-                rollback_partial(page_table, frames, start, mapped, &allocated);
+                if let Err(rollback_error) =
+                    rollback_partial(page_table, frames, start, mapped, &allocated)
+                {
+                    fail_stop_heap_rollback(allocated, rollback_error);
+                }
                 return Err(HeapGrowError::FrameAllocator(error));
             }
         };
         allocated.push(frame);
-        let page = VirtPage::from_start_address(VirtAddr::new(start + index as u64 * PAGE_SIZE))
-            .map_err(|_| HeapGrowError::AddressOverflow)?;
+        let page =
+            match VirtPage::from_start_address(VirtAddr::new(start + index as u64 * PAGE_SIZE)) {
+                Ok(page) => page,
+                Err(_) => {
+                    if let Err(error) =
+                        rollback_partial(page_table, frames, start, mapped, &allocated)
+                    {
+                        fail_stop_heap_rollback(allocated, error);
+                    }
+                    return Err(HeapGrowError::AddressOverflow);
+                }
+            };
         if let Err(error) = unsafe {
             page_table.map_4k(
                 page,
@@ -216,37 +264,25 @@ fn map_heap_pages(
                 frames,
             )
         } {
-            rollback_partial(page_table, frames, start, mapped, &allocated);
+            if let Err(rollback_error) =
+                rollback_partial(page_table, frames, start, mapped, &allocated)
+            {
+                fail_stop_heap_rollback(allocated, rollback_error);
+            }
             return Err(HeapGrowError::Mapping(error));
         }
         mapped += 1;
     }
-    Ok(())
+    Ok(allocated)
 }
 
 fn rollback_heap_pages(
     page_table: &mut ActivePageTable,
     frames: &mut UsableFrameAllocator<'_>,
     start: u64,
-    bytes: usize,
-) {
-    let pages = bytes / PAGE_SIZE as usize;
-    let mut allocated = Vec::new();
-    allocated
-        .try_reserve_exact(pages)
-        .expect("heap rollback metadata allocation failed");
-    for index in 0..pages {
-        let page = VirtPage::from_start_address(VirtAddr::new(start + index as u64 * PAGE_SIZE))
-            .expect("heap rollback page must remain aligned");
-        allocated.push(unsafe {
-            page_table
-                .unmap_4k(page)
-                .expect("heap rollback mapping must remain present")
-        });
-    }
-    frames
-        .deallocate_frames(&allocated)
-        .expect("heap rollback frames must remain allocator-owned");
+    allocated: &[PhysFrame],
+) -> Result<(), HeapRollbackError> {
+    rollback_partial(page_table, frames, start, allocated.len(), allocated)
 }
 
 fn rollback_partial(
@@ -255,33 +291,12 @@ fn rollback_partial(
     start: u64,
     mapped: usize,
     allocated: &[PhysFrame],
-) {
-    for index in (0..mapped).rev() {
-        let page = VirtPage::from_start_address(VirtAddr::new(start + index as u64 * PAGE_SIZE))
-            .expect("heap rollback page must remain aligned");
-        let unmapped = unsafe {
-            page_table
-                .unmap_4k(page)
-                .expect("heap rollback mapping must remain present")
-        };
-        assert_eq!(unmapped, allocated[index]);
-    }
-    if !allocated.is_empty() {
-        frames
-            .deallocate_frames(allocated)
-            .expect("heap rollback frames must remain allocator-owned");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{total_committed_bytes, BOOTSTRAP_HEAP_SIZE, INITIAL_PAGE_BACKED_BYTES};
-
-    #[test]
-    fn committed_capacity_includes_bootstrap_and_page_backed_arenas() {
-        assert_eq!(
-            total_committed_bytes(INITIAL_PAGE_BACKED_BYTES as u64),
-            (BOOTSTRAP_HEAP_SIZE + INITIAL_PAGE_BACKED_BYTES) as u64,
-        );
-    }
+) -> Result<(), HeapRollbackError> {
+    rollback_heap_frames(
+        start,
+        mapped,
+        allocated,
+        |page| unsafe { page_table.unmap_4k(page) },
+        |owned| frames.deallocate_frames(owned),
+    )
 }

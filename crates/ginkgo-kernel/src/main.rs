@@ -1628,14 +1628,27 @@ struct KernelContext {
 }
 
 fn maintain_kernel_heap(context: &mut KernelContext) {
-    if context.kernel_heap.failed_growth_count() != 0 {
-        return;
-    }
-    let _ = context.kernel_heap.ensure_headroom(
-        heap::MINIMUM_HEAP_HEADROOM,
+    let minimum_available = heap::scheduler_heap_headroom(context.frames.available_bytes());
+    let growth_before = context.kernel_heap.growth_count();
+    let result = context.kernel_heap.ensure_headroom(
+        minimum_available,
         &mut context.page_table,
         &mut context.frames,
     );
+    let may_have_allocated_page_tables = context.kernel_heap.growth_count() != growth_before
+        || matches!(
+            result,
+            Err(heap::HeapGrowError::OutOfFrames
+                | heap::HeapGrowError::FrameAllocator(_)
+                | heap::HeapGrowError::Mapping(_))
+        );
+    if may_have_allocated_page_tables {
+        // Heap growth can allocate paging structures. Reserve them now so a later
+        // process creation does not change live-frame accounting retroactively.
+        let _ = context
+            .page_table
+            .reserve_active_frames(&mut context.frames);
+    }
 }
 
 /// Returns shared frames released by any task in the completed scheduler round.

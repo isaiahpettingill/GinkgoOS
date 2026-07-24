@@ -105,6 +105,23 @@ impl OwnershipLedger {
             .position(|record| record.address == address)
     }
 
+    fn reserve_new_record(&mut self) -> Result<(), FrameAllocatorError> {
+        self.records
+            .try_reserve(1)
+            .map_err(|_| FrameAllocatorError::OwnershipTrackingAllocationFailed)?;
+        let eventual_free_count = self
+            .records
+            .len()
+            .checked_add(1)
+            .ok_or(FrameAllocatorError::OwnershipTrackingAllocationFailed)?;
+        if self.free.capacity() < eventual_free_count {
+            self.free
+                .try_reserve_exact(eventual_free_count - self.free.len())
+                .map_err(|_| FrameAllocatorError::OwnershipTrackingAllocationFailed)?;
+        }
+        Ok(())
+    }
+
     /// Claims an address that has not previously been issued. Returns `false`
     /// when the address is already tracked, including when it is reserved.
     fn claim_fresh(&mut self, address: u64) -> Result<bool, FrameAllocatorError> {
@@ -112,9 +129,7 @@ impl OwnershipLedger {
             return Ok(false);
         }
 
-        self.records
-            .try_reserve(1)
-            .map_err(|_| FrameAllocatorError::OwnershipTrackingAllocationFailed)?;
+        self.reserve_new_record()?;
         self.records.push(OwnershipRecord {
             address,
             state: OwnershipState::Allocated,
@@ -223,9 +238,7 @@ impl OwnershipLedger {
             return Ok(true);
         }
 
-        self.records
-            .try_reserve(1)
-            .map_err(|_| FrameAllocatorError::OwnershipTrackingAllocationFailed)?;
+        self.reserve_new_record()?;
         self.records.push(OwnershipRecord {
             address,
             state: OwnershipState::Reserved,
@@ -265,9 +278,7 @@ impl OwnershipLedger {
             }
         }
 
-        self.free
-            .try_reserve(count)
-            .map_err(|_| FrameAllocatorError::OwnershipTrackingAllocationFailed)?;
+        debug_assert!(self.free.capacity().saturating_sub(self.free.len()) >= count);
         let mut dma_low_reclaimed = 0u64;
         let mut above_4g_reclaimed = 0u64;
         for index in 0..count {
@@ -475,6 +486,8 @@ pub struct UsableFrameAllocator<'a> {
     allocation_failures: u64,
     ownership: OwnershipLedger,
     error: Option<FrameAllocatorError>,
+    #[cfg(test)]
+    fail_ownership_reservation_after: Option<usize>,
     #[cfg(ginkgo_memory_policy_smoke)]
     smoke_fail_next_unrestricted_allocation: bool,
     #[cfg(ginkgo_memory_policy_smoke)]
@@ -515,6 +528,8 @@ impl<'a> UsableFrameAllocator<'a> {
             allocation_failures: 0,
             ownership: OwnershipLedger::new(),
             error: None,
+            #[cfg(test)]
+            fail_ownership_reservation_after: None,
             #[cfg(ginkgo_memory_policy_smoke)]
             smoke_fail_next_unrestricted_allocation: false,
             #[cfg(ginkgo_memory_policy_smoke)]
@@ -558,6 +573,8 @@ impl<'a> UsableFrameAllocator<'a> {
             allocation_failures: 0,
             ownership: OwnershipLedger::new(),
             error: None,
+            #[cfg(test)]
+            fail_ownership_reservation_after: None,
             #[cfg(ginkgo_memory_policy_smoke)]
             smoke_fail_next_unrestricted_allocation: false,
             #[cfg(ginkgo_memory_policy_smoke)]
@@ -697,6 +714,14 @@ impl<'a> UsableFrameAllocator<'a> {
     }
 
     pub fn allocate_frame(&mut self) -> Result<Option<PhysFrame>, FrameAllocatorError> {
+        #[cfg(test)]
+        if let Some(remaining) = self.fail_ownership_reservation_after.as_mut() {
+            if *remaining == 0 {
+                self.fail_ownership_reservation_after = None;
+                return self.fail(FrameAllocatorError::OwnershipTrackingAllocationFailed);
+            }
+            *remaining -= 1;
+        }
         #[cfg(ginkgo_memory_policy_smoke)]
         if core::mem::take(&mut self.smoke_fail_next_unrestricted_allocation) {
             self.allocation_failures = self.allocation_failures.saturating_add(1);
@@ -719,6 +744,11 @@ impl<'a> UsableFrameAllocator<'a> {
             self.allocation_failures = self.allocation_failures.saturating_add(1);
         }
         result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_ownership_reservation_after_for_test(&mut self, successes: usize) {
+        self.fail_ownership_reservation_after = Some(successes);
     }
 
     #[cfg(ginkgo_memory_policy_smoke)]
@@ -875,23 +905,35 @@ impl<'a> UsableFrameAllocator<'a> {
         }
 
         loop {
-            let Some(region) = self.usable_regions.iter_mut().find(|region| {
-                region.next < region.end
-                    && region
-                        .next
-                        .checked_add(PAGE_SIZE)
-                        .is_some_and(|end| end <= max_address_exclusive)
-            }) else {
+            let Some(address) = self
+                .usable_regions
+                .iter()
+                .find(|region| {
+                    region.next < region.end
+                        && region
+                            .next
+                            .checked_add(PAGE_SIZE)
+                            .is_some_and(|end| end <= max_address_exclusive)
+                })
+                .map(|region| region.next)
+            else {
                 return Ok(None);
             };
-            let address = region.next;
-            region.next += PAGE_SIZE;
-            match self.ownership.claim_fresh(address) {
+            let claimed = match self.ownership.claim_fresh(address) {
                 Ok(true) => {
                     self.fresh_remaining_frames = self.fresh_remaining_frames.saturating_sub(1);
+                    true
                 }
-                Ok(false) => continue,
+                Ok(false) => false,
                 Err(error) => return self.fail(error),
+            };
+            self.usable_regions
+                .iter_mut()
+                .find(|region| region.next == address && region.contains(address))
+                .expect("allocation candidate region disappeared")
+                .next += PAGE_SIZE;
+            if !claimed {
+                continue;
             }
 
             self.highest_issued_address = self.highest_issued_address.max(address);
@@ -1427,6 +1469,19 @@ mod tests {
         assert_eq!(ledger.fresh_issued_count(), 2);
         assert_eq!(ledger.free_count(), 0);
         assert_eq!(ledger.reserved_count(), 0);
+    }
+
+    #[test]
+    fn issued_records_pre_reserve_all_eventual_reclaim_slots() {
+        let mut ledger = OwnershipLedger::new();
+        for address in [A, B, C] {
+            assert_eq!(ledger.claim_fresh(address), Ok(true));
+            assert!(ledger.free.capacity() >= ledger.records.len());
+        }
+
+        assert_eq!(ledger.reclaim(&[A, B, C]), Ok(()));
+        assert_eq!(ledger.free_count(), 3);
+        assert_eq!(ledger.live_allocated_count(), 0);
     }
 
     #[test]

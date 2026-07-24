@@ -126,6 +126,7 @@ pub enum AddressSpaceError {
     /// Reserved for callers that require an already-hardened source root.
     /// `AddressSpace::new` instead clears this bit while copying kernel entries.
     UserAccessibleKernelP4Entry(usize),
+    OutOfMemory,
     OutOfFrames,
     FrameAllocator(FrameAllocatorError),
     KernelPageTable(MapError),
@@ -367,6 +368,8 @@ pub struct AddressSpace {
     owned_data_frames: Vec<PhysFrame<Size4KiB>>,
     retired_data_frames: Vec<PhysFrame<Size4KiB>>,
     owned_page_table_frames: Vec<PhysFrame<Size4KiB>>,
+    #[cfg(test)]
+    fail_next_metadata_reservation: bool,
 }
 
 impl AddressSpace {
@@ -382,14 +385,42 @@ impl AddressSpace {
         kernel: &ActivePageTable,
         allocator: &mut UsableFrameAllocator<'_>,
     ) -> Result<Self, AddressSpaceError> {
+        Self::new_with_private_mapping_capacity(kernel, allocator, 0)
+    }
+
+    pub(crate) fn new_with_private_mapping_capacity(
+        kernel: &ActivePageTable,
+        allocator: &mut UsableFrameAllocator<'_>,
+        page_count: usize,
+    ) -> Result<Self, AddressSpaceError> {
         if !kernel.is_active() {
             return Err(AddressSpaceError::ActiveKernelPageTableRequired);
         }
+        let page_table_count = page_count
+            .checked_mul(3)
+            .and_then(|count| count.checked_add(1))
+            .ok_or(AddressSpaceError::AddressOverflow)?;
+        let mut mappings = Vec::new();
+        mappings
+            .try_reserve_exact(page_count)
+            .map_err(|_| AddressSpaceError::OutOfMemory)?;
+        let mut owned_data_frames = Vec::new();
+        owned_data_frames
+            .try_reserve_exact(page_count)
+            .map_err(|_| AddressSpaceError::OutOfMemory)?;
+        let mut retired_data_frames = Vec::new();
+        retired_data_frames
+            .try_reserve_exact(page_count)
+            .map_err(|_| AddressSpaceError::OutOfMemory)?;
+        let mut owned_page_table_frames = Vec::new();
+        owned_page_table_frames
+            .try_reserve_exact(page_table_count)
+            .map_err(|_| AddressSpaceError::OutOfMemory)?;
+
         let hhdm_offset = kernel.hhdm_offset();
         kernel
             .reserve_active_frames(allocator)
             .map_err(AddressSpaceError::KernelPageTable)?;
-
         let root = allocator
             .allocate_frame()
             .map_err(AddressSpaceError::FrameAllocator)?
@@ -407,14 +438,17 @@ impl AddressSpace {
         copy_kernel_half(kernel.mapper.level_4_table(), root_table);
         let mapper = unsafe { OffsetPageTable::new(root_table, hhdm_offset) };
 
+        owned_page_table_frames.push(root);
         Ok(Self {
             root,
             hhdm_offset,
             mapper,
-            mappings: Vec::new(),
-            owned_data_frames: Vec::new(),
-            retired_data_frames: Vec::new(),
-            owned_page_table_frames: alloc::vec![root],
+            mappings,
+            owned_data_frames,
+            retired_data_frames,
+            owned_page_table_frames,
+            #[cfg(test)]
+            fail_next_metadata_reservation: false,
         })
     }
 
@@ -422,6 +456,13 @@ impl AddressSpace {
     pub(crate) fn new_for_test(
         allocator: &mut UsableFrameAllocator<'_>,
     ) -> Result<Self, AddressSpaceError> {
+        let mappings = Vec::new();
+        let owned_data_frames = Vec::new();
+        let retired_data_frames = Vec::new();
+        let mut owned_page_table_frames = Vec::new();
+        owned_page_table_frames
+            .try_reserve_exact(1)
+            .map_err(|_| AddressSpaceError::OutOfMemory)?;
         let root = allocator
             .allocate_frame()
             .map_err(AddressSpaceError::FrameAllocator)?
@@ -429,14 +470,16 @@ impl AddressSpace {
         let root_table = unsafe { &mut *(root.start_address().as_u64() as *mut PageTable) };
         root_table.zero();
         let mapper = unsafe { OffsetPageTable::new(root_table, VirtAddr::zero()) };
+        owned_page_table_frames.push(root);
         Ok(Self {
             root,
             hhdm_offset: VirtAddr::zero(),
             mapper,
-            mappings: Vec::new(),
-            owned_data_frames: Vec::new(),
-            retired_data_frames: Vec::new(),
-            owned_page_table_frames: alloc::vec![root],
+            mappings,
+            owned_data_frames,
+            retired_data_frames,
+            owned_page_table_frames,
+            fail_next_metadata_reservation: false,
         })
     }
 
@@ -517,6 +560,56 @@ impl AddressSpace {
         &self.owned_page_table_frames
     }
 
+    /// Reserves every address-space metadata slot a batch of private mappings can need.
+    /// No frame is allocated and no PTE is changed unless the complete reservation succeeds.
+    pub fn preflight_owned_user_mappings(
+        &mut self,
+        page_count: usize,
+    ) -> Result<(), AddressSpaceError> {
+        self.reserve_mapping_metadata(page_count, page_count, page_count)
+    }
+
+    /// Reserves every address-space metadata slot a batch of shared aliases can need.
+    pub fn preflight_shared_user_mappings(
+        &mut self,
+        page_count: usize,
+    ) -> Result<(), AddressSpaceError> {
+        self.reserve_mapping_metadata(page_count, 0, 0)
+    }
+
+    fn reserve_mapping_metadata(
+        &mut self,
+        mapping_count: usize,
+        owned_count: usize,
+        retirement_count: usize,
+    ) -> Result<(), AddressSpaceError> {
+        #[cfg(test)]
+        if core::mem::take(&mut self.fail_next_metadata_reservation) {
+            return Err(AddressSpaceError::OutOfMemory);
+        }
+        let page_table_count = mapping_count
+            .checked_mul(3)
+            .ok_or(AddressSpaceError::AddressOverflow)?;
+        self.mappings
+            .try_reserve_exact(mapping_count)
+            .map_err(|_| AddressSpaceError::OutOfMemory)?;
+        self.owned_data_frames
+            .try_reserve_exact(owned_count)
+            .map_err(|_| AddressSpaceError::OutOfMemory)?;
+        self.retired_data_frames
+            .try_reserve_exact(retirement_count)
+            .map_err(|_| AddressSpaceError::OutOfMemory)?;
+        self.owned_page_table_frames
+            .try_reserve_exact(page_table_count)
+            .map_err(|_| AddressSpaceError::OutOfMemory)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_metadata_reservation_for_test(&mut self) {
+        self.fail_next_metadata_reservation = true;
+    }
+
     pub fn is_active(&self) -> bool {
         active_root_is(self.root)
     }
@@ -545,6 +638,7 @@ impl AddressSpace {
         permissions: UserPagePermissions,
         allocator: &mut UsableFrameAllocator<'_>,
     ) -> Result<(), AddressSpaceError> {
+        self.preflight_owned_user_mappings(1)?;
         let result = unsafe {
             self.map_user_4k_with_allocator(
                 address,
@@ -575,6 +669,7 @@ impl AddressSpace {
         permissions: UserPagePermissions,
         allocator: &mut UsableFrameAllocator<'_>,
     ) -> Result<(), AddressSpaceError> {
+        self.preflight_shared_user_mappings(1)?;
         let result = unsafe {
             self.map_user_4k_with_allocator(
                 address,
@@ -601,6 +696,7 @@ impl AddressSpace {
     ) -> Result<PhysFrame<Size4KiB>, AddressSpaceError> {
         validate_user_page(address)?;
         self.ensure_unmapped(address)?;
+        self.preflight_owned_user_mappings(1)?;
 
         let frame = allocator
             .allocate_frame()
@@ -686,43 +782,68 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// Unmaps several discontiguous ranges after preflighting the complete set.
+    /// Unmaps several discontiguous ranges after reserving all output and retirement metadata.
     pub fn unmap_user_ranges(
         &mut self,
         ranges: &[(u64, usize)],
     ) -> Result<Vec<UserPageMapping>, AddressSpaceError> {
         self.preflight_mapped_user_ranges(ranges)?;
+        #[cfg(test)]
+        if core::mem::take(&mut self.fail_next_metadata_reservation) {
+            return Err(AddressSpaceError::OutOfMemory);
+        }
         let mapping_count = ranges
             .iter()
             .try_fold(0usize, |total, (_, length)| {
                 total.checked_add(length / PAGE_SIZE as usize)
             })
             .ok_or(AddressSpaceError::AddressOverflow)?;
-        let mut removed = Vec::new();
-        removed
+        let mut planned = Vec::new();
+        planned
             .try_reserve_exact(mapping_count)
-            .map_err(|_| AddressSpaceError::OutOfFrames)?;
+            .map_err(|_| AddressSpaceError::OutOfMemory)?;
         for &(address, length) in ranges {
-            removed.extend(self.unmap_user_range(address, length)?);
+            self.plan_user_range(address, length, &mut planned)?;
         }
-        Ok(removed)
+        self.reserve_unmap_retirement(&planned)?;
+        self.unmap_planned(&planned)?;
+        Ok(planned)
     }
 
     /// Unmaps exactly `length` bytes of page-aligned user mappings.
     ///
     /// Both the start and length must be 4 KiB aligned and `length` must be
-    /// nonzero. The complete range is checked before any PTE is changed, so a
-    /// missing or untracked page cannot produce a partial unmap. Returned shared
-    /// alias frames are identities only, never ownership tokens.
+    /// nonzero. The complete range and all output and retirement capacity are
+    /// reserved before any PTE is changed.
     pub fn unmap_user_range(
         &mut self,
         address: u64,
         length: usize,
     ) -> Result<Vec<UserPageMapping>, AddressSpaceError> {
-        let (_, end) = validate_exact_user_page_range(address, length)?;
-        let mut planned = Vec::with_capacity(length / PAGE_SIZE as usize);
-        let mut page_address = address;
+        validate_exact_user_page_range(address, length)?;
+        #[cfg(test)]
+        if core::mem::take(&mut self.fail_next_metadata_reservation) {
+            return Err(AddressSpaceError::OutOfMemory);
+        }
+        let mapping_count = length / PAGE_SIZE as usize;
+        let mut planned = Vec::new();
+        planned
+            .try_reserve_exact(mapping_count)
+            .map_err(|_| AddressSpaceError::OutOfMemory)?;
+        self.plan_user_range(address, length, &mut planned)?;
+        self.reserve_unmap_retirement(&planned)?;
+        self.unmap_planned(&planned)?;
+        Ok(planned)
+    }
 
+    fn plan_user_range(
+        &self,
+        address: u64,
+        length: usize,
+        planned: &mut Vec<UserPageMapping>,
+    ) -> Result<(), AddressSpaceError> {
+        let (_, end) = validate_exact_user_page_range(address, length)?;
+        let mut page_address = address;
         loop {
             let walked = match self.walk_user_page(page_address)? {
                 WalkResult::Unmapped => return Err(AddressSpaceError::NotMapped(page_address)),
@@ -759,12 +880,26 @@ impl AddressSpace {
                 .checked_add(PAGE_SIZE)
                 .ok_or(AddressSpaceError::AddressOverflow)?;
         }
+        Ok(())
+    }
 
-        for tracked in &planned {
-            let page = x86_64::structures::paging::Page::from_start_address(VirtAddr::new(
-                tracked.virtual_address,
-            ))
-            .map_err(|_| AddressSpaceError::UnalignedAddress(tracked.virtual_address))?;
+    fn reserve_unmap_retirement(
+        &mut self,
+        planned: &[UserPageMapping],
+    ) -> Result<(), AddressSpaceError> {
+        let owned_count = planned
+            .iter()
+            .filter(|mapping| mapping.backing == UserMappingBacking::OwnedPrivate)
+            .count();
+        self.retired_data_frames
+            .try_reserve_exact(owned_count)
+            .map_err(|_| AddressSpaceError::OutOfMemory)
+    }
+
+    fn unmap_planned(&mut self, planned: &[UserPageMapping]) -> Result<(), AddressSpaceError> {
+        for tracked in planned {
+            let page = Page::from_start_address(VirtAddr::new(tracked.virtual_address))
+                .map_err(|_| AddressSpaceError::UnalignedAddress(tracked.virtual_address))?;
             let (frame, flush) = match self.mapper.unmap(page) {
                 Ok(result) => result,
                 Err(X86UnmapError::PageNotMapped) => {
@@ -781,7 +916,6 @@ impl AddressSpace {
             if frame != tracked.frame {
                 return Err(AddressSpaceError::CorruptPageTable);
             }
-
             let mapping_index = self
                 .mappings
                 .iter()
@@ -798,7 +932,7 @@ impl AddressSpace {
                 self.retired_data_frames.push(frame);
             }
         }
-        Ok(planned)
+        Ok(())
     }
 
     /// Applies one permission set to several mapped ranges after complete preflight.
@@ -1002,18 +1136,24 @@ impl AddressSpace {
     /// ensure no other CPU can use it. Reclamation is then performed by
     /// [`RetiredAddressSpace::reclaim`].
     pub unsafe fn retire(self) -> RetiredAddressSpace {
-        let shared_alias_mappings = self
-            .mappings
-            .iter()
-            .filter(|mapping| mapping.backing == UserMappingBacking::SharedAlias)
-            .copied()
-            .collect();
+        let Self {
+            root,
+            hhdm_offset: _,
+            mapper: _,
+            mut mappings,
+            owned_data_frames,
+            retired_data_frames,
+            owned_page_table_frames,
+            #[cfg(test)]
+                fail_next_metadata_reservation: _,
+        } = self;
+        mappings.retain(|mapping| mapping.backing == UserMappingBacking::SharedAlias);
         RetiredAddressSpace {
-            root: self.root,
-            mapped_data_frames: self.owned_data_frames,
-            retired_data_frames: self.retired_data_frames,
-            shared_alias_mappings,
-            page_table_frames: self.owned_page_table_frames,
+            root,
+            mapped_data_frames: owned_data_frames,
+            retired_data_frames,
+            shared_alias_mappings: mappings,
+            page_table_frames: owned_page_table_frames,
         }
     }
 
@@ -1030,6 +1170,10 @@ impl AddressSpace {
     {
         validate_user_page(address)?;
         self.ensure_unmapped(address)?;
+        match backing {
+            UserMappingBacking::OwnedPrivate => self.preflight_owned_user_mappings(1)?,
+            UserMappingBacking::SharedAlias => self.preflight_shared_user_mappings(1)?,
+        }
         if self.mappings.iter().any(|mapping| mapping.frame == frame) {
             return match backing {
                 UserMappingBacking::OwnedPrivate => {
@@ -1167,6 +1311,9 @@ where
     A: FrameAllocator<Size4KiB> + ?Sized,
 {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
+        if self.recorded.len() == self.recorded.capacity() {
+            return None;
+        }
         let frame = self.inner.allocate_frame()?;
         self.recorded.push(frame);
         Some(frame)
@@ -1389,6 +1536,7 @@ mod tests {
             owned_data_frames: Vec::new(),
             retired_data_frames: Vec::new(),
             owned_page_table_frames: alloc::vec![root],
+            fail_next_metadata_reservation: false,
         }
     }
 
@@ -1453,6 +1601,68 @@ mod tests {
             .all(|entry| entry.is_unused()));
         assert_eq!(destination[300].addr(), source[300].addr());
         assert_eq!(destination[300].flags(), source[300].flags());
+    }
+
+    #[test]
+    fn mapping_metadata_oom_precedes_pte_and_ownership_mutation() {
+        let mut address_space = fake_address_space();
+        let mut allocator = FakeFrameAllocator::new();
+        let data = allocator.allocate_frame().unwrap();
+        let tables_before = allocator.tables.len();
+        let accounting_before = address_space.accounting();
+        address_space.fail_next_metadata_reservation_for_test();
+
+        assert_eq!(
+            unsafe {
+                address_space.map_user_4k_with_allocator(
+                    0x1000,
+                    data,
+                    UserPagePermissions::READ_WRITE,
+                    UserMappingBacking::OwnedPrivate,
+                    &mut allocator,
+                )
+            },
+            Err(AddressSpaceError::OutOfMemory),
+        );
+        assert_eq!(address_space.accounting(), accounting_before);
+        assert!(address_space.mappings().is_empty());
+        assert!(matches!(
+            address_space.walk_user_page(0x1000),
+            Ok(WalkResult::Unmapped)
+        ));
+        assert_eq!(allocator.tables.len(), tables_before);
+    }
+
+    #[test]
+    fn unmap_metadata_oom_leaves_mapping_and_pte_unchanged() {
+        let mut address_space = fake_address_space();
+        let mut allocator = FakeFrameAllocator::new();
+        let data = allocator.allocate_frame().unwrap();
+        unsafe {
+            address_space
+                .map_user_4k_with_allocator(
+                    0x1000,
+                    data,
+                    UserPagePermissions::READ_WRITE,
+                    UserMappingBacking::OwnedPrivate,
+                    &mut allocator,
+                )
+                .unwrap();
+        }
+        let accounting_before = address_space.accounting();
+        let mapping_before = address_space.mappings()[0];
+        address_space.fail_next_metadata_reservation_for_test();
+
+        assert_eq!(
+            address_space.unmap_user_range(0x1000, PAGE_SIZE as usize),
+            Err(AddressSpaceError::OutOfMemory),
+        );
+        assert_eq!(address_space.accounting(), accounting_before);
+        assert_eq!(address_space.mappings(), &[mapping_before]);
+        assert!(matches!(
+            address_space.walk_user_page(0x1000),
+            Ok(WalkResult::Mapped(mapping)) if mapping.frame == data
+        ));
     }
 
     #[test]

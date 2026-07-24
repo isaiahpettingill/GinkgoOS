@@ -39,8 +39,8 @@ use crate::{
         ActivePageTable, MapError,
     },
     process::{
-        DirectStartupBlock, PendingWaitMany, Process, ProcessCreateError, ProcessLimits,
-        SharedMappingError, WaitDeadline, WaitManyCompletion,
+        DirectStartupBlock, ElfPageLoadError, PendingWaitMany, Process, ProcessCreateError,
+        ProcessLimits, SharedMappingError, WaitDeadline, WaitManyCompletion,
     },
     shared_memory::{SharedFrameArena, SharedMemoryFactory},
 };
@@ -2197,12 +2197,19 @@ fn bounded_startup_length(raw: u64) -> Result<usize, Status> {
 }
 
 fn reclaim_unstarted_process(process: Process, frame_allocator: &mut UsableFrameAllocator<'_>) {
-    let retired = process
-        .retire()
-        .expect("unstarted child address space unexpectedly active");
-    retired
-        .reclaim(frame_allocator)
-        .expect("failed to reclaim unstarted child process");
+    let retired = match process.retire() {
+        Ok(retired) => retired,
+        Err(error) => {
+            core::mem::forget(error);
+            panic!("unstarted process unexpectedly remained active");
+        }
+    };
+    if let Err(error) = retired.reclaim(frame_allocator) {
+        // Reclaim is allocation-free. Retain exact ownership and fail-stop on any
+        // allocator invariant violation rather than returning to the scheduler.
+        core::mem::forget(error);
+        panic!("unstarted process reclaim invariant failed");
+    }
 }
 
 const fn is_process_memory_policy_error(error: ProcessCreateError) -> bool {
@@ -2215,8 +2222,25 @@ const fn map_process_create_error(error: ProcessCreateError) -> Status {
             Status::ResourceLimit
         }
         ProcessCreateError::OutOfMemory
+        | ProcessCreateError::ElfPage(ElfPageLoadError::AddressSpace {
+            error: AddressSpaceError::OutOfMemory,
+            ..
+        })
+        | ProcessCreateError::ElfPage(ElfPageLoadError::AddressSpace {
+            error: AddressSpaceError::OutOfFrames,
+            ..
+        })
+        | ProcessCreateError::ElfPage(ElfPageLoadError::AddressSpace {
+            error: AddressSpaceError::FrameAllocator(_),
+            ..
+        })
+        | ProcessCreateError::AddressSpace(AddressSpaceError::OutOfMemory)
         | ProcessCreateError::AddressSpace(AddressSpaceError::OutOfFrames)
         | ProcessCreateError::AddressSpace(AddressSpaceError::FrameAllocator(_))
+        | ProcessCreateError::StackPage {
+            error: AddressSpaceError::OutOfMemory,
+            ..
+        }
         | ProcessCreateError::StackPage {
             error: AddressSpaceError::OutOfFrames,
             ..
@@ -2471,9 +2495,9 @@ const fn map_address_space_error(error: AddressSpaceError) -> Status {
     match error {
         AddressSpaceError::AlreadyMapped(_) => Status::AlreadyMapped,
         AddressSpaceError::PermissionDenied { .. } => Status::AccessDenied,
-        AddressSpaceError::OutOfFrames | AddressSpaceError::FrameAllocator(_) => {
-            Status::OutOfMemory
-        }
+        AddressSpaceError::OutOfMemory
+        | AddressSpaceError::OutOfFrames
+        | AddressSpaceError::FrameAllocator(_) => Status::OutOfMemory,
         AddressSpaceError::InvalidRangeLength(_) | AddressSpaceError::WritableExecutable => {
             Status::InvalidArgument
         }
@@ -3005,6 +3029,25 @@ mod tests {
         assert_eq!(
             map_address_space_error(AddressSpaceError::AlreadyMapped(0x2000)),
             Status::AlreadyMapped
+        );
+        assert_eq!(
+            map_address_space_error(AddressSpaceError::OutOfMemory),
+            Status::OutOfMemory
+        );
+        assert_eq!(
+            map_process_create_error(ProcessCreateError::AddressSpace(
+                AddressSpaceError::OutOfMemory,
+            )),
+            Status::OutOfMemory
+        );
+        assert_eq!(
+            map_process_create_error(ProcessCreateError::ElfPage(
+                ElfPageLoadError::AddressSpace {
+                    address: 0x3000,
+                    error: AddressSpaceError::OutOfMemory,
+                },
+            )),
+            Status::OutOfMemory
         );
         assert_eq!(
             map_shared_mapping_error(SharedMappingError::RangeOverflow),
