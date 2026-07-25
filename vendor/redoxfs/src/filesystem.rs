@@ -6,8 +6,8 @@ use alloc::{
 use syscall::error::{Error, Result, ENOENT, ENOKEY};
 
 use crate::{
-    AllocEntry, AllocList, Allocator, BlockAddr, BlockData, BlockLevel, BlockMeta, BlockTrait, Disk,
-    Header, Node, Transaction, TreeList, BLOCK_SIZE, HEADER_RING, RECORD_SIZE,
+    AllocEntry, AllocList, Allocator, BlockAddr, BlockData, BlockLevel, BlockMeta, BlockTrait,
+    Disk, Header, Node, Transaction, TreeList, BLOCK_SIZE, HEADER_RING, RECORD_SIZE,
 };
 
 fn compress_cache() -> Vec<u8> {

@@ -17,6 +17,10 @@ MEMORY_POLICY_SMOKE_ROOT := $(BUILD_DIR)/memory_policy_smoke_root
 MEMORY_POLICY_SMOKE_DISK := $(BUILD_DIR)/memory-policy-smoke.img
 REQUEST_SMOKE_ROOT := $(BUILD_DIR)/request_smoke_root
 REQUEST_SMOKE_DISK := $(BUILD_DIR)/request-smoke.img
+VIRTIO_BLK_SMOKE_ROOT := $(BUILD_DIR)/virtio_blk_smoke_root
+VIRTIO_BLK_SMOKE_DISK := $(BUILD_DIR)/virtio-blk-smoke.img
+AHCI_NCQ_SMOKE_ROOT := $(BUILD_DIR)/ahci_ncq_smoke_root
+AHCI_NCQ_SMOKE_DISK := $(BUILD_DIR)/ahci-ncq-smoke.img
 POWER_SYNC_ROOT := $(BUILD_DIR)/power_sync_root
 POWER_VERIFY_ROOT := $(BUILD_DIR)/power_verify_root
 POWER_CANCEL_ROOT := $(BUILD_DIR)/power_cancel_root
@@ -66,7 +70,7 @@ endif
 QEMU_FLAGS ?= -cpu max -m 512M -M pc,i8042=off -serial stdio -device qemu-xhci,id=xhci,msi=on,msix=off -device usb-hub,id=ginkgo-hub,bus=xhci.0,port=1 -device usb-kbd,bus=xhci.0,port=1.1 -device usb-tablet,bus=xhci.0,port=1.2 $(QEMU_AUDIO_FLAGS) -device ich9-intel-hda -device hda-output,audiodev=ginkgo-audio
 THREAD_SMOKE_KERNEL_BUILD = GINKGO_THREAD_SMOKE=1 GINKGO_THREAD_SMOKE_ELF="$(abspath $(THREAD_SMOKE_ELF))" GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" GINKGO_TEXT_EDITOR_ELF="$(abspath $(TEXT_EDITOR_ELF))" GINKGO_TERMINAL_ELF="$(abspath $(TERMINAL_ELF))" cargo build -p ginkgo-kernel --bin ginkgo-os
 
-.PHONY: all userspace kernel iso qemu no-iso run usb-smoke frame-reclaim-smoke thread-smoke scheduler-smoke request-smoke filesystem-smoke text-editor-smoke process-capability-smoke memory-policy-smoke power-smoke check clean distclean reset-fs FORCE
+.PHONY: all userspace kernel iso qemu no-iso run usb-smoke frame-reclaim-smoke thread-smoke scheduler-smoke request-smoke virtio-blk-smoke ahci-ncq-smoke filesystem-smoke text-editor-smoke process-capability-smoke memory-policy-smoke power-smoke check clean distclean reset-fs FORCE
 
 all: iso
 
@@ -185,6 +189,28 @@ request-smoke: userspace $(LIMINE_DIR)/BOOTX64.EFI $(OVMF_CODE)
 	$(PYTHON) tools/create_gpt_disk.py $(REQUEST_SMOKE_DISK) --size-mb 32
 	$(PYTHON) tools/qemu_request_test.py --qemu "$(QEMU)" --ovmf $(OVMF_CODE) --disk $(REQUEST_SMOKE_DISK) --boot-root $(REQUEST_SMOKE_ROOT)
 
+virtio-blk-smoke: userspace $(LIMINE_DIR)/BOOTX64.EFI $(OVMF_CODE)
+	GINKGO_VIRTIO_BLK_SMOKE=1 GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" GINKGO_TEXT_EDITOR_ELF="$(abspath $(TEXT_EDITOR_ELF))" GINKGO_TERMINAL_ELF="$(abspath $(TERMINAL_ELF))" cargo build -p ginkgo-kernel --bin ginkgo-os
+	rm -rf $(VIRTIO_BLK_SMOKE_ROOT)
+	mkdir -p $(VIRTIO_BLK_SMOKE_ROOT)/boot/limine $(VIRTIO_BLK_SMOKE_ROOT)/EFI/BOOT
+	cp $(KERNEL) $(VIRTIO_BLK_SMOKE_ROOT)/boot/kernel
+	cp limine.conf $(VIRTIO_BLK_SMOKE_ROOT)/boot/limine/limine.conf
+	cp $(LIMINE_DIR)/BOOTX64.EFI $(VIRTIO_BLK_SMOKE_ROOT)/EFI/BOOT/
+	rm -f $(VIRTIO_BLK_SMOKE_DISK)
+	$(PYTHON) tools/create_gpt_disk.py $(VIRTIO_BLK_SMOKE_DISK) --size-mb 32
+	$(PYTHON) tools/qemu_virtio_blk_test.py --qemu "$(QEMU)" --ovmf $(OVMF_CODE) --disk $(VIRTIO_BLK_SMOKE_DISK) --boot-root $(VIRTIO_BLK_SMOKE_ROOT)
+
+ahci-ncq-smoke: userspace $(LIMINE_DIR)/BOOTX64.EFI $(OVMF_CODE)
+	GINKGO_AHCI_SMOKE=1 GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" GINKGO_TEXT_EDITOR_ELF="$(abspath $(TEXT_EDITOR_ELF))" GINKGO_TERMINAL_ELF="$(abspath $(TERMINAL_ELF))" cargo build -p ginkgo-kernel --bin ginkgo-os
+	rm -rf $(AHCI_NCQ_SMOKE_ROOT)
+	mkdir -p $(AHCI_NCQ_SMOKE_ROOT)/boot/limine $(AHCI_NCQ_SMOKE_ROOT)/EFI/BOOT
+	cp $(KERNEL) $(AHCI_NCQ_SMOKE_ROOT)/boot/kernel
+	cp limine.conf $(AHCI_NCQ_SMOKE_ROOT)/boot/limine/limine.conf
+	cp $(LIMINE_DIR)/BOOTX64.EFI $(AHCI_NCQ_SMOKE_ROOT)/EFI/BOOT/
+	rm -f $(AHCI_NCQ_SMOKE_DISK)
+	$(PYTHON) tools/create_gpt_disk.py $(AHCI_NCQ_SMOKE_DISK) --size-mb 32
+	$(PYTHON) tools/qemu_ahci_ncq_test.py --qemu "$(QEMU)" --ovmf $(OVMF_CODE) --disk $(AHCI_NCQ_SMOKE_DISK) --boot-root $(AHCI_NCQ_SMOKE_ROOT)
+
 process-capability-smoke: userspace $(LIMINE_DIR)/BOOTX64.EFI $(OVMF_CODE) $(FS_IMAGE)
 	GINKGO_PROCESS_CAPABILITY_SMOKE=1 GINKGO_PROCESS_CAPABILITY_SMOKE_ELF="$(abspath $(PROCESS_CAPABILITY_SMOKE_ELF))" GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" GINKGO_TEXT_EDITOR_ELF="$(abspath $(TEXT_EDITOR_ELF))" GINKGO_TERMINAL_ELF="$(abspath $(TERMINAL_ELF))" cargo build -p ginkgo-kernel --bin ginkgo-os
 	rm -rf $(PROCESS_CAPABILITY_SMOKE_ROOT)
@@ -266,7 +292,7 @@ check: userspace
 
 clean:
 	cargo clean
-	rm -rf $(ISO_ROOT) $(NO_ISO_ROOT) $(USB_SMOKE_ROOT) $(FRAME_RECLAIM_ROOT) $(THREAD_SMOKE_ROOT) $(SCHEDULER_SMOKE_ROOT) $(SCHEDULER_SMOKE_DISK) $(REQUEST_SMOKE_ROOT) $(REQUEST_SMOKE_DISK) $(FILESYSTEM_SMOKE_ROOT) $(FILESYSTEM_SMOKE_DISK) $(TEXT_EDITOR_SAVE_ROOT) $(TEXT_EDITOR_VERIFY_ROOT) $(TEXT_EDITOR_SMOKE_DISK) $(PROCESS_CAPABILITY_SMOKE_ROOT) $(PROCESS_CAPABILITY_SMOKE_DISK) $(MEMORY_POLICY_SMOKE_ROOT) $(MEMORY_POLICY_SMOKE_DISK) $(POWER_SYNC_ROOT) $(POWER_VERIFY_ROOT) $(POWER_CANCEL_ROOT) $(POWER_REBOOT_ROOT) $(POWER_PERSIST_DISK) $(POWER_CANCEL_DISK) $(POWER_REBOOT_DISK) $(ISO)
+	rm -rf $(ISO_ROOT) $(NO_ISO_ROOT) $(USB_SMOKE_ROOT) $(FRAME_RECLAIM_ROOT) $(THREAD_SMOKE_ROOT) $(SCHEDULER_SMOKE_ROOT) $(SCHEDULER_SMOKE_DISK) $(REQUEST_SMOKE_ROOT) $(REQUEST_SMOKE_DISK) $(VIRTIO_BLK_SMOKE_ROOT) $(VIRTIO_BLK_SMOKE_DISK) $(AHCI_NCQ_SMOKE_ROOT) $(AHCI_NCQ_SMOKE_DISK) $(FILESYSTEM_SMOKE_ROOT) $(FILESYSTEM_SMOKE_DISK) $(TEXT_EDITOR_SAVE_ROOT) $(TEXT_EDITOR_VERIFY_ROOT) $(TEXT_EDITOR_SMOKE_DISK) $(PROCESS_CAPABILITY_SMOKE_ROOT) $(PROCESS_CAPABILITY_SMOKE_DISK) $(MEMORY_POLICY_SMOKE_ROOT) $(MEMORY_POLICY_SMOKE_DISK) $(POWER_SYNC_ROOT) $(POWER_VERIFY_ROOT) $(POWER_CANCEL_ROOT) $(POWER_REBOOT_ROOT) $(POWER_PERSIST_DISK) $(POWER_CANCEL_DISK) $(POWER_REBOOT_DISK) $(ISO)
 
 reset-fs:
 	rm -f $(FS_IMAGE)

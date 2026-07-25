@@ -24,6 +24,7 @@ use x86_64::{
 use crate::{
     arch::UserContext,
     elf::{self, ElfError, LoadError, SegmentPermissions},
+    fs_executor::{FileSnapshotRange, FsJobId},
     memory::{UsableFrameAllocator, PAGE_SIZE},
     paging::{
         address_space::{
@@ -306,6 +307,12 @@ pub(crate) struct PendingRequestCountOutput {
     pub(crate) pages: Vec<PinnedUserPage>,
 }
 
+pub(crate) struct PendingFilesystem {
+    pub(crate) id: FsJobId,
+    pub(crate) completion: Option<Status>,
+    pub(crate) registration: Option<BlockedWaitRegistration>,
+}
+
 pub(crate) struct PendingRequest {
     pub(crate) id: RequestId,
     pub(crate) output: Option<PendingRequestOutput>,
@@ -321,6 +328,7 @@ pub(crate) enum BlockedSyscall {
     Sleep(PendingSleep),
     Join(PendingJoin),
     Request(PendingRequest),
+    Filesystem(PendingFilesystem),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -329,6 +337,7 @@ pub enum BlockedKind {
     Sleep,
     Join,
     Request,
+    Filesystem,
 }
 
 /// Fully allocated direct-process startup bytes awaiting child-local handles.
@@ -2437,7 +2446,10 @@ impl Process {
             .expect("blocked thread lost its syscall continuation")
         {
             BlockedSyscall::WaitMany(wait) => wait,
-            BlockedSyscall::Sleep(_) | BlockedSyscall::Join(_) | BlockedSyscall::Request(_) => {
+            BlockedSyscall::Sleep(_)
+            | BlockedSyscall::Join(_)
+            | BlockedSyscall::Request(_)
+            | BlockedSyscall::Filesystem(_) => {
                 panic!("blocked thread does not own a wait-many continuation")
             }
         };
@@ -2457,7 +2469,10 @@ impl Process {
             .expect("blocked thread lost its syscall continuation")
         {
             BlockedSyscall::WaitMany(wait) => wait,
-            BlockedSyscall::Sleep(_) | BlockedSyscall::Join(_) | BlockedSyscall::Request(_) => {
+            BlockedSyscall::Sleep(_)
+            | BlockedSyscall::Join(_)
+            | BlockedSyscall::Request(_)
+            | BlockedSyscall::Filesystem(_) => {
                 panic!("blocked thread does not own a wait-many continuation")
             }
         }
@@ -2478,6 +2493,85 @@ impl Process {
         );
         thread.blocked_syscall = Some(BlockedSyscall::Request(pending));
         thread.state = ThreadState::Blocked;
+    }
+
+    pub(crate) fn block_thread_filesystem(&mut self, thread_id: ThreadId, id: FsJobId) {
+        let thread = self
+            .thread_mut(thread_id)
+            .expect("filesystem caller thread disappeared");
+        assert_eq!(
+            thread.state,
+            ThreadState::Ready,
+            "only a ready thread can block"
+        );
+        assert!(
+            thread.blocked_syscall.is_none(),
+            "ready thread retained a blocked syscall"
+        );
+        thread.blocked_syscall = Some(BlockedSyscall::Filesystem(PendingFilesystem {
+            id,
+            completion: None,
+            registration: None,
+        }));
+        thread.state = ThreadState::Blocked;
+    }
+
+    pub fn blocked_filesystem_id(&self, thread_id: ThreadId) -> Option<FsJobId> {
+        let BlockedSyscall::Filesystem(filesystem) =
+            self.thread(thread_id)?.blocked_syscall.as_ref()?
+        else {
+            return None;
+        };
+        Some(filesystem.id)
+    }
+
+    pub fn filesystem_completion_ready(&self, thread_id: ThreadId) -> bool {
+        matches!(
+            self.thread(thread_id)
+                .and_then(|thread| thread.blocked_syscall.as_ref()),
+            Some(BlockedSyscall::Filesystem(PendingFilesystem {
+                completion: Some(_),
+                ..
+            }))
+        )
+    }
+
+    pub fn stage_filesystem_completion(
+        &mut self,
+        thread_id: ThreadId,
+        id: FsJobId,
+        status: Status,
+    ) -> bool {
+        let Some(BlockedSyscall::Filesystem(filesystem)) = self
+            .thread_mut(thread_id)
+            .and_then(|thread| thread.blocked_syscall.as_mut())
+        else {
+            return false;
+        };
+        if filesystem.id != id || filesystem.completion.is_some() {
+            return false;
+        }
+        filesystem.completion = Some(status);
+        true
+    }
+
+    pub(crate) fn take_completed_filesystem(
+        &mut self,
+        thread_id: ThreadId,
+    ) -> Result<PendingFilesystem, Status> {
+        let thread = self.thread_mut(thread_id).ok_or(Status::InvalidHandle)?;
+        let Some(blocked) = thread.blocked_syscall.take() else {
+            return Err(Status::InvalidArgument);
+        };
+        let BlockedSyscall::Filesystem(filesystem) = blocked else {
+            thread.blocked_syscall = Some(blocked);
+            return Err(Status::InvalidArgument);
+        };
+        if filesystem.completion.is_none() {
+            thread.blocked_syscall = Some(BlockedSyscall::Filesystem(filesystem));
+            return Err(Status::ShouldWait);
+        }
+        Ok(filesystem)
     }
 
     pub fn blocked_request_id(&self, thread_id: ThreadId) -> Option<RequestId> {
@@ -2656,6 +2750,7 @@ impl Process {
             BlockedSyscall::Sleep(_) => Some(BlockedKind::Sleep),
             BlockedSyscall::Join(_) => Some(BlockedKind::Join),
             BlockedSyscall::Request(_) => Some(BlockedKind::Request),
+            BlockedSyscall::Filesystem(_) => Some(BlockedKind::Filesystem),
         }
     }
 
@@ -2689,6 +2784,11 @@ impl Process {
             BlockedSyscall::Request(request) => {
                 (BlockedKind::Request, None, request.registration.as_ref())
             }
+            BlockedSyscall::Filesystem(filesystem) => (
+                BlockedKind::Filesystem,
+                None,
+                filesystem.registration.as_ref(),
+            ),
         };
         Some((
             kind,
@@ -2764,6 +2864,16 @@ impl Process {
                     .expect("request registration disappeared")
                     .objects = Some(objects);
             }
+            BlockedSyscall::Filesystem(filesystem) => {
+                assert!(
+                    filesystem.registration.is_none(),
+                    "filesystem wait was registered twice"
+                );
+                filesystem.registration = Some(BlockedWaitRegistration {
+                    token,
+                    objects: None,
+                });
+            }
         }
         Ok(())
     }
@@ -2790,7 +2900,7 @@ impl Process {
                 self.release_join_claim(target, thread_id);
                 true
             }
-            Some(BlockedKind::Sleep | BlockedKind::Request) => {
+            Some(BlockedKind::Sleep | BlockedKind::Request | BlockedKind::Filesystem) => {
                 self.cancel_blocked_syscall(thread_id);
                 let Some(thread) = self.thread_mut(thread_id) else {
                     return false;
@@ -2821,6 +2931,7 @@ impl Process {
             BlockedSyscall::Sleep(sleep) => &mut sleep.registration,
             BlockedSyscall::Join(join) => &mut join.registration,
             BlockedSyscall::Request(request) => &mut request.registration,
+            BlockedSyscall::Filesystem(filesystem) => &mut filesystem.registration,
         };
         if registration
             .as_ref()
@@ -2848,9 +2959,10 @@ impl Process {
         let thread = self.thread_mut(thread_id)?;
         match thread.blocked_syscall.as_ref()? {
             BlockedSyscall::Sleep(sleep) => Some(now_ns >= sleep.deadline_ns),
-            BlockedSyscall::WaitMany(_) | BlockedSyscall::Join(_) | BlockedSyscall::Request(_) => {
-                None
-            }
+            BlockedSyscall::WaitMany(_)
+            | BlockedSyscall::Join(_)
+            | BlockedSyscall::Request(_)
+            | BlockedSyscall::Filesystem(_) => None,
         }
     }
 
@@ -3000,7 +3112,12 @@ impl Process {
                 self.release_join_claim(join.target, thread_id);
             }
             Some(BlockedSyscall::Request(request)) => self.release_pending_request(request),
-            Some(BlockedSyscall::WaitMany(_) | BlockedSyscall::Sleep(_)) | None => {}
+            Some(
+                BlockedSyscall::WaitMany(_)
+                | BlockedSyscall::Sleep(_)
+                | BlockedSyscall::Filesystem(_),
+            )
+            | None => {}
         }
     }
 
@@ -3843,6 +3960,44 @@ impl Process {
                 SharedMappingError::AddressSpace(AddressSpaceError::FrameAllocator(error))
             })?;
         Ok(())
+    }
+
+    pub fn file_snapshot_ranges(
+        &self,
+        address: u64,
+        length: u64,
+    ) -> Result<Vec<FileSnapshotRange>, SharedMappingError> {
+        let (end, _) = normalize_anonymous_range(address, length)?;
+        plan_file_change(self.vmas(), address, end, FileChange::Commit)?;
+        let segments = file_segments(self.vmas(), address, end, false)?;
+        let mut ranges = Vec::new();
+        ranges
+            .try_reserve_exact(segments.len())
+            .map_err(|_| SharedMappingError::OutOfMemory)?;
+        for segment in segments {
+            let backing = self
+                .file_backings
+                .as_ref()
+                .expect("live process lost its file backing records")
+                .iter()
+                .find(|backing| backing.id == segment.backing_id)
+                .ok_or(SharedMappingError::InvalidBackingLength)?;
+            let length = usize::try_from(segment.end - segment.start)
+                .map_err(|_| SharedMappingError::RangeOverflow)?;
+            let source_end = segment
+                .file_offset
+                .checked_add(length as u64)
+                .ok_or(SharedMappingError::RangeOverflow)?;
+            if source_end > backing.source_end {
+                return Err(SharedMappingError::InvalidBackingLength);
+            }
+            ranges.push(FileSnapshotRange {
+                file: backing.file,
+                offset: segment.file_offset,
+                length,
+            });
+        }
+        Ok(ranges)
     }
 
     pub fn commit_file_backed<F>(
@@ -6196,6 +6351,69 @@ mod tests {
             process.usage().reserved_virtual_bytes,
             baseline_usage.reserved_virtual_bytes
         );
+    }
+
+    #[test]
+    fn file_recommit_publishes_only_after_owned_snapshots_are_ready() {
+        let source = vec![0x5a; PAGE_SIZE as usize];
+        let (mut filesystem, file) = file_fixture(&source);
+        let (_region, mut allocator) = TestFrameRegion::allocator(128);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let args = VirtualMapFileArgs {
+            address: 0,
+            offset: 0,
+            length: PAGE_SIZE,
+            protection: MapProtection::READ,
+            flags: MapFlags::empty(),
+        };
+        let address = process
+            .map_file_backed(
+                file,
+                source.len() as u64,
+                MapProtection::READ,
+                args,
+                &mut allocator,
+                |offset, output| {
+                    filesystem
+                        .read(file, offset, output)
+                        .map_err(|_| SharedMappingError::Io)
+                },
+            )
+            .unwrap();
+        process
+            .decommit_file_backed(address, PAGE_SIZE, &mut allocator)
+            .unwrap();
+        assert_eq!(process.virtual_query(address).unwrap().committed_bytes, 0);
+
+        let ranges = process.file_snapshot_ranges(address, PAGE_SIZE).unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(process.virtual_query(address).unwrap().committed_bytes, 0);
+        let mut snapshot = vec![0; ranges[0].length];
+        assert_eq!(
+            filesystem
+                .read(ranges[0].file, ranges[0].offset, &mut snapshot)
+                .unwrap(),
+            snapshot.len()
+        );
+        filesystem
+            .write(file, 0, &vec![0xa5; PAGE_SIZE as usize])
+            .unwrap();
+        process
+            .commit_file_backed(address, PAGE_SIZE, &mut allocator, |_, offset, output| {
+                let start = usize::try_from(offset - ranges[0].offset).unwrap();
+                output.copy_from_slice(&snapshot[start..start + output.len()]);
+                Ok(output.len())
+            })
+            .unwrap();
+        assert_eq!(
+            process.virtual_query(address).unwrap().committed_bytes,
+            PAGE_SIZE
+        );
+        let frame = *process.address_space().owned_data_frames().last().unwrap();
+        assert!(unsafe { frame_bytes(frame) }
+            .iter()
+            .all(|byte| *byte == 0x5a));
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
     }
 
     #[test]

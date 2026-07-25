@@ -8,10 +8,12 @@ mod heap;
 
 extern crate alloc;
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 use core::{
     fmt::{self, Write as _},
+    mem::MaybeUninit,
     panic::PanicInfo,
+    pin::Pin,
     ptr::{self, NonNull},
 };
 use embedded_graphics::{
@@ -29,17 +31,33 @@ use ginkgo_hid::{ApplicationKind, Axis, InputEvent, AXIS_MAX, AXIS_MIN};
 use ginkgo_ipc::{
     shared_memory_backing_stats, IpcError, SchedulingAuthorityControl, SystemPowerControl,
 };
+#[cfg(ginkgo_ahci_smoke)]
+use ginkgo_kernel::ahci::AhciDisk;
+#[cfg(any(ginkgo_ahci_smoke, ginkgo_virtio_blk_smoke))]
+use ginkgo_kernel::async_block::{
+    run_device_worker, AsyncBlockDevice, AsyncBlockQueue, BlockBuffer, BlockOperation,
+    BlockPriority, BlockRequestId, DeviceWorkerBudget, DmaSegment, QueueConfig, RequestOutcome,
+    RequestSpec,
+};
+#[cfg(any(ginkgo_ahci_smoke, ginkgo_virtio_blk_smoke))]
+use ginkgo_kernel::memory::{DMA_32BIT_ADDRESS_LIMIT, PAGE_SIZE};
 #[cfg(ginkgo_memory_policy_smoke)]
 use ginkgo_kernel::paging::address_space::{
     UserMappingBacking, UserPageMapping, UserPagePermissions,
 };
+#[cfg(ginkgo_virtio_blk_smoke)]
+use ginkgo_kernel::virtio_blk::VirtioBlk;
 use ginkgo_kernel::{
-    ahci::{AhciDisk, AhciError},
     arch::{self, CpuPrivilegeState, ExternalInterruptState, KernelExit, PrivilegeStackTops},
     audio::AudioDevice,
     block::{BlockDevice, Volume, SECTOR_SIZE},
     desktop_runtime::{DesktopBroker, DesktopBrokerError, DesktopRuntimeEvent},
     entropy::EntropyPool,
+    fiber::FixedStack,
+    fs_executor::{
+        FsDirectory, FsExecutor, FsExecutorError, FsJob, FsJobId, FsResult, PollStep,
+        FS_JOB_CAPACITY,
+    },
     input::{DeviceInputEvent, InputManager},
     io::SerialPort,
     limine::{
@@ -58,6 +76,7 @@ use ginkgo_kernel::{
     request::{RequestAction, RequestCancelReason, RequestWorkerBudget},
     request_broker::{BrokerCompletion, PreparedRequestBuffer, RequestBroker},
     shared_memory::{SharedFrameArena, SharedMemoryFactory},
+    storage::{StorageDisk, StorageDriver},
     syscall::{self, DebugSink, SyscallOutcome},
     task::{Scheduler, TaskPoll, TaskState},
     thread_scheduler::{
@@ -66,7 +85,6 @@ use ginkgo_kernel::{
     },
     trust::TrustedManifest,
     usb::{self, UsbError},
-    virtio_blk::{VirtioBlk, VirtioBlkError},
     wait_runtime::{WaitKind, WaitRuntime, WakeCause},
     writeback::WriteBackDisk,
 };
@@ -192,6 +210,16 @@ fn request_smoke_enabled() -> bool {
     option_env!("GINKGO_REQUEST_SMOKE") == Some("1")
 }
 
+#[cfg(ginkgo_virtio_blk_smoke)]
+fn virtio_blk_smoke_enabled() -> bool {
+    true
+}
+
+#[cfg(ginkgo_ahci_smoke)]
+fn ahci_smoke_enabled() -> bool {
+    true
+}
+
 fn text_editor_smoke_enabled() -> bool {
     option_env!("GINKGO_TEXT_EDITOR_SMOKE") == Some("1")
 }
@@ -210,6 +238,9 @@ const TERMINAL_PATH: &str = "/system/terminal.elf";
 const PROGRAM_REGISTRY_PATH: &str = "/system/programs.gkr";
 const PROCESS_CAPABILITY_SMOKE_PATH: &str = "/system/process-capability-smoke.elf";
 const PROCESS_CAPABILITY_MALFORMED_PATH: &str = "/system/process-capability-malformed.elf";
+const POWER_SMOKE_PERSIST_PATH: &str = "/power-smoke-persisted";
+const POWER_SMOKE_PERSIST_CONTENT: &[u8] = b"sync-before-poweroff\n";
+const POWER_SMOKE_REBOOT_PATH: &str = "/power-smoke-rebooted";
 const MAX_LAUNCHER_PROGRAMS: usize = 6;
 const FRAME_RECLAIM_STRESS_CYCLES: u32 = 512;
 
@@ -295,51 +326,6 @@ struct MemoryPolicySmoke {
     success_stage: MemoryPolicySuccessStage,
     shared_frame: Option<u64>,
     anonymous_frame: Option<u64>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StorageError {
-    Virtio(VirtioBlkError),
-    Ahci(AhciError),
-}
-
-enum StorageDisk {
-    Virtio(VirtioBlk),
-    Ahci(AhciDisk),
-}
-
-impl BlockDevice for StorageDisk {
-    type Error = StorageError;
-
-    fn capacity_sectors(&self) -> u64 {
-        match self {
-            Self::Virtio(disk) => disk.capacity_sectors(),
-            Self::Ahci(disk) => disk.capacity_sectors(),
-        }
-    }
-
-    fn read_sectors(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), Self::Error> {
-        match self {
-            Self::Virtio(disk) => disk.read_sectors(lba, buffer).map_err(StorageError::Virtio),
-            Self::Ahci(disk) => disk.read_sectors(lba, buffer).map_err(StorageError::Ahci),
-        }
-    }
-
-    fn write_sectors(&mut self, lba: u64, buffer: &[u8]) -> Result<(), Self::Error> {
-        match self {
-            Self::Virtio(disk) => disk
-                .write_sectors(lba, buffer)
-                .map_err(StorageError::Virtio),
-            Self::Ahci(disk) => disk.write_sectors(lba, buffer).map_err(StorageError::Ahci),
-        }
-    }
-
-    fn flush(&mut self) -> Result<(), Self::Error> {
-        match self {
-            Self::Virtio(disk) => disk.flush().map_err(StorageError::Virtio),
-            Self::Ahci(disk) => disk.flush().map_err(StorageError::Ahci),
-        }
-    }
 }
 
 fn volume_is_blank<D: BlockDevice>(volume: &mut Volume<D>) -> bool {
@@ -897,6 +883,30 @@ fn run_filesystem_hierarchy_smoke<D: Disk>(
 }
 
 const PRIVILEGE_STACK_SIZE: usize = 64 * 1024;
+const FILESYSTEM_STACK_SIZE: usize = 256 * 1024;
+const FILESYSTEM_STACK_GUARD_SIZE: usize = 4096;
+const FILESYSTEM_STACK_GUARD_BYTE: u8 = 0xa5;
+
+#[repr(C, align(4096))]
+struct GuardedFilesystemStack {
+    lower_guard: [u8; FILESYSTEM_STACK_GUARD_SIZE],
+    stack: FixedStack<FILESYSTEM_STACK_SIZE>,
+}
+
+impl GuardedFilesystemStack {
+    const fn new() -> Self {
+        Self {
+            lower_guard: [FILESYSTEM_STACK_GUARD_BYTE; FILESYSTEM_STACK_GUARD_SIZE],
+            stack: FixedStack::new(),
+        }
+    }
+
+    fn guard_intact(&self) -> bool {
+        self.lower_guard
+            .iter()
+            .all(|byte| *byte == FILESYSTEM_STACK_GUARD_BYTE)
+    }
+}
 
 #[repr(C, align(64))]
 struct PrivilegeStack([u8; PRIVILEGE_STACK_SIZE]);
@@ -907,6 +917,9 @@ static mut NMI_STACK: PrivilegeStack = PrivilegeStack([0; PRIVILEGE_STACK_SIZE])
 static mut MACHINE_CHECK_STACK: PrivilegeStack = PrivilegeStack([0; PRIVILEGE_STACK_SIZE]);
 static mut SYSCALL_STACK: PrivilegeStack = PrivilegeStack([0; PRIVILEGE_STACK_SIZE]);
 static mut CPU_PRIVILEGE_STATE: CpuPrivilegeState = CpuPrivilegeState::new();
+static mut FILESYSTEM_STACK: GuardedFilesystemStack = GuardedFilesystemStack::new();
+static mut FILESYSTEM_EXECUTOR: MaybeUninit<FsExecutor<'static, FILESYSTEM_STACK_SIZE>> =
+    MaybeUninit::uninit();
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -996,7 +1009,8 @@ pub extern "C" fn _start() -> ! {
         }
     };
 
-    let timer =
+    #[allow(unused_mut)]
+    let mut timer =
         match unsafe { LocalApicTimer::initialize(&mut page_table, &mut frames, tsc_frequency) } {
             Ok(timer) => timer,
             Err(error) => {
@@ -1007,33 +1021,71 @@ pub extern "C" fn _start() -> ! {
             }
         };
 
+    let cpu_state: &'static mut CpuPrivilegeState =
+        unsafe { &mut *ptr::addr_of_mut!(CPU_PRIVILEGE_STATE) };
+    if let Err(error) = unsafe {
+        arch::initialize_cpu_with_external_interrupts(
+            cpu_state,
+            privilege_stack_tops(),
+            arch::capture_syscall_and_yield,
+            ExternalInterruptState::local_apic(timer.eoi_register_address()),
+        )
+    } {
+        let mut sink = SerialDebugSink::new(&mut serial);
+        let _ = writeln!(sink, "userspace: CPU initialization failed: {error:?}\r");
+        ui.render_boot_log(&mut screen, "userspace: CPU initialization failed");
+        halt_forever();
+    }
+
     usb::configure_timestamp_frequency(Some(tsc_frequency));
-    let storage = match unsafe { VirtioBlk::initialize(&mut frames, hhdm.offset) } {
-        Ok(disk) => {
-            ui.render_boot_log(&mut screen, "storage: virtio-blk online");
-            StorageDisk::Virtio(disk)
-        }
-        Err(error) => {
-            let _ = writeln!(
-                SerialDebugSink::new(&mut serial),
-                "storage: virtio-blk initialization failed: {error:?}\r"
-            );
-            match unsafe { AhciDisk::initialize(&mut page_table, &mut frames) } {
-                Ok(disk) => {
-                    ui.render_boot_log(&mut screen, "storage: AHCI/SATA online");
-                    StorageDisk::Ahci(disk)
-                }
-                Err(error) => {
-                    let _ = writeln!(
-                        SerialDebugSink::new(&mut serial),
-                        "storage: AHCI initialization failed: {error:?}\r"
-                    );
-                    ui.render_boot_log(&mut screen, "storage: no virtio-blk or AHCI disk");
-                    halt_forever();
-                }
+    #[allow(unused_mut)]
+    let mut storage =
+        match unsafe { StorageDisk::initialize(&mut page_table, &mut frames, tsc_frequency) } {
+            Ok(storage) => storage,
+            Err(error) => {
+                let _ = writeln!(
+                    SerialDebugSink::new(&mut serial),
+                    "storage: initialization failed: {error:?}\r"
+                );
+                ui.render_boot_log(&mut screen, "storage: no virtio-blk or AHCI disk");
+                halt_forever();
+            }
+        };
+    ui.render_boot_log(
+        &mut screen,
+        match storage.driver() {
+            StorageDriver::Virtio(_) => "storage: virtio-blk online",
+            StorageDriver::Ahci(_) => "storage: AHCI/SATA online",
+        },
+    );
+
+    #[cfg(ginkgo_virtio_blk_smoke)]
+    if virtio_blk_smoke_enabled() {
+        match storage.driver_mut() {
+            StorageDriver::Virtio(disk) => {
+                run_virtio_blk_smoke(disk, &mut frames, hhdm.offset, &mut timer, &mut serial)
+            }
+            StorageDriver::Ahci(_) => {
+                let mut sink = SerialDebugSink::new(&mut serial);
+                let _ = writeln!(sink, "virtio-blk-smoke: FAIL virtio device unavailable\r");
+                halt_forever();
             }
         }
-    };
+    }
+
+    #[cfg(ginkgo_ahci_smoke)]
+    if ahci_smoke_enabled() {
+        match storage.driver_mut() {
+            StorageDriver::Ahci(disk) => {
+                run_ahci_smoke(disk, &mut frames, hhdm.offset, &mut timer, &mut serial)
+            }
+            StorageDriver::Virtio(_) => {
+                let mut sink = SerialDebugSink::new(&mut serial);
+                let _ = writeln!(sink, "ahci-smoke: FAIL AHCI device unavailable\r");
+                halt_forever();
+            }
+        }
+    }
 
     let Ok(mut volume) = Volume::discover(storage) else {
         ui.render_boot_log(&mut screen, "storage: invalid partition table");
@@ -1099,7 +1151,26 @@ pub extern "C" fn _start() -> ! {
         };
     ui.catalog = catalog;
     ui.render_boot_log(&mut screen, "redoxfs: desktop ELF and registry loaded");
-    fs.disk_mut().enable_async_writeback();
+    let power_smoke_action = prepare_power_smoke_before_executor(&mut fs, &mut serial);
+    let filesystem_root = fs.root_directory().unwrap_or_else(|_| halt_forever());
+    let user_directory = fs
+        .open_directory_at(filesystem_root, USER_DIRECTORY)
+        .unwrap_or_else(|_| halt_forever());
+    let filesystem_stack = unsafe { &mut *ptr::addr_of_mut!(FILESYSTEM_STACK) };
+    let stack = unsafe { Pin::new_unchecked(&mut filesystem_stack.stack) };
+    let mut filesystem_executor = FsExecutor::new(fs, stack);
+    if filesystem_executor
+        .activate_async_before_start(timer.id())
+        .is_err()
+    {
+        ui.render_boot_log(&mut screen, "storage: async activation failed");
+        halt_forever();
+    }
+    let filesystem_executor = unsafe {
+        let slot = ptr::addr_of_mut!(FILESYSTEM_EXECUTOR);
+        (*slot).write(filesystem_executor);
+        Pin::new_unchecked(&mut *(*slot).as_mut_ptr())
+    };
 
     let acpi_power = RSDP_REQUEST.response().and_then(|response| {
         match unsafe { AcpiPower::discover(response.address, hhdm.offset, tsc_frequency) } {
@@ -1131,7 +1202,10 @@ pub extern "C" fn _start() -> ! {
         page_table,
         kernel_heap,
         hhdm_offset: hhdm.offset,
-        fs,
+        filesystem_executor,
+        filesystem_bridges: core::array::from_fn(|_| None),
+        filesystem_root,
+        user_directory,
         serial,
         input: None,
         audio: None,
@@ -1140,6 +1214,7 @@ pub extern "C" fn _start() -> ! {
         acpi_power,
         power_control,
         launch_quiesced: false,
+        power_smoke_action,
         screen,
         ui,
         paging_verified: false,
@@ -1177,6 +1252,17 @@ pub extern "C" fn _start() -> ! {
         pressed_keys: Vec::new(),
         pressed_pointer_buttons: Vec::new(),
         log_flush_deadline: 0,
+        writeback_job: None,
+        writeback_retry: false,
+        system_log_job: None,
+        console_log_job: None,
+        input_log_job: None,
+        accounting_job: None,
+        power_job: None,
+        power_completion: None,
+        system_log_written: false,
+        accounting_written: false,
+        process_creation_pending: false,
     };
     context.paging_verified = verify_paging(&mut context);
     if !context.paging_verified {
@@ -1270,23 +1356,6 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    let cpu_state: &'static mut CpuPrivilegeState =
-        unsafe { &mut *ptr::addr_of_mut!(CPU_PRIVILEGE_STATE) };
-    if let Err(error) = unsafe {
-        arch::initialize_cpu_with_external_interrupts(
-            cpu_state,
-            privilege_stack_tops(),
-            arch::capture_syscall_and_yield,
-            ExternalInterruptState::local_apic(context.timer.eoi_register_address()),
-        )
-    } {
-        let mut sink = SerialDebugSink::new(&mut context.serial);
-        let _ = writeln!(sink, "userspace: CPU initialization failed: {error:?}\r");
-        context
-            .ui
-            .render_boot_log(&mut context.screen, "userspace: CPU initialization failed");
-        halt_forever();
-    }
     if let Some(input) = context.input.as_mut() {
         match unsafe { input.enable_msi(context.timer.id()) } {
             Ok(()) => {
@@ -1525,104 +1594,115 @@ pub extern "C" fn _start() -> ! {
     run_scheduler(&mut context)
 }
 
-fn run_power_smoke(context: &mut KernelContext) -> ! {
-    const PERSIST_PATH: &str = "/power-smoke-persisted";
-    const PERSIST_CONTENT: &[u8] = b"sync-before-poweroff\n";
-    const REBOOT_PATH: &str = "/power-smoke-rebooted";
-
-    let now_ns = context.timer.clock().now_ns();
-    let action = match power_smoke_mode().unwrap_or("") {
+fn prepare_power_smoke_before_executor<D: Disk>(
+    filesystem: &mut RedoxFs<D>,
+    serial: &mut Option<SerialPort>,
+) -> Option<ginkgo_sysapi::SystemPowerAction> {
+    let mode = power_smoke_mode()?;
+    let action = match mode {
         "sync" => {
-            let result = context
-                .fs
-                .open(PERSIST_PATH)
-                .or_else(|_| context.fs.create(PERSIST_PATH))
+            let result = filesystem
+                .open(POWER_SMOKE_PERSIST_PATH)
+                .or_else(|_| filesystem.create(POWER_SMOKE_PERSIST_PATH))
                 .and_then(|file| {
-                    context.fs.truncate(file, 0)?;
-                    let written = context.fs.write(file, 0, PERSIST_CONTENT)?;
-                    (written == PERSIST_CONTENT.len())
+                    filesystem.truncate(file, 0)?;
+                    let written = filesystem.write(file, 0, POWER_SMOKE_PERSIST_CONTENT)?;
+                    (written == POWER_SMOKE_PERSIST_CONTENT.len())
                         .then_some(())
                         .ok_or(FsError::Io)
                 });
             if result.is_err() {
-                let mut sink = SerialDebugSink::new(&mut context.serial);
-                let _ = writeln!(sink, "power-smoke: sync staging failed\r");
+                let _ = writeln!(
+                    SerialDebugSink::new(serial),
+                    "power-smoke: sync staging failed\r"
+                );
                 halt_forever();
             }
-            let status = context.fs.disk().status();
-            let mut sink = SerialDebugSink::new(&mut context.serial);
             let _ = writeln!(
-                sink,
-                "power-smoke: sync-before-poweroff staged write={} requested={} durable={} dirty={}\r",
-                status.write_sequence,
-                status.requested_sequence,
-                status.durable_sequence,
-                status.dirty_count
+                SerialDebugSink::new(serial),
+                "power-smoke: sync-before-poweroff staged\r"
             );
             ginkgo_sysapi::SystemPowerAction::PowerOff
         }
         "verify" => {
             let mut bytes = [0_u8; 64];
-            let verified = context
-                .fs
-                .open(PERSIST_PATH)
+            let verified = filesystem
+                .open(POWER_SMOKE_PERSIST_PATH)
                 .and_then(|file| {
-                    context
-                        .fs
-                        .read(file, 0, &mut bytes[..PERSIST_CONTENT.len()])
+                    filesystem.read(file, 0, &mut bytes[..POWER_SMOKE_PERSIST_CONTENT.len()])
                 })
                 .is_ok_and(|read| {
-                    read == PERSIST_CONTENT.len()
-                        && bytes[..PERSIST_CONTENT.len()] == *PERSIST_CONTENT
+                    read == POWER_SMOKE_PERSIST_CONTENT.len()
+                        && bytes[..POWER_SMOKE_PERSIST_CONTENT.len()]
+                            == *POWER_SMOKE_PERSIST_CONTENT
                 });
-            let mut sink = SerialDebugSink::new(&mut context.serial);
-            if verified {
-                let _ = writeln!(sink, "power-smoke: persisted after poweroff\r");
-            } else {
-                let _ = writeln!(sink, "power-smoke: persistence verification failed\r");
+            if !verified {
+                let _ = writeln!(
+                    SerialDebugSink::new(serial),
+                    "power-smoke: persistence verification failed\r"
+                );
                 halt_forever();
             }
+            let _ = writeln!(
+                SerialDebugSink::new(serial),
+                "power-smoke: persisted after poweroff\r"
+            );
             ginkgo_sysapi::SystemPowerAction::PowerOff
         }
-        "cancel" => {
-            let deadline = now_ns.saturating_add(10_000_000_000);
-            context
-                .power_control
-                .request(
-                    ginkgo_sysapi::SystemPowerAction::PowerOff,
-                    ginkgo_sysapi::SystemPowerFlags::empty(),
-                    deadline,
-                )
-                .unwrap_or_else(|_| halt_forever());
-            context
-                .power_control
-                .cancel()
-                .unwrap_or_else(|_| halt_forever());
-            let mut sink = SerialDebugSink::new(&mut context.serial);
-            let _ = writeln!(sink, "power-smoke: cancellation passed\r");
-            ginkgo_sysapi::SystemPowerAction::PowerOff
-        }
+        "cancel" => ginkgo_sysapi::SystemPowerAction::PowerOff,
         "reboot" => {
-            if context.fs.open(REBOOT_PATH).is_ok() {
-                let mut sink = SerialDebugSink::new(&mut context.serial);
-                let _ = writeln!(sink, "power-smoke: reboot observed\r");
+            if filesystem.open(POWER_SMOKE_REBOOT_PATH).is_ok() {
                 ginkgo_sysapi::SystemPowerAction::PowerOff
             } else {
-                let created = context.fs.create(REBOOT_PATH).and_then(|file| {
-                    (context.fs.write(file, 0, b"reboot\n")? == 7)
+                let created = filesystem.create(POWER_SMOKE_REBOOT_PATH).and_then(|file| {
+                    (filesystem.write(file, 0, b"reboot\n")? == 7)
                         .then_some(())
                         .ok_or(FsError::Io)
                 });
                 if created.is_err() {
                     halt_forever();
                 }
-                let mut sink = SerialDebugSink::new(&mut context.serial);
-                let _ = writeln!(sink, "power-smoke: reboot requested\r");
+                let _ = writeln!(
+                    SerialDebugSink::new(serial),
+                    "power-smoke: reboot requested\r"
+                );
                 ginkgo_sysapi::SystemPowerAction::Reboot
             }
         }
         _ => halt_forever(),
     };
+    Some(action)
+}
+
+fn run_power_smoke(context: &mut KernelContext) -> ! {
+    let now_ns = context.timer.clock().now_ns();
+    let action = context.power_smoke_action.unwrap_or_else(|| halt_forever());
+    if power_smoke_mode() == Some("reboot") && action == ginkgo_sysapi::SystemPowerAction::PowerOff
+    {
+        let _ = writeln!(
+            SerialDebugSink::new(&mut context.serial),
+            "power-smoke: reboot observed\r"
+        );
+    }
+    if power_smoke_mode() == Some("cancel") {
+        let deadline = now_ns.saturating_add(10_000_000_000);
+        context
+            .power_control
+            .request(
+                ginkgo_sysapi::SystemPowerAction::PowerOff,
+                ginkgo_sysapi::SystemPowerFlags::empty(),
+                deadline,
+            )
+            .unwrap_or_else(|_| halt_forever());
+        context
+            .power_control
+            .cancel()
+            .unwrap_or_else(|_| halt_forever());
+        let _ = writeln!(
+            SerialDebugSink::new(&mut context.serial),
+            "power-smoke: cancellation passed\r"
+        );
+    }
 
     context
         .power_control
@@ -1633,6 +1713,464 @@ fn run_power_smoke(context: &mut KernelContext) -> ! {
         )
         .unwrap_or_else(|_| halt_forever());
     run_scheduler(context)
+}
+
+#[cfg(ginkgo_virtio_blk_smoke)]
+fn run_virtio_blk_smoke(
+    disk: &mut VirtioBlk,
+    frames: &mut UsableFrameAllocator<'_>,
+    hhdm_offset: u64,
+    timer: &mut LocalApicTimer,
+    serial: &mut Option<SerialPort>,
+) -> ! {
+    const BUFFER_BYTES: usize = 16 * 1024;
+    const BUFFER_PAGES: usize = BUFFER_BYTES / PAGE_SIZE as usize;
+    const TOTAL_PAGES: usize = BUFFER_PAGES * 2;
+    const FIRST_LBA: u64 = 64;
+    const SECOND_LBA: u64 = FIRST_LBA + (BUFFER_BYTES / SECTOR_SIZE) as u64;
+
+    if let Err(error) = disk.enable_msix(timer.id()) {
+        let mut sink = SerialDebugSink::new(serial);
+        let _ = writeln!(sink, "virtio-blk-smoke: FAIL MSI-X {error:?}\r");
+        halt_forever();
+    }
+
+    let allocated =
+        match frames.allocate_contiguous_frames_below(TOTAL_PAGES, DMA_32BIT_ADDRESS_LIMIT) {
+            Ok(Some(allocated)) => allocated,
+            result => {
+                let mut sink = SerialDebugSink::new(serial);
+                let _ = writeln!(sink, "virtio-blk-smoke: FAIL DMA allocation {result:?}\r");
+                halt_forever();
+            }
+        };
+    let physical = allocated
+        .first()
+        .map(|frame| frame.start_address().as_u64())
+        .unwrap_or_else(|| halt_forever());
+    let virtual_address = hhdm_offset
+        .checked_add(physical)
+        .and_then(|address| usize::try_from(address).ok())
+        .unwrap_or_else(|| halt_forever());
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            virtual_address as *mut u8,
+            TOTAL_PAGES * PAGE_SIZE as usize,
+        )
+    };
+    for (offset, byte) in bytes[..BUFFER_BYTES].iter_mut().enumerate() {
+        *byte = virtio_smoke_pattern(0, offset);
+    }
+    for (offset, byte) in bytes[BUFFER_BYTES..].iter_mut().enumerate() {
+        *byte = virtio_smoke_pattern(1, offset);
+    }
+
+    let first_segments = block_smoke_segments::<BUFFER_PAGES>(physical);
+    let second_segments = block_smoke_segments::<BUFFER_PAGES>(physical + BUFFER_BYTES as u64);
+    let mut queue = AsyncBlockQueue::try_new(
+        8,
+        1,
+        QueueConfig {
+            child_bytes: BUFFER_BYTES as u32,
+            ..QueueConfig::default()
+        },
+    )
+    .unwrap_or_else(|error| {
+        let mut sink = SerialDebugSink::new(serial);
+        let _ = writeln!(sink, "virtio-blk-smoke: FAIL queue {error:?}\r");
+        halt_forever();
+    });
+    let device = queue
+        .register_device(AsyncBlockDevice::config(disk))
+        .unwrap_or_else(|error| {
+            let mut sink = SerialDebugSink::new(serial);
+            let _ = writeln!(sink, "virtio-blk-smoke: FAIL register {error:?}\r");
+            halt_forever();
+        });
+
+    let write_ids = submit_block_smoke_pair(
+        &mut queue,
+        device,
+        timer.clock().now_ns(),
+        BlockOperation::Write,
+        BUFFER_BYTES as u32,
+        FIRST_LBA,
+        SECOND_LBA,
+        &first_segments,
+        &second_segments,
+        serial,
+        "virtio-blk-smoke",
+    );
+    drive_block_smoke_pair(
+        &mut queue,
+        device,
+        disk,
+        write_ids,
+        BUFFER_BYTES as u32,
+        timer,
+        serial,
+        "virtio-blk-smoke",
+    );
+
+    bytes.fill(0);
+    let read_ids = submit_block_smoke_pair(
+        &mut queue,
+        device,
+        timer.clock().now_ns(),
+        BlockOperation::Read,
+        BUFFER_BYTES as u32,
+        FIRST_LBA,
+        SECOND_LBA,
+        &first_segments,
+        &second_segments,
+        serial,
+        "virtio-blk-smoke",
+    );
+    drive_block_smoke_pair(
+        &mut queue,
+        device,
+        disk,
+        read_ids,
+        BUFFER_BYTES as u32,
+        timer,
+        serial,
+        "virtio-blk-smoke",
+    );
+
+    let first_valid = bytes[..BUFFER_BYTES]
+        .iter()
+        .enumerate()
+        .all(|(offset, byte)| *byte == virtio_smoke_pattern(0, offset));
+    let second_valid = bytes[BUFFER_BYTES..]
+        .iter()
+        .enumerate()
+        .all(|(offset, byte)| *byte == virtio_smoke_pattern(1, offset));
+    if !first_valid || !second_valid {
+        let mut sink = SerialDebugSink::new(serial);
+        let _ = writeln!(sink, "virtio-blk-smoke: FAIL readback mismatch\r");
+        halt_forever();
+    }
+
+    let block = queue.diagnostics();
+    let driver = disk.diagnostics();
+    let errors = block
+        .counters
+        .failed_requests
+        .saturating_add(block.counters.rejected_submissions)
+        .saturating_add(driver.errors);
+    let mut sink = SerialDebugSink::new(serial);
+    let _ = writeln!(
+        sink,
+        "virtio-blk-smoke: PASS msix={} interrupts={} queue_hwm={} driver_hwm={} bytes={} errors={} live={} queued={} in_flight={}\r",
+        u8::from(driver.msix_enabled),
+        driver.interrupts,
+        block.counters.in_flight_high_water,
+        driver.in_flight_high_water,
+        4 * BUFFER_BYTES,
+        errors,
+        block.live_requests,
+        block.queued_requests,
+        block.in_flight_commands
+    );
+    halt_forever()
+}
+
+#[cfg(ginkgo_ahci_smoke)]
+fn run_ahci_smoke(
+    disk: &mut AhciDisk,
+    frames: &mut UsableFrameAllocator<'_>,
+    hhdm_offset: u64,
+    timer: &mut LocalApicTimer,
+    serial: &mut Option<SerialPort>,
+) -> ! {
+    const BUFFER_BYTES: usize = 128 * 1024;
+    const BUFFER_PAGES: usize = BUFFER_BYTES / PAGE_SIZE as usize;
+    const TOTAL_PAGES: usize = BUFFER_PAGES * 2;
+    const FIRST_LBA: u64 = 64;
+    const SECOND_LBA: u64 = FIRST_LBA + (BUFFER_BYTES / SECTOR_SIZE) as u64;
+
+    if let Err(error) = disk.enable_msi(timer.id()) {
+        let mut sink = SerialDebugSink::new(serial);
+        let _ = writeln!(sink, "ahci-smoke: FAIL MSI {error:?}\r");
+        halt_forever();
+    }
+
+    let allocated =
+        match frames.allocate_contiguous_frames_below(TOTAL_PAGES, DMA_32BIT_ADDRESS_LIMIT) {
+            Ok(Some(allocated)) => allocated,
+            result => {
+                let mut sink = SerialDebugSink::new(serial);
+                let _ = writeln!(sink, "ahci-smoke: FAIL DMA allocation {result:?}\r");
+                halt_forever();
+            }
+        };
+    let physical = allocated
+        .first()
+        .map(|frame| frame.start_address().as_u64())
+        .unwrap_or_else(|| halt_forever());
+    let virtual_address = hhdm_offset
+        .checked_add(physical)
+        .and_then(|address| usize::try_from(address).ok())
+        .unwrap_or_else(|| halt_forever());
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            virtual_address as *mut u8,
+            TOTAL_PAGES * PAGE_SIZE as usize,
+        )
+    };
+    for (offset, byte) in bytes[..BUFFER_BYTES].iter_mut().enumerate() {
+        *byte = virtio_smoke_pattern(0, offset);
+    }
+    for (offset, byte) in bytes[BUFFER_BYTES..].iter_mut().enumerate() {
+        *byte = virtio_smoke_pattern(1, offset);
+    }
+
+    let first_segments = block_smoke_segments::<BUFFER_PAGES>(physical);
+    let second_segments = block_smoke_segments::<BUFFER_PAGES>(physical + BUFFER_BYTES as u64);
+    let mut queue = AsyncBlockQueue::try_new(
+        8,
+        1,
+        QueueConfig {
+            child_bytes: BUFFER_BYTES as u32,
+            ..QueueConfig::default()
+        },
+    )
+    .unwrap_or_else(|error| {
+        let mut sink = SerialDebugSink::new(serial);
+        let _ = writeln!(sink, "ahci-smoke: FAIL queue {error:?}\r");
+        halt_forever();
+    });
+    let device = queue
+        .register_device(AsyncBlockDevice::config(disk))
+        .unwrap_or_else(|error| {
+            let mut sink = SerialDebugSink::new(serial);
+            let _ = writeln!(sink, "ahci-smoke: FAIL register {error:?}\r");
+            halt_forever();
+        });
+
+    let write_ids = submit_block_smoke_pair(
+        &mut queue,
+        device,
+        timer.clock().now_ns(),
+        BlockOperation::Write,
+        BUFFER_BYTES as u32,
+        FIRST_LBA,
+        SECOND_LBA,
+        &first_segments,
+        &second_segments,
+        serial,
+        "ahci-smoke",
+    );
+    drive_block_smoke_pair(
+        &mut queue,
+        device,
+        disk,
+        write_ids,
+        BUFFER_BYTES as u32,
+        timer,
+        serial,
+        "ahci-smoke",
+    );
+
+    bytes.fill(0);
+    let read_ids = submit_block_smoke_pair(
+        &mut queue,
+        device,
+        timer.clock().now_ns(),
+        BlockOperation::Read,
+        BUFFER_BYTES as u32,
+        FIRST_LBA,
+        SECOND_LBA,
+        &first_segments,
+        &second_segments,
+        serial,
+        "ahci-smoke",
+    );
+    drive_block_smoke_pair(
+        &mut queue,
+        device,
+        disk,
+        read_ids,
+        BUFFER_BYTES as u32,
+        timer,
+        serial,
+        "ahci-smoke",
+    );
+
+    let first_valid = bytes[..BUFFER_BYTES]
+        .iter()
+        .enumerate()
+        .all(|(offset, byte)| *byte == virtio_smoke_pattern(0, offset));
+    let second_valid = bytes[BUFFER_BYTES..]
+        .iter()
+        .enumerate()
+        .all(|(offset, byte)| *byte == virtio_smoke_pattern(1, offset));
+    if !first_valid || !second_valid {
+        let mut sink = SerialDebugSink::new(serial);
+        let _ = writeln!(sink, "ahci-smoke: FAIL readback mismatch\r");
+        halt_forever();
+    }
+
+    let block = queue.diagnostics();
+    let driver = disk.diagnostics();
+    let errors = block
+        .counters
+        .failed_requests
+        .saturating_add(block.counters.rejected_submissions)
+        .saturating_add(driver.errors);
+    let mut sink = SerialDebugSink::new(serial);
+    let _ = writeln!(
+        sink,
+        "ahci-smoke: PASS ncq={} depth={} msi={} interrupts={} queue_hwm={} driver_hwm={} prdt_hwm={} bytes={} errors={} quarantined={} live={} queued={} in_flight={}\r",
+        u8::from(driver.ncq_enabled),
+        driver.negotiated_queue_depth,
+        u8::from(driver.msi_enabled),
+        driver.interrupts,
+        block.counters.in_flight_high_water,
+        driver.slot_high_water,
+        driver.prdt_high_water,
+        4 * BUFFER_BYTES,
+        errors,
+        driver.quarantines,
+        block.live_requests,
+        block.queued_requests,
+        block.in_flight_commands
+    );
+    halt_forever()
+}
+
+#[cfg(any(ginkgo_ahci_smoke, ginkgo_virtio_blk_smoke))]
+fn submit_block_smoke_pair<const N: usize>(
+    queue: &mut AsyncBlockQueue,
+    device: ginkgo_kernel::async_block::BlockDeviceId,
+    now_ns: u64,
+    operation: BlockOperation,
+    byte_len: u32,
+    first_lba: u64,
+    second_lba: u64,
+    first_segments: &[DmaSegment; N],
+    second_segments: &[DmaSegment; N],
+    serial: &mut Option<SerialPort>,
+    label: &str,
+) -> [BlockRequestId; 2] {
+    let deadline_ns = Some(now_ns.saturating_add(5_000_000_000));
+    let first_buffer = unsafe {
+        BlockBuffer::from_dma_segments(byte_len, first_segments).unwrap_or_else(|_| halt_forever())
+    };
+    let second_buffer = unsafe {
+        BlockBuffer::from_dma_segments(byte_len, second_segments).unwrap_or_else(|_| halt_forever())
+    };
+    let first = queue.submit(
+        now_ns,
+        RequestSpec {
+            device,
+            operation,
+            lba: first_lba,
+            buffer: Some(first_buffer),
+            priority: BlockPriority::Latency,
+            deadline_ns,
+        },
+    );
+    let second = queue.submit(
+        now_ns,
+        RequestSpec {
+            device,
+            operation,
+            lba: second_lba,
+            buffer: Some(second_buffer),
+            priority: BlockPriority::Latency,
+            deadline_ns,
+        },
+    );
+    match (first, second) {
+        (Ok(first), Ok(second)) => [first, second],
+        (first, second) => {
+            let mut sink = SerialDebugSink::new(serial);
+            let _ = writeln!(
+                sink,
+                "{label}: FAIL submit first={first:?} second={second:?}\r"
+            );
+            halt_forever();
+        }
+    }
+}
+
+#[cfg(any(ginkgo_ahci_smoke, ginkgo_virtio_blk_smoke))]
+fn drive_block_smoke_pair<D: AsyncBlockDevice>(
+    queue: &mut AsyncBlockQueue,
+    device: ginkgo_kernel::async_block::BlockDeviceId,
+    disk: &mut D,
+    ids: [BlockRequestId; 2],
+    byte_len: u32,
+    timer: &mut LocalApicTimer,
+    serial: &mut Option<SerialPort>,
+    label: &str,
+) where
+    D::Error: core::fmt::Debug,
+{
+    let deadline_ns = timer.clock().now_ns().saturating_add(5_000_000_000);
+    let mut completed = [false; 2];
+    while !completed.iter().all(|done| *done) {
+        let now_ns = timer.clock().now_ns();
+        if now_ns >= deadline_ns {
+            let mut sink = SerialDebugSink::new(serial);
+            let _ = writeln!(sink, "{label}: FAIL completion timeout\r");
+            halt_forever();
+        }
+        if let Err(error) = run_device_worker(
+            queue,
+            device,
+            disk,
+            now_ns,
+            DeviceWorkerBudget {
+                completions: 8,
+                cancellations: 8,
+                submissions: 8,
+            },
+        ) {
+            let mut sink = SerialDebugSink::new(serial);
+            let _ = writeln!(sink, "{label}: FAIL worker {error:?}\r");
+            halt_forever();
+        }
+        for (index, id) in ids.iter().copied().enumerate() {
+            if completed[index] {
+                continue;
+            }
+            if let Some(completion) = queue.take_completion(id) {
+                if completion.outcome != RequestOutcome::Success
+                    || completion.bytes_completed != byte_len
+                {
+                    let mut sink = SerialDebugSink::new(serial);
+                    let _ = writeln!(sink, "{label}: FAIL completion {completion:?}\r");
+                    halt_forever();
+                }
+                completed[index] = true;
+            }
+        }
+        if !completed.iter().all(|done| *done) {
+            if timer.arm_one_shot(10_000_000).is_err() {
+                halt_forever();
+            }
+            let _ = arch::idle_until_interrupt();
+            timer.disarm();
+        }
+    }
+}
+
+#[cfg(any(ginkgo_ahci_smoke, ginkgo_virtio_blk_smoke))]
+fn block_smoke_segments<const N: usize>(physical: u64) -> [DmaSegment; N] {
+    core::array::from_fn(|index| DmaSegment {
+        physical_address: physical + index as u64 * PAGE_SIZE,
+        length: PAGE_SIZE as u32,
+    })
+}
+
+#[cfg(any(ginkgo_ahci_smoke, ginkgo_virtio_blk_smoke))]
+fn virtio_smoke_pattern(buffer: usize, offset: usize) -> u8 {
+    (offset as u32)
+        .wrapping_mul(31)
+        .wrapping_add(buffer as u32 * 0x5d)
+        .wrapping_add((offset >> 8) as u32) as u8
 }
 
 fn run_memory_policy_smoke_if_enabled(context: &mut KernelContext) {
@@ -1657,8 +2195,9 @@ fn run_memory_policy_smoke_if_enabled(context: &mut KernelContext) {
 }
 
 fn run_scheduler(context: &mut KernelContext) -> ! {
-    let mut scheduler = Scheduler::<KernelContext, 14>::new();
-    if scheduler.spawn(writeback_task).is_err()
+    let mut scheduler = Scheduler::<KernelContext, 15>::new();
+    if scheduler.spawn(filesystem_executor_task).is_err()
+        || scheduler.spawn(writeback_task).is_err()
         || scheduler.spawn(filesystem_task).is_err()
         || scheduler.spawn(console_task).is_err()
         || scheduler.spawn(accounting_task).is_err()
@@ -1704,6 +2243,51 @@ fn run_scheduler(context: &mut KernelContext) -> ! {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KernelFilesystemOwner {
+    Writeback,
+    SystemLog,
+    ConsoleLog { length: usize },
+    InputLog { length: usize },
+    Accounting,
+    Power,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestFilesystemJob {
+    Open { flags: u32 },
+    RollbackOpen { status: ginkgo_sysapi::Status },
+    Read { requested: usize },
+    Write { requested: usize },
+    Sync,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RequestFilesystemBridge {
+    request: ginkgo_kernel::request::RequestId,
+    job: RequestFilesystemJob,
+}
+
+struct PendingProgramLaunch {
+    program: ProgramSummary,
+    startup: Option<ginkgo_sysapi::Handle>,
+}
+
+enum FilesystemBridgeOwner {
+    Request(RequestFilesystemBridge),
+    Thread {
+        thread: ThreadRef,
+        continuation: syscall::DirectFilesystemContinuation,
+    },
+    Kernel(KernelFilesystemOwner),
+    ProgramLaunch(PendingProgramLaunch),
+}
+
+struct FilesystemBridge {
+    id: FsJobId,
+    owner: FilesystemBridgeOwner,
+}
+
 #[derive(Clone)]
 struct ProcessClient {
     process_id: ProcessId,
@@ -1718,7 +2302,10 @@ struct KernelContext {
     page_table: ActivePageTable,
     kernel_heap: heap::PageBackedHeap,
     hhdm_offset: u64,
-    fs: RedoxFs<WriteBackDisk<Volume<StorageDisk>>>,
+    filesystem_executor: Pin<&'static mut FsExecutor<'static, FILESYSTEM_STACK_SIZE>>,
+    filesystem_bridges: [Option<FilesystemBridge>; FS_JOB_CAPACITY],
+    filesystem_root: ginkgo_filesystem::DirectoryHandle,
+    user_directory: ginkgo_filesystem::DirectoryHandle,
     serial: Option<SerialPort>,
     input: Option<InputManager>,
     audio: Option<AudioDevice>,
@@ -1727,6 +2314,7 @@ struct KernelContext {
     acpi_power: Option<AcpiPower>,
     power_control: SystemPowerControl,
     launch_quiesced: bool,
+    power_smoke_action: Option<ginkgo_sysapi::SystemPowerAction>,
     screen: FramebufferWriter<'static>,
     ui: ValidationUi,
     paging_verified: bool,
@@ -1756,6 +2344,17 @@ struct KernelContext {
     pressed_keys: Vec<(ginkgo_kernel::usb::HidInterfaceId, u16)>,
     pressed_pointer_buttons: Vec<(ginkgo_kernel::usb::HidInterfaceId, u16)>,
     log_flush_deadline: u64,
+    writeback_job: Option<FsJobId>,
+    writeback_retry: bool,
+    system_log_job: Option<FsJobId>,
+    console_log_job: Option<FsJobId>,
+    input_log_job: Option<FsJobId>,
+    accounting_job: Option<FsJobId>,
+    power_job: Option<FsJobId>,
+    power_completion: Option<Result<FsResult, FsExecutorError>>,
+    system_log_written: bool,
+    accounting_written: bool,
+    process_creation_pending: bool,
 }
 
 fn maintain_kernel_heap(context: &mut KernelContext) {
@@ -2619,7 +3218,7 @@ fn runtime_wait_kind(kind: BlockedKind) -> WaitKind {
         BlockedKind::WaitMany => WaitKind::WaitMany,
         BlockedKind::Sleep => WaitKind::Sleep,
         BlockedKind::Join => WaitKind::Join,
-        BlockedKind::Request => WaitKind::Request,
+        BlockedKind::Request | BlockedKind::Filesystem => WaitKind::Request,
     }
 }
 
@@ -2734,6 +3333,203 @@ fn notify_completed_joins(context: &mut KernelContext, process_id: ProcessId) {
         if let Some(token) = context.waits.token_for_key(caller) {
             let _ = context.waits.notify_dependency(token);
         }
+    }
+}
+
+struct ProcessFilesystemQueue<'a> {
+    executor: &'a mut Pin<&'static mut FsExecutor<'static, FILESYSTEM_STACK_SIZE>>,
+    bridges: &'a mut [Option<FilesystemBridge>; FS_JOB_CAPACITY],
+    root_directory: ginkgo_filesystem::DirectoryHandle,
+    thread: ThreadRef,
+    process_creation_pending: &'a mut bool,
+}
+
+impl syscall::FilesystemJobQueue for ProcessFilesystemQueue<'_> {
+    fn root_directory(&self) -> ginkgo_filesystem::DirectoryHandle {
+        self.root_directory
+    }
+
+    fn enqueue_for_thread(
+        &mut self,
+        job: FsJob,
+        continuation: syscall::DirectFilesystemContinuation,
+    ) -> Result<FsJobId, FsExecutorError> {
+        let reserves_process_slot = matches!(
+            &continuation,
+            syscall::DirectFilesystemContinuation::ProcessCreate(_)
+        );
+        if reserves_process_slot && *self.process_creation_pending {
+            return Err(FsExecutorError::ReservedCapacity);
+        }
+        let id = self
+            .executor
+            .as_mut()
+            .enqueue(job)
+            .map_err(|failure| failure.error)?;
+        let Some(slot) = self.bridges.get_mut(id.index()) else {
+            let _ = self.executor.as_mut().cancel(id);
+            return Err(FsExecutorError::Internal);
+        };
+        if slot.is_some() {
+            let _ = self.executor.as_mut().cancel(id);
+            return Err(FsExecutorError::Internal);
+        }
+        if reserves_process_slot {
+            *self.process_creation_pending = true;
+        }
+        *slot = Some(FilesystemBridge {
+            id,
+            owner: FilesystemBridgeOwner::Thread {
+                thread: self.thread,
+                continuation,
+            },
+        });
+        Ok(id)
+    }
+}
+
+fn enqueue_filesystem_job(
+    context: &mut KernelContext,
+    job: FsJob,
+    owner: FilesystemBridgeOwner,
+) -> Result<FsJobId, FsExecutorError> {
+    let id = context
+        .filesystem_executor
+        .as_mut()
+        .enqueue(job)
+        .map_err(|failure| failure.error)?;
+    let Some(slot) = context.filesystem_bridges.get_mut(id.index()) else {
+        let _ = context.filesystem_executor.as_mut().cancel(id);
+        return Err(FsExecutorError::Internal);
+    };
+    if slot.is_some() {
+        let _ = context.filesystem_executor.as_mut().cancel(id);
+        return Err(FsExecutorError::Internal);
+    }
+    *slot = Some(FilesystemBridge { id, owner });
+    Ok(id)
+}
+
+fn bridge_for_request(
+    context: &KernelContext,
+    request: ginkgo_kernel::request::RequestId,
+) -> Option<FsJobId> {
+    context
+        .filesystem_bridges
+        .iter()
+        .flatten()
+        .find(|bridge| {
+            matches!(
+                &bridge.owner,
+                FilesystemBridgeOwner::Request(owner) if owner.request == request
+            )
+        })
+        .map(|bridge| bridge.id)
+}
+
+fn filesystem_executor_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll {
+    if !unsafe { (&*ptr::addr_of!(FILESYSTEM_STACK)).guard_intact() } {
+        halt_forever();
+    }
+    let completed = match context.filesystem_executor.as_mut().poll_step() {
+        PollStep::Idle | PollStep::Yielded(_) => return TaskPoll::Pending,
+        PollStep::Completed(id) | PollStep::Faulted(id, _) => id,
+    };
+    let completion = match context
+        .filesystem_executor
+        .as_mut()
+        .take_completion(completed)
+    {
+        Ok(completion) => completion,
+        Err(_) => halt_forever(),
+    };
+    let bridge = context
+        .filesystem_bridges
+        .get_mut(completed.index())
+        .and_then(Option::take)
+        .filter(|bridge| bridge.id == completed)
+        .unwrap_or_else(|| halt_forever());
+    match bridge.owner {
+        FilesystemBridgeOwner::Request(request) => {
+            complete_filesystem_request_job(context, request, completion.result);
+        }
+        FilesystemBridgeOwner::Kernel(owner) => {
+            complete_kernel_filesystem_job(context, owner, completion.result);
+        }
+        FilesystemBridgeOwner::ProgramLaunch(pending) => {
+            complete_program_launch(context, pending, completion.result);
+        }
+        FilesystemBridgeOwner::Thread {
+            thread,
+            continuation,
+        } => complete_direct_filesystem_job(
+            context,
+            completed,
+            thread,
+            continuation,
+            completion.result,
+        ),
+    }
+    TaskPoll::Pending
+}
+
+fn complete_direct_filesystem_job(
+    context: &mut KernelContext,
+    id: FsJobId,
+    thread: ThreadRef,
+    continuation: syscall::DirectFilesystemContinuation,
+    result: Result<FsResult, FsExecutorError>,
+) {
+    let reserved_process_slot = matches!(
+        &continuation,
+        syscall::DirectFilesystemContinuation::ProcessCreate(_)
+    );
+    if reserved_process_slot {
+        context.process_creation_pending = false;
+    }
+    let mut created_child = None;
+    let staged = if let Some(process) = context.processes.get_mut(thread.process_id) {
+        if process.blocked_filesystem_id(thread.thread_id) != Some(id) {
+            false
+        } else {
+            unsafe { process.address_space().activate() };
+            let outcome = syscall::complete_direct_filesystem(
+                process,
+                continuation,
+                result,
+                &context.page_table,
+                &mut context.frames,
+                &mut context.entropy,
+            );
+            created_child = outcome.child;
+            let staged = process.stage_filesystem_completion(thread.thread_id, id, outcome.status);
+            unsafe { context.page_table.activate() };
+            staged
+        }
+    } else {
+        false
+    };
+    if let Some(child) = created_child {
+        let child_id = context
+            .processes
+            .insert(*child)
+            .unwrap_or_else(|_| halt_forever());
+        synchronize_process_scheduler(context, child_id);
+    }
+    if !staged {
+        return;
+    }
+    if context
+        .processes
+        .get(thread.process_id)
+        .and_then(|process| process.blocked_wait_spec(thread.thread_id))
+        .and_then(|(_, _, token)| token)
+        .is_none()
+    {
+        let _ = arm_blocked_thread(context, thread);
+    }
+    if let Some(token) = context.waits.token_for_key(thread) {
+        let _ = context.waits.notify_dependency(token);
     }
 }
 
@@ -2905,6 +3701,24 @@ fn service_request_cancellation(
         return;
     }
 
+    if let Some(job) = bridge_for_request(context, id) {
+        let _ = context.filesystem_executor.as_mut().cancel(job);
+        if let Ok(completion) = context.filesystem_executor.as_mut().take_completion(job) {
+            let bridge = context
+                .filesystem_bridges
+                .get_mut(job.index())
+                .and_then(Option::take)
+                .filter(|bridge| bridge.id == job);
+            if let Some(FilesystemBridge {
+                owner: FilesystemBridgeOwner::Request(owner),
+                ..
+            }) = bridge
+            {
+                complete_filesystem_request_job(context, owner, completion.result);
+            }
+        }
+        return;
+    }
     let _ = context
         .requests
         .acknowledge_cancel(id, context.timer.clock().now_ns(), true);
@@ -2913,6 +3727,23 @@ fn service_request_cancellation(
 enum RequestServiceResult {
     Complete(ginkgo_sysapi::Status, u64),
     Requeued,
+}
+
+fn filesystem_enqueue_failure(
+    context: &mut KernelContext,
+    id: ginkgo_kernel::request::RequestId,
+    error: FsExecutorError,
+    progress: u64,
+) -> RequestServiceResult {
+    if matches!(
+        error,
+        FsExecutorError::QueueFull | FsExecutorError::ReservedCapacity
+    ) && context.requests.requeue_active(id).is_ok()
+    {
+        RequestServiceResult::Requeued
+    } else {
+        RequestServiceResult::Complete(map_fs_executor_error(error), progress)
+    }
 }
 
 fn service_filesystem_open_request(
@@ -2935,82 +3766,60 @@ fn service_filesystem_open_request(
     else {
         return RequestServiceResult::Complete(Status::InvalidArgument, 0);
     };
-    let directory = match directory {
-        Some(directory) => directory,
-        None => match context.fs.root_directory() {
-            Ok(directory) => directory,
-            Err(error) => return RequestServiceResult::Complete(map_request_fs_error(error), 0),
-        },
-    };
-    let file = {
+    let path = {
         let Some(buffers) = context.requests.buffers(dispatch.id) else {
             return RequestServiceResult::Complete(Status::InvalidHandle, 0);
         };
-        let Some(PreparedRequestBuffer::Copied { bytes: path, .. }) = buffers.first() else {
+        let Some(PreparedRequestBuffer::Copied { bytes, .. }) = buffers.first() else {
             return RequestServiceResult::Complete(Status::InvalidArgument, 0);
         };
-        let Ok(path) = core::str::from_utf8(path) else {
+        let Ok(path) = core::str::from_utf8(bytes) else {
             return RequestServiceResult::Complete(Status::InvalidArgument, 0);
         };
-        let file = match context.fs.open_file_at(directory, path) {
-            Ok(file) => file,
-            Err(FsError::NotFound) if flags.contains(FilesystemOpenFlags::CREATE) => {
-                match context.fs.create_file_at(directory, path) {
-                    Ok(file) => file,
-                    Err(error) => {
-                        return RequestServiceResult::Complete(map_request_fs_error(error), 0)
-                    }
-                }
-            }
-            Err(error) => return RequestServiceResult::Complete(map_request_fs_error(error), 0),
-        };
-        if flags.contains(FilesystemOpenFlags::TRUNCATE) {
-            if let Err(error) = context.fs.truncate(file, 0) {
-                return RequestServiceResult::Complete(map_request_fs_error(error), 0);
-            }
-        }
-        file
+        String::from(path)
     };
+    let directory = directory.map_or(FsDirectory::Root, FsDirectory::Handle);
+    let owner = FilesystemBridgeOwner::Request(RequestFilesystemBridge {
+        request: dispatch.id,
+        job: RequestFilesystemJob::Open {
+            flags: flags.bits(),
+        },
+    });
+    match enqueue_filesystem_job(
+        context,
+        FsJob::OpenFileOptions {
+            directory,
+            path,
+            create: flags.contains(FilesystemOpenFlags::CREATE),
+            truncate: flags.contains(FilesystemOpenFlags::TRUNCATE),
+        },
+        owner,
+    ) {
+        Ok(_) => RequestServiceResult::Requeued,
+        Err(error) => filesystem_enqueue_failure(context, dispatch.id, error, 0),
+    }
+}
 
-    let mut rights = ginkgo_ipc::Rights::empty();
-    if flags.contains(FilesystemOpenFlags::READ) {
-        rights |= ginkgo_ipc::Rights::READ;
-    }
-    if flags.contains(FilesystemOpenFlags::WRITE) {
-        rights |= ginkgo_ipc::Rights::WRITE;
-    }
-    if flags.contains(FilesystemOpenFlags::EXECUTE) {
-        rights |= ginkgo_ipc::Rights::EXECUTE
-            | ginkgo_ipc::Rights::DUPLICATE
-            | ginkgo_ipc::Rights::TRANSFER;
-    }
-    let Some(owner) = context.requests.owner(dispatch.id) else {
-        return RequestServiceResult::Complete(Status::InvalidHandle, 0);
-    };
-    let Some(process) = context
-        .processes
-        .get_mut(ProcessId::from_raw(owner.process_id))
-    else {
-        return RequestServiceResult::Complete(Status::InvalidHandle, 0);
-    };
-    let handle = match process.handles_mut().filesystem_file_create(file, rights) {
-        Ok(handle) => handle,
-        Err(error) => return RequestServiceResult::Complete(error.status(), 0),
-    };
-    let mut output = [0_u8; 8];
-    output[..4].copy_from_slice(&handle.raw().to_le_bytes());
-    let hhdm_offset = context.hhdm_offset;
-    let write_result = match context.requests.buffers_mut(dispatch.id) {
-        Some([_, PreparedRequestBuffer::Pinned { pages, .. }]) => {
-            copy_to_pinned_pages(hhdm_offset, pages, 0, &output)
+fn map_fs_executor_error(error: FsExecutorError) -> ginkgo_sysapi::Status {
+    match error {
+        FsExecutorError::Filesystem(error) => map_request_fs_error(error),
+        FsExecutorError::QueueFull | FsExecutorError::ReservedCapacity => {
+            ginkgo_sysapi::Status::ShouldWait
         }
-        _ => Err(Status::InvalidArgument),
-    };
-    if let Err(status) = write_result {
-        let _ = process.handles_mut().handle_close(handle);
-        return RequestServiceResult::Complete(status, 0);
+        FsExecutorError::PayloadTooLarge | FsExecutorError::ResultTooLarge => {
+            ginkgo_sysapi::Status::OutOfRange
+        }
+        FsExecutorError::AllocationFailed => ginkgo_sysapi::Status::OutOfMemory,
+        FsExecutorError::Canceled => ginkgo_sysapi::Status::Canceled,
+        FsExecutorError::Storage(_)
+        | FsExecutorError::Writeback(_)
+        | FsExecutorError::ExecutorStarted
+        | FsExecutorError::UnknownJob
+        | FsExecutorError::NotComplete
+        | FsExecutorError::Fiber(_)
+        | FsExecutorError::FiberFault(_)
+        | FsExecutorError::Internal => ginkgo_sysapi::Status::Io,
     }
-    RequestServiceResult::Complete(Status::Ok, 0)
 }
 
 fn map_request_fs_error(error: FsError) -> ginkgo_sysapi::Status {
@@ -3039,30 +3848,24 @@ fn service_filesystem_request(
     use ginkgo_sysapi::{RequestOperation, Status};
 
     if dispatch.operation == RequestOperation::FilesystemSync {
-        let ticket = match context.requests.durability_ticket(dispatch.id) {
-            Some(Some(ticket)) => ticket,
-            Some(None) => match context.fs.sync_ticket() {
-                Ok(ticket) => {
-                    if context
-                        .requests
-                        .set_durability_ticket(dispatch.id, ticket)
-                        .is_err()
-                    {
-                        return RequestServiceResult::Complete(Status::Io, 0);
-                    }
-                    ticket
-                }
-                Err(_) => return RequestServiceResult::Complete(Status::Io, 0),
+        let job = match context.requests.durability_ticket(dispatch.id) {
+            Some(Some(ticket)) => FsJob::WaitDurable {
+                ticket,
+                max_writeback_steps: 1,
             },
+            Some(None) => FsJob::Checkpoint,
             None => return RequestServiceResult::Complete(Status::InvalidHandle, 0),
         };
-        if context.fs.is_ticket_durable(ticket) {
-            return RequestServiceResult::Complete(Status::Ok, 0);
-        }
-        return if context.requests.requeue_active(dispatch.id).is_ok() {
-            RequestServiceResult::Requeued
-        } else {
-            RequestServiceResult::Complete(Status::Io, 0)
+        return match enqueue_filesystem_job(
+            context,
+            job,
+            FilesystemBridgeOwner::Request(RequestFilesystemBridge {
+                request: dispatch.id,
+                job: RequestFilesystemJob::Sync,
+            }),
+        ) {
+            Ok(_) => RequestServiceResult::Requeued,
+            Err(error) => filesystem_enqueue_failure(context, dispatch.id, error, 0),
         };
     }
 
@@ -3080,61 +3883,292 @@ fn service_filesystem_request(
     }
     let amount = usize::try_from((total - progress).min(redoxfs::BLOCK_SIZE))
         .unwrap_or(redoxfs::BLOCK_SIZE as usize);
-    let mut chunk = [0_u8; redoxfs::BLOCK_SIZE as usize];
-    let buffer_result = match dispatch.operation {
-        RequestOperation::FilesystemRead => match context.fs.read(
-            file,
-            dispatch
-                .service_payload
-                .operation_argument
-                .saturating_add(progress),
-            &mut chunk[..amount],
-        ) {
-            Ok(count) => {
-                write_request_buffer(context, dispatch.id, progress as usize, &chunk[..count])
-                    .map(|()| count)
-            }
-            Err(_) => Err(Status::Io),
-        },
+    let (job, bridge_job) = match dispatch.operation {
+        RequestOperation::FilesystemRead => (
+            FsJob::ReadChunk {
+                file,
+                offset: dispatch
+                    .service_payload
+                    .operation_argument
+                    .saturating_add(progress),
+                length: amount,
+            },
+            RequestFilesystemJob::Read { requested: amount },
+        ),
         RequestOperation::FilesystemWrite => {
-            match read_request_buffer(
-                context,
-                dispatch.id,
-                progress as usize,
-                &mut chunk[..amount],
-            ) {
-                Ok(()) => context
-                    .fs
-                    .write(
-                        file,
-                        dispatch
-                            .service_payload
-                            .operation_argument
-                            .saturating_add(progress),
-                        &chunk[..amount],
-                    )
-                    .map_err(|_| Status::Io),
-                Err(status) => Err(status),
+            let mut data = Vec::new();
+            if data.try_reserve_exact(amount).is_err() {
+                return RequestServiceResult::Complete(Status::OutOfMemory, progress);
             }
+            data.resize(amount, 0);
+            if let Err(status) =
+                read_request_buffer(context, dispatch.id, progress as usize, &mut data)
+            {
+                return RequestServiceResult::Complete(status, progress);
+            }
+            (
+                FsJob::WriteChunk {
+                    file,
+                    offset: dispatch
+                        .service_payload
+                        .operation_argument
+                        .saturating_add(progress),
+                    data,
+                },
+                RequestFilesystemJob::Write { requested: amount },
+            )
         }
         _ => unreachable!(),
     };
-    let count = match buffer_result {
-        Ok(count) => count,
-        Err(status) => return RequestServiceResult::Complete(status, progress),
-    };
-    let Ok(next) = context
+    match enqueue_filesystem_job(
+        context,
+        job,
+        FilesystemBridgeOwner::Request(RequestFilesystemBridge {
+            request: dispatch.id,
+            job: bridge_job,
+        }),
+    ) {
+        Ok(_) => RequestServiceResult::Requeued,
+        Err(error) => filesystem_enqueue_failure(context, dispatch.id, error, progress),
+    }
+}
+
+fn complete_broker_filesystem_request(
+    context: &mut KernelContext,
+    id: ginkgo_kernel::request::RequestId,
+    status: ginkgo_sysapi::Status,
+    bytes_transferred: u64,
+) {
+    let _ = context.requests.record_completion(BrokerCompletion {
+        id,
+        status,
+        device_released: true,
+        bytes_transferred,
+        result_flags: ginkgo_sysapi::RequestResultFlags::empty(),
+    });
+    context
         .requests
-        .advance_service_offset(dispatch.id, count as u64)
-    else {
-        return RequestServiceResult::Complete(Status::Io, progress);
+        .run_worker(context.timer.clock().now_ns(), RequestWorkerBudget::DEFAULT);
+}
+
+fn complete_filesystem_request_job(
+    context: &mut KernelContext,
+    bridge: RequestFilesystemBridge,
+    result: Result<FsResult, FsExecutorError>,
+) {
+    use ginkgo_sysapi::{FilesystemOpenFlags, Status};
+
+    let id = bridge.request;
+    if context.requests.info(id).is_none() {
+        return;
+    }
+    if matches!(&result, Err(FsExecutorError::Canceled)) {
+        let _ = context
+            .requests
+            .acknowledge_cancel(id, context.timer.clock().now_ns(), true);
+        context
+            .requests
+            .run_worker(context.timer.clock().now_ns(), RequestWorkerBudget::DEFAULT);
+        return;
+    }
+    let progress = context.requests.service_offset(id).unwrap_or(0);
+    match bridge.job {
+        RequestFilesystemJob::RollbackOpen { status } => {
+            complete_broker_filesystem_request(context, id, status, 0);
+        }
+        RequestFilesystemJob::Open { flags } => {
+            let flags = FilesystemOpenFlags::from_bits_retain(flags);
+            let FsResult::OpenedFile {
+                file,
+                created,
+                directory,
+                path,
+            } = (match result {
+                Ok(result) => result,
+                Err(error) => {
+                    complete_broker_filesystem_request(
+                        context,
+                        id,
+                        map_fs_executor_error(error),
+                        0,
+                    );
+                    return;
+                }
+            })
+            else {
+                complete_broker_filesystem_request(context, id, Status::Io, 0);
+                return;
+            };
+            let Some(owner) = context.requests.owner(id) else {
+                return;
+            };
+            let Some(process) = context
+                .processes
+                .get_mut(ProcessId::from_raw(owner.process_id))
+            else {
+                if created {
+                    let _ = enqueue_filesystem_job(
+                        context,
+                        FsJob::Unlink { directory, path },
+                        FilesystemBridgeOwner::Request(RequestFilesystemBridge {
+                            request: id,
+                            job: RequestFilesystemJob::RollbackOpen {
+                                status: Status::Canceled,
+                            },
+                        }),
+                    );
+                }
+                return;
+            };
+            let mut rights = ginkgo_ipc::Rights::empty();
+            if flags.contains(FilesystemOpenFlags::READ) {
+                rights |= ginkgo_ipc::Rights::READ;
+            }
+            if flags.contains(FilesystemOpenFlags::WRITE) {
+                rights |= ginkgo_ipc::Rights::WRITE;
+            }
+            if flags.contains(FilesystemOpenFlags::EXECUTE) {
+                rights |= ginkgo_ipc::Rights::EXECUTE
+                    | ginkgo_ipc::Rights::DUPLICATE
+                    | ginkgo_ipc::Rights::TRANSFER;
+            }
+            let handle = match process.handles_mut().filesystem_file_create(file, rights) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    let status = error.status();
+                    if created {
+                        let _ = enqueue_filesystem_job(
+                            context,
+                            FsJob::Unlink { directory, path },
+                            FilesystemBridgeOwner::Request(RequestFilesystemBridge {
+                                request: id,
+                                job: RequestFilesystemJob::RollbackOpen { status },
+                            }),
+                        );
+                    } else {
+                        complete_broker_filesystem_request(context, id, status, 0);
+                    }
+                    return;
+                }
+            };
+            let mut output = [0_u8; 8];
+            output[..4].copy_from_slice(&handle.raw().to_le_bytes());
+            let write_result = match context.requests.buffers_mut(id) {
+                Some([_, PreparedRequestBuffer::Pinned { pages, .. }]) => {
+                    copy_to_pinned_pages(context.hhdm_offset, pages, 0, &output)
+                }
+                _ => Err(Status::InvalidArgument),
+            };
+            if let Err(status) = write_result {
+                let _ = process.handles_mut().handle_close(handle);
+                if created {
+                    let _ = enqueue_filesystem_job(
+                        context,
+                        FsJob::Unlink { directory, path },
+                        FilesystemBridgeOwner::Request(RequestFilesystemBridge {
+                            request: id,
+                            job: RequestFilesystemJob::RollbackOpen { status },
+                        }),
+                    );
+                } else {
+                    complete_broker_filesystem_request(context, id, status, 0);
+                }
+                return;
+            }
+            complete_broker_filesystem_request(context, id, Status::Ok, 0);
+        }
+        RequestFilesystemJob::Read { requested } => {
+            let bytes = match result {
+                Ok(FsResult::Bytes(bytes)) => bytes,
+                Ok(_) => {
+                    complete_broker_filesystem_request(context, id, Status::Io, progress);
+                    return;
+                }
+                Err(error) => {
+                    complete_broker_filesystem_request(
+                        context,
+                        id,
+                        map_fs_executor_error(error),
+                        progress,
+                    );
+                    return;
+                }
+            };
+            let count = bytes.len();
+            if let Err(status) = write_request_buffer(context, id, progress as usize, &bytes) {
+                complete_broker_filesystem_request(context, id, status, progress);
+                return;
+            }
+            finish_filesystem_chunk(context, id, progress, count, requested);
+        }
+        RequestFilesystemJob::Write { requested } => {
+            let count = match result {
+                Ok(FsResult::Count(count)) => count,
+                Ok(_) => {
+                    complete_broker_filesystem_request(context, id, Status::Io, progress);
+                    return;
+                }
+                Err(error) => {
+                    complete_broker_filesystem_request(
+                        context,
+                        id,
+                        map_fs_executor_error(error),
+                        progress,
+                    );
+                    return;
+                }
+            };
+            finish_filesystem_chunk(context, id, progress, count, requested);
+        }
+        RequestFilesystemJob::Sync => {
+            let durability = match result {
+                Ok(FsResult::Durability(durability)) => durability,
+                Ok(_) => {
+                    complete_broker_filesystem_request(context, id, Status::Io, 0);
+                    return;
+                }
+                Err(error) => {
+                    complete_broker_filesystem_request(
+                        context,
+                        id,
+                        map_fs_executor_error(error),
+                        0,
+                    );
+                    return;
+                }
+            };
+            if context
+                .requests
+                .set_durability_ticket(id, durability.ticket)
+                .is_err()
+            {
+                complete_broker_filesystem_request(context, id, Status::Io, 0);
+            } else if durability.complete {
+                complete_broker_filesystem_request(context, id, Status::Ok, 0);
+            } else if context.requests.requeue_active(id).is_err() {
+                complete_broker_filesystem_request(context, id, Status::Io, 0);
+            }
+        }
+    }
+}
+
+fn finish_filesystem_chunk(
+    context: &mut KernelContext,
+    id: ginkgo_kernel::request::RequestId,
+    progress: u64,
+    count: usize,
+    requested: usize,
+) {
+    use ginkgo_sysapi::Status;
+    let Ok(next) = context.requests.advance_service_offset(id, count as u64) else {
+        complete_broker_filesystem_request(context, id, Status::Io, progress);
+        return;
     };
-    if next >= total || count == 0 || count < amount {
-        RequestServiceResult::Complete(Status::Ok, next)
-    } else if context.requests.requeue_active(dispatch.id).is_ok() {
-        RequestServiceResult::Requeued
-    } else {
-        RequestServiceResult::Complete(Status::Io, next)
+    let total = context.requests.total_requested_bytes(id).unwrap_or(next);
+    if next >= total || count == 0 || count < requested {
+        complete_broker_filesystem_request(context, id, Status::Ok, next);
+    } else if context.requests.requeue_active(id).is_err() {
+        complete_broker_filesystem_request(context, id, Status::Io, next);
     }
 }
 
@@ -3495,7 +4529,8 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
         thread_id,
     } = selected;
 
-    let child_slot_reserved = context.processes.prepare_insert().is_ok();
+    let child_slot_reserved =
+        context.processes.prepare_insert().is_ok() && !context.process_creation_pending;
     let mut created_child = None;
     let mut dispatch_elapsed_ns = 0;
     #[cfg(ginkgo_memory_policy_smoke)]
@@ -3562,6 +4597,16 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                             };
                             let syscall_number = user_context.rax;
                             let mut sink = SerialDebugSink::new(&mut context.serial);
+                            let mut filesystem_queue = ProcessFilesystemQueue {
+                                executor: &mut context.filesystem_executor,
+                                bridges: &mut context.filesystem_bridges,
+                                root_directory: context.filesystem_root,
+                                thread: ThreadRef {
+                                    process_id,
+                                    thread_id,
+                                },
+                                process_creation_pending: &mut context.process_creation_pending,
+                            };
                             let outcome = syscall::dispatch(
                                 process_id,
                                 process,
@@ -3572,7 +4617,7 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                                 &mut context.frames,
                                 kernel_heap_stats,
                                 &context.shared_frame_arena,
-                                &mut context.fs,
+                                &mut filesystem_queue,
                                 &mut context.audio,
                                 &mut context.entropy,
                                 &mut context.requests,
@@ -4162,6 +5207,8 @@ fn power_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
                     && context.requests.is_system_drained()
                     && context.power_control.begin_synchronizing()
                 {
+                    state.set(3, 0);
+                    context.power_completion = None;
                     context.ui.render_power_progress(
                         &mut context.screen,
                         "Synchronizing filesystem and storage...",
@@ -4170,119 +5217,60 @@ fn power_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
             }
         }
         ginkgo_sysapi::SystemPowerState::Synchronizing => {
-            const DRAIN_STEPS_PER_TURN: usize = 8;
-            let force = info
-                .power_flags()
-                .contains(ginkgo_sysapi::SystemPowerFlags::FORCE);
-            if state.get(3) != Some(1) {
-                let before = context.fs.disk().status();
-                {
-                    let mut sink = SerialDebugSink::new(&mut context.serial);
-                    let _ = writeln!(
-                        sink,
-                        "power: checkpoint start write={} requested={} durable={} dirty={}\r",
-                        before.write_sequence,
-                        before.requested_sequence,
-                        before.durable_sequence,
-                        before.dirty_count
-                    );
-                }
-                let filesystem_ticket = context.fs.sync_ticket();
-                let after_sync = context.fs.disk().status();
-                {
-                    let mut sink = SerialDebugSink::new(&mut context.serial);
-                    let _ = writeln!(
-                        sink,
-                        "power: checkpoint result={filesystem_ticket:?} write={} requested={} durable={} dirty={} failure={:?}\r",
-                        after_sync.write_sequence,
-                        after_sync.requested_sequence,
-                        after_sync.durable_sequence,
-                        after_sync.dirty_count,
-                        after_sync.failure
-                    );
-                }
-                let ticket = filesystem_ticket.and_then(|filesystem_ticket| {
-                    context
-                        .fs
-                        .disk_mut()
-                        .quiesce()
-                        .map(|cache_ticket| filesystem_ticket.max(cache_ticket))
-                        .map_err(|_| FsError::Io)
-                });
-                let after_quiesce = context.fs.disk().status();
-                {
-                    let mut sink = SerialDebugSink::new(&mut context.serial);
-                    let _ = writeln!(
-                        sink,
-                        "power: quiesce result={ticket:?} write={} requested={} durable={} dirty={} failure={:?}\r",
-                        after_quiesce.write_sequence,
-                        after_quiesce.requested_sequence,
-                        after_quiesce.durable_sequence,
-                        after_quiesce.dirty_count,
-                        after_quiesce.failure
-                    );
-                }
-                let ticket = match ticket {
-                    Ok(ticket) => ticket,
-                    Err(_) if force => context.fs.requested_flush_sequence(),
-                    Err(_) => {
-                        context.power_control.fail(ginkgo_sysapi::Status::Io);
-                        let mut sink = SerialDebugSink::new(&mut context.serial);
-                        let _ = writeln!(sink, "power: synchronization checkpoint failed\r");
-                        drop(sink);
-                        redraw_desktop(context);
-                        return TaskPoll::Pending;
-                    }
+            const SHUTDOWN_DRAIN_STEPS: usize = 4096;
+            let phase = state.get(3).unwrap_or(0);
+            if context.power_job.is_none() && context.power_completion.is_none() {
+                let job = match phase {
+                    0 => FsJob::CheckpointAndWait {
+                        max_writeback_steps: SHUTDOWN_DRAIN_STEPS,
+                    },
+                    1 => FsJob::Quiesce,
+                    2 => FsJob::ShutdownDrain {
+                        max_writeback_steps: SHUTDOWN_DRAIN_STEPS,
+                        shutdown_storage: true,
+                    },
+                    _ => return TaskPoll::Pending,
                 };
-                state.set(2, usize::try_from(ticket).unwrap_or(usize::MAX));
-                state.set(3, 1);
+                if let Ok(id) = enqueue_filesystem_job(
+                    context,
+                    job,
+                    FilesystemBridgeOwner::Kernel(KernelFilesystemOwner::Power),
+                ) {
+                    context.power_job = Some(id);
+                }
+                return TaskPoll::Pending;
             }
-
-            let ticket = state.get(2).unwrap_or(0) as u64;
-            let report = context
-                .fs
-                .disk_mut()
-                .drain_ticket(ticket, DRAIN_STEPS_PER_TURN);
-            {
-                let status = context.fs.disk().status();
+            let Some(completion) = context.power_completion.take() else {
+                return TaskPoll::Pending;
+            };
+            let complete = match (phase, completion) {
+                (0, Ok(FsResult::Durability(durability))) => durability.complete,
+                (1, Ok(FsResult::Durability(_))) => true,
+                (2, Ok(FsResult::Drain(report))) => report.complete,
+                _ => false,
+            };
+            if !complete {
+                context.power_control.fail(ginkgo_sysapi::Status::Io);
+                context.ui.render_power_progress(
+                    &mut context.screen,
+                    "Storage shutdown failed; the system remains stopped",
+                );
                 let mut sink = SerialDebugSink::new(&mut context.serial);
                 let _ = writeln!(
                     sink,
-                    "power: drain ticket={ticket} report={report:?} write={} requested={} durable={} dirty={} failure={:?}\r",
-                    status.write_sequence,
-                    status.requested_sequence,
-                    status.durable_sequence,
-                    status.dirty_count,
-                    status.failure
+                    "power: durability sequence failed phase={phase}; system remains quiesced\r"
                 );
+                return TaskPoll::Pending;
             }
-            let durable = match report {
-                Ok(report) if report.complete => true,
-                Ok(_) => return TaskPoll::Pending,
-                Err(_) if force => false,
-                Err(_) => {
-                    context.power_control.fail(ginkgo_sysapi::Status::Io);
-                    let status = context.fs.disk().status();
-                    let mut sink = SerialDebugSink::new(&mut context.serial);
-                    let _ = writeln!(
-                        sink,
-                        "power: synchronization failed ticket={ticket} durable={} dirty={} failure={:?}\r",
-                        status.durable_sequence,
-                        status.dirty_count,
-                        status.failure
-                    );
-                    drop(sink);
-                    redraw_desktop(context);
-                    return TaskPoll::Pending;
-                }
-            };
-            let status = context.fs.disk().status();
+            if phase < 2 {
+                state.set(3, phase + 1);
+                return TaskPoll::Pending;
+            }
+
             let mut sink = SerialDebugSink::new(&mut context.serial);
             let _ = writeln!(
                 sink,
-                "power: synchronization complete ticket={ticket} durable={} dirty={} forced={force} verified={durable}\r",
-                status.durable_sequence,
-                status.dirty_count
+                "power: quiesce, checkpoint, drain, and storage shutdown complete\r"
             );
             let _ = writeln!(sink, "power: committing action={:?}\r", info.power_action());
             drop(sink);
@@ -4310,38 +5298,54 @@ fn power_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
                     });
             if result.is_err() {
                 context.power_control.fail(ginkgo_sysapi::Status::Io);
-                context.launch_quiesced = false;
-                let _ = context.fs.disk_mut().resume_after_quiesce();
-                context.requests.resume_after_shutdown_cancel();
                 context
                     .ui
                     .render_power_progress(&mut context.screen, "Firmware power transition failed");
                 let mut sink = SerialDebugSink::new(&mut context.serial);
-                let _ = writeln!(sink, "power: ACPI transition failed\r");
+                let _ = writeln!(
+                    sink,
+                    "power: ACPI transition failed after durable shutdown\r"
+                );
                 drop(sink);
-                redraw_desktop(context);
             }
         }
         ginkgo_sysapi::SystemPowerState::Canceled => {
             context.launch_quiesced = false;
-            let _ = context.fs.disk_mut().resume_after_quiesce();
+            if context.power_job.is_some() {
+                return TaskPoll::Pending;
+            }
+            if state.get(4) != Some(1) {
+                context.power_completion = None;
+                if let Ok(id) = enqueue_filesystem_job(
+                    context,
+                    FsJob::Resume,
+                    FilesystemBridgeOwner::Kernel(KernelFilesystemOwner::Power),
+                ) {
+                    context.power_job = Some(id);
+                    state.set(4, 1);
+                }
+                return TaskPoll::Pending;
+            }
+            if context.power_completion.take().is_none() {
+                return TaskPoll::Pending;
+            }
+            state.set(4, 0);
             context.requests.resume_after_shutdown_cancel();
             if changed {
                 redraw_desktop(context);
                 let mut sink = SerialDebugSink::new(&mut context.serial);
-                let _ = writeln!(sink, "power: request canceled\r");
+                let _ = writeln!(sink, "power: request canceled after filesystem resume\r");
             }
         }
         ginkgo_sysapi::SystemPowerState::Committing => {
             if context.timer.clock().now_ns() >= info.deadline_ns {
                 context.power_control.fail(ginkgo_sysapi::Status::TimedOut);
-                context.launch_quiesced = false;
-                let _ = context.fs.disk_mut().resume_after_quiesce();
-                context.requests.resume_after_shutdown_cancel();
+                context.ui.render_power_progress(
+                    &mut context.screen,
+                    "Firmware power transition timed out; the system remains stopped",
+                );
                 let mut sink = SerialDebugSink::new(&mut context.serial);
-                let _ = writeln!(sink, "power: firmware transition timed out\r");
-                drop(sink);
-                redraw_desktop(context);
+                let _ = writeln!(sink, "power: firmware transition timed out after storage shutdown; system remains quiesced\r");
             }
         }
         ginkgo_sysapi::SystemPowerState::Failed => {}
@@ -4349,35 +5353,90 @@ fn power_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
     TaskPoll::Pending
 }
 
+fn complete_kernel_filesystem_job(
+    context: &mut KernelContext,
+    owner: KernelFilesystemOwner,
+    result: Result<FsResult, FsExecutorError>,
+) {
+    let succeeded = result.is_ok();
+    match owner {
+        KernelFilesystemOwner::Writeback => {
+            context.writeback_job = None;
+            context.writeback_retry = matches!(result, Err(FsExecutorError::Writeback(_)));
+        }
+        KernelFilesystemOwner::SystemLog => {
+            context.system_log_job = None;
+            context.system_log_written = succeeded;
+        }
+        KernelFilesystemOwner::ConsoleLog { length } => {
+            context.console_log_job = None;
+            if succeeded {
+                let consumed = length.min(context.pending_console_len);
+                context
+                    .pending_console
+                    .copy_within(consumed..context.pending_console_len, 0);
+                context.pending_console_len -= consumed;
+            }
+        }
+        KernelFilesystemOwner::InputLog { length } => {
+            context.input_log_job = None;
+            if succeeded {
+                let consumed = length.min(context.pending_input_len);
+                context
+                    .pending_input
+                    .copy_within(consumed..context.pending_input_len, 0);
+                context.pending_input_len -= consumed;
+            }
+        }
+        KernelFilesystemOwner::Accounting => {
+            context.accounting_job = None;
+            context.accounting_written = succeeded;
+        }
+        KernelFilesystemOwner::Power => {
+            context.power_job = None;
+            context.power_completion = Some(result);
+        }
+    }
+}
+
 fn writeback_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
     const WRITEBACK_INTERVAL_NS: u64 = 100_000_000;
     let now_ns = context.timer.clock().now_ns();
     let next_ns = state.get(0).unwrap_or(0) as u64;
-    if now_ns < next_ns {
+    if now_ns < next_ns || context.writeback_job.is_some() {
         return TaskPoll::Pending;
     }
-    let _ = context.fs.disk_mut().writeback_step();
-    let next = now_ns.saturating_add(WRITEBACK_INTERVAL_NS);
-    state.set(0, usize::try_from(next).unwrap_or(usize::MAX));
+    let job = if context.writeback_retry {
+        FsJob::RetryWritebackStep
+    } else {
+        FsJob::WritebackStep
+    };
+    if let Ok(id) = enqueue_filesystem_job(
+        context,
+        job,
+        FilesystemBridgeOwner::Kernel(KernelFilesystemOwner::Writeback),
+    ) {
+        context.writeback_job = Some(id);
+        let next = now_ns.saturating_add(WRITEBACK_INTERVAL_NS);
+        state.set(0, usize::try_from(next).unwrap_or(usize::MAX));
+    }
     TaskPoll::Pending
 }
 
 fn filesystem_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
     const MESSAGE: &[u8] = b"GinkgoOS: paging, RedoxFS, devices, and scheduler online\r\n";
 
-    if state.get(0) == Some(0) {
-        let file = match context
-            .fs
-            .open("/system.log")
-            .or_else(|_| context.fs.create("/system.log"))
-        {
-            Ok(file) => file,
-            Err(_) => return TaskPoll::Complete,
-        };
-        if context.fs.truncate(file, 0).is_err() || context.fs.write(file, 0, MESSAGE).is_err() {
-            return TaskPoll::Complete;
+    if !context.system_log_written && context.system_log_job.is_none() {
+        if let Ok(id) = enqueue_filesystem_job(
+            context,
+            FsJob::ReplaceFile {
+                path: String::from("/system.log"),
+                data: Vec::from(MESSAGE),
+            },
+            FilesystemBridgeOwner::Kernel(KernelFilesystemOwner::SystemLog),
+        ) {
+            context.system_log_job = Some(id);
         }
-        state.set(0, 1);
     }
 
     let offset = state.get(1).unwrap_or(0).min(MESSAGE.len());
@@ -4393,19 +5452,7 @@ fn filesystem_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPo
     }
 }
 
-fn console_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
-    if state.get(0) == Some(0) {
-        if context
-            .fs
-            .open("/console")
-            .or_else(|_| context.fs.create("/console"))
-            .is_err()
-        {
-            return TaskPoll::Complete;
-        }
-        state.set(0, 1);
-    }
-
+fn console_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll {
     let Some(serial) = context.serial.as_mut() else {
         return TaskPoll::Complete;
     };
@@ -4447,30 +5494,8 @@ fn reject_unstarted_client(
     Err(())
 }
 
-fn ensure_application_data_directory<B: Disk>(
-    filesystem: &mut RedoxFs<B>,
-    app_id: &str,
-) -> Result<(), ()> {
-    let root = filesystem.root_directory().map_err(|_| ())?;
-    let appdata = match filesystem.open_directory_at(root, "appdata") {
-        Ok(directory) => directory,
-        Err(FsError::NotFound) => filesystem
-            .create_directory_at(root, "appdata")
-            .map_err(|_| ())?,
-        Err(_) => return Err(()),
-    };
-    match filesystem.open_directory_at(appdata, app_id) {
-        Ok(_) => Ok(()),
-        Err(FsError::NotFound) => filesystem
-            .create_directory_at(appdata, app_id)
-            .map(|_| ())
-            .map_err(|_| ()),
-        Err(_) => Err(()),
-    }
-}
-
-fn install_program_workspace<B: Disk>(
-    filesystem: &mut RedoxFs<B>,
+fn install_program_workspace(
+    user_directory: ginkgo_filesystem::DirectoryHandle,
     process: &mut Process,
     program: ProgramSummary,
 ) -> Result<ginkgo_sysapi::Handle, ()> {
@@ -4487,13 +5512,9 @@ fn install_program_workspace<B: Disk>(
             .map_err(|_| ());
     }
 
-    let root = filesystem.root_directory().map_err(|_| ())?;
-    let user = filesystem
-        .open_directory_at(root, USER_DIRECTORY)
-        .map_err(|_| ())?;
     process
         .handles_mut()
-        .filesystem_directory_create(user, rights)
+        .filesystem_directory_create(user_directory, rights)
         .map_err(|_| ())
 }
 
@@ -4502,22 +5523,76 @@ fn launch_program(
     program: ProgramSummary,
     startup: Option<ginkgo_sysapi::Handle>,
 ) -> Result<(), ()> {
-    if context.launch_quiesced {
+    if context.launch_quiesced || context.process_creation_pending {
         return Err(());
     }
     context.processes.prepare_insert().map_err(|_| ())?;
-    let image = read_trusted_system_file(
-        &mut context.fs,
-        program.path(),
-        usize::try_from(
-            ginkgo_kernel::process::ProcessLimits::from_available_memory_bytes(
-                context.frames.available_bytes(),
-            )
-            .executable_source_bytes,
+    let maximum = usize::try_from(
+        ginkgo_kernel::process::ProcessLimits::from_available_memory_bytes(
+            context.frames.available_bytes(),
         )
-        .map_err(|_| ())?,
+        .executable_source_bytes,
     )
-    .ok_or(())?;
+    .map_err(|_| ())?
+    .min(ginkgo_kernel::fs_executor::WholeFileKind::Elf.maximum());
+    let result = enqueue_filesystem_job(
+        context,
+        FsJob::PrepareProgramLaunch {
+            executable_path: String::from(program.path()),
+            application_id: String::from(program.app_id()),
+            maximum,
+        },
+        FilesystemBridgeOwner::ProgramLaunch(PendingProgramLaunch { program, startup }),
+    );
+    if result.is_ok() {
+        context.process_creation_pending = true;
+    }
+    result.map(|_| ()).map_err(|_| ())
+}
+
+fn complete_program_launch(
+    context: &mut KernelContext,
+    pending: PendingProgramLaunch,
+    result: Result<FsResult, FsExecutorError>,
+) {
+    context.process_creation_pending = false;
+    let FsResult::ProgramLaunch {
+        image,
+        application_data,
+    } = (match result {
+        Ok(result) => result,
+        Err(_) => return,
+    })
+    else {
+        return;
+    };
+    let manifest = match TrustedManifest::verify(TRUST_MANIFEST, TRUST_SIGNATURE, TRUST_PUBLIC_KEY)
+    {
+        Ok(manifest) => manifest,
+        Err(_) => return,
+    };
+    if manifest
+        .verify_artifact(pending.program.path(), &image)
+        .is_err()
+    {
+        return;
+    }
+    let _ = finish_program_launch(
+        context,
+        pending.program,
+        pending.startup,
+        image,
+        application_data,
+    );
+}
+
+fn finish_program_launch(
+    context: &mut KernelContext,
+    program: ProgramSummary,
+    startup: Option<ginkgo_sysapi::Handle>,
+    image: Vec<u8>,
+    _application_data_directory: ginkgo_filesystem::DirectoryHandle,
+) -> Result<(), ()> {
     let randomness = [
         context.entropy.next_u64(),
         context.entropy.next_u64(),
@@ -4536,9 +5611,7 @@ fn launch_program(
             return Err(());
         }
     };
-    if ensure_application_data_directory(&mut context.fs, program.app_id()).is_err()
-        || process.set_application_data(application_data).is_err()
-    {
+    if process.set_application_data(application_data).is_err() {
         discard_unstarted_process(context, process);
         return Err(());
     }
@@ -4568,7 +5641,8 @@ fn launch_program(
     };
     context.next_client_id = next_client_id;
 
-    let filesystem = match install_program_workspace(&mut context.fs, &mut process, program) {
+    let filesystem = match install_program_workspace(context.user_directory, &mut process, program)
+    {
         Ok(handle) => handle,
         Err(()) => return reject_unstarted_client(context, client_id, process),
     };
@@ -6078,23 +7152,37 @@ fn log_flush_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPo
         return TaskPoll::Pending;
     }
 
-    if context.pending_console_len != 0
-        && append_log(
-            &mut context.fs,
-            "/console",
-            &context.pending_console[..context.pending_console_len],
-        )
-    {
-        context.pending_console_len = 0;
+    if context.pending_console_len != 0 && context.console_log_job.is_none() {
+        let length = context
+            .pending_console_len
+            .min(redoxfs::BLOCK_SIZE as usize);
+        let data = Vec::from(&context.pending_console[..length]);
+        if let Ok(id) = enqueue_filesystem_job(
+            context,
+            FsJob::AppendBoundedLog {
+                path: String::from("/console"),
+                data,
+                limit: 64 * 1024,
+            },
+            FilesystemBridgeOwner::Kernel(KernelFilesystemOwner::ConsoleLog { length }),
+        ) {
+            context.console_log_job = Some(id);
+        }
     }
-    if context.pending_input_len != 0
-        && append_log(
-            &mut context.fs,
-            "/input",
-            &context.pending_input[..context.pending_input_len],
-        )
-    {
-        context.pending_input_len = 0;
+    if context.pending_input_len != 0 && context.input_log_job.is_none() {
+        let length = context.pending_input_len.min(redoxfs::BLOCK_SIZE as usize);
+        let data = Vec::from(&context.pending_input[..length]);
+        if let Ok(id) = enqueue_filesystem_job(
+            context,
+            FsJob::AppendBoundedLog {
+                path: String::from("/input"),
+                data,
+                limit: 64 * 1024,
+            },
+            FilesystemBridgeOwner::Kernel(KernelFilesystemOwner::InputLog { length }),
+        ) {
+            context.input_log_job = Some(id);
+        }
     }
     context.log_flush_deadline =
         if context.pending_console_len == 0 && context.pending_input_len == 0 {
@@ -6103,28 +7191,6 @@ fn log_flush_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPo
             now.saturating_add(usb::timestamp_frequency().saturating_mul(LOG_FLUSH_DELAY_SECONDS))
         };
     TaskPoll::Pending
-}
-
-fn append_log<D: Disk>(fs: &mut RedoxFs<D>, path: &str, bytes: &[u8]) -> bool {
-    const LOG_LIMIT: u64 = 64 * 1024;
-    let file = match fs.open(path).or_else(|_| fs.create(path)) {
-        Ok(file) => file,
-        Err(_) => return false,
-    };
-    let Ok(info) = fs.stat(file) else {
-        return false;
-    };
-    let incoming = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    let reset = info.len >= LOG_LIMIT
-        || info
-            .len
-            .checked_add(incoming)
-            .is_none_or(|end| end > LOG_LIMIT);
-    if reset && fs.truncate(file, 0).is_err() {
-        return false;
-    }
-    let offset = if reset { 0 } else { info.len };
-    fs.write(file, offset, bytes).is_ok()
 }
 
 fn keyboard_ascii(usage: u16, shift: bool, caps_lock: bool) -> Option<u8> {
@@ -6273,15 +7339,17 @@ fn accounting_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPo
     let ticks = state.get(0).unwrap_or(0).wrapping_add(1);
     state.set(0, ticks);
 
-    if state.get(1) == Some(0) {
-        let file = match context.fs.create("/scheduler") {
-            Ok(file) => file,
-            Err(_) => return TaskPoll::Complete,
-        };
-        if context.fs.write(file, 0, &ticks.to_le_bytes()).is_err() {
-            return TaskPoll::Complete;
+    if !context.accounting_written && context.accounting_job.is_none() {
+        if let Ok(id) = enqueue_filesystem_job(
+            context,
+            FsJob::ReplaceFile {
+                path: String::from("/scheduler"),
+                data: Vec::from(ticks.to_le_bytes()),
+            },
+            FilesystemBridgeOwner::Kernel(KernelFilesystemOwner::Accounting),
+        ) {
+            context.accounting_job = Some(id);
         }
-        state.set(1, 1);
     }
 
     TaskPoll::Pending

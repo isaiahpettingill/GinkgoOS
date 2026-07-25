@@ -21,12 +21,20 @@ const MSI_CAPABILITY_ID: u8 = 0x05;
 const MSI_ENABLE: u16 = 1;
 const MSI_MULTIPLE_MESSAGE_ENABLE: u16 = 0b111 << 4;
 const MSI_64_BIT_CAPABLE: u16 = 1 << 7;
+const MSI_PER_VECTOR_MASKING_CAPABLE: u16 = 1 << 8;
 const MSI_ADDRESS_BASE: u32 = 0xfee0_0000;
+const MSIX_CAPABILITY_ID: u8 = 0x11;
+const MSIX_TABLE_SIZE: u16 = 0x07ff;
+const MSIX_FUNCTION_MASK: u16 = 1 << 14;
+const MSIX_ENABLE: u16 = 1 << 15;
+const MSIX_WRITABLE_CONTROL: u16 = MSIX_FUNCTION_MASK | MSIX_ENABLE;
+const MSIX_TABLE_ENTRY_SIZE: u32 = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PciError {
     Io(IoError),
     DeviceNotPresent,
+    CommandStateMismatch,
     InvalidRegister,
     InvalidBar,
     UnsupportedIoBar,
@@ -80,6 +88,20 @@ pub struct PciBar {
     pub size: u64,
     pub is_64_bit: bool,
     pub prefetchable: bool,
+}
+
+/// The locations described by a conventional PCI MSI-X capability.
+///
+/// BAR indices identify configuration-space BARs; offsets are relative to the
+/// corresponding BAR. This module does not probe or map either BAR.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PciMsixCapability {
+    pub capability_offset: u8,
+    pub table_size: u16,
+    pub table_bar: u8,
+    pub table_offset: u32,
+    pub pba_bar: u8,
+    pub pba_offset: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -338,13 +360,28 @@ impl PciConfig {
         })
     }
 
+    /// Enables or disables PCI bus mastering without changing other command bits.
+    ///
+    /// The requested state is read back from the command register so a device
+    /// that rejects the update is reported to the caller.
+    pub fn set_bus_mastering(&mut self, device: PciDevice, enabled: bool) -> Result<(), PciError> {
+        let command = self.read_u16(device.address, 0x04)?;
+        let updated = command_with_bus_mastering(command, enabled);
+        if updated != command {
+            self.write_u16(device.address, 0x04, updated)?;
+        }
+        let readback = self.read_u16(device.address, 0x04)?;
+        if bus_mastering_matches(readback, enabled) {
+            Ok(())
+        } else {
+            Err(PciError::CommandStateMismatch)
+        }
+    }
+
     pub fn enable_memory_and_bus_mastering(&mut self, device: PciDevice) -> Result<(), PciError> {
         let command = self.read_u16(device.address, 0x04)?;
-        self.write_u16(
-            device.address,
-            0x04,
-            command | COMMAND_MEMORY_SPACE | COMMAND_BUS_MASTER,
-        )
+        self.write_u16(device.address, 0x04, command | COMMAND_MEMORY_SPACE)?;
+        self.set_bus_mastering(device, true)
     }
 
     /// Finds a conventional PCI capability while bounding and validating the list.
@@ -372,6 +409,78 @@ impl PciConfig {
         })
     }
 
+    /// Finds and parses the conventional MSI-X capability for `device`.
+    ///
+    /// The capability must fit in conventional configuration space. Both BIRs
+    /// must name BARs present in the device's header layout, and the complete
+    /// table and pending-bit array must fit in 32-bit BAR-relative arithmetic.
+    /// Overlapping structures in one BAR are rejected. The BARs are not probed
+    /// or mapped by this method.
+    pub fn find_msix_capability(
+        &mut self,
+        device: PciDevice,
+    ) -> Result<Option<PciMsixCapability>, PciError> {
+        let Some(capability_offset) = self.find_capability(device, MSIX_CAPABILITY_ID)? else {
+            return Ok(None);
+        };
+        let registers = msix_registers(capability_offset)?;
+        let control = self.read_u16(device.address, registers.control)?;
+        let table = self.read_u32(device.address, registers.table)?;
+        let pba = self.read_u32(device.address, registers.pba)?;
+        parse_msix_capability(device.header_type, capability_offset, control, table, pba).map(Some)
+    }
+
+    /// Updates MSI-X enable and function-mask state without changing other bits.
+    ///
+    /// If the enable state changes, the function mask is asserted first. Thus a
+    /// failed final write leaves the function masked. Read-only table-size bits
+    /// and reserved control bits are copied from the value read from hardware.
+    /// Callers must initialize and mask individual table entries before asking
+    /// for an enabled, unmasked function.
+    pub fn set_msix_control(
+        &mut self,
+        device: PciDevice,
+        capability: PciMsixCapability,
+        enabled: bool,
+        function_masked: bool,
+    ) -> Result<(), PciError> {
+        let registers = msix_registers(capability.capability_offset)?;
+        let header = self.read_u32(device.address, capability.capability_offset)?;
+        if header as u8 != MSIX_CAPABILITY_ID {
+            return Err(PciError::MalformedCapabilityList);
+        }
+
+        let control = self.read_u16(device.address, registers.control)?;
+        let (transition, final_control) = msix_control_values(control, enabled, function_masked);
+        if let Some(masked_control) = transition {
+            self.write_u16(device.address, registers.control, masked_control)?;
+        }
+        self.write_u16(device.address, registers.control, final_control)
+    }
+
+    /// Disables conventional MSI for `device` without changing other control bits.
+    ///
+    /// If the capability supports per-vector masking, every vector is masked
+    /// before MSI is disabled. A failed final write therefore leaves interrupts
+    /// masked.
+    pub fn disable_msi(&mut self, device: PciDevice) -> Result<(), PciError> {
+        let capability = self
+            .find_capability(device, MSI_CAPABILITY_ID)?
+            .ok_or(PciError::MsiCapabilityNotPresent)?;
+        let control_register = msi_control_register(capability)?;
+        let control = self.read_u16(device.address, control_register)?;
+        let registers = msi_registers(capability, control)?;
+
+        if let Some(mask_bits) = registers.mask_bits {
+            self.write_u32(device.address, mask_bits, u32::MAX)?;
+        }
+        self.write_u16(
+            device.address,
+            control_register,
+            msi_disabled_control(control),
+        )
+    }
+
     /// Programs one fixed, edge-triggered MSI message for `device`.
     ///
     /// `destination_apic_id` is the eight-bit xAPIC ID and `vector` must be in
@@ -390,9 +499,7 @@ impl PciConfig {
         let capability = self
             .find_capability(device, MSI_CAPABILITY_ID)?
             .ok_or(PciError::MsiCapabilityNotPresent)?;
-        let control_register = capability
-            .checked_add(2)
-            .ok_or(PciError::MalformedCapabilityList)?;
+        let control_register = msi_control_register(capability)?;
         let control = self.read_u16(device.address, control_register)?;
         let registers = msi_registers(capability, control)?;
         let disabled_control = control & !(MSI_ENABLE | MSI_MULTIPLE_MESSAGE_ENABLE);
@@ -407,6 +514,14 @@ impl PciConfig {
             self.write_u32(device.address, address_high, 0)?;
         }
         self.write_u16(device.address, registers.message_data, u16::from(vector))?;
+        if let Some(mask_bits) = registers.mask_bits {
+            let current_mask = self.read_u32(device.address, mask_bits)?;
+            self.write_u32(
+                device.address,
+                mask_bits,
+                msi_mask_with_vector_zero_enabled(current_mask),
+            )?;
+        }
         self.write_u16(
             device.address,
             control_register,
@@ -453,10 +568,101 @@ where
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MsixRegisters {
+    control: u8,
+    table: u8,
+    pba: u8,
+}
+
+fn msix_registers(capability: u8) -> Result<MsixRegisters, PciError> {
+    if capability < CAPABILITY_MIN_OFFSET || capability & 3 != 0 {
+        return Err(PciError::MalformedCapabilityList);
+    }
+    let control = capability
+        .checked_add(2)
+        .filter(|offset| *offset <= 0xfe)
+        .ok_or(PciError::MalformedCapabilityList)?;
+    let table = capability
+        .checked_add(4)
+        .filter(|offset| *offset <= CAPABILITY_MAX_OFFSET)
+        .ok_or(PciError::MalformedCapabilityList)?;
+    let pba = capability
+        .checked_add(8)
+        .filter(|offset| *offset <= CAPABILITY_MAX_OFFSET)
+        .ok_or(PciError::MalformedCapabilityList)?;
+    Ok(MsixRegisters {
+        control,
+        table,
+        pba,
+    })
+}
+
+fn parse_msix_capability(
+    header_type: u8,
+    capability_offset: u8,
+    control: u16,
+    table: u32,
+    pba: u32,
+) -> Result<PciMsixCapability, PciError> {
+    msix_registers(capability_offset)?;
+
+    let table_size = (control & MSIX_TABLE_SIZE) + 1;
+    let table_bytes = u32::from(table_size) * MSIX_TABLE_ENTRY_SIZE;
+    let pba_bytes = ((u32::from(table_size) + 63) / 64) * 8;
+    let (table_bar, table_offset, table_end) = msix_region(header_type, table, table_bytes)?;
+    let (pba_bar, pba_offset, pba_end) = msix_region(header_type, pba, pba_bytes)?;
+
+    if table_bar == pba_bar && table_offset <= pba_end && pba_offset <= table_end {
+        return Err(PciError::MalformedCapabilityList);
+    }
+
+    Ok(PciMsixCapability {
+        capability_offset,
+        table_size,
+        table_bar,
+        table_offset,
+        pba_bar,
+        pba_offset,
+    })
+}
+
+fn msix_region(header_type: u8, value: u32, size: u32) -> Result<(u8, u32, u32), PciError> {
+    let bar = (value & 0b111) as u8;
+    memory_bar_register(header_type, bar)?;
+    let offset = value & !0b111;
+    let end = offset
+        .checked_add(size - 1)
+        .ok_or(PciError::MalformedCapabilityList)?;
+    Ok((bar, offset, end))
+}
+
+fn msix_control_values(control: u16, enabled: bool, function_masked: bool) -> (Option<u16>, u16) {
+    let preserved = control & !MSIX_WRITABLE_CONTROL;
+    let final_control = preserved
+        | if enabled { MSIX_ENABLE } else { 0 }
+        | if function_masked {
+            MSIX_FUNCTION_MASK
+        } else {
+            0
+        };
+    let enable_changes = control & MSIX_ENABLE != final_control & MSIX_ENABLE;
+    let transition = enable_changes.then_some(control | MSIX_FUNCTION_MASK);
+    (transition, final_control)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MsiRegisters {
     address_low: u8,
     address_high: Option<u8>,
     message_data: u8,
+    mask_bits: Option<u8>,
+}
+
+fn msi_control_register(capability: u8) -> Result<u8, PciError> {
+    capability
+        .checked_add(2)
+        .filter(|offset| *offset <= 0xfe)
+        .ok_or(PciError::MalformedCapabilityList)
 }
 
 fn msi_registers(capability: u8, control: u16) -> Result<MsiRegisters, PciError> {
@@ -476,11 +682,45 @@ fn msi_registers(capability: u8, control: u16) -> Result<MsiRegisters, PciError>
         .checked_add(if is_64_bit { 12 } else { 8 })
         .filter(|offset| *offset <= 0xfe)
         .ok_or(PciError::MalformedCapabilityList)?;
+    let mask_bits = if control & MSI_PER_VECTOR_MASKING_CAPABLE != 0 {
+        let mask_bits = capability
+            .checked_add(if is_64_bit { 16 } else { 12 })
+            .filter(|offset| *offset <= CAPABILITY_MAX_OFFSET)
+            .ok_or(PciError::MalformedCapabilityList)?;
+        capability
+            .checked_add(if is_64_bit { 20 } else { 16 })
+            .filter(|offset| *offset <= CAPABILITY_MAX_OFFSET)
+            .ok_or(PciError::MalformedCapabilityList)?;
+        Some(mask_bits)
+    } else {
+        None
+    };
     Ok(MsiRegisters {
         address_low,
         address_high,
         message_data,
+        mask_bits,
     })
+}
+
+fn command_with_bus_mastering(command: u16, enabled: bool) -> u16 {
+    if enabled {
+        command | COMMAND_BUS_MASTER
+    } else {
+        command & !COMMAND_BUS_MASTER
+    }
+}
+
+fn bus_mastering_matches(command: u16, enabled: bool) -> bool {
+    (command & COMMAND_BUS_MASTER != 0) == enabled
+}
+
+fn msi_disabled_control(control: u16) -> u16 {
+    control & !MSI_ENABLE
+}
+
+const fn msi_mask_with_vector_zero_enabled(mask: u32) -> u32 {
+    mask & !1
 }
 
 fn device_matches(
@@ -643,6 +883,22 @@ mod tests {
     }
 
     #[test]
+    fn bus_mastering_updates_only_its_command_bit() {
+        let command = 0xa5a3;
+        assert_eq!(
+            command_with_bus_mastering(command, true),
+            command | COMMAND_BUS_MASTER
+        );
+        assert_eq!(
+            command_with_bus_mastering(command | COMMAND_BUS_MASTER, false),
+            command
+        );
+        assert!(bus_mastering_matches(command | COMMAND_BUS_MASTER, true));
+        assert!(bus_mastering_matches(command, false));
+        assert!(!bus_mastering_matches(command, true));
+    }
+
+    #[test]
     fn capability_search_finds_entries_and_terminates_at_a_null_link() {
         let entries = [(0x40, 0x01, 0x4c), (0x4c, MSI_CAPABILITY_ID, 0)];
         assert_eq!(
@@ -677,6 +933,80 @@ mod tests {
     }
 
     #[test]
+    fn msix_parser_extracts_layout_and_decodes_table_size() {
+        assert_eq!(
+            parse_msix_capability(0x80, 0x40, 7, 0x0000_2002, 0x0000_3005),
+            Ok(PciMsixCapability {
+                capability_offset: 0x40,
+                table_size: 8,
+                table_bar: 2,
+                table_offset: 0x2000,
+                pba_bar: 5,
+                pba_offset: 0x3000,
+            })
+        );
+        assert_eq!(
+            parse_msix_capability(0, 0xf4, MSIX_TABLE_SIZE, 0x0000_0000, 0x0000_8000)
+                .unwrap()
+                .table_size,
+            2048
+        );
+    }
+
+    #[test]
+    fn msix_parser_rejects_incomplete_capabilities_and_invalid_birs() {
+        assert_eq!(
+            parse_msix_capability(0, 0xf8, 0, 0, 0x1000),
+            Err(PciError::MalformedCapabilityList)
+        );
+        for (header_type, table) in [(0x00, 6), (0x01, 2), (0x02, 0)] {
+            assert_eq!(
+                parse_msix_capability(header_type, 0x40, 0, table, 0x1000),
+                Err(PciError::InvalidBar)
+            );
+        }
+    }
+
+    #[test]
+    fn msix_parser_checks_region_arithmetic_and_overlap() {
+        assert!(parse_msix_capability(0, 0x40, 0, 0xffff_fff0, 0x1001).is_ok());
+        assert_eq!(
+            parse_msix_capability(0, 0x40, 0, 0xffff_fff8, 0x1001),
+            Err(PciError::MalformedCapabilityList)
+        );
+        assert_eq!(
+            parse_msix_capability(0, 0x40, 64, 0x1000, 0xffff_fff8),
+            Err(PciError::MalformedCapabilityList)
+        );
+        assert_eq!(
+            parse_msix_capability(0, 0x40, 3, 0x1000, 0x1020),
+            Err(PciError::MalformedCapabilityList)
+        );
+    }
+
+    #[test]
+    fn msix_control_masks_transitions_and_preserves_other_bits() {
+        let preserved = 0x2a55;
+        assert_eq!(
+            msix_control_values(preserved, true, false),
+            (
+                Some(preserved | MSIX_FUNCTION_MASK),
+                preserved | MSIX_ENABLE
+            )
+        );
+
+        let enabled = preserved | MSIX_ENABLE;
+        assert_eq!(
+            msix_control_values(enabled, false, false),
+            (Some(enabled | MSIX_FUNCTION_MASK), preserved)
+        );
+        assert_eq!(
+            msix_control_values(enabled, true, true),
+            (None, enabled | MSIX_FUNCTION_MASK)
+        );
+    }
+
+    #[test]
     fn msi_layout_accepts_complete_32_and_64_bit_capabilities_only() {
         assert_eq!(
             msi_registers(0x40, 0),
@@ -684,6 +1014,7 @@ mod tests {
                 address_low: 0x44,
                 address_high: None,
                 message_data: 0x48,
+                mask_bits: None,
             })
         );
         assert_eq!(
@@ -692,6 +1023,7 @@ mod tests {
                 address_low: 0x44,
                 address_high: Some(0x48),
                 message_data: 0x4c,
+                mask_bits: None,
             })
         );
         assert_eq!(
@@ -702,5 +1034,41 @@ mod tests {
             msi_registers(0xf4, MSI_64_BIT_CAPABLE),
             Err(PciError::MalformedCapabilityList)
         );
+    }
+
+    #[test]
+    fn msi_layout_locates_complete_per_vector_mask_registers() {
+        assert_eq!(
+            msi_registers(0x40, MSI_PER_VECTOR_MASKING_CAPABLE)
+                .unwrap()
+                .mask_bits,
+            Some(0x4c)
+        );
+        assert_eq!(
+            msi_registers(0x40, MSI_64_BIT_CAPABLE | MSI_PER_VECTOR_MASKING_CAPABLE)
+                .unwrap()
+                .mask_bits,
+            Some(0x50)
+        );
+        assert_eq!(
+            msi_registers(0xf0, MSI_PER_VECTOR_MASKING_CAPABLE),
+            Err(PciError::MalformedCapabilityList)
+        );
+        assert_eq!(
+            msi_registers(0xec, MSI_64_BIT_CAPABLE | MSI_PER_VECTOR_MASKING_CAPABLE),
+            Err(PciError::MalformedCapabilityList)
+        );
+    }
+
+    #[test]
+    fn disabling_msi_preserves_all_other_control_bits() {
+        let control = 0xa5f1;
+        assert_eq!(msi_disabled_control(control), control & !MSI_ENABLE);
+    }
+
+    #[test]
+    fn enabling_one_msi_message_unmasks_only_vector_zero() {
+        assert_eq!(msi_mask_with_vector_zero_enabled(u32::MAX), u32::MAX - 1);
+        assert_eq!(msi_mask_with_vector_zero_enabled(0xa5a5_5a5b), 0xa5a5_5a5a);
     }
 }

@@ -447,7 +447,6 @@ impl QueueConfig {
             && self.max_request_bytes <= MAX_REQUEST_BYTES
             && self.max_request_bytes % SECTOR_SIZE == 0
             && self.child_bytes != 0
-            && self.child_bytes <= DEFAULT_CHILD_BYTES
             && self.child_bytes % SECTOR_SIZE == 0
             && self.child_bytes <= self.max_request_bytes
             && self.priority_weights[0] != 0
@@ -461,6 +460,7 @@ impl QueueConfig {
 pub struct BlockDeviceConfig {
     pub capacity_sectors: u64,
     pub queue_depth: u16,
+    pub supports_flush: bool,
     pub dma: DmaConstraints,
 }
 
@@ -653,6 +653,8 @@ pub struct DriverCompletion {
 /// hardware and make that worker runnable. Once `submit` accepts a command, the driver must report
 /// its token exactly once, unless a successful reset/removal has stopped DMA and the queue has been
 /// notified through `reset_device`/`remove_device`. Returning `Pending` must not spin indefinitely.
+/// If `submit` returns `Err`, it must not have retained the command or started DMA; this lets
+/// [`run_device_worker`] safely finish the rejected command as an I/O error.
 pub trait AsyncBlockDevice {
     type Error;
 
@@ -669,6 +671,133 @@ pub trait AsyncBlockDevice {
 
     /// Completes only after old-epoch DMA has stopped.
     fn poll_reset(&mut self) -> Poll<Result<(), Self::Error>>;
+}
+
+/// Maximum driver operations performed by one [`run_device_worker`] call.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DeviceWorkerBudget {
+    pub completions: usize,
+    pub cancellations: usize,
+    pub submissions: usize,
+}
+
+/// Work completed by one bounded device-worker call.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DeviceWorkerReport {
+    pub completion_polls: usize,
+    pub accepted_completions: usize,
+    pub duplicate_completions: usize,
+    pub stale_completions: usize,
+    pub cancellation_polls: usize,
+    pub cancellations_requested: usize,
+    pub readiness_polls: usize,
+    pub commands_submitted: usize,
+    pub rejected_commands: usize,
+    pub timeouts: TimeoutReport,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceWorkerOperation {
+    PollCompletion,
+    RequestCancel,
+    PollReady,
+    Submit,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct DeviceWorkerError<E> {
+    pub operation: DeviceWorkerOperation,
+    pub error: E,
+    pub token: Option<DispatchToken>,
+    pub report: DeviceWorkerReport,
+}
+
+/// Polls one driver without allocation or unbounded draining.
+///
+/// Each budget field limits calls to its matching driver operation. Completions run first so a
+/// completion already visible to the driver wins over a queued cancellation. Deadline expiry and
+/// queue scans remain bounded by capacities fixed in [`AsyncBlockQueue::try_new`]. DMA ownership
+/// remains with the queue until completion or a reset/removal epoch proves that hardware stopped.
+pub fn run_device_worker<D: AsyncBlockDevice + ?Sized>(
+    queue: &mut AsyncBlockQueue,
+    device: BlockDeviceId,
+    driver: &mut D,
+    now_ns: u64,
+    budget: DeviceWorkerBudget,
+) -> Result<DeviceWorkerReport, DeviceWorkerError<D::Error>> {
+    let mut report = DeviceWorkerReport::default();
+
+    for _ in 0..budget.completions {
+        report.completion_polls += 1;
+        let completion = match driver.poll_completion() {
+            Poll::Pending => break,
+            Poll::Ready(Ok(completion)) => completion,
+            Poll::Ready(Err(error)) => {
+                return Err(DeviceWorkerError {
+                    operation: DeviceWorkerOperation::PollCompletion,
+                    error,
+                    token: None,
+                    report,
+                });
+            }
+        };
+        match queue.complete(completion.token, completion.status) {
+            CompletionDisposition::Accepted => report.accepted_completions += 1,
+            CompletionDisposition::DuplicateRejected => report.duplicate_completions += 1,
+            CompletionDisposition::StaleRejected => report.stale_completions += 1,
+        }
+    }
+
+    report.timeouts = queue.expire_deadlines(now_ns);
+
+    for _ in 0..budget.cancellations {
+        report.cancellation_polls += 1;
+        let Some(token) = queue.poll_cancel(device) else {
+            break;
+        };
+        if let Err(error) = driver.request_cancel(token) {
+            return Err(DeviceWorkerError {
+                operation: DeviceWorkerOperation::RequestCancel,
+                error,
+                token: Some(token),
+                report,
+            });
+        }
+        report.cancellations_requested += 1;
+    }
+
+    for _ in 0..budget.submissions {
+        report.readiness_polls += 1;
+        match driver.poll_ready() {
+            Poll::Pending => break,
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => {
+                return Err(DeviceWorkerError {
+                    operation: DeviceWorkerOperation::PollReady,
+                    error,
+                    token: None,
+                    report,
+                });
+            }
+        }
+        let Some(command) = queue.dispatch_one(device, now_ns) else {
+            break;
+        };
+        if let Err(error) = driver.submit(&command) {
+            let disposition = queue.complete(command.token, HardwareStatus::IoError);
+            debug_assert_eq!(disposition, CompletionDisposition::Accepted);
+            report.rejected_commands += 1;
+            return Err(DeviceWorkerError {
+                operation: DeviceWorkerOperation::Submit,
+                error,
+                token: Some(command.token),
+                report,
+            });
+        }
+        report.commands_submitted += 1;
+    }
+
+    Ok(report)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -812,6 +941,7 @@ impl DeviceSlot {
     const EMPTY_CONFIG: BlockDeviceConfig = BlockDeviceConfig {
         capacity_sectors: 0,
         queue_depth: 0,
+        supports_flush: false,
         dma: DmaConstraints::dma64(),
     };
 
@@ -1644,7 +1774,11 @@ impl AsyncBlockQueue {
         self.shutdown = ShutdownState::Quiescing;
         for device in &mut self.devices {
             if device.present {
-                device.shutdown_flush = ShutdownFlushState::Pending;
+                device.shutdown_flush = if device.config.supports_flush {
+                    ShutdownFlushState::Pending
+                } else {
+                    ShutdownFlushState::Done
+                };
             }
         }
         self.update_shutdown_state();
@@ -1830,6 +1964,7 @@ mod tests {
         BlockDeviceConfig {
             capacity_sectors: 4096,
             queue_depth: depth,
+            supports_flush: true,
             dma,
         }
     }
@@ -1992,6 +2127,218 @@ mod tests {
         let completion = queue.take_completion(id).unwrap();
         assert_eq!(completion.outcome, RequestOutcome::Success);
         assert_eq!(completion.bytes_completed, 12 * 1024);
+    }
+
+    #[test]
+    fn sixteen_kib_child_spans_four_dma_segments() {
+        let config = QueueConfig {
+            max_request_bytes: 16 * 1024,
+            child_bytes: 16 * 1024,
+            ..QueueConfig::default()
+        };
+        let mut queue = AsyncBlockQueue::try_new(1, 1, config).unwrap();
+        let device = queue
+            .register_device(device_config(1, DmaConstraints::dma64()))
+            .unwrap();
+        let segments = [
+            DmaSegment {
+                physical_address: 0x10_000,
+                length: 4096,
+            },
+            DmaSegment {
+                physical_address: 0x30_000,
+                length: 4096,
+            },
+            DmaSegment {
+                physical_address: 0x50_000,
+                length: 4096,
+            },
+            DmaSegment {
+                physical_address: 0x70_000,
+                length: 4096,
+            },
+        ];
+        let id = queue
+            .submit(
+                0,
+                RequestSpec {
+                    device,
+                    operation: BlockOperation::Read,
+                    lba: 8,
+                    buffer: Some(
+                        // SAFETY: These fixed, non-overlapping ranges remain owned by this test
+                        // until the request completion is taken.
+                        unsafe { BlockBuffer::from_dma_segments(16 * 1024, &segments) }.unwrap(),
+                    ),
+                    priority: BlockPriority::Normal,
+                    deadline_ns: None,
+                },
+            )
+            .unwrap();
+
+        let command = queue.dispatch_one(device, 1).unwrap();
+        assert_eq!(command.byte_len, 16 * 1024);
+        assert_eq!(command.segments(), &segments);
+        assert!(queue.dispatch_one(device, 2).is_none());
+        assert_eq!(
+            queue.complete(command.token, HardwareStatus::Success),
+            CompletionDisposition::Accepted
+        );
+        assert_eq!(
+            queue.take_completion(id).unwrap().bytes_completed,
+            16 * 1024
+        );
+
+        let invalid = QueueConfig {
+            max_request_bytes: 16 * 1024,
+            child_bytes: 16 * 1024 + SECTOR_SIZE,
+            ..QueueConfig::default()
+        };
+        assert!(matches!(
+            AsyncBlockQueue::try_new(1, 1, invalid),
+            Err(QueueBuildError::InvalidConfiguration)
+        ));
+    }
+
+    #[test]
+    fn larger_parent_still_splits_with_sixteen_kib_children() {
+        let config = QueueConfig {
+            max_request_bytes: 48 * 1024,
+            child_bytes: 16 * 1024,
+            ..QueueConfig::default()
+        };
+        let mut queue = AsyncBlockQueue::try_new(1, 1, config).unwrap();
+        let device = queue
+            .register_device(device_config(3, DmaConstraints::dma64()))
+            .unwrap();
+        let id = queue
+            .submit(
+                0,
+                transfer(
+                    device,
+                    BlockOperation::Write,
+                    32,
+                    40 * 1024,
+                    0x10_000,
+                    BlockPriority::Normal,
+                    None,
+                ),
+            )
+            .unwrap();
+
+        let first = queue.dispatch_one(device, 1).unwrap();
+        let second = queue.dispatch_one(device, 2).unwrap();
+        let third = queue.dispatch_one(device, 3).unwrap();
+        assert_eq!(
+            [first.byte_len, second.byte_len, third.byte_len],
+            [16 * 1024, 16 * 1024, 8 * 1024]
+        );
+        assert_eq!([first.lba, second.lba, third.lba], [32, 64, 96]);
+        assert_eq!(first.segments()[0].physical_address, 0x10_000);
+        assert_eq!(second.segments()[0].physical_address, 0x14_000);
+        assert_eq!(third.segments()[0].physical_address, 0x18_000);
+        queue.complete(first.token, HardwareStatus::Success);
+        queue.complete(second.token, HardwareStatus::Success);
+        queue.complete(third.token, HardwareStatus::Success);
+        assert_eq!(
+            queue.take_completion(id).unwrap().bytes_completed,
+            40 * 1024
+        );
+    }
+
+    #[test]
+    fn child_completions_may_arrive_in_reverse_order() {
+        let config = QueueConfig {
+            max_request_bytes: 48 * 1024,
+            child_bytes: 16 * 1024,
+            ..QueueConfig::default()
+        };
+        let mut queue = AsyncBlockQueue::try_new(1, 1, config).unwrap();
+        let device = queue
+            .register_device(device_config(3, DmaConstraints::dma64()))
+            .unwrap();
+        let id = queue
+            .submit(
+                0,
+                transfer(
+                    device,
+                    BlockOperation::Read,
+                    0,
+                    48 * 1024,
+                    0x20_000,
+                    BlockPriority::Normal,
+                    None,
+                ),
+            )
+            .unwrap();
+        let first = queue.dispatch_one(device, 1).unwrap();
+        let second = queue.dispatch_one(device, 2).unwrap();
+        let third = queue.dispatch_one(device, 3).unwrap();
+
+        assert_eq!(
+            queue.complete(third.token, HardwareStatus::Success),
+            CompletionDisposition::Accepted
+        );
+        assert_eq!(queue.poll_request(id), RequestPoll::InFlight);
+        assert_eq!(
+            queue.complete(second.token, HardwareStatus::Success),
+            CompletionDisposition::Accepted
+        );
+        assert_eq!(queue.poll_request(id), RequestPoll::InFlight);
+        assert_eq!(
+            queue.complete(first.token, HardwareStatus::Success),
+            CompletionDisposition::Accepted
+        );
+        assert_eq!(
+            queue.poll_request(id),
+            RequestPoll::Complete(RequestOutcome::Success)
+        );
+        assert_eq!(
+            queue.take_completion(id).unwrap().bytes_completed,
+            48 * 1024
+        );
+    }
+
+    #[test]
+    fn one_parent_can_have_multiple_children_in_flight() {
+        let (mut queue, device) = queue(1, 2);
+        let id = queue
+            .submit(
+                0,
+                transfer(
+                    device,
+                    BlockOperation::Read,
+                    0,
+                    12 * 1024,
+                    0x40_000,
+                    BlockPriority::Normal,
+                    None,
+                ),
+            )
+            .unwrap();
+
+        let first = queue.dispatch_one(device, 1).unwrap();
+        let second = queue.dispatch_one(device, 2).unwrap();
+        assert_eq!(first.token.request_id(), id);
+        assert_eq!(second.token.request_id(), id);
+        assert_eq!(
+            [first.token.child_index(), second.token.child_index()],
+            [0, 1]
+        );
+        assert_eq!(queue.diagnostics().in_flight_commands, 2);
+        assert!(queue.dispatch_one(device, 3).is_none());
+
+        queue.complete(second.token, HardwareStatus::Success);
+        let third = queue.dispatch_one(device, 4).unwrap();
+        assert_eq!(third.token.request_id(), id);
+        assert_eq!(third.token.child_index(), 2);
+        queue.complete(third.token, HardwareStatus::Success);
+        assert_eq!(queue.poll_request(id), RequestPoll::InFlight);
+        queue.complete(first.token, HardwareStatus::Success);
+        assert_eq!(
+            queue.take_completion(id).unwrap().bytes_completed,
+            12 * 1024
+        );
     }
 
     #[test]
@@ -2586,6 +2933,20 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_skips_flush_for_devices_without_flush_support() {
+        let mut queue = AsyncBlockQueue::try_new(1, 1, QueueConfig::default()).unwrap();
+        let mut config = device_config(1, DmaConstraints::dma64());
+        config.supports_flush = false;
+        let device = queue.register_device(config).unwrap();
+
+        queue.begin_shutdown();
+
+        assert_eq!(queue.shutdown_state(), ShutdownState::Drained);
+        assert!(queue.dispatch_one(device, 0).is_none());
+        assert_eq!(queue.diagnostics().counters.shutdown_flushes, 0);
+    }
+
+    #[test]
     fn two_registered_devices_have_independent_slots_and_limits() {
         let mut queue = AsyncBlockQueue::try_new(4, 2, QueueConfig::default()).unwrap();
         let first_device = queue
@@ -2753,6 +3114,126 @@ mod tests {
                 Poll::Pending
             }
         }
+    }
+
+    #[test]
+    fn device_worker_bounds_each_work_class_without_growing_queue_storage() {
+        let (mut queue, device) = queue(2, 1);
+        let slot_capacity = queue.slots.capacity();
+        let device_capacity = queue.devices.capacity();
+        let queue_capacities =
+            core::array::from_fn::<_, PRIORITY_COUNT, _>(|index| queue.queues[index].capacity());
+        let mut driver = FakeAsyncDriver {
+            config: device_config(1, DmaConstraints::dma64()),
+            ready: true,
+            completion: None,
+            cancelled: None,
+            reset_complete: false,
+        };
+        let first = queue
+            .submit(
+                0,
+                transfer(
+                    device,
+                    BlockOperation::Read,
+                    0,
+                    512,
+                    0x1000,
+                    BlockPriority::Normal,
+                    None,
+                ),
+            )
+            .unwrap();
+        let second = queue
+            .submit(
+                0,
+                transfer(
+                    device,
+                    BlockOperation::Read,
+                    1,
+                    512,
+                    0x2000,
+                    BlockPriority::Normal,
+                    None,
+                ),
+            )
+            .unwrap();
+
+        let submitted = run_device_worker(
+            &mut queue,
+            device,
+            &mut driver,
+            1,
+            DeviceWorkerBudget {
+                completions: 0,
+                cancellations: 0,
+                submissions: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(submitted.readiness_polls, 1);
+        assert_eq!(submitted.commands_submitted, 1);
+        assert_eq!(queue.cancel(first), CancelResult::PendingHardware);
+
+        let cancelled = run_device_worker(
+            &mut queue,
+            device,
+            &mut driver,
+            2,
+            DeviceWorkerBudget {
+                completions: 0,
+                cancellations: 1,
+                submissions: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(cancelled.cancellation_polls, 1);
+        assert_eq!(cancelled.cancellations_requested, 1);
+        assert!(driver.cancelled.is_some());
+
+        let completed_and_submitted = run_device_worker(
+            &mut queue,
+            device,
+            &mut driver,
+            3,
+            DeviceWorkerBudget {
+                completions: 1,
+                cancellations: 0,
+                submissions: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(completed_and_submitted.completion_polls, 1);
+        assert_eq!(completed_and_submitted.accepted_completions, 1);
+        assert_eq!(completed_and_submitted.commands_submitted, 1);
+        assert_eq!(
+            queue.take_completion(first).unwrap().outcome,
+            RequestOutcome::Cancelled
+        );
+
+        let completed = run_device_worker(
+            &mut queue,
+            device,
+            &mut driver,
+            4,
+            DeviceWorkerBudget {
+                completions: 1,
+                cancellations: 0,
+                submissions: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(completed.accepted_completions, 1);
+        assert_eq!(
+            queue.take_completion(second).unwrap().outcome,
+            RequestOutcome::Success
+        );
+        assert_eq!(queue.slots.capacity(), slot_capacity);
+        assert_eq!(queue.devices.capacity(), device_capacity);
+        assert_eq!(
+            core::array::from_fn::<_, PRIORITY_COUNT, _>(|index| queue.queues[index].capacity()),
+            queue_capacities
+        );
     }
 
     #[test]

@@ -19,9 +19,10 @@
 //! acknowledges the APIC, and returns [`KernelExit::Preempted`] to the suspended
 //! scheduler continuation. A timer arriving at the CPL0 idle site preserves the
 //! interrupted register state, acknowledges EOI, and returns to the idle `CLI`.
-//! The dedicated xHCI MSI entry similarly preserves interrupted state at CPL0 or
-//! CPL3, records one coalescing pending bit, acknowledges EOI without entering
-//! Rust or relying on GS, and returns directly. #DF, NMI, and #MC use dedicated
+//! The dedicated xHCI, virtio-blk, and AHCI MSI entries similarly preserve
+//! interrupted state at CPL0 or CPL3, record coalescing pending bits, acknowledge
+//! EOI without entering Rust or relying on GS, and return directly. #DF, NMI, and
+//! #MC use dedicated
 //! IST1/IST2/IST3 stacks and always fail-stop without accessing GS. Other external
 //! interrupts, nested kernel entries, and enabling IF elsewhere in kernel Rust
 //! remain unsupported.
@@ -146,6 +147,10 @@ const VMM_COMMUNICATION_VECTOR: usize = 29;
 const SECURITY_EXCEPTION_VECTOR: usize = 30;
 /// Dedicated fixed xHCI MSI vector installed by the CPU IDT initialization.
 pub const XHCI_VECTOR: u8 = 0x41;
+/// Dedicated fixed virtio-blk MSI vector installed by the CPU IDT initialization.
+pub const VIRTIO_BLK_VECTOR: u8 = 0x42;
+/// Dedicated fixed AHCI MSI vector installed by the CPU IDT initialization.
+pub const AHCI_VECTOR: u8 = 0x43;
 const INTERRUPT_GATE_PRESENT_RING0: u8 = 0x8e;
 const INTERRUPT_GATE_PRESENT_RING3: u8 = 0xee;
 const DOUBLE_FAULT_IST_INDEX: u8 = 1;
@@ -156,10 +161,14 @@ const KERNEL_EXIT_PREEMPTED: u64 = 4;
 const USER_CONTEXT_GPR_QWORDS: usize = offset_of!(UserContext, rip) / size_of::<u64>();
 const USER_CONTEXT_QWORDS: usize = size_of::<UserContext>() / size_of::<u64>();
 
-// These symbols are accessed directly by the xHCI assembly entry. They are
-// process-global because this interrupt layer currently supports only the BSP.
+// These symbols are accessed directly by the external-interrupt assembly entries.
+// They are process-global because this interrupt layer currently supports only the BSP.
 #[no_mangle]
 static GINKGO_XHCI_INTERRUPT_PENDING: AtomicU8 = AtomicU8::new(0);
+#[no_mangle]
+static GINKGO_VIRTIO_BLK_INTERRUPT_PENDING: AtomicU8 = AtomicU8::new(0);
+#[no_mangle]
+static GINKGO_AHCI_INTERRUPT_PENDING: AtomicU8 = AtomicU8::new(0);
 #[no_mangle]
 static GINKGO_EXTERNAL_INTERRUPT_EOI: AtomicU64 = AtomicU64::new(0);
 
@@ -169,6 +178,22 @@ static GINKGO_EXTERNAL_INTERRUPT_EOI: AtomicU64 = AtomicU64::new(0);
 /// interrupts before one call intentionally coalesce into a single `true` result.
 pub fn take_xhci_interrupt_pending() -> bool {
     GINKGO_XHCI_INTERRUPT_PENDING.swap(0, Ordering::AcqRel) != 0
+}
+
+/// Consumes the coalescing virtio-blk interrupt-pending flag.
+///
+/// The assembly ISR sets this flag before acknowledging the local APIC. Multiple
+/// interrupts before one call intentionally coalesce into a single `true` result.
+pub fn take_virtio_blk_interrupt_pending() -> bool {
+    GINKGO_VIRTIO_BLK_INTERRUPT_PENDING.swap(0, Ordering::AcqRel) != 0
+}
+
+/// Consumes the coalescing AHCI interrupt-pending flag.
+///
+/// The assembly ISR sets this flag before acknowledging the local APIC. Multiple
+/// interrupts before one call intentionally coalesce into a single `true` result.
+pub fn take_ahci_interrupt_pending() -> bool {
+    GINKGO_AHCI_INTERRUPT_PENDING.swap(0, Ordering::AcqRel) != 0
 }
 
 /// Aligned extended state area. XSAVE-capable CPUs preserve enabled AVX state;
@@ -972,6 +997,8 @@ pub unsafe fn initialize_cpu_with_external_interrupts(
     state.syscall.dispatcher = dispatcher as usize as u64;
     state.syscall.interrupt_eoi = external.local_apic_eoi;
     GINKGO_XHCI_INTERRUPT_PENDING.store(0, Ordering::Relaxed);
+    GINKGO_VIRTIO_BLK_INTERRUPT_PENDING.store(0, Ordering::Relaxed);
+    GINKGO_AHCI_INTERRUPT_PENDING.store(0, Ordering::Relaxed);
     GINKGO_EXTERNAL_INTERRUPT_EOI.store(external.local_apic_eoi, Ordering::Release);
     unsafe { state.tss.set_stack_tops(stacks) };
 
@@ -1072,6 +1099,14 @@ pub unsafe fn initialize_cpu_with_external_interrupts(
             ExceptionGate::ring0(
                 usize::from(XHCI_VECTOR),
                 ginkgo_x86_xhci_interrupt as *const () as usize as u64,
+            ),
+            ExceptionGate::ring0(
+                usize::from(VIRTIO_BLK_VECTOR),
+                ginkgo_x86_virtio_blk_interrupt as *const () as usize as u64,
+            ),
+            ExceptionGate::ring0(
+                usize::from(AHCI_VECTOR),
+                ginkgo_x86_ahci_interrupt as *const () as usize as u64,
             ),
             ExceptionGate::ring0(
                 usize::from(SPURIOUS_VECTOR),
@@ -1559,6 +1594,8 @@ extern "C" {
     fn ginkgo_x86_exception_security();
     fn ginkgo_x86_timer_interrupt();
     fn ginkgo_x86_xhci_interrupt();
+    fn ginkgo_x86_virtio_blk_interrupt();
+    fn ginkgo_x86_ahci_interrupt();
     fn ginkgo_x86_spurious_interrupt();
 }
 
@@ -1601,6 +1638,8 @@ global_asm!(
     .global ginkgo_x86_exception_security
     .global ginkgo_x86_timer_interrupt
     .global ginkgo_x86_xhci_interrupt
+    .global ginkgo_x86_virtio_blk_interrupt
+    .global ginkgo_x86_ahci_interrupt
     .global ginkgo_x86_spurious_interrupt
 
 // Fault-contained copy used after page-table validation. The page-fault handler
@@ -1646,6 +1685,30 @@ ginkgo_x86_spurious_interrupt:
 ginkgo_x86_xhci_interrupt:
     pushq %rax
     movb $1, GINKGO_XHCI_INTERRUPT_PENDING(%rip)
+    movq GINKGO_EXTERNAL_INTERRUPT_EOI(%rip), %rax
+    testq %rax, %rax
+    jz .Lginkgo_fail_stop
+    movl $0, (%rax)
+    popq %rax
+    iretq
+
+// The virtio-blk MSI follows the same minimal path as xHCI. Device status and
+// queue processing remain in Rust after the coalescing pending flag is consumed.
+ginkgo_x86_virtio_blk_interrupt:
+    pushq %rax
+    movb $1, GINKGO_VIRTIO_BLK_INTERRUPT_PENDING(%rip)
+    movq GINKGO_EXTERNAL_INTERRUPT_EOI(%rip), %rax
+    testq %rax, %rax
+    jz .Lginkgo_fail_stop
+    movl $0, (%rax)
+    popq %rax
+    iretq
+
+// The AHCI MSI only records pending work and acknowledges the local APIC. Device
+// status and command completion processing remain outside the interrupt handler.
+ginkgo_x86_ahci_interrupt:
+    pushq %rax
+    movb $1, GINKGO_AHCI_INTERRUPT_PENDING(%rip)
     movq GINKGO_EXTERNAL_INTERRUPT_EOI(%rip), %rax
     testq %rax, %rax
     jz .Lginkgo_fail_stop
@@ -2363,9 +2426,25 @@ mod tests {
 
         let fail_stop = 0xffff_8000_0000_1000;
         let contained = 0xffff_8000_0000_2000;
+        assert_eq!(XHCI_VECTOR, 0x41);
+        assert_eq!(VIRTIO_BLK_VECTOR, 0x42);
+        assert_eq!(AHCI_VECTOR, 0x43);
+        let external_vectors = [
+            PREEMPTION_VECTOR,
+            XHCI_VECTOR,
+            VIRTIO_BLK_VECTOR,
+            AHCI_VECTOR,
+            SPURIOUS_VECTOR,
+        ];
+        for (index, vector) in external_vectors.iter().enumerate() {
+            assert!(!external_vectors[..index].contains(vector));
+        }
+
         let timer = 0xffff_8000_0000_3000;
         let xhci = 0xffff_8000_0000_4000;
-        let spurious = 0xffff_8000_0000_5000;
+        let virtio_blk = 0xffff_8000_0000_5000;
+        let ahci = 0xffff_8000_0000_6000;
+        let spurious = 0xffff_8000_0000_7000;
         let gates = [
             ExceptionGate::ring0(DIVIDE_ERROR_VECTOR, contained),
             ExceptionGate::ring0(DEBUG_VECTOR, contained),
@@ -2392,6 +2471,8 @@ mod tests {
             ExceptionGate::ring0(SECURITY_EXCEPTION_VECTOR, contained),
             ExceptionGate::ring0(usize::from(PREEMPTION_VECTOR), timer),
             ExceptionGate::ring0(usize::from(XHCI_VECTOR), xhci),
+            ExceptionGate::ring0(usize::from(VIRTIO_BLK_VECTOR), virtio_blk),
+            ExceptionGate::ring0(usize::from(AHCI_VECTOR), ahci),
             ExceptionGate::ring0(usize::from(SPURIOUS_VECTOR), spurious),
         ];
         let idt = exception_idt(fail_stop, &gates);
@@ -2451,6 +2532,17 @@ mod tests {
         assert_eq!(xhci_gate.handler(), xhci);
         assert_eq!(xhci_gate.ist, 0);
         assert_eq!(xhci_gate.type_attributes, INTERRUPT_GATE_PRESENT_RING0);
+        let virtio_blk_gate = idt.entries[usize::from(VIRTIO_BLK_VECTOR)];
+        assert_eq!(virtio_blk_gate.handler(), virtio_blk);
+        assert_eq!(virtio_blk_gate.ist, 0);
+        assert_eq!(
+            virtio_blk_gate.type_attributes,
+            INTERRUPT_GATE_PRESENT_RING0
+        );
+        let ahci_gate = idt.entries[usize::from(AHCI_VECTOR)];
+        assert_eq!(ahci_gate.handler(), ahci);
+        assert_eq!(ahci_gate.ist, 0);
+        assert_eq!(ahci_gate.type_attributes, INTERRUPT_GATE_PRESENT_RING0);
         let spurious_gate = idt.entries[usize::from(SPURIOUS_VECTOR)];
         assert_eq!(spurious_gate.handler(), spurious);
         assert_eq!(spurious_gate.ist, 0);
@@ -2653,6 +2745,26 @@ mod tests {
         GINKGO_XHCI_INTERRUPT_PENDING.store(1, Ordering::Release);
         assert!(take_xhci_interrupt_pending());
         assert!(!take_xhci_interrupt_pending());
+    }
+
+    #[test]
+    fn virtio_blk_pending_flag_coalesces_and_is_consumed() {
+        GINKGO_VIRTIO_BLK_INTERRUPT_PENDING.store(0, Ordering::Relaxed);
+        assert!(!take_virtio_blk_interrupt_pending());
+        GINKGO_VIRTIO_BLK_INTERRUPT_PENDING.store(1, Ordering::Release);
+        GINKGO_VIRTIO_BLK_INTERRUPT_PENDING.store(1, Ordering::Release);
+        assert!(take_virtio_blk_interrupt_pending());
+        assert!(!take_virtio_blk_interrupt_pending());
+    }
+
+    #[test]
+    fn ahci_pending_flag_coalesces_and_is_consumed() {
+        GINKGO_AHCI_INTERRUPT_PENDING.store(0, Ordering::Relaxed);
+        assert!(!take_ahci_interrupt_pending());
+        GINKGO_AHCI_INTERRUPT_PENDING.store(1, Ordering::Release);
+        GINKGO_AHCI_INTERRUPT_PENDING.store(1, Ordering::Release);
+        assert!(take_ahci_interrupt_pending());
+        assert!(!take_ahci_interrupt_pending());
     }
 
     #[test]

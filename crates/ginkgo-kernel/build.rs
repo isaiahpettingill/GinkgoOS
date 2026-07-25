@@ -70,11 +70,24 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GINKGO_PROCESS_CAPABILITY_SMOKE_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_REQUEST_SMOKE");
     println!("cargo:rerun-if-env-changed=GINKGO_REQUEST_SMOKE_ELF");
+    println!("cargo:rerun-if-env-changed=GINKGO_VIRTIO_BLK_SMOKE");
+    println!("cargo:rerun-if-env-changed=GINKGO_AHCI_SMOKE");
     println!("cargo:rerun-if-env-changed=GINKGO_THREAD_SMOKE");
     println!("cargo:rerun-if-env-changed=GINKGO_THREAD_SMOKE_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_TRUST_SIGNING_KEY_HEX");
     println!("cargo:rustc-check-cfg=cfg(ginkgo_memory_policy_smoke)");
     println!("cargo:rustc-check-cfg=cfg(ginkgo_request_smoke)");
+    println!("cargo:rustc-check-cfg=cfg(ginkgo_virtio_blk_smoke)");
+    println!("cargo:rustc-check-cfg=cfg(ginkgo_ahci_smoke)");
+    let ahci_smoke = env::var_os("GINKGO_AHCI_SMOKE").as_deref() == Some(std::ffi::OsStr::new("1"));
+    if ahci_smoke {
+        println!("cargo:rustc-cfg=ginkgo_ahci_smoke");
+    }
+    let virtio_blk_smoke =
+        env::var_os("GINKGO_VIRTIO_BLK_SMOKE").as_deref() == Some(std::ffi::OsStr::new("1"));
+    if virtio_blk_smoke {
+        println!("cargo:rustc-cfg=ginkgo_virtio_blk_smoke");
+    }
     let request_smoke =
         env::var_os("GINKGO_REQUEST_SMOKE").as_deref() == Some(std::ffi::OsStr::new("1"));
     if request_smoke {

@@ -12,8 +12,10 @@
 use alloc::{boxed::Box, string::String, vec, vec::Vec};
 use core::mem::size_of;
 
+#[cfg(test)]
+use ginkgo_filesystem::RedoxFs;
 use ginkgo_filesystem::{
-    DirectoryHandle, FsError, NodeKind, NodeMetadata, RedoxFs, RenameMode, MAX_TRAVERSAL_DEPTH,
+    DirectoryHandle, FsError, NodeKind, NodeMetadata, RenameMode, MAX_TRAVERSAL_DEPTH,
 };
 use ginkgo_ipc::{
     handle_transfer_batch_between, shared_memory_backing_stats, HandleOperation,
@@ -36,6 +38,7 @@ use ginkgo_sysapi::{
     THREAD_CREATE_ARGS_VERSION, THREAD_INFO_VERSION, THREAD_SCHEDULING_INFO_VERSION,
     VIRTUAL_AREA_INFO_VERSION,
 };
+#[cfg(test)]
 use redoxfs::Disk;
 use zerocopy::IntoBytes;
 
@@ -43,6 +46,7 @@ use crate::{
     arch::UserContext,
     audio::AudioDevice,
     entropy::EntropyPool,
+    fs_executor::{FsDirectory, FsExecutorError, FsJob, FsJobId, FsResult, WholeFileKind},
     memory::{UsableFrameAllocator, PAGE_SIZE},
     paging::{
         address_space::{AddressSpaceError, UserAccess},
@@ -89,7 +93,9 @@ const FILESYSTEM_STAT_SIZE: usize = 24;
 const FILESYSTEM_DIRECTORY_ENTRY_SIZE: usize = size_of::<FilesystemDirectoryEntry>();
 const FILESYSTEM_OPEN_DIRECTORY_ARGS_SIZE: usize = 32;
 const FILESYSTEM_CREATE_DIRECTORY_ARGS_SIZE: usize = 24;
+#[cfg(test)]
 const FILESYSTEM_REMOVE_DIRECTORY_ARGS_SIZE: usize = 24;
+
 const FILESYSTEM_RENAME_ARGS_SIZE: usize = 48;
 const FILESYSTEM_SYNC_ARGS_SIZE: usize = 8;
 const FILESYSTEM_GET_INFO_ARGS_SIZE: usize = 16;
@@ -133,6 +139,72 @@ pub trait DebugSink {
     fn write(&mut self, bytes: &[u8]);
 }
 
+pub struct PendingProcessCreate {
+    startup: DirectStartupBlock,
+    dispositions: Vec<HandleOperationDisposition>,
+    application_data_index: Option<usize>,
+    output_address: u64,
+    selected_limits: ProcessLimits,
+}
+
+pub enum DirectFilesystemContinuation {
+    Stat {
+        output_address: u64,
+    },
+    ReadDirectory {
+        cookie: u64,
+        output_address: u64,
+    },
+    Unit,
+    OpenDirectory {
+        output_address: u64,
+        rights: Rights,
+    },
+    FilesystemInfo {
+        output_address: u64,
+    },
+    Metadata {
+        output_address: u64,
+    },
+    ReadDirectory2 {
+        cookie: u64,
+        output_address: u64,
+    },
+    ApplicationDataDirectory {
+        output_address: u64,
+    },
+    ApplicationDataCreate {
+        handle: Handle,
+        output_address: u64,
+    },
+    VirtualMap {
+        file: ginkgo_filesystem::FileHandle,
+        max_protection: MapProtection,
+        args: VirtualMapFileArgs,
+        output_address: u64,
+    },
+    VirtualCommit {
+        address: u64,
+        length: u64,
+    },
+    ProcessCreate(PendingProcessCreate),
+}
+
+pub struct DirectFilesystemOutcome {
+    pub status: Status,
+    pub child: Option<Box<Process>>,
+}
+
+pub trait FilesystemJobQueue {
+    fn root_directory(&self) -> DirectoryHandle;
+
+    fn enqueue_for_thread(
+        &mut self,
+        job: FsJob,
+        continuation: DirectFilesystemContinuation,
+    ) -> Result<FsJobId, FsExecutorError>;
+}
+
 /// Scheduler action produced by one syscall dispatch.
 pub enum SyscallOutcome {
     /// The syscall completed (successfully or with an error) and the process is
@@ -151,7 +223,6 @@ pub enum SyscallOutcome {
 enum DispatchResult {
     Complete(Status),
     Blocked,
-    ChildCreated(Box<Process>),
 }
 
 /// Result of one bounded scheduler poll of a blocked process.
@@ -169,7 +240,7 @@ pub enum BlockedPoll {
 /// Completed outcomes write a sign-extended [`Status`] to RAX. A blocked
 /// outcome leaves RAX untouched until [`complete_blocked`] runs. Unknown syscall
 /// numbers are decoded without converting an arbitrary integer into a Rust enum.
-pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
+pub fn dispatch<D: DebugSink + ?Sized, Q: FilesystemJobQueue + ?Sized>(
     process_id: ProcessId,
     process: &mut Process,
     thread_id: ThreadId,
@@ -179,7 +250,7 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
     frame_allocator: &mut UsableFrameAllocator<'_>,
     kernel_heap: KernelHeapStats,
     shared_frame_arena: &SharedFrameArena,
-    filesystem: &mut RedoxFs<B>,
+    filesystem: &mut Q,
     audio: &mut Option<AudioDevice>,
     entropy: &mut EntropyPool,
     requests: &mut RequestBroker,
@@ -248,14 +319,10 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
             SyscallOutcome::Yield
         }
         DispatchResult::Blocked => SyscallOutcome::Blocked,
-        DispatchResult::ChildCreated(child) => {
-            set_status(context, Status::Ok);
-            SyscallOutcome::ChildCreated(child)
-        }
     }
 }
 
-fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
+fn dispatch_non_exit<D: DebugSink + ?Sized, Q: FilesystemJobQueue + ?Sized>(
     number: SyscallNumber,
     process_id: ProcessId,
     process: &mut Process,
@@ -266,7 +333,7 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
     frame_allocator: &mut UsableFrameAllocator<'_>,
     kernel_heap: KernelHeapStats,
     shared_frame_arena: &SharedFrameArena,
-    filesystem: &mut RedoxFs<B>,
+    filesystem: &mut Q,
     audio: &mut Option<AudioDevice>,
     entropy: &mut EntropyPool,
     requests: &mut RequestBroker,
@@ -317,7 +384,7 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
                 process_id,
                 process,
                 thread_id,
-                filesystem,
+                filesystem.root_directory(),
                 requests,
                 context.rdi,
                 context.rsi,
@@ -354,16 +421,42 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
             );
         }
         SyscallNumber::FilesystemStat => {
-            filesystem_stat(process, filesystem, context.rdi, context.rsi)
+            return prepare_filesystem_stat(
+                process,
+                thread_id,
+                filesystem,
+                context.rdi,
+                context.rsi,
+            );
         }
         SyscallNumber::FilesystemReadDirectory => {
-            filesystem_read_directory(process, filesystem, context.rdi, context.rsi, context.rdx)
+            return prepare_filesystem_read_directory(
+                process,
+                thread_id,
+                filesystem,
+                context.rdi,
+                context.rsi,
+                context.rdx,
+            );
         }
         SyscallNumber::FilesystemTruncate => {
-            filesystem_truncate(process, filesystem, context.rdi, context.rsi)
+            return prepare_filesystem_truncate(
+                process,
+                thread_id,
+                filesystem,
+                context.rdi,
+                context.rsi,
+            );
         }
         SyscallNumber::FilesystemUnlink => {
-            filesystem_unlink(process, filesystem, context.rdi, context.rsi, context.rdx)
+            return prepare_filesystem_unlink(
+                process,
+                thread_id,
+                filesystem,
+                context.rdi,
+                context.rsi,
+                context.rdx,
+            );
         }
         SyscallNumber::AudioWrite => audio_write(process, audio, context.rdi, context.rsi),
         SyscallNumber::ClockGetMonotonic => clock_get_monotonic(process, context.rdi, now_ns),
@@ -376,38 +469,48 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
             return DispatchResult::Complete(Status::AccessDenied);
         }
         SyscallNumber::ProcessCreate => {
-            return match process_create(
+            return prepare_process_create(
                 process,
+                thread_id,
                 filesystem,
                 context.rdi,
-                kernel_page_table,
-                frame_allocator,
-                entropy,
+                frame_allocator.available_bytes(),
                 child_slot_reserved,
                 false,
-            ) {
-                Ok(child) => DispatchResult::ChildCreated(child),
-                Err(status) => {
-                    record_memory_failure_once(process, memory_failures_before, status);
-                    DispatchResult::Complete(status)
-                }
-            };
+            );
         }
         SyscallNumber::ProcessGetInfo => process_get_info(process, context.rdi, context.rsi),
         SyscallNumber::ProcessTerminate => process_terminate(process, context.rdi),
         SyscallNumber::ApplicationGetDataDirectory => {
-            application_get_data_directory(process, filesystem, context.rdi)
+            return prepare_application_get_data_directory(
+                process,
+                thread_id,
+                filesystem,
+                context.rdi,
+            );
         }
         SyscallNumber::FilesystemOpenDirectory => {
-            filesystem_open_directory(process, filesystem, context.rdi)
+            return prepare_filesystem_open_directory(process, thread_id, filesystem, context.rdi);
         }
         SyscallNumber::FilesystemCreateDirectory => {
-            filesystem_create_directory(process, filesystem, context.rdi)
+            return prepare_filesystem_create_directory(
+                process,
+                thread_id,
+                filesystem,
+                context.rdi,
+            );
         }
         SyscallNumber::FilesystemRemoveDirectory => {
-            filesystem_remove_directory(process, filesystem, context.rdi)
+            return prepare_filesystem_remove_directory(
+                process,
+                thread_id,
+                filesystem,
+                context.rdi,
+            );
         }
-        SyscallNumber::FilesystemRename => filesystem_rename(process, filesystem, context.rdi),
+        SyscallNumber::FilesystemRename => {
+            return prepare_filesystem_rename(process, thread_id, filesystem, context.rdi);
+        }
         SyscallNumber::FilesystemSync => {
             return filesystem_sync_request(
                 process_id,
@@ -418,15 +521,17 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
                 now_ns,
             );
         }
-        SyscallNumber::FilesystemGetInfo => filesystem_get_info(process, filesystem, context.rdi),
+        SyscallNumber::FilesystemGetInfo => {
+            return prepare_filesystem_get_info(process, thread_id, filesystem, context.rdi);
+        }
         SyscallNumber::FilesystemGetMetadata => {
-            filesystem_get_metadata(process, filesystem, context.rdi)
+            return prepare_filesystem_get_metadata(process, thread_id, filesystem, context.rdi);
         }
         SyscallNumber::FilesystemReadDirectory2 => {
-            filesystem_read_directory2(process, filesystem, context.rdi)
+            return prepare_filesystem_read_directory2(process, thread_id, filesystem, context.rdi);
         }
         SyscallNumber::ApplicationDataCreate => {
-            application_data_create(process, filesystem, context.rdi)
+            return prepare_application_data_create(process, thread_id, filesystem, context.rdi);
         }
         SyscallNumber::SystemPowerRequest => {
             system_power_request(process, context.rdi, context.rsi, context.rdx, now_ns)
@@ -466,21 +571,25 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
             kernel_heap,
             shared_frame_arena,
         ),
-        SyscallNumber::VirtualMapFile => virtual_map_file(
-            process,
-            filesystem,
-            context.rdi,
-            context.rsi,
-            context.rdx,
-            frame_allocator,
-        ),
-        SyscallNumber::VirtualCommit => virtual_commit(
-            process,
-            filesystem,
-            context.rdi,
-            context.rsi,
-            frame_allocator,
-        ),
+        SyscallNumber::VirtualMapFile => {
+            return prepare_virtual_map_file(
+                process,
+                thread_id,
+                filesystem,
+                context.rdi,
+                context.rsi,
+                context.rdx,
+            );
+        }
+        SyscallNumber::VirtualCommit => {
+            return prepare_virtual_commit(
+                process,
+                thread_id,
+                filesystem,
+                context.rdi,
+                context.rsi,
+            );
+        }
         SyscallNumber::VirtualDecommit => process
             .decommit_file_backed(context.rdi, context.rsi, frame_allocator)
             .map_err(map_shared_mapping_error),
@@ -569,22 +678,15 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
             request_get_diagnostics(process, requests, context.rdi, context.rsi, context.rdx)
         }
         SyscallNumber::ProcessCreate2 => {
-            return match process_create(
+            return prepare_process_create(
                 process,
+                thread_id,
                 filesystem,
                 context.rdi,
-                kernel_page_table,
-                frame_allocator,
-                entropy,
+                frame_allocator.available_bytes(),
                 child_slot_reserved,
                 true,
-            ) {
-                Ok(child) => DispatchResult::ChildCreated(child),
-                Err(status) => {
-                    record_memory_failure_once(process, memory_failures_before, status);
-                    DispatchResult::Complete(status)
-                }
-            };
+            );
         }
     };
     if let Err(status) = result {
@@ -2012,6 +2114,13 @@ pub fn poll_blocked(
                 BlockedPoll::Pending
             };
         }
+        Some(BlockedKind::Filesystem) => {
+            return if process.filesystem_completion_ready(thread_id) {
+                BlockedPoll::Complete
+            } else {
+                BlockedPoll::Pending
+            };
+        }
         Some(BlockedKind::Request) => {
             let Some(id) = process.blocked_request_id(thread_id) else {
                 return BlockedPoll::Pending;
@@ -2070,6 +2179,21 @@ pub fn complete_blocked(
             .complete_sleep(thread_id)
             .err()
             .unwrap_or(Status::Ok);
+    }
+    if process.blocked_kind(thread_id) == Some(BlockedKind::Filesystem) {
+        let filesystem = match process.take_completed_filesystem(thread_id) {
+            Ok(filesystem) => filesystem,
+            Err(status) => return status,
+        };
+        let status = filesystem.completion.unwrap_or(Status::ShouldWait);
+        set_status(
+            process
+                .thread_context_mut(thread_id)
+                .expect("filesystem caller disappeared before completion"),
+            status,
+        );
+        process.resume_thread_from_block(thread_id);
+        return status;
     }
     if process.blocked_kind(thread_id) == Some(BlockedKind::Request) {
         let mut request = match process.take_completed_request(thread_id) {
@@ -2697,6 +2821,85 @@ fn anonymous_protect(
         .map_err(map_shared_mapping_error)
 }
 
+fn prepare_virtual_map_file<Q: FilesystemJobQueue + ?Sized>(
+    process: &mut Process,
+    thread_id: ThreadId,
+    filesystem: &mut Q,
+    raw_file: u64,
+    args_address: u64,
+    output_address: u64,
+) -> DispatchResult {
+    let prepared = (|| {
+        let handle = decode_handle(raw_file)?;
+        let raw_args = copy_block_from_user::<SHARED_MEMORY_MAP_ARGS_SIZE>(process, args_address)?;
+        let shared = parse_shared_memory_map_args(&raw_args)?;
+        let args = VirtualMapFileArgs {
+            address: shared.address,
+            offset: shared.offset,
+            length: shared.length,
+            protection: shared.protection,
+            flags: shared.flags,
+        };
+        validate_user_output(process, output_address, SHARED_MEMORY_MAP_OUTPUT_SIZE)?;
+        let rights = process
+            .handles()
+            .handle_rights(handle)
+            .map_err(map_ipc_error)?;
+        let mut required = Rights::READ;
+        if args.protection.contains(MapProtection::WRITE) {
+            required |= Rights::WRITE;
+        }
+        if args.protection.contains(MapProtection::EXECUTE) {
+            required |= Rights::EXECUTE;
+        }
+        let file = process
+            .handles()
+            .filesystem_file(handle, required)
+            .map_err(map_ipc_error)?;
+        let max_protection = file_max_protection(rights).map_err(map_shared_mapping_error)?;
+        let length = usize::try_from(args.length).map_err(|_| Status::OutOfRange)?;
+        Ok::<_, Status>((
+            FsJob::ReadFileSnapshot {
+                file,
+                offset: args.offset,
+                length,
+            },
+            DirectFilesystemContinuation::VirtualMap {
+                file,
+                max_protection,
+                args,
+                output_address,
+            },
+        ))
+    })();
+    match prepared {
+        Ok((job, continuation)) => {
+            submit_direct_filesystem(process, thread_id, filesystem, job, continuation)
+        }
+        Err(status) => DispatchResult::Complete(status),
+    }
+}
+
+fn prepare_virtual_commit<Q: FilesystemJobQueue + ?Sized>(
+    process: &mut Process,
+    thread_id: ThreadId,
+    filesystem: &mut Q,
+    address: u64,
+    length: u64,
+) -> DispatchResult {
+    match process.file_snapshot_ranges(address, length) {
+        Ok(ranges) => submit_direct_filesystem(
+            process,
+            thread_id,
+            filesystem,
+            FsJob::ReadFileSnapshots { ranges },
+            DirectFilesystemContinuation::VirtualCommit { address, length },
+        ),
+        Err(error) => DispatchResult::Complete(map_shared_mapping_error(error)),
+    }
+}
+
+#[cfg(test)]
 fn virtual_map_file<B: Disk>(
     process: &mut Process,
     filesystem: &mut RedoxFs<B>,
@@ -2756,6 +2959,7 @@ fn virtual_map_file<B: Disk>(
     Ok(())
 }
 
+#[cfg(test)]
 fn virtual_commit<B: Disk>(
     process: &mut Process,
     filesystem: &mut RedoxFs<B>,
@@ -2887,11 +3091,11 @@ fn prepare_filesystem_open_broker_request(
     }
 }
 
-fn filesystem_open_request<B: Disk>(
+fn filesystem_open_request(
     process_id: ProcessId,
     process: &mut Process,
     thread_id: ThreadId,
-    filesystem: &mut RedoxFs<B>,
+    root_directory: DirectoryHandle,
     requests: &mut RequestBroker,
     raw_anchor: u64,
     args_address: u64,
@@ -2905,7 +3109,8 @@ fn filesystem_open_request<B: Disk>(
         validate_user_output(process, output_address, HANDLE_OUTPUT_SIZE)?;
         let path = copy_filesystem_path(process, args.path_address, args.path_length)?;
         let required = filesystem_open_required_rights(args.flags);
-        let anchor = resolve_directory_anchor(process, filesystem, anchor_handle, required)?;
+        let anchor =
+            resolve_directory_anchor_owned(process, root_directory, anchor_handle, required)?;
         if anchor.is_root && required.contains(Rights::WRITE) && is_protected_system_path(&path) {
             return Err(Status::AccessDenied);
         }
@@ -2946,7 +3151,7 @@ fn filesystem_open_request<B: Disk>(
     result.unwrap_or_else(DispatchResult::Complete)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn filesystem_open<B: Disk>(
     process: &mut Process,
     filesystem: &mut RedoxFs<B>,
@@ -3274,7 +3479,7 @@ fn submit_legacy_filesystem_request(
     Ok(DispatchResult::Blocked)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn filesystem_read<B: Disk>(
     process: &mut Process,
     filesystem: &mut RedoxFs<B>,
@@ -3305,7 +3510,7 @@ fn filesystem_read<B: Disk>(
     copy_to_user(process, count_address, &(count as u64).to_le_bytes())
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn filesystem_write<B: Disk>(
     process: &mut Process,
     filesystem: &mut RedoxFs<B>,
@@ -3334,6 +3539,561 @@ fn filesystem_write<B: Disk>(
     copy_to_user(process, count_address, &(count as u64).to_le_bytes())
 }
 
+pub fn complete_direct_filesystem(
+    process: &mut Process,
+    continuation: DirectFilesystemContinuation,
+    result: Result<FsResult, FsExecutorError>,
+    kernel_page_table: &ActivePageTable,
+    frame_allocator: &mut UsableFrameAllocator<'_>,
+    entropy: &mut EntropyPool,
+) -> DirectFilesystemOutcome {
+    let continuation = match continuation {
+        DirectFilesystemContinuation::ProcessCreate(pending) => {
+            return complete_process_create(
+                process,
+                pending,
+                result,
+                kernel_page_table,
+                frame_allocator,
+                entropy,
+            );
+        }
+        continuation => continuation,
+    };
+    let status = (|| {
+        let result = result.map_err(map_executor_error);
+        let completed = match continuation {
+            DirectFilesystemContinuation::Stat { output_address } => {
+                let info = match result {
+                    Ok(FsResult::FileInfo(info)) => info,
+                    Ok(_) => return Status::Io,
+                    Err(status) => return status,
+                };
+                let mut output = [0_u8; FILESYSTEM_STAT_SIZE];
+                output[..8].copy_from_slice(&info.len.to_le_bytes());
+                copy_to_user(process, output_address, &output)
+            }
+            DirectFilesystemContinuation::ReadDirectory {
+                cookie,
+                output_address,
+            } => {
+                let entries = match result {
+                    Ok(FsResult::DirectoryEntries(entries)) => entries,
+                    Ok(_) => return Status::Io,
+                    Err(status) => return status,
+                };
+                let index = match usize::try_from(cookie) {
+                    Ok(index) => index,
+                    Err(_) => return Status::OutOfRange,
+                };
+                let Some(entry) = entries
+                    .iter()
+                    .filter(|entry| entry.metadata.kind == NodeKind::File)
+                    .nth(index)
+                else {
+                    return Status::EndOfDirectory;
+                };
+                let Some(next_cookie) = cookie.checked_add(1) else {
+                    return Status::OutOfRange;
+                };
+                let mut output = vec![0_u8; FILESYSTEM_DIRECTORY_ENTRY_SIZE];
+                put_u64(&mut output, 0, next_cookie);
+                put_u64(&mut output, 8, entry.len);
+                put_u16(&mut output, 16, entry.name.len() as u16);
+                output[24..24 + entry.name.len()].copy_from_slice(entry.name.as_bytes());
+                copy_to_user(process, output_address, &output)
+            }
+            DirectFilesystemContinuation::Unit => match result {
+                Ok(FsResult::Unit | FsResult::Directory(_)) => Ok(()),
+                Ok(_) => Err(Status::Io),
+                Err(status) => Err(status),
+            },
+            DirectFilesystemContinuation::OpenDirectory {
+                output_address,
+                rights,
+            } => {
+                let directory = match result {
+                    Ok(FsResult::Directory(directory)) => directory,
+                    Ok(_) => return Status::Io,
+                    Err(status) => return status,
+                };
+                let handle = match process
+                    .handles_mut()
+                    .filesystem_directory_create(directory, rights)
+                    .map_err(map_ipc_error)
+                {
+                    Ok(handle) => handle,
+                    Err(status) => return status,
+                };
+                if let Err(status) =
+                    copy_to_user(process, output_address, &encode_handle_output(handle))
+                {
+                    close_handles(process, core::slice::from_ref(&handle));
+                    return status;
+                }
+                Ok(())
+            }
+            DirectFilesystemContinuation::FilesystemInfo { output_address } => {
+                let info = match result {
+                    Ok(FsResult::FilesystemInfo(info)) => info,
+                    Ok(_) => return Status::Io,
+                    Err(status) => return status,
+                };
+                let block_size = match u32::try_from(info.block_size) {
+                    Ok(value) => value,
+                    Err(_) => return Status::OutOfRange,
+                };
+                let free_bytes = info.free_bytes.unwrap_or(0);
+                let mut output = [0_u8; FILESYSTEM_INFO_SIZE];
+                put_u64(&mut output, 0, info.capacity_bytes);
+                put_u64(&mut output, 8, free_bytes);
+                put_u64(&mut output, 16, free_bytes);
+                put_u32(&mut output, 24, block_size);
+                put_u32(&mut output, 28, FILESYSTEM_NAME_MAX as u32);
+                put_u32(&mut output, 32, MAX_TRAVERSAL_DEPTH as u32);
+                copy_to_user(process, output_address, &output)
+            }
+            DirectFilesystemContinuation::Metadata { output_address } => {
+                let metadata = match result {
+                    Ok(FsResult::Metadata(metadata)) => metadata,
+                    Ok(_) => return Status::Io,
+                    Err(status) => return status,
+                };
+                encode_filesystem_metadata(metadata)
+                    .and_then(|output| copy_to_user(process, output_address, &output))
+            }
+            DirectFilesystemContinuation::ReadDirectory2 {
+                cookie,
+                output_address,
+            } => {
+                let mut entries = match result {
+                    Ok(FsResult::DirectoryEntries(entries)) => entries,
+                    Ok(_) => return Status::Io,
+                    Err(status) => return status,
+                };
+                entries.sort_by_key(|entry| entry.metadata.identity);
+                let Some(entry) = entries
+                    .iter()
+                    .find(|entry| entry.metadata.identity > cookie)
+                else {
+                    return Status::EndOfDirectory;
+                };
+                let mut output = [0_u8; FILESYSTEM_DIRECTORY_ENTRY2_SIZE];
+                put_u64(&mut output, 0, entry.metadata.identity);
+                put_u64(&mut output, 8, entry.metadata.size);
+                put_u64(&mut output, 16, entry.metadata.identity);
+                put_u32(&mut output, 24, filesystem_kind(entry.metadata.kind));
+                put_u16(&mut output, 28, entry.name.len() as u16);
+                output[36..36 + entry.name.len()].copy_from_slice(entry.name.as_bytes());
+                copy_to_user(process, output_address, &output)
+            }
+            DirectFilesystemContinuation::ApplicationDataDirectory { output_address } => {
+                let directory = match result {
+                    Ok(FsResult::Directory(directory)) => directory,
+                    Ok(_) => return Status::Io,
+                    Err(status) => return status,
+                };
+                let handle = match process
+                    .handles_mut()
+                    .filesystem_directory_create(directory, Rights::READ | Rights::WRITE)
+                    .map_err(map_ipc_error)
+                {
+                    Ok(handle) => handle,
+                    Err(status) => return status,
+                };
+                if let Err(status) =
+                    copy_to_user(process, output_address, &encode_handle_output(handle))
+                {
+                    close_handles(process, core::slice::from_ref(&handle));
+                    return status;
+                }
+                Ok(())
+            }
+            DirectFilesystemContinuation::ApplicationDataCreate {
+                handle,
+                output_address,
+            } => match result {
+                Ok(FsResult::Directory(_)) => {
+                    if let Err(status) =
+                        copy_to_user(process, output_address, &encode_handle_output(handle))
+                    {
+                        close_handles(process, core::slice::from_ref(&handle));
+                        Err(status)
+                    } else {
+                        Ok(())
+                    }
+                }
+                Ok(_) => {
+                    close_handles(process, core::slice::from_ref(&handle));
+                    Err(Status::Io)
+                }
+                Err(status) => {
+                    close_handles(process, core::slice::from_ref(&handle));
+                    Err(status)
+                }
+            },
+            DirectFilesystemContinuation::VirtualMap {
+                file,
+                max_protection,
+                args,
+                output_address,
+            } => {
+                let (bytes, file_length) = match result {
+                    Ok(FsResult::FileSnapshot { bytes, file_length }) => (bytes, file_length),
+                    Ok(_) => return Status::Io,
+                    Err(status) => return status,
+                };
+                let base_offset = args.offset;
+                let address = match process
+                    .map_file_backed(
+                        file,
+                        file_length,
+                        max_protection,
+                        args,
+                        frame_allocator,
+                        |offset, output| {
+                            let start = usize::try_from(offset.saturating_sub(base_offset))
+                                .map_err(|_| SharedMappingError::RangeOverflow)?;
+                            let end = start
+                                .checked_add(output.len())
+                                .ok_or(SharedMappingError::RangeOverflow)?;
+                            let source = bytes
+                                .get(start..end)
+                                .ok_or(SharedMappingError::InvalidBackingLength)?;
+                            output.copy_from_slice(source);
+                            Ok(output.len())
+                        },
+                    )
+                    .map_err(map_shared_mapping_error)
+                {
+                    Ok(address) => address,
+                    Err(status) => return status,
+                };
+                if let Err(status) = copy_to_user(process, output_address, &address.to_le_bytes()) {
+                    if let Err(error) =
+                        process.unmap_file_backed(address, args.length, frame_allocator)
+                    {
+                        return map_shared_mapping_error(error);
+                    }
+                    Err(status)
+                } else {
+                    Ok(())
+                }
+            }
+            DirectFilesystemContinuation::ProcessCreate(_) => {
+                unreachable!("handled before direct completion")
+            }
+            DirectFilesystemContinuation::VirtualCommit { address, length } => {
+                let snapshots = match result {
+                    Ok(FsResult::FileSnapshots(snapshots)) => snapshots,
+                    Ok(_) => return Status::Io,
+                    Err(status) => return status,
+                };
+                process
+                    .commit_file_backed(address, length, frame_allocator, |file, offset, output| {
+                        let Some((range, bytes)) = snapshots.iter().find(|(range, _)| {
+                            range.file == file
+                                && offset >= range.offset
+                                && offset
+                                    .checked_add(output.len() as u64)
+                                    .is_some_and(|end| end <= range.offset + range.length as u64)
+                        }) else {
+                            return Err(SharedMappingError::InvalidBackingLength);
+                        };
+                        let start = usize::try_from(offset - range.offset)
+                            .map_err(|_| SharedMappingError::RangeOverflow)?;
+                        let end = start
+                            .checked_add(output.len())
+                            .ok_or(SharedMappingError::RangeOverflow)?;
+                        output.copy_from_slice(&bytes[start..end]);
+                        Ok(output.len())
+                    })
+                    .map_err(map_shared_mapping_error)
+            }
+        };
+        completed.err().unwrap_or(Status::Ok)
+    })();
+    DirectFilesystemOutcome {
+        status,
+        child: None,
+    }
+}
+
+fn complete_process_create(
+    process: &mut Process,
+    mut pending: PendingProcessCreate,
+    result: Result<FsResult, FsExecutorError>,
+    kernel_page_table: &ActivePageTable,
+    frame_allocator: &mut UsableFrameAllocator<'_>,
+    entropy: &mut EntropyPool,
+) -> DirectFilesystemOutcome {
+    let image = match result {
+        Ok(FsResult::Bytes(image)) if !image.is_empty() => image,
+        Ok(FsResult::Bytes(_)) => {
+            return DirectFilesystemOutcome {
+                status: Status::ResourceLimit,
+                child: None,
+            }
+        }
+        Ok(_) => {
+            return DirectFilesystemOutcome {
+                status: Status::Io,
+                child: None,
+            }
+        }
+        Err(error) => {
+            return DirectFilesystemOutcome {
+                status: map_executor_error(error),
+                child: None,
+            }
+        }
+    };
+    if image.len() as u64 > pending.selected_limits.executable_source_bytes {
+        return DirectFilesystemOutcome {
+            status: Status::ResourceLimit,
+            child: None,
+        };
+    }
+    let mut child_storage = match Box::<Process>::try_new_uninit() {
+        Ok(storage) => storage,
+        Err(_) => {
+            return DirectFilesystemOutcome {
+                status: Status::OutOfMemory,
+                child: None,
+            }
+        }
+    };
+    let randomness = [entropy.next_u64(), entropy.next_u64(), entropy.next_u64()];
+    unsafe { kernel_page_table.activate() };
+    let child = Process::from_elf_randomized_with_limits(
+        &image,
+        kernel_page_table,
+        frame_allocator,
+        randomness,
+        pending.selected_limits,
+    );
+    unsafe { process.address_space().activate() };
+    let child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            return DirectFilesystemOutcome {
+                status: map_process_create_error(error),
+                child: None,
+            }
+        }
+    };
+    child_storage.write(child);
+    let mut child = unsafe { child_storage.assume_init() };
+    let (process_handle, control) = match process.handles_mut().process_create() {
+        Ok(created) => created,
+        Err(error) => {
+            reclaim_unstarted_process(*child, frame_allocator);
+            return DirectFilesystemOutcome {
+                status: map_ipc_error(error),
+                child: None,
+            };
+        }
+    };
+    child.attach_control(control);
+    let child_handles = match handle_transfer_batch_between(
+        process.handles_mut(),
+        child.handles_mut(),
+        &pending.dispositions,
+    ) {
+        Ok(handles) => handles,
+        Err(error) => {
+            let _ = process.handles_mut().handle_close(process_handle);
+            reclaim_unstarted_process(*child, frame_allocator);
+            return DirectFilesystemOutcome {
+                status: map_ipc_error(error),
+                child: None,
+            };
+        }
+    };
+    if let Some(index) = pending.application_data_index {
+        child
+            .set_application_data(child_handles[index])
+            .expect("prevalidated application-data disposition changed type after commit");
+    }
+    pending.startup.set_handles(&child_handles);
+    unsafe { child.address_space().activate() };
+    child
+        .install_direct_startup(&pending.startup)
+        .expect("validated child stack startup copy failed after handle commit");
+    unsafe { process.address_space().activate() };
+    copy_to_user(
+        process,
+        pending.output_address,
+        &encode_handle_output(process_handle),
+    )
+    .expect("validated process-create output failed after handle commit");
+    DirectFilesystemOutcome {
+        status: Status::Ok,
+        child: Some(child),
+    }
+}
+
+fn map_executor_error(error: FsExecutorError) -> Status {
+    match error {
+        FsExecutorError::Filesystem(error) => map_fs_error(error),
+        FsExecutorError::QueueFull | FsExecutorError::ReservedCapacity => Status::ShouldWait,
+        FsExecutorError::PayloadTooLarge | FsExecutorError::ResultTooLarge => Status::OutOfRange,
+        FsExecutorError::AllocationFailed => Status::OutOfMemory,
+        FsExecutorError::Canceled => Status::Canceled,
+        FsExecutorError::Storage(_)
+        | FsExecutorError::Writeback(_)
+        | FsExecutorError::ExecutorStarted
+        | FsExecutorError::UnknownJob
+        | FsExecutorError::NotComplete
+        | FsExecutorError::Fiber(_)
+        | FsExecutorError::FiberFault(_)
+        | FsExecutorError::Internal => Status::Io,
+    }
+}
+
+fn submit_direct_filesystem<Q: FilesystemJobQueue + ?Sized>(
+    process: &mut Process,
+    thread_id: ThreadId,
+    filesystem: &mut Q,
+    job: FsJob,
+    continuation: DirectFilesystemContinuation,
+) -> DispatchResult {
+    match filesystem.enqueue_for_thread(job, continuation) {
+        Ok(id) => {
+            process.block_thread_filesystem(thread_id, id);
+            DispatchResult::Blocked
+        }
+        Err(error) => DispatchResult::Complete(map_executor_error(error)),
+    }
+}
+
+fn prepare_filesystem_stat<Q: FilesystemJobQueue + ?Sized>(
+    process: &mut Process,
+    thread_id: ThreadId,
+    filesystem: &mut Q,
+    raw_file: u64,
+    output_address: u64,
+) -> DispatchResult {
+    let prepared = (|| {
+        let handle = decode_handle(raw_file)?;
+        validate_user_output(process, output_address, FILESYSTEM_STAT_SIZE)?;
+        let file = process
+            .handles()
+            .filesystem_file(handle, Rights::READ)
+            .map_err(map_ipc_error)?;
+        Ok::<_, Status>((
+            FsJob::Stat { file },
+            DirectFilesystemContinuation::Stat { output_address },
+        ))
+    })();
+    match prepared {
+        Ok((job, continuation)) => {
+            submit_direct_filesystem(process, thread_id, filesystem, job, continuation)
+        }
+        Err(status) => DispatchResult::Complete(status),
+    }
+}
+
+fn prepare_filesystem_read_directory<Q: FilesystemJobQueue + ?Sized>(
+    process: &mut Process,
+    thread_id: ThreadId,
+    filesystem: &mut Q,
+    raw_anchor: u64,
+    cookie: u64,
+    output_address: u64,
+) -> DispatchResult {
+    let prepared = (|| {
+        let anchor_handle = decode_handle(raw_anchor)?;
+        validate_user_output(process, output_address, FILESYSTEM_DIRECTORY_ENTRY_SIZE)?;
+        let anchor = resolve_directory_anchor_owned(
+            process,
+            filesystem.root_directory(),
+            anchor_handle,
+            Rights::READ,
+        )?;
+        Ok::<_, Status>((
+            FsJob::ListDirectory {
+                directory: FsDirectory::Handle(anchor.directory),
+            },
+            DirectFilesystemContinuation::ReadDirectory {
+                cookie,
+                output_address,
+            },
+        ))
+    })();
+    match prepared {
+        Ok((job, continuation)) => {
+            submit_direct_filesystem(process, thread_id, filesystem, job, continuation)
+        }
+        Err(status) => DispatchResult::Complete(status),
+    }
+}
+
+fn prepare_filesystem_truncate<Q: FilesystemJobQueue + ?Sized>(
+    process: &mut Process,
+    thread_id: ThreadId,
+    filesystem: &mut Q,
+    raw_file: u64,
+    length: u64,
+) -> DispatchResult {
+    let prepared = (|| {
+        let handle = decode_handle(raw_file)?;
+        let file = process
+            .handles()
+            .filesystem_file(handle, Rights::WRITE)
+            .map_err(map_ipc_error)?;
+        Ok::<_, Status>(FsJob::Truncate { file, length })
+    })();
+    match prepared {
+        Ok(job) => submit_direct_filesystem(
+            process,
+            thread_id,
+            filesystem,
+            job,
+            DirectFilesystemContinuation::Unit,
+        ),
+        Err(status) => DispatchResult::Complete(status),
+    }
+}
+
+fn prepare_filesystem_unlink<Q: FilesystemJobQueue + ?Sized>(
+    process: &mut Process,
+    thread_id: ThreadId,
+    filesystem: &mut Q,
+    raw_anchor: u64,
+    path_address: u64,
+    path_length: u64,
+) -> DispatchResult {
+    let prepared = (|| {
+        let anchor_handle = decode_handle(raw_anchor)?;
+        let path = copy_filesystem_path(process, path_address, path_length)?;
+        let anchor = resolve_directory_anchor_owned(
+            process,
+            filesystem.root_directory(),
+            anchor_handle,
+            Rights::WRITE,
+        )?;
+        if anchor.is_root && is_protected_system_path(&path) {
+            return Err(Status::AccessDenied);
+        }
+        Ok(FsJob::Unlink {
+            directory: FsDirectory::Handle(anchor.directory),
+            path,
+        })
+    })();
+    match prepared {
+        Ok(job) => submit_direct_filesystem(
+            process,
+            thread_id,
+            filesystem,
+            job,
+            DirectFilesystemContinuation::Unit,
+        ),
+        Err(status) => DispatchResult::Complete(status),
+    }
+}
+
+#[cfg(test)]
 fn filesystem_stat<B: Disk>(
     process: &Process,
     filesystem: &mut RedoxFs<B>,
@@ -3352,6 +4112,7 @@ fn filesystem_stat<B: Disk>(
     copy_to_user(process, output_address, &output)
 }
 
+#[cfg(test)]
 fn filesystem_read_directory<B: Disk>(
     process: &Process,
     filesystem: &mut RedoxFs<B>,
@@ -3380,6 +4141,7 @@ fn filesystem_read_directory<B: Disk>(
     copy_to_user(process, output_address, &output)
 }
 
+#[cfg(test)]
 fn filesystem_truncate<B: Disk>(
     process: &Process,
     filesystem: &mut RedoxFs<B>,
@@ -3394,6 +4156,7 @@ fn filesystem_truncate<B: Disk>(
     filesystem.truncate(file, length).map_err(map_fs_error)
 }
 
+#[cfg(test)]
 fn filesystem_unlink<B: Disk>(
     process: &Process,
     filesystem: &mut RedoxFs<B>,
@@ -3417,6 +4180,45 @@ struct DirectoryAnchor {
     is_root: bool,
 }
 
+fn resolve_directory_anchor_owned(
+    process: &Process,
+    root_directory: DirectoryHandle,
+    handle: Handle,
+    required_rights: Rights,
+) -> Result<DirectoryAnchor, Status> {
+    let object_type = process
+        .handles()
+        .object_type(handle)
+        .map_err(map_ipc_error)?;
+    let rights = process
+        .handles()
+        .handle_rights(handle)
+        .map_err(map_ipc_error)?;
+    match object_type {
+        ObjectType::FilesystemRoot => {
+            process
+                .handles()
+                .filesystem_root(handle, required_rights)
+                .map_err(map_ipc_error)?;
+            Ok(DirectoryAnchor {
+                directory: root_directory,
+                rights,
+                is_root: true,
+            })
+        }
+        ObjectType::Directory => Ok(DirectoryAnchor {
+            directory: process
+                .handles()
+                .filesystem_directory(handle, required_rights)
+                .map_err(map_ipc_error)?,
+            rights,
+            is_root: false,
+        }),
+        _ => Err(Status::WrongObjectType),
+    }
+}
+
+#[cfg(test)]
 fn resolve_directory_anchor<B: Disk>(
     process: &Process,
     filesystem: &mut RedoxFs<B>,
@@ -3472,6 +4274,151 @@ fn child_directory_rights(
     namespace_rights | delegation_rights
 }
 
+fn prepare_filesystem_open_directory<Q: FilesystemJobQueue + ?Sized>(
+    process: &mut Process,
+    thread_id: ThreadId,
+    filesystem: &mut Q,
+    args_address: u64,
+) -> DispatchResult {
+    let prepared = (|| {
+        let raw =
+            copy_block_from_user::<FILESYSTEM_OPEN_DIRECTORY_ARGS_SIZE>(process, args_address)?;
+        let (anchor_handle, path_address, path_length) = parse_filesystem_path_args(&raw)?;
+        let output_address = read_u64(&raw, 24);
+        validate_user_output(process, output_address, HANDLE_OUTPUT_SIZE)?;
+        let path = copy_filesystem_path(process, path_address, path_length)?;
+        let anchor = resolve_directory_anchor_owned(
+            process,
+            filesystem.root_directory(),
+            anchor_handle,
+            Rights::READ,
+        )?;
+        let protected = anchor.is_root && is_protected_system_path(&path);
+        let rights = child_directory_rights(anchor.rights, anchor.is_root, protected);
+        Ok::<_, Status>((
+            FsJob::OpenDirectory {
+                directory: FsDirectory::Handle(anchor.directory),
+                path,
+            },
+            DirectFilesystemContinuation::OpenDirectory {
+                output_address,
+                rights,
+            },
+        ))
+    })();
+    match prepared {
+        Ok((job, continuation)) => {
+            submit_direct_filesystem(process, thread_id, filesystem, job, continuation)
+        }
+        Err(status) => DispatchResult::Complete(status),
+    }
+}
+
+fn prepare_filesystem_create_directory<Q: FilesystemJobQueue + ?Sized>(
+    process: &mut Process,
+    thread_id: ThreadId,
+    filesystem: &mut Q,
+    args_address: u64,
+) -> DispatchResult {
+    prepare_namespace_path_job(process, thread_id, filesystem, args_address, true)
+}
+
+fn prepare_filesystem_remove_directory<Q: FilesystemJobQueue + ?Sized>(
+    process: &mut Process,
+    thread_id: ThreadId,
+    filesystem: &mut Q,
+    args_address: u64,
+) -> DispatchResult {
+    prepare_namespace_path_job(process, thread_id, filesystem, args_address, false)
+}
+
+fn prepare_namespace_path_job<Q: FilesystemJobQueue + ?Sized>(
+    process: &mut Process,
+    thread_id: ThreadId,
+    filesystem: &mut Q,
+    args_address: u64,
+    create: bool,
+) -> DispatchResult {
+    let prepared = (|| {
+        let raw =
+            copy_block_from_user::<FILESYSTEM_CREATE_DIRECTORY_ARGS_SIZE>(process, args_address)?;
+        let (anchor_handle, path_address, path_length) = parse_filesystem_path_args(&raw)?;
+        let path = copy_filesystem_path(process, path_address, path_length)?;
+        let anchor = resolve_directory_anchor_owned(
+            process,
+            filesystem.root_directory(),
+            anchor_handle,
+            Rights::WRITE,
+        )?;
+        if anchor.is_root && is_protected_system_path(&path) {
+            return Err(Status::AccessDenied);
+        }
+        let directory = FsDirectory::Handle(anchor.directory);
+        Ok(if create {
+            FsJob::CreateDirectory { directory, path }
+        } else {
+            FsJob::RemoveDirectory { directory, path }
+        })
+    })();
+    match prepared {
+        Ok(job) => submit_direct_filesystem(
+            process,
+            thread_id,
+            filesystem,
+            job,
+            DirectFilesystemContinuation::Unit,
+        ),
+        Err(status) => DispatchResult::Complete(status),
+    }
+}
+
+fn prepare_filesystem_rename<Q: FilesystemJobQueue + ?Sized>(
+    process: &mut Process,
+    thread_id: ThreadId,
+    filesystem: &mut Q,
+    args_address: u64,
+) -> DispatchResult {
+    let prepared = (|| {
+        let raw = copy_block_from_user::<FILESYSTEM_RENAME_ARGS_SIZE>(process, args_address)?;
+        let args = parse_filesystem_rename_args(&raw)?;
+        let source_path = copy_filesystem_path(process, args.source_address, args.source_length)?;
+        let destination_path =
+            copy_filesystem_path(process, args.destination_address, args.destination_length)?;
+        let root = filesystem.root_directory();
+        let source =
+            resolve_directory_anchor_owned(process, root, args.source_anchor, Rights::WRITE)?;
+        let destination =
+            resolve_directory_anchor_owned(process, root, args.destination_anchor, Rights::WRITE)?;
+        if (source.is_root && is_protected_system_path(&source_path))
+            || (destination.is_root && is_protected_system_path(&destination_path))
+        {
+            return Err(Status::AccessDenied);
+        }
+        Ok(FsJob::Rename {
+            source_directory: FsDirectory::Handle(source.directory),
+            source_path,
+            destination_directory: FsDirectory::Handle(destination.directory),
+            destination_path,
+            mode: if args.flags.contains(FilesystemRenameFlags::REPLACE) {
+                RenameMode::Replace
+            } else {
+                RenameMode::NoReplace
+            },
+        })
+    })();
+    match prepared {
+        Ok(job) => submit_direct_filesystem(
+            process,
+            thread_id,
+            filesystem,
+            job,
+            DirectFilesystemContinuation::Unit,
+        ),
+        Err(status) => DispatchResult::Complete(status),
+    }
+}
+
+#[cfg(test)]
 fn filesystem_open_directory<B: Disk>(
     process: &mut Process,
     filesystem: &mut RedoxFs<B>,
@@ -3499,6 +4446,7 @@ fn filesystem_open_directory<B: Disk>(
     Ok(())
 }
 
+#[cfg(test)]
 fn filesystem_create_directory<B: Disk>(
     process: &Process,
     filesystem: &mut RedoxFs<B>,
@@ -3517,6 +4465,7 @@ fn filesystem_create_directory<B: Disk>(
         .map_err(map_fs_error)
 }
 
+#[cfg(test)]
 fn filesystem_remove_directory<B: Disk>(
     process: &Process,
     filesystem: &mut RedoxFs<B>,
@@ -3535,6 +4484,7 @@ fn filesystem_remove_directory<B: Disk>(
         .map_err(map_fs_error)
 }
 
+#[cfg(test)]
 fn filesystem_rename<B: Disk>(
     process: &Process,
     filesystem: &mut RedoxFs<B>,
@@ -3569,7 +4519,7 @@ fn filesystem_rename<B: Disk>(
         .map_err(map_fs_error)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn filesystem_sync<B: Disk>(
     process: &Process,
     filesystem: &mut RedoxFs<B>,
@@ -3606,6 +4556,114 @@ fn filesystem_sync<B: Disk>(
     filesystem.sync().map_err(map_fs_error)
 }
 
+fn prepare_filesystem_get_info<Q: FilesystemJobQueue + ?Sized>(
+    process: &mut Process,
+    thread_id: ThreadId,
+    filesystem: &mut Q,
+    args_address: u64,
+) -> DispatchResult {
+    let prepared = (|| {
+        let raw = copy_block_from_user::<FILESYSTEM_GET_INFO_ARGS_SIZE>(process, args_address)?;
+        let anchor_handle = Handle::from_raw(read_u32(&raw, 0));
+        if read_u32(&raw, 4) != 0 {
+            return Err(Status::InvalidArgument);
+        }
+        let output_address = read_u64(&raw, 8);
+        validate_user_output(process, output_address, FILESYSTEM_INFO_SIZE)?;
+        resolve_directory_anchor_owned(
+            process,
+            filesystem.root_directory(),
+            anchor_handle,
+            Rights::READ,
+        )?;
+        Ok::<_, Status>((
+            FsJob::FilesystemInfo,
+            DirectFilesystemContinuation::FilesystemInfo { output_address },
+        ))
+    })();
+    match prepared {
+        Ok((job, continuation)) => {
+            submit_direct_filesystem(process, thread_id, filesystem, job, continuation)
+        }
+        Err(status) => DispatchResult::Complete(status),
+    }
+}
+
+fn prepare_filesystem_get_metadata<Q: FilesystemJobQueue + ?Sized>(
+    process: &mut Process,
+    thread_id: ThreadId,
+    filesystem: &mut Q,
+    args_address: u64,
+) -> DispatchResult {
+    let prepared = (|| {
+        let raw = copy_block_from_user::<FILESYSTEM_GET_METADATA_ARGS_SIZE>(process, args_address)?;
+        let (anchor_handle, path_address, path_length) = parse_filesystem_path_args(&raw)?;
+        let output_address = read_u64(&raw, 24);
+        validate_user_output(process, output_address, FILESYSTEM_METADATA_SIZE)?;
+        let path = copy_filesystem_path(process, path_address, path_length)?;
+        let anchor = resolve_directory_anchor_owned(
+            process,
+            filesystem.root_directory(),
+            anchor_handle,
+            Rights::READ,
+        )?;
+        Ok::<_, Status>((
+            FsJob::MetadataAt {
+                directory: FsDirectory::Handle(anchor.directory),
+                path,
+            },
+            DirectFilesystemContinuation::Metadata { output_address },
+        ))
+    })();
+    match prepared {
+        Ok((job, continuation)) => {
+            submit_direct_filesystem(process, thread_id, filesystem, job, continuation)
+        }
+        Err(status) => DispatchResult::Complete(status),
+    }
+}
+
+fn prepare_filesystem_read_directory2<Q: FilesystemJobQueue + ?Sized>(
+    process: &mut Process,
+    thread_id: ThreadId,
+    filesystem: &mut Q,
+    args_address: u64,
+) -> DispatchResult {
+    let prepared = (|| {
+        let raw =
+            copy_block_from_user::<FILESYSTEM_READ_DIRECTORY2_ARGS_SIZE>(process, args_address)?;
+        let directory_handle = Handle::from_raw(read_u32(&raw, 0));
+        if read_u32(&raw, 4) != 0 {
+            return Err(Status::InvalidArgument);
+        }
+        let cookie = read_u64(&raw, 8);
+        let output_address = read_u64(&raw, 16);
+        validate_user_output(process, output_address, FILESYSTEM_DIRECTORY_ENTRY2_SIZE)?;
+        let anchor = resolve_directory_anchor_owned(
+            process,
+            filesystem.root_directory(),
+            directory_handle,
+            Rights::READ,
+        )?;
+        Ok::<_, Status>((
+            FsJob::ListDirectory {
+                directory: FsDirectory::Handle(anchor.directory),
+            },
+            DirectFilesystemContinuation::ReadDirectory2 {
+                cookie,
+                output_address,
+            },
+        ))
+    })();
+    match prepared {
+        Ok((job, continuation)) => {
+            submit_direct_filesystem(process, thread_id, filesystem, job, continuation)
+        }
+        Err(status) => DispatchResult::Complete(status),
+    }
+}
+
+#[cfg(test)]
 fn filesystem_get_info<B: Disk>(
     process: &Process,
     filesystem: &mut RedoxFs<B>,
@@ -3634,6 +4692,7 @@ fn filesystem_get_info<B: Disk>(
     copy_to_user(process, output_address, &output)
 }
 
+#[cfg(test)]
 fn filesystem_get_metadata<B: Disk>(
     process: &Process,
     filesystem: &mut RedoxFs<B>,
@@ -3650,6 +4709,7 @@ fn filesystem_get_metadata<B: Disk>(
     copy_to_user(process, output_address, &output)
 }
 
+#[cfg(test)]
 fn filesystem_read_directory2<B: Disk>(
     process: &Process,
     filesystem: &mut RedoxFs<B>,
@@ -3772,6 +4832,7 @@ fn validate_filesystem_path(path: &str) -> Result<(), Status> {
     Ok(())
 }
 
+#[cfg(test)]
 fn resolve_parent_directory<'a, B: Disk>(
     filesystem: &mut RedoxFs<B>,
     anchor: DirectoryHandle,
@@ -3788,6 +4849,7 @@ fn resolve_parent_directory<'a, B: Disk>(
     }
 }
 
+#[cfg(test)]
 fn remove_file_path<B: Disk>(
     filesystem: &mut RedoxFs<B>,
     anchor: DirectoryHandle,
@@ -3800,6 +4862,7 @@ fn remove_file_path<B: Disk>(
     filesystem.remove_file_at(parent, name)
 }
 
+#[cfg(test)]
 fn metadata_at<B: Disk>(
     filesystem: &mut RedoxFs<B>,
     anchor: DirectoryHandle,
@@ -3912,6 +4975,128 @@ fn audio_write(
     }
 }
 
+fn prepare_process_create<Q: FilesystemJobQueue + ?Sized>(
+    process: &mut Process,
+    thread_id: ThreadId,
+    filesystem: &mut Q,
+    args_address: u64,
+    available_bytes: u64,
+    child_slot_reserved: bool,
+    extended: bool,
+) -> DispatchResult {
+    let prepared = (|| {
+        if !child_slot_reserved {
+            return Err(Status::ResourceLimit);
+        }
+        let raw_length = if extended {
+            PROCESS_CREATE_ARGS2_SIZE
+        } else {
+            PROCESS_CREATE_ARGS_SIZE
+        };
+        let raw_vec = copy_vec_from_user(process, args_address, raw_length)?;
+        let raw = raw_vec.as_slice();
+        let executable = Handle::from_raw(read_u32(raw, 0));
+        if read_u32(raw, 4) != 0 {
+            return Err(Status::InvalidArgument);
+        }
+        let startup_args_address = read_u64(raw, 8);
+        let args_length = bounded_startup_length(read_u64(raw, 16))?;
+        let dispositions_address = read_u64(raw, 24);
+        let disposition_count = checked_array_bytes(
+            read_u64(raw, 32),
+            1,
+            PROCESS_MAX_STARTUP_HANDLES as u64,
+            Status::ResourceLimit,
+        )?;
+        let config_address = read_u64(raw, 40);
+        let config_length = bounded_startup_length(read_u64(raw, 48))?;
+        let output_address = read_u64(raw, 56);
+        let requested_policy = if extended {
+            if read_u32(raw, 64) != 1 || read_u32(raw, 68) != PROCESS_CREATE_ARGS2_SIZE as u32 {
+                return Err(Status::InvalidArgument);
+            }
+            let policy_raw =
+                copy_block_from_user::<PROCESS_MEMORY_POLICY_SIZE>(process, read_u64(raw, 72))?;
+            Some(parse_process_memory_policy(&policy_raw)?)
+        } else {
+            None
+        };
+        if args_length
+            .checked_add(config_length)
+            .is_none_or(|length| length > PROCESS_MAX_STARTUP_BYTES)
+        {
+            return Err(Status::ResourceLimit);
+        }
+        validate_user_output(process, output_address, HANDLE_OUTPUT_SIZE)?;
+        let args = copy_vec_from_user(process, startup_args_address, args_length)?;
+        let config = copy_vec_from_user(process, config_address, config_length)?;
+        let disposition_bytes = checked_array_bytes(
+            disposition_count as u64,
+            HANDLE_DISPOSITION_SIZE,
+            PROCESS_MAX_STARTUP_HANDLES as u64,
+            Status::ResourceLimit,
+        )?;
+        let raw_dispositions =
+            copy_vec_from_user(process, dispositions_address, disposition_bytes)?;
+        let mut dispositions = Vec::new();
+        dispositions
+            .try_reserve_exact(disposition_count)
+            .map_err(|_| Status::OutOfMemory)?;
+        for raw in raw_dispositions.chunks_exact(HANDLE_DISPOSITION_SIZE) {
+            dispositions.push(parse_handle_disposition(raw)?);
+        }
+        let application_data_index = application_data_disposition_index(&dispositions, |handle| {
+            process.handles().object_type(handle)
+        })?;
+        let startup = DirectStartupBlock::new(&args, &config, disposition_count)?;
+        let file = process
+            .handles()
+            .filesystem_file(executable, Rights::EXECUTE)
+            .map_err(map_ipc_error)?;
+        let inherited_limits = select_child_process_limits(process.limits(), available_bytes, None)
+            .expect("legacy child limit selection cannot fail");
+        let requested_limits = requested_policy.map(|values| ProcessLimits {
+            private_pages: values[0],
+            shared_memory_bytes: values[1],
+            mapped_shared_bytes: values[2],
+            reserved_virtual_bytes: values[3],
+            vma_count: values[4],
+            executable_image_pages: values[5],
+            executable_source_bytes: values[6],
+            channel_traffic_bytes: inherited_limits.channel_traffic_bytes,
+            cpu_quantum_ns: inherited_limits.cpu_quantum_ns,
+        });
+        let selected_limits =
+            select_child_process_limits(process.limits(), available_bytes, requested_limits)
+                .ok_or(Status::ResourceLimit)?;
+        let maximum = usize::try_from(selected_limits.executable_source_bytes)
+            .unwrap_or(usize::MAX)
+            .min(WholeFileKind::Elf.maximum());
+        let pending = PendingProcessCreate {
+            startup,
+            dispositions,
+            application_data_index,
+            output_address,
+            selected_limits,
+        };
+        Ok::<_, Status>((
+            FsJob::ReadWholeFileHandle {
+                file,
+                kind: WholeFileKind::Elf,
+                maximum,
+            },
+            DirectFilesystemContinuation::ProcessCreate(pending),
+        ))
+    })();
+    match prepared {
+        Ok((job, continuation)) => {
+            submit_direct_filesystem(process, thread_id, filesystem, job, continuation)
+        }
+        Err(status) => DispatchResult::Complete(status),
+    }
+}
+
+#[cfg(test)]
 fn process_create<B: Disk>(
     process: &mut Process,
     filesystem: &mut RedoxFs<B>,
@@ -4223,6 +5408,76 @@ fn require_application_data_installation_authority(
         .map_err(map_ipc_error)
 }
 
+fn prepare_application_data_create<Q: FilesystemJobQueue + ?Sized>(
+    process: &mut Process,
+    thread_id: ThreadId,
+    filesystem: &mut Q,
+    args_address: u64,
+) -> DispatchResult {
+    let prepared = (|| {
+        let raw = copy_block_from_user::<APPLICATION_DATA_CREATE_ARGS_SIZE>(process, args_address)?;
+        let request = parse_application_data_create_args(&raw)?;
+        validate_user_output(process, request.output_address, HANDLE_OUTPUT_SIZE)?;
+        require_application_data_installation_authority(process.handles(), request.root)?;
+        let bytes = copy_vec_from_user(process, request.app_id_address, request.app_id_length)?;
+        let app_id = core::str::from_utf8(&bytes).map_err(|_| Status::InvalidArgument)?;
+        let handle = process
+            .handles_mut()
+            .application_data_create(app_id)
+            .map_err(map_ipc_error)?;
+        Ok::<_, Status>((
+            handle,
+            FsJob::SetupApplicationDataDirectory {
+                application_id: String::from(app_id),
+            },
+            DirectFilesystemContinuation::ApplicationDataCreate {
+                handle,
+                output_address: request.output_address,
+            },
+        ))
+    })();
+    match prepared {
+        Ok((handle, job, continuation)) => {
+            let outcome =
+                submit_direct_filesystem(process, thread_id, filesystem, job, continuation);
+            if !matches!(outcome, DispatchResult::Blocked) {
+                close_handles(process, core::slice::from_ref(&handle));
+            }
+            outcome
+        }
+        Err(status) => DispatchResult::Complete(status),
+    }
+}
+
+fn prepare_application_get_data_directory<Q: FilesystemJobQueue + ?Sized>(
+    process: &mut Process,
+    thread_id: ThreadId,
+    filesystem: &mut Q,
+    output_address: u64,
+) -> DispatchResult {
+    let prepared = (|| {
+        let identity = process.application_data().ok_or(Status::NotFound)?;
+        validate_user_output(process, output_address, HANDLE_OUTPUT_SIZE)?;
+        let scope = process
+            .handles()
+            .application_data_scope(identity, Rights::READ)
+            .map_err(map_ipc_error)?;
+        Ok::<_, Status>((
+            FsJob::OpenApplicationDataDirectory {
+                application_id: String::from(scope.app_id()),
+            },
+            DirectFilesystemContinuation::ApplicationDataDirectory { output_address },
+        ))
+    })();
+    match prepared {
+        Ok((job, continuation)) => {
+            submit_direct_filesystem(process, thread_id, filesystem, job, continuation)
+        }
+        Err(status) => DispatchResult::Complete(status),
+    }
+}
+
+#[cfg(test)]
 fn application_data_create<B: Disk>(
     process: &mut Process,
     filesystem: &mut RedoxFs<B>,
@@ -4258,6 +5513,7 @@ fn application_data_create<B: Disk>(
     Ok(())
 }
 
+#[cfg(test)]
 fn application_get_data_directory<B: Disk>(
     process: &mut Process,
     filesystem: &mut RedoxFs<B>,
@@ -4281,6 +5537,7 @@ fn application_get_data_directory<B: Disk>(
     Ok(())
 }
 
+#[cfg(test)]
 fn ensure_application_data_directory<B: Disk>(
     filesystem: &mut RedoxFs<B>,
     app_id: &str,
@@ -4302,6 +5559,7 @@ fn ensure_application_data_directory<B: Disk>(
     }
 }
 
+#[cfg(test)]
 fn open_application_data_directory<B: Disk>(
     filesystem: &mut RedoxFs<B>,
     app_id: &str,
