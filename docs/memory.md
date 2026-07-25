@@ -129,6 +129,12 @@ Early allocation uses a linked 32 MiB bootstrap Talc arena. It remains mapped fo
 
 Scheduler maintenance asks for adaptive free heap headroom derived from RAM and clamped from 8 MiB to 256 MiB. Growth leaves at least 64 physical frames outside the heap and conservatively budgets two frames per added heap page. Low-memory growth can defer and retry after frames return. Mapping is installed before Talc receives the range. A failed map rolls back exact frames; an incomplete rollback fails stop. Talc rejecting or partially consuming a successfully mapped extension also fails stop because allocator and page-table ownership would disagree.
 
+## Request page pins
+
+Pinned request buffers validate the complete mapped range, access direction, and page permissions before publication. Pin counts live in central user-page mapping metadata. Multi-page pinning is transactional: any failure removes all pins acquired by that attempt.
+
+`VirtualUnmap`, decommit, and protection changes that would invalidate a pinned page return `ShouldWait`. A logical request timeout or cancellation does not release pins while a device may still access them. Pins are removed exactly once after completion, cancellation acknowledgement, reset/removal drain, owner termination drain, or shutdown drain proves that device ownership ended. Process retirement waits for every request pin and shared-memory request lease to be released.
+
 ## Shared-frame leases
 
 A shared-memory object owns a list of distinct physical frames. Handles, transferred aliases, windows, and process mappings hold reference-counted ownership. Mapping records retain a lease after the source handle closes. Unmap drops that lease only after all PTE aliases are unreachable. Process retirement first switches back to the kernel CR3 and removes aliases, then releases mappings and object references.

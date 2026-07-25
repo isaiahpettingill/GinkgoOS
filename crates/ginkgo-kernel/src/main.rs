@@ -26,7 +26,9 @@ use framebuffer::{FramebufferWriter, Rgb};
 use ginkgo_desktop::ClientId;
 use ginkgo_filesystem::{FsError, NodeKind, NodeMetadata, RedoxFs, RenameMode};
 use ginkgo_hid::{ApplicationKind, Axis, InputEvent, AXIS_MAX, AXIS_MIN};
-use ginkgo_ipc::{shared_memory_backing_stats, IpcError, SystemPowerControl};
+use ginkgo_ipc::{
+    shared_memory_backing_stats, IpcError, SchedulingAuthorityControl, SystemPowerControl,
+};
 #[cfg(ginkgo_memory_policy_smoke)]
 use ginkgo_kernel::paging::address_space::{
     UserMappingBacking, UserPageMapping, UserPagePermissions,
@@ -49,19 +51,24 @@ use ginkgo_kernel::{
     paging::{ActivePageTable, PageTableFlags},
     power::AcpiPower,
     process::{
-        Process, ProcessFault, ProcessFaultReason, ProcessId, ProcessState, ProcessTable,
-        ThreadRef, ThreadState, UserPageFaultResolution, USER_SCHEDULER_CAPACITY,
+        BlockedKind, Process, ProcessFault, ProcessFaultReason, ProcessId, ProcessState,
+        ProcessTable, ThreadRef, ThreadState, UserPageFaultResolution, PROCESS_TABLE_CAPACITY,
+        USER_SCHEDULER_CAPACITY,
     },
+    request::{RequestAction, RequestCancelReason, RequestWorkerBudget},
+    request_broker::{BrokerCompletion, PreparedRequestBuffer, RequestBroker},
     shared_memory::{SharedFrameArena, SharedMemoryFactory},
     syscall::{self, DebugSink, SyscallOutcome},
     task::{Scheduler, TaskPoll, TaskState},
     thread_scheduler::{
         Authority as SchedulerAuthority, RunDisposition, SchedulingClass, ThreadScheduler,
-        ThreadState as SchedulerThreadState,
+        ThreadState as SchedulerThreadState, DEFAULT_MAX_DONATION_DEPTH, DEFAULT_MAX_DONATION_NS,
     },
     trust::TrustedManifest,
     usb::{self, UsbError},
     virtio_blk::{VirtioBlk, VirtioBlkError},
+    wait_runtime::{WaitKind, WaitRuntime, WakeCause},
+    writeback::WriteBackDisk,
 };
 use ginkgo_program_registry::{EntryFlags, Registry};
 use ginkgo_window::{
@@ -134,6 +141,8 @@ static PROCESS_CAPABILITY_MALFORMED_ELF: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/ginkgo-process-capability-malformed.elf"
 ));
+static REQUEST_SMOKE_ELF: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-request-smoke.elf"));
 static THREAD_SMOKE_ELF: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-thread-smoke.elf"));
 #[cfg(ginkgo_memory_policy_smoke)]
@@ -177,6 +186,10 @@ fn filesystem_hierarchy_smoke_enabled() -> bool {
 
 fn process_capability_smoke_enabled() -> bool {
     option_env!("GINKGO_PROCESS_CAPABILITY_SMOKE") == Some("1")
+}
+
+fn request_smoke_enabled() -> bool {
+    option_env!("GINKGO_REQUEST_SMOKE") == Some("1")
 }
 
 fn text_editor_smoke_enabled() -> bool {
@@ -1027,10 +1040,11 @@ pub extern "C" fn _start() -> ! {
         halt_forever();
     };
     let blank_disk = volume_is_blank(&mut volume);
+    let writeback = WriteBackDisk::try_new(volume, 3_072).unwrap_or_else(|_| halt_forever());
     let fs_result = if blank_disk {
-        RedoxFs::format_disk(volume)
+        RedoxFs::format_disk(writeback)
     } else {
-        RedoxFs::open_disk(volume)
+        RedoxFs::open_disk(writeback)
     };
     let Ok(mut fs) = fs_result else {
         ui.render_boot_log(&mut screen, "redoxfs: persistent disk mount failed");
@@ -1085,6 +1099,7 @@ pub extern "C" fn _start() -> ! {
         };
     ui.catalog = catalog;
     ui.render_boot_log(&mut screen, "redoxfs: desktop ELF and registry loaded");
+    fs.disk_mut().enable_async_writeback();
 
     let acpi_power = RSDP_REQUEST.response().and_then(|response| {
         match unsafe { AcpiPower::discover(response.address, hhdm.offset, tsc_frequency) } {
@@ -1143,8 +1158,14 @@ pub extern "C" fn _start() -> ! {
         processes: ProcessTable::new(),
         user_scheduler: ThreadScheduler::try_with_default_policy(USER_SCHEDULER_CAPACITY)
             .unwrap_or_else(|_| halt_forever()),
+        waits: WaitRuntime::try_new(USER_SCHEDULER_CAPACITY).unwrap_or_else(|_| halt_forever()),
+        process_terminations: WaitRuntime::try_new(PROCESS_TABLE_CAPACITY)
+            .unwrap_or_else(|_| halt_forever()),
+        requests: RequestBroker::try_new().unwrap_or_else(|_| halt_forever()),
+        urgent_process_dispatch: false,
         desktop: None,
         desktop_process_id: None,
+        focused_process_id: None,
         process_clients: Vec::new(),
         next_client_id: 1,
         launch_requested: None,
@@ -1176,10 +1197,6 @@ pub extern "C" fn _start() -> ! {
             let _ = writeln!(sink, "ginkgo-memory-policy-smoke: FAIL {reason}\r");
             halt_forever();
         }
-    }
-
-    if power_smoke_mode().is_some() {
-        run_power_smoke(&mut context);
     }
 
     match unsafe {
@@ -1316,6 +1333,10 @@ pub extern "C" fn _start() -> ! {
 
     run_memory_policy_smoke_if_enabled(&mut context);
 
+    if power_smoke_mode().is_some() {
+        run_power_smoke(&mut context);
+    }
+
     if process_capability_smoke_enabled() {
         if spawn_process_capability_smoke(&mut context).is_err() {
             let mut sink = SerialDebugSink::new(&mut context.serial);
@@ -1323,6 +1344,15 @@ pub extern "C" fn _start() -> ! {
                 sink,
                 "ginkgo-process-capability-smoke: FAIL kernel launch\r"
             );
+            halt_forever();
+        }
+        run_scheduler(&mut context);
+    }
+
+    if request_smoke_enabled() {
+        if spawn_request_smoke(&mut context).is_err() {
+            let mut sink = SerialDebugSink::new(&mut context.serial);
+            let _ = writeln!(sink, "ginkgo-request-smoke: FAIL kernel launch\r");
             halt_forever();
         }
         run_scheduler(&mut context);
@@ -1390,6 +1420,10 @@ pub extern "C" fn _start() -> ! {
             SchedulingClass::Interactive,
         );
     }
+    synchronize_process_scheduler(&mut context, process_id);
+    context
+        .ui
+        .render_boot_log(&mut context.screen, "desktop: userspace service started");
     {
         let mut sink = SerialDebugSink::new(&mut context.serial);
         let _ = writeln!(
@@ -1421,6 +1455,7 @@ pub extern "C" fn _start() -> ! {
         };
         match context.processes.insert(smoke) {
             Ok(smoke_id) => {
+                synchronize_process_scheduler(&mut context, smoke_id);
                 context.preemption_smoke_id = Some(smoke_id);
                 let mut sink = SerialDebugSink::new(&mut context.serial);
                 let _ = writeln!(
@@ -1446,7 +1481,7 @@ pub extern "C" fn _start() -> ! {
             context.entropy.next_u64(),
             context.entropy.next_u64(),
         ];
-        let smoke = Process::from_elf_randomized(
+        let mut smoke = Process::from_elf_randomized(
             THREAD_SMOKE_ELF,
             &context.page_table,
             &mut context.frames,
@@ -1457,11 +1492,32 @@ pub extern "C" fn _start() -> ! {
             let _ = writeln!(sink, "thread-smoke: load failed: {error:?}\r");
             halt_forever();
         });
+        let root = smoke
+            .handles_mut()
+            .filesystem_root_create_with_rights(
+                ginkgo_sysapi::Rights::READ
+                    | ginkgo_sysapi::Rights::WRITE
+                    | ginkgo_sysapi::Rights::EXECUTE,
+            )
+            .unwrap_or_else(|_| halt_forever());
+        let (audio_authority, _) = smoke
+            .handles_mut()
+            .scheduling_authority_create(ginkgo_sysapi::ThreadSchedulingClass::Audio, true)
+            .unwrap_or_else(|_| halt_forever());
+        smoke.set_start_arguments6([
+            u64::from(root.raw()),
+            0,
+            0,
+            0,
+            u64::from(audio_authority.raw()),
+            0,
+        ]);
         let smoke_id = context.processes.insert(smoke).unwrap_or_else(|error| {
             let mut sink = SerialDebugSink::new(&mut context.serial);
             let _ = writeln!(sink, "thread-smoke: insertion failed: {error:?}\r");
             halt_forever();
         });
+        synchronize_process_scheduler(&mut context, smoke_id);
         let mut sink = SerialDebugSink::new(&mut context.serial);
         let _ = writeln!(sink, "thread-smoke: started pid={}\r", smoke_id.raw());
     }
@@ -1493,8 +1549,16 @@ fn run_power_smoke(context: &mut KernelContext) -> ! {
                 let _ = writeln!(sink, "power-smoke: sync staging failed\r");
                 halt_forever();
             }
+            let status = context.fs.disk().status();
             let mut sink = SerialDebugSink::new(&mut context.serial);
-            let _ = writeln!(sink, "power-smoke: sync-before-poweroff staged\r");
+            let _ = writeln!(
+                sink,
+                "power-smoke: sync-before-poweroff staged write={} requested={} durable={} dirty={}\r",
+                status.write_sequence,
+                status.requested_sequence,
+                status.durable_sequence,
+                status.dirty_count
+            );
             ginkgo_sysapi::SystemPowerAction::PowerOff
         }
         "verify" => {
@@ -1593,8 +1657,9 @@ fn run_memory_policy_smoke_if_enabled(context: &mut KernelContext) {
 }
 
 fn run_scheduler(context: &mut KernelContext) -> ! {
-    let mut scheduler = Scheduler::<KernelContext, 9>::new();
-    if scheduler.spawn(filesystem_task).is_err()
+    let mut scheduler = Scheduler::<KernelContext, 14>::new();
+    if scheduler.spawn(writeback_task).is_err()
+        || scheduler.spawn(filesystem_task).is_err()
         || scheduler.spawn(console_task).is_err()
         || scheduler.spawn(accounting_task).is_err()
         || scheduler.spawn(log_flush_task).is_err()
@@ -1602,10 +1667,14 @@ fn run_scheduler(context: &mut KernelContext) -> ! {
         || scheduler.spawn(audio_task).is_err()
         || scheduler.spawn(desktop_task).is_err()
         || scheduler.spawn(power_task).is_err()
+        || scheduler.spawn(request_task).is_err()
+        || scheduler.spawn(wait_task).is_err()
+        || scheduler.spawn(process_task).is_err()
+        || scheduler.spawn(wait_task).is_err()
     {
         halt_forever();
     }
-    if scheduler.spawn(process_task).is_err() {
+    if scheduler.spawn(urgent_process_task).is_err() {
         halt_forever();
     }
 
@@ -1613,9 +1682,20 @@ fn run_scheduler(context: &mut KernelContext) -> ! {
         maintain_kernel_heap(context);
         scheduler.run_round(context);
         reclaim_idle_shared_frames(context);
-        if !context.processes.has_runnable()
-            && context.timer.arm_one_shot(KERNEL_IDLE_POLL_NS).is_ok()
-        {
+        let now_ns = context.timer.clock().now_ns();
+        let next_deadline_ns = match (
+            context.waits.next_deadline_ns(),
+            context.requests.next_deadline_ns(),
+        ) {
+            (Some(wait), Some(request)) => Some(wait.min(request)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        };
+        let idle_slice_ns = next_deadline_ns
+            .map(|deadline| deadline.saturating_sub(now_ns).max(1))
+            .unwrap_or(KERNEL_IDLE_POLL_NS)
+            .min(KERNEL_IDLE_POLL_NS);
+        if !context.processes.has_runnable() && context.timer.arm_one_shot(idle_slice_ns).is_ok() {
             let _ = arch::idle_until_interrupt();
             context.timer.disarm();
         } else {
@@ -1624,11 +1704,12 @@ fn run_scheduler(context: &mut KernelContext) -> ! {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ProcessClient {
     process_id: ProcessId,
     client_id: ClientId,
     launch_authority: RegistryLaunchAuthority,
+    interactive_authority: SchedulingAuthorityControl,
 }
 
 struct KernelContext {
@@ -1637,7 +1718,7 @@ struct KernelContext {
     page_table: ActivePageTable,
     kernel_heap: heap::PageBackedHeap,
     hhdm_offset: u64,
-    fs: RedoxFs<Volume<StorageDisk>>,
+    fs: RedoxFs<WriteBackDisk<Volume<StorageDisk>>>,
     serial: Option<SerialPort>,
     input: Option<InputManager>,
     audio: Option<AudioDevice>,
@@ -1657,8 +1738,13 @@ struct KernelContext {
     memory_policy_smoke: Option<MemoryPolicySmoke>,
     processes: ProcessTable,
     user_scheduler: ThreadScheduler<ThreadRef>,
+    waits: WaitRuntime<ThreadRef>,
+    process_terminations: WaitRuntime<ProcessId>,
+    requests: RequestBroker,
+    urgent_process_dispatch: bool,
     desktop: Option<DesktopBroker>,
     desktop_process_id: Option<ProcessId>,
+    focused_process_id: Option<ProcessId>,
     process_clients: Vec<ProcessClient>,
     next_client_id: u64,
     launch_requested: Option<usize>,
@@ -2402,75 +2488,1004 @@ fn scheduler_authority(class: SchedulingClass) -> SchedulerAuthority {
     }
 }
 
-fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll {
-    let now_ns = context.timer.clock().now_ns();
+fn ensure_process_termination_registration(context: &mut KernelContext, process_id: ProcessId) {
+    if context
+        .process_terminations
+        .token_for_key(process_id)
+        .is_some()
+        || context
+            .processes
+            .get(process_id)
+            .is_none_or(|process| process.state().is_terminal())
     {
-        let (processes, scheduler) = (&context.processes, &mut context.user_scheduler);
-        for thread_ref in processes.thread_refs() {
-            let process = processes.get(thread_ref.process_id);
-            let state = process.and_then(|process| process.thread_state(thread_ref.thread_id));
-            let class = process
-                .and_then(|process| process.thread_scheduling_class(thread_ref.thread_id))
-                .unwrap_or(SchedulingClass::Normal);
-            if scheduler
-                .snapshot(thread_ref)
-                .is_some_and(|snapshot| snapshot.base_class != class)
-            {
-                scheduler
-                    .set_base_class(thread_ref, class, now_ns)
-                    .unwrap_or_else(|_| halt_forever());
-            }
-            match state {
-                Some(ThreadState::Ready) => match scheduler.snapshot(thread_ref) {
-                    None => {
-                        scheduler
-                            .add_thread(thread_ref, class, scheduler_authority(class), now_ns)
-                            .unwrap_or_else(|_| halt_forever());
-                    }
-                    Some(snapshot) if snapshot.state == SchedulerThreadState::Blocked => {
-                        scheduler
-                            .wake(thread_ref, now_ns)
-                            .unwrap_or_else(|_| halt_forever());
-                    }
-                    Some(_) => {}
-                },
-                Some(ThreadState::Blocked) => match scheduler.snapshot(thread_ref) {
-                    None => {
-                        scheduler
-                            .add_thread(thread_ref, class, scheduler_authority(class), now_ns)
-                            .unwrap_or_else(|_| halt_forever());
-                        scheduler
-                            .block(thread_ref)
-                            .unwrap_or_else(|_| halt_forever());
-                    }
-                    Some(snapshot)
-                        if matches!(
-                            snapshot.state,
-                            SchedulerThreadState::Runnable | SchedulerThreadState::Running
-                        ) =>
-                    {
-                        scheduler
-                            .block(thread_ref)
-                            .unwrap_or_else(|_| halt_forever());
-                    }
-                    Some(_) => {}
-                },
-                Some(
-                    ThreadState::Exited(_) | ThreadState::Faulted(_) | ThreadState::Terminated,
-                ) => {
-                    if scheduler.snapshot(thread_ref).is_some() {
-                        let _ = scheduler.remove_thread(thread_ref, now_ns);
-                    }
+        return;
+    }
+
+    let token = context
+        .process_terminations
+        .register(process_id, WaitKind::ProcessTermination, None)
+        .unwrap_or_else(|_| halt_forever());
+    let observer = context.process_terminations.observer();
+    let registered = context
+        .processes
+        .get(process_id)
+        .and_then(|process| process.register_termination_observer(token, &observer).ok())
+        .unwrap_or(false);
+    if !registered {
+        let _ = context.process_terminations.cancel(token);
+    }
+}
+
+fn synchronize_process_scheduler(context: &mut KernelContext, process_id: ProcessId) {
+    ensure_process_termination_registration(context, process_id);
+    let mut threads = [None; ginkgo_kernel::process::MAX_THREADS_PER_PROCESS];
+    let mut count = 0usize;
+    if let Some(process) = context.processes.get(process_id) {
+        for thread_id in process.thread_ids() {
+            threads[count] = process.thread_state(thread_id).and_then(|state| {
+                process.thread_scheduling_class(thread_id).map(|class| {
+                    (
+                        ThreadRef {
+                            process_id,
+                            thread_id,
+                        },
+                        state,
+                        class,
+                    )
+                })
+            });
+            count += 1;
+        }
+    }
+    let now_ns = context.timer.clock().now_ns();
+    for (thread_ref, state, class) in threads[..count].iter().flatten().copied() {
+        let snapshot = context.user_scheduler.snapshot(thread_ref);
+        let authority = scheduler_authority(class);
+        if snapshot
+            .is_some_and(|snapshot| snapshot.base_class != class || snapshot.authority != authority)
+        {
+            context
+                .user_scheduler
+                .set_base_class_with_authority(thread_ref, class, authority, now_ns)
+                .unwrap_or_else(|_| halt_forever());
+        }
+        match state {
+            ThreadState::Ready => match context.user_scheduler.snapshot(thread_ref) {
+                None => {
+                    context
+                        .user_scheduler
+                        .add_thread(thread_ref, class, scheduler_authority(class), now_ns)
+                        .unwrap_or_else(|_| halt_forever());
                 }
-                None => {}
+                Some(snapshot) if snapshot.state == SchedulerThreadState::Blocked => {
+                    let _ = context.user_scheduler.wake(thread_ref, now_ns);
+                }
+                Some(_) => {}
+            },
+            ThreadState::Blocked => match context.user_scheduler.snapshot(thread_ref) {
+                None => {
+                    context
+                        .user_scheduler
+                        .add_thread(thread_ref, class, scheduler_authority(class), now_ns)
+                        .unwrap_or_else(|_| halt_forever());
+                    let _ = context.user_scheduler.block(thread_ref);
+                }
+                Some(snapshot)
+                    if matches!(
+                        snapshot.state,
+                        SchedulerThreadState::Runnable | SchedulerThreadState::Running
+                    ) =>
+                {
+                    let _ = context.user_scheduler.block(thread_ref);
+                }
+                Some(_) => {}
+            },
+            ThreadState::Exited(_) | ThreadState::Faulted(_) | ThreadState::Terminated => {
+                if context.user_scheduler.snapshot(thread_ref).is_some() {
+                    let _ = context.user_scheduler.remove_thread(thread_ref, now_ns);
+                }
+                let _ = context.waits.cancel_key(thread_ref);
             }
         }
     }
+    record_process_scheduler_snapshots(context, process_id);
+}
+
+fn record_process_scheduler_snapshots(context: &mut KernelContext, process_id: ProcessId) {
+    let mut snapshots = [None; ginkgo_kernel::process::MAX_THREADS_PER_PROCESS];
+    let mut count = 0usize;
+    if let Some(process) = context.processes.get(process_id) {
+        for thread_id in process.thread_ids() {
+            let thread_ref = ThreadRef {
+                process_id,
+                thread_id,
+            };
+            snapshots[count] = context
+                .user_scheduler
+                .snapshot(thread_ref)
+                .map(|snapshot| (thread_id, snapshot));
+            count += 1;
+        }
+    }
+    if let Some(process) = context.processes.get_mut(process_id) {
+        for (thread_id, snapshot) in snapshots[..count].iter().flatten().copied() {
+            process.record_scheduler_snapshot(thread_id, snapshot);
+        }
+    }
+}
+
+fn runtime_wait_kind(kind: BlockedKind) -> WaitKind {
+    match kind {
+        BlockedKind::WaitMany => WaitKind::WaitMany,
+        BlockedKind::Sleep => WaitKind::Sleep,
+        BlockedKind::Join => WaitKind::Join,
+        BlockedKind::Request => WaitKind::Request,
+    }
+}
+
+fn arm_blocked_thread(context: &mut KernelContext, thread_ref: ThreadRef) -> Result<(), ()> {
+    let Some((kind, deadline_ns, existing)) = context
+        .processes
+        .get(thread_ref.process_id)
+        .and_then(|process| process.blocked_wait_spec(thread_ref.thread_id))
+    else {
+        return Err(());
+    };
+    if existing.is_some() {
+        return Ok(());
+    }
+
+    let token = context
+        .waits
+        .register(thread_ref, runtime_wait_kind(kind), deadline_ns)
+        .map_err(|_| ())?;
+    let observer = context.waits.observer();
+    let registration = context
+        .processes
+        .get_mut(thread_ref.process_id)
+        .ok_or(())?
+        .install_blocked_wait_registration(thread_ref.thread_id, token, &observer);
+    if let Err(error) = registration {
+        let status = error.status();
+        let process = context.processes.get_mut(thread_ref.process_id).ok_or(())?;
+        if !process.fail_blocked_wait_registration(thread_ref.thread_id, status) {
+            let _ = context.waits.cancel(token);
+            return Err(());
+        }
+        let _ = context.waits.notify_dependency(token);
+    }
+    let _ = context.user_scheduler.clear_deadline(thread_ref);
+    Ok(())
+}
+
+fn donate_for_blocked_join(context: &mut KernelContext, donor: ThreadRef, now_ns: u64) {
+    let Some(process) = context.processes.get(donor.process_id) else {
+        return;
+    };
+    let Some(first_target) = process.blocked_join_target(donor.thread_id) else {
+        return;
+    };
+    let mut chain = [donor; DEFAULT_MAX_DONATION_DEPTH];
+    let mut count = 0usize;
+    let mut target = Some(first_target);
+    while let Some(thread_id) = target {
+        if count == chain.len() {
+            break;
+        }
+        chain[count] = ThreadRef {
+            process_id: donor.process_id,
+            thread_id,
+        };
+        count += 1;
+        target = process.blocked_join_target(thread_id);
+    }
+    let deadline_ns = process
+        .blocked_wait_spec(donor.thread_id)
+        .and_then(|(_, deadline, _)| deadline);
+    let expires_at_ns = deadline_ns
+        .unwrap_or_else(|| now_ns.saturating_add(DEFAULT_MAX_DONATION_NS))
+        .min(now_ns.saturating_add(DEFAULT_MAX_DONATION_NS));
+    match context
+        .user_scheduler
+        .donate_chain(donor, &chain[..count], expires_at_ns, now_ns)
+    {
+        Ok(_) => record_process_scheduler_snapshots(context, donor.process_id),
+        Err(error) => {
+            let mut sink = SerialDebugSink::new(&mut context.serial);
+            let _ = writeln!(
+                sink,
+                "scheduler: donation rejected donor={}:{} depth={} error={error:?}\r",
+                donor.process_id.raw(),
+                donor.thread_id.raw(),
+                count,
+            );
+        }
+    }
+}
+
+fn notify_completed_joins(context: &mut KernelContext, process_id: ProcessId) {
+    let mut notifications = [None; ginkgo_kernel::process::MAX_THREADS_PER_PROCESS];
+    let mut count = 0usize;
+    if let Some(process) = context.processes.get(process_id) {
+        for target in process.thread_ids() {
+            if !process
+                .thread_state(target)
+                .is_some_and(ThreadState::is_terminal)
+                || !context
+                    .requests
+                    .is_thread_drained(ginkgo_kernel::request::RequestOwner::new(
+                        process_id.raw(),
+                        target.raw(),
+                    ))
+            {
+                continue;
+            }
+            let Some(caller) = process.blocked_join_claimant(target) else {
+                continue;
+            };
+            notifications[count] = Some(ThreadRef {
+                process_id,
+                thread_id: caller,
+            });
+            count += 1;
+        }
+    }
+    for caller in notifications[..count].iter().flatten().copied() {
+        if let Some(token) = context.waits.token_for_key(caller) {
+            let _ = context.waits.notify_dependency(token);
+        }
+    }
+}
+
+fn request_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
+    let now_ns = context.timer.clock().now_ns();
+    context
+        .requests
+        .run_worker(now_ns, RequestWorkerBudget::DEFAULT);
+
+    if let Some(dispatch) = context.requests.next_dispatch(now_ns) {
+        let owner_is_background = context
+            .processes
+            .get(ProcessId::from_raw(dispatch.owner.process_id))
+            .and_then(|process| {
+                process.thread_scheduling_class(ginkgo_kernel::process::ThreadId::from_raw(
+                    dispatch.owner.thread_id,
+                ))
+            })
+            == Some(SchedulingClass::Background);
+        let background_service_due = now_ns >= state.get(0).unwrap_or(0) as u64;
+        if owner_is_background
+            && matches!(
+                dispatch.operation,
+                ginkgo_sysapi::RequestOperation::FilesystemRead
+                    | ginkgo_sysapi::RequestOperation::FilesystemWrite
+                    | ginkgo_sysapi::RequestOperation::FilesystemSync
+                    | ginkgo_sysapi::RequestOperation::FilesystemOpen
+                    | ginkgo_sysapi::RequestOperation::FilesystemTruncate
+                    | ginkgo_sysapi::RequestOperation::FilesystemNamespace
+            )
+            && !background_service_due
+        {
+            let _ = context.requests.requeue_active(dispatch.id);
+        } else if dispatch.operation == ginkgo_sysapi::RequestOperation::Synthetic
+            && dispatch.service_payload.operation_argument != 0
+        {
+            let _ = context.requests.mark_device_owned(dispatch.id);
+            #[cfg(ginkgo_request_smoke)]
+            if let Some(device) = dispatch.device {
+                const SYNTHETIC_RESET_MODE: u64 = 1 << 63;
+                const SYNTHETIC_REMOVE_MODE: u64 = 1 << 62;
+                if dispatch.service_payload.operation_argument & SYNTHETIC_RESET_MODE != 0 {
+                    context.requests.reset_device(device, now_ns);
+                } else if dispatch.service_payload.operation_argument & SYNTHETIC_REMOVE_MODE != 0 {
+                    context.requests.remove_device(device, now_ns, true);
+                }
+            }
+        } else {
+            let service_result = match dispatch.operation {
+                ginkgo_sysapi::RequestOperation::Synthetic => {
+                    let (status, bytes) = service_synthetic_request(context, dispatch.id);
+                    RequestServiceResult::Complete(status, bytes)
+                }
+                ginkgo_sysapi::RequestOperation::AudioWrite => {
+                    let (status, bytes) = service_audio_request(context, dispatch.id);
+                    RequestServiceResult::Complete(status, bytes)
+                }
+                ginkgo_sysapi::RequestOperation::Nop => {
+                    RequestServiceResult::Complete(ginkgo_sysapi::Status::Ok, 0)
+                }
+                ginkgo_sysapi::RequestOperation::FilesystemRead
+                | ginkgo_sysapi::RequestOperation::FilesystemWrite
+                | ginkgo_sysapi::RequestOperation::FilesystemSync => {
+                    service_filesystem_request(context, dispatch)
+                }
+                ginkgo_sysapi::RequestOperation::FilesystemOpen => {
+                    service_filesystem_open_request(context, dispatch)
+                }
+                ginkgo_sysapi::RequestOperation::FilesystemTruncate
+                | ginkgo_sysapi::RequestOperation::FilesystemNamespace => {
+                    RequestServiceResult::Complete(ginkgo_sysapi::Status::InvalidArgument, 0)
+                }
+            };
+            if owner_is_background
+                && matches!(
+                    dispatch.operation,
+                    ginkgo_sysapi::RequestOperation::FilesystemRead
+                        | ginkgo_sysapi::RequestOperation::FilesystemWrite
+                        | ginkgo_sysapi::RequestOperation::FilesystemSync
+                        | ginkgo_sysapi::RequestOperation::FilesystemOpen
+                        | ginkgo_sysapi::RequestOperation::FilesystemTruncate
+                        | ginkgo_sysapi::RequestOperation::FilesystemNamespace
+                )
+            {
+                state.set(
+                    0,
+                    usize::try_from(now_ns.saturating_add(100_000_000)).unwrap_or(usize::MAX),
+                );
+            }
+            if let RequestServiceResult::Complete(status, bytes_transferred) = service_result {
+                let _ = context.requests.record_completion(BrokerCompletion {
+                    id: dispatch.id,
+                    status,
+                    device_released: true,
+                    bytes_transferred,
+                    result_flags: ginkgo_sysapi::RequestResultFlags::empty(),
+                });
+                context
+                    .requests
+                    .run_worker(context.timer.clock().now_ns(), RequestWorkerBudget::DEFAULT);
+            }
+        }
+    }
+
+    let action = match context.requests.pop_action() {
+        Ok(Some(action)) => action,
+        Ok(None) => return TaskPoll::Pending,
+        Err(_) => return TaskPoll::Pending,
+    };
+    match action {
+        RequestAction::PublishTerminal { id, .. } => {
+            copy_copied_request_outputs(context, id);
+            let owner = context.requests.owner(id);
+            let info = context.requests.info(id);
+            if let (Some(owner), Some(info)) = (owner, info) {
+                let output = ginkgo_sysapi::RequestSubmitOutput {
+                    request: ginkgo_sysapi::Handle::INVALID,
+                    state: info.state,
+                    result: info.result,
+                    result_flags: info.result_flags,
+                    bytes_transferred: info.bytes_transferred,
+                };
+                if let Some(process) = context
+                    .processes
+                    .get_mut(ProcessId::from_raw(owner.process_id))
+                {
+                    process.stage_request_completion(
+                        ginkgo_kernel::process::ThreadId::from_raw(owner.thread_id),
+                        id,
+                        output,
+                    );
+                }
+            }
+        }
+        RequestAction::CancelDevice { id, reason, .. } => {
+            service_request_cancellation(context, id, reason);
+        }
+        RequestAction::ReleaseResources { id, .. } => {
+            if let Ok(released) = context.requests.take_external_resources(id) {
+                release_request_resources(context, released);
+            }
+        }
+    }
+    TaskPoll::Pending
+}
+
+fn service_request_cancellation(
+    context: &mut KernelContext,
+    id: ginkgo_kernel::request::RequestId,
+    _reason: RequestCancelReason,
+) {
+    #[cfg(ginkgo_request_smoke)]
+    if _reason == RequestCancelReason::Deadline
+        && context.requests.info(id).and_then(|info| info.operation())
+            == Some(ginkgo_sysapi::RequestOperation::Synthetic)
+    {
+        let completion = BrokerCompletion {
+            id,
+            status: ginkgo_sysapi::Status::Ok,
+            device_released: true,
+            bytes_transferred: 0,
+            result_flags: ginkgo_sysapi::RequestResultFlags::empty(),
+        };
+        let _ = context.requests.record_completion(completion);
+        let _ = context.requests.record_completion(completion);
+        context
+            .requests
+            .run_worker(context.timer.clock().now_ns(), RequestWorkerBudget::DEFAULT);
+        return;
+    }
+
+    let _ = context
+        .requests
+        .acknowledge_cancel(id, context.timer.clock().now_ns(), true);
+}
+
+enum RequestServiceResult {
+    Complete(ginkgo_sysapi::Status, u64),
+    Requeued,
+}
+
+fn service_filesystem_open_request(
+    context: &mut KernelContext,
+    dispatch: ginkgo_kernel::request::RequestDispatch<
+        ginkgo_sysapi::RequestOperation,
+        ginkgo_kernel::request_broker::BrokerPayload,
+    >,
+) -> RequestServiceResult {
+    use ginkgo_sysapi::{FilesystemOpenFlags, Status};
+
+    let Some((directory, _is_root, _anchor_rights)) =
+        context.requests.directory_target(dispatch.id)
+    else {
+        return RequestServiceResult::Complete(Status::InvalidHandle, 0);
+    };
+    let Some(flags) = u32::try_from(dispatch.service_payload.operation_argument)
+        .ok()
+        .and_then(FilesystemOpenFlags::from_bits)
+    else {
+        return RequestServiceResult::Complete(Status::InvalidArgument, 0);
+    };
+    let directory = match directory {
+        Some(directory) => directory,
+        None => match context.fs.root_directory() {
+            Ok(directory) => directory,
+            Err(error) => return RequestServiceResult::Complete(map_request_fs_error(error), 0),
+        },
+    };
+    let file = {
+        let Some(buffers) = context.requests.buffers(dispatch.id) else {
+            return RequestServiceResult::Complete(Status::InvalidHandle, 0);
+        };
+        let Some(PreparedRequestBuffer::Copied { bytes: path, .. }) = buffers.first() else {
+            return RequestServiceResult::Complete(Status::InvalidArgument, 0);
+        };
+        let Ok(path) = core::str::from_utf8(path) else {
+            return RequestServiceResult::Complete(Status::InvalidArgument, 0);
+        };
+        let file = match context.fs.open_file_at(directory, path) {
+            Ok(file) => file,
+            Err(FsError::NotFound) if flags.contains(FilesystemOpenFlags::CREATE) => {
+                match context.fs.create_file_at(directory, path) {
+                    Ok(file) => file,
+                    Err(error) => {
+                        return RequestServiceResult::Complete(map_request_fs_error(error), 0)
+                    }
+                }
+            }
+            Err(error) => return RequestServiceResult::Complete(map_request_fs_error(error), 0),
+        };
+        if flags.contains(FilesystemOpenFlags::TRUNCATE) {
+            if let Err(error) = context.fs.truncate(file, 0) {
+                return RequestServiceResult::Complete(map_request_fs_error(error), 0);
+            }
+        }
+        file
+    };
+
+    let mut rights = ginkgo_ipc::Rights::empty();
+    if flags.contains(FilesystemOpenFlags::READ) {
+        rights |= ginkgo_ipc::Rights::READ;
+    }
+    if flags.contains(FilesystemOpenFlags::WRITE) {
+        rights |= ginkgo_ipc::Rights::WRITE;
+    }
+    if flags.contains(FilesystemOpenFlags::EXECUTE) {
+        rights |= ginkgo_ipc::Rights::EXECUTE
+            | ginkgo_ipc::Rights::DUPLICATE
+            | ginkgo_ipc::Rights::TRANSFER;
+    }
+    let Some(owner) = context.requests.owner(dispatch.id) else {
+        return RequestServiceResult::Complete(Status::InvalidHandle, 0);
+    };
+    let Some(process) = context
+        .processes
+        .get_mut(ProcessId::from_raw(owner.process_id))
+    else {
+        return RequestServiceResult::Complete(Status::InvalidHandle, 0);
+    };
+    let handle = match process.handles_mut().filesystem_file_create(file, rights) {
+        Ok(handle) => handle,
+        Err(error) => return RequestServiceResult::Complete(error.status(), 0),
+    };
+    let mut output = [0_u8; 8];
+    output[..4].copy_from_slice(&handle.raw().to_le_bytes());
+    let hhdm_offset = context.hhdm_offset;
+    let write_result = match context.requests.buffers_mut(dispatch.id) {
+        Some([_, PreparedRequestBuffer::Pinned { pages, .. }]) => {
+            copy_to_pinned_pages(hhdm_offset, pages, 0, &output)
+        }
+        _ => Err(Status::InvalidArgument),
+    };
+    if let Err(status) = write_result {
+        let _ = process.handles_mut().handle_close(handle);
+        return RequestServiceResult::Complete(status, 0);
+    }
+    RequestServiceResult::Complete(Status::Ok, 0)
+}
+
+fn map_request_fs_error(error: FsError) -> ginkgo_sysapi::Status {
+    use ginkgo_sysapi::Status;
+    match error {
+        FsError::InvalidName | FsError::TraversalTooDeep => Status::InvalidArgument,
+        FsError::AlreadyExists => Status::AlreadyExists,
+        FsError::NotFound | FsError::InvalidHandle => Status::NotFound,
+        FsError::NoSpace => Status::ResourceLimit,
+        FsError::NotDirectory => Status::NotDirectory,
+        FsError::IsDirectory => Status::IsDirectory,
+        FsError::DirectoryNotEmpty => Status::DirectoryNotEmpty,
+        FsError::WouldCycle => Status::InvalidArgument,
+        FsError::OffsetOverflow => Status::OutOfRange,
+        FsError::Io => Status::Io,
+    }
+}
+
+fn service_filesystem_request(
+    context: &mut KernelContext,
+    dispatch: ginkgo_kernel::request::RequestDispatch<
+        ginkgo_sysapi::RequestOperation,
+        ginkgo_kernel::request_broker::BrokerPayload,
+    >,
+) -> RequestServiceResult {
+    use ginkgo_sysapi::{RequestOperation, Status};
+
+    if dispatch.operation == RequestOperation::FilesystemSync {
+        let ticket = match context.requests.durability_ticket(dispatch.id) {
+            Some(Some(ticket)) => ticket,
+            Some(None) => match context.fs.sync_ticket() {
+                Ok(ticket) => {
+                    if context
+                        .requests
+                        .set_durability_ticket(dispatch.id, ticket)
+                        .is_err()
+                    {
+                        return RequestServiceResult::Complete(Status::Io, 0);
+                    }
+                    ticket
+                }
+                Err(_) => return RequestServiceResult::Complete(Status::Io, 0),
+            },
+            None => return RequestServiceResult::Complete(Status::InvalidHandle, 0),
+        };
+        if context.fs.is_ticket_durable(ticket) {
+            return RequestServiceResult::Complete(Status::Ok, 0);
+        }
+        return if context.requests.requeue_active(dispatch.id).is_ok() {
+            RequestServiceResult::Requeued
+        } else {
+            RequestServiceResult::Complete(Status::Io, 0)
+        };
+    }
+
+    let Some(file) = context.requests.file_target(dispatch.id).copied() else {
+        return RequestServiceResult::Complete(Status::InvalidHandle, 0);
+    };
+    let Some(progress) = context.requests.service_offset(dispatch.id) else {
+        return RequestServiceResult::Complete(Status::InvalidHandle, 0);
+    };
+    let Some(total) = context.requests.total_requested_bytes(dispatch.id) else {
+        return RequestServiceResult::Complete(Status::InvalidHandle, 0);
+    };
+    if progress >= total {
+        return RequestServiceResult::Complete(Status::Ok, total);
+    }
+    let amount = usize::try_from((total - progress).min(redoxfs::BLOCK_SIZE))
+        .unwrap_or(redoxfs::BLOCK_SIZE as usize);
+    let mut chunk = [0_u8; redoxfs::BLOCK_SIZE as usize];
+    let buffer_result = match dispatch.operation {
+        RequestOperation::FilesystemRead => match context.fs.read(
+            file,
+            dispatch
+                .service_payload
+                .operation_argument
+                .saturating_add(progress),
+            &mut chunk[..amount],
+        ) {
+            Ok(count) => {
+                write_request_buffer(context, dispatch.id, progress as usize, &chunk[..count])
+                    .map(|()| count)
+            }
+            Err(_) => Err(Status::Io),
+        },
+        RequestOperation::FilesystemWrite => {
+            match read_request_buffer(
+                context,
+                dispatch.id,
+                progress as usize,
+                &mut chunk[..amount],
+            ) {
+                Ok(()) => context
+                    .fs
+                    .write(
+                        file,
+                        dispatch
+                            .service_payload
+                            .operation_argument
+                            .saturating_add(progress),
+                        &chunk[..amount],
+                    )
+                    .map_err(|_| Status::Io),
+                Err(status) => Err(status),
+            }
+        }
+        _ => unreachable!(),
+    };
+    let count = match buffer_result {
+        Ok(count) => count,
+        Err(status) => return RequestServiceResult::Complete(status, progress),
+    };
+    let Ok(next) = context
+        .requests
+        .advance_service_offset(dispatch.id, count as u64)
+    else {
+        return RequestServiceResult::Complete(Status::Io, progress);
+    };
+    if next >= total || count == 0 || count < amount {
+        RequestServiceResult::Complete(Status::Ok, next)
+    } else if context.requests.requeue_active(dispatch.id).is_ok() {
+        RequestServiceResult::Requeued
+    } else {
+        RequestServiceResult::Complete(Status::Io, next)
+    }
+}
+
+fn write_request_buffer(
+    context: &mut KernelContext,
+    id: ginkgo_kernel::request::RequestId,
+    offset: usize,
+    input: &[u8],
+) -> Result<(), ginkgo_sysapi::Status> {
+    let hhdm_offset = context.hhdm_offset;
+    let Some([buffer]) = context.requests.buffers_mut(id) else {
+        return Err(ginkgo_sysapi::Status::InvalidHandle);
+    };
+    match buffer {
+        PreparedRequestBuffer::Copied { bytes, .. } => {
+            let end = offset
+                .checked_add(input.len())
+                .ok_or(ginkgo_sysapi::Status::OutOfRange)?;
+            let output = bytes
+                .get_mut(offset..end)
+                .ok_or(ginkgo_sysapi::Status::OutOfRange)?;
+            output.copy_from_slice(input);
+            Ok(())
+        }
+        PreparedRequestBuffer::Pinned { pages, .. } => {
+            copy_to_pinned_pages(hhdm_offset, pages, offset, input)
+        }
+        PreparedRequestBuffer::SharedMemory { lease, .. } => lease
+            .write(offset, input)
+            .map_err(|_| ginkgo_sysapi::Status::Io),
+    }
+}
+
+fn read_request_buffer(
+    context: &KernelContext,
+    id: ginkgo_kernel::request::RequestId,
+    offset: usize,
+    output: &mut [u8],
+) -> Result<(), ginkgo_sysapi::Status> {
+    let Some([buffer]) = context.requests.buffers(id) else {
+        return Err(ginkgo_sysapi::Status::InvalidHandle);
+    };
+    match buffer {
+        PreparedRequestBuffer::Copied { bytes, .. } => {
+            let end = offset
+                .checked_add(output.len())
+                .ok_or(ginkgo_sysapi::Status::OutOfRange)?;
+            output.copy_from_slice(
+                bytes
+                    .get(offset..end)
+                    .ok_or(ginkgo_sysapi::Status::OutOfRange)?,
+            );
+            Ok(())
+        }
+        PreparedRequestBuffer::Pinned { pages, .. } => {
+            copy_from_pinned_pages(context.hhdm_offset, pages, offset, output)
+        }
+        PreparedRequestBuffer::SharedMemory { lease, .. } => lease
+            .read(offset, output)
+            .map_err(|_| ginkgo_sysapi::Status::Io),
+    }
+}
+
+fn copy_to_pinned_pages(
+    hhdm_offset: u64,
+    pages: &[ginkgo_kernel::paging::address_space::PinnedUserPage],
+    mut offset: usize,
+    mut input: &[u8],
+) -> Result<(), ginkgo_sysapi::Status> {
+    for page in pages {
+        if offset >= page.byte_length {
+            offset -= page.byte_length;
+            continue;
+        }
+        let amount = input.len().min(page.byte_length - offset);
+        let address = hhdm_offset
+            .checked_add(page.physical_start)
+            .and_then(|address| address.checked_add((page.page_offset + offset) as u64))
+            .and_then(|address| usize::try_from(address).ok())
+            .ok_or(ginkgo_sysapi::Status::OutOfRange)?;
+        unsafe {
+            ptr::copy_nonoverlapping(input.as_ptr(), address as *mut u8, amount);
+        }
+        input = &input[amount..];
+        offset = 0;
+        if input.is_empty() {
+            return Ok(());
+        }
+    }
+    Err(ginkgo_sysapi::Status::OutOfRange)
+}
+
+fn copy_from_pinned_pages(
+    hhdm_offset: u64,
+    pages: &[ginkgo_kernel::paging::address_space::PinnedUserPage],
+    mut offset: usize,
+    mut output: &mut [u8],
+) -> Result<(), ginkgo_sysapi::Status> {
+    for page in pages {
+        if offset >= page.byte_length {
+            offset -= page.byte_length;
+            continue;
+        }
+        let amount = output.len().min(page.byte_length - offset);
+        let address = hhdm_offset
+            .checked_add(page.physical_start)
+            .and_then(|address| address.checked_add((page.page_offset + offset) as u64))
+            .and_then(|address| usize::try_from(address).ok())
+            .ok_or(ginkgo_sysapi::Status::OutOfRange)?;
+        unsafe {
+            ptr::copy_nonoverlapping(address as *const u8, output.as_mut_ptr(), amount);
+        }
+        let (_, rest) = output.split_at_mut(amount);
+        output = rest;
+        offset = 0;
+        if output.is_empty() {
+            return Ok(());
+        }
+    }
+    Err(ginkgo_sysapi::Status::OutOfRange)
+}
+
+fn copy_copied_request_outputs(context: &mut KernelContext, id: ginkgo_kernel::request::RequestId) {
+    let Some(owner) = context.requests.owner(id) else {
+        return;
+    };
+    let process_id = ProcessId::from_raw(owner.process_id);
+    let Some(process) = context.processes.get_mut(process_id) else {
+        return;
+    };
+    unsafe { process.address_space().activate() };
+    if let Some(buffers) = context.requests.buffers(id) {
+        for buffer in buffers {
+            if let PreparedRequestBuffer::Copied {
+                flags,
+                user_address,
+                bytes,
+            } = buffer
+            {
+                if flags.contains(ginkgo_sysapi::RequestBufferFlags::WRITE) {
+                    let _ = process.address_space().copy_to_user(*user_address, bytes);
+                }
+            }
+        }
+    }
+    unsafe { context.page_table.activate() };
+}
+
+fn service_synthetic_request(
+    context: &mut KernelContext,
+    id: ginkgo_kernel::request::RequestId,
+) -> (ginkgo_sysapi::Status, u64) {
+    let hhdm_offset = context.hhdm_offset;
+    let Some(buffers) = context.requests.buffers_mut(id) else {
+        return (ginkgo_sysapi::Status::InvalidHandle, 0);
+    };
+    let mut transferred = 0_u64;
+    let fill = [0xa5_u8; 256];
+    for buffer in buffers {
+        transferred = transferred.saturating_add(buffer.byte_len() as u64);
+        if !buffer
+            .flags()
+            .contains(ginkgo_sysapi::RequestBufferFlags::WRITE)
+        {
+            continue;
+        }
+        match buffer {
+            PreparedRequestBuffer::Copied { bytes, .. } => bytes.fill(0xa5),
+            PreparedRequestBuffer::Pinned { pages, .. } => {
+                for page in pages {
+                    let Some(address) = hhdm_offset
+                        .checked_add(page.physical_start)
+                        .and_then(|address| address.checked_add(page.page_offset as u64))
+                    else {
+                        return (ginkgo_sysapi::Status::OutOfRange, 0);
+                    };
+                    let Ok(address) = usize::try_from(address) else {
+                        return (ginkgo_sysapi::Status::OutOfRange, 0);
+                    };
+                    unsafe {
+                        ptr::write_bytes(address as *mut u8, 0xa5, page.byte_length);
+                    }
+                }
+            }
+            PreparedRequestBuffer::SharedMemory { lease, .. } => {
+                let mut offset = 0usize;
+                while offset < lease.len() {
+                    let amount = (lease.len() - offset).min(fill.len());
+                    if lease.write(offset, &fill[..amount]).is_err() {
+                        return (ginkgo_sysapi::Status::Io, 0);
+                    }
+                    offset += amount;
+                }
+            }
+        }
+    }
+    (ginkgo_sysapi::Status::Ok, transferred)
+}
+
+fn service_audio_request(
+    context: &mut KernelContext,
+    id: ginkgo_kernel::request::RequestId,
+) -> (ginkgo_sysapi::Status, u64) {
+    let Some(audio) = context.audio.as_mut() else {
+        return (ginkgo_sysapi::Status::Io, 0);
+    };
+    let Some(buffers) = context.requests.buffers(id) else {
+        return (ginkgo_sysapi::Status::InvalidHandle, 0);
+    };
+    let [PreparedRequestBuffer::Copied { bytes, .. }] = buffers else {
+        return (ginkgo_sysapi::Status::InvalidArgument, 0);
+    };
+    match audio.write_pcm(bytes) {
+        Ok(written) if written == bytes.len() => (ginkgo_sysapi::Status::Ok, written as u64),
+        Ok(_) => (ginkgo_sysapi::Status::ShouldWait, 0),
+        Err(_) => (ginkgo_sysapi::Status::Io, 0),
+    }
+}
+
+fn release_request_resources(
+    context: &mut KernelContext,
+    released: ginkgo_kernel::request_broker::ReleasedBrokerResources,
+) {
+    let process_id = ProcessId::from_raw(released.owner.process_id);
+    let Some(process) = context.processes.get_mut(process_id) else {
+        return;
+    };
+    unsafe { process.address_space().activate() };
+    for buffer in released.buffers {
+        match buffer {
+            PreparedRequestBuffer::Copied {
+                flags,
+                user_address,
+                bytes,
+            } => {
+                if flags.contains(ginkgo_sysapi::RequestBufferFlags::WRITE) {
+                    let _ = process.address_space().copy_to_user(user_address, &bytes);
+                }
+            }
+            PreparedRequestBuffer::Pinned { pages, .. } => {
+                let _ = process.address_space_mut().unpin_user_pages(&pages);
+            }
+            PreparedRequestBuffer::SharedMemory { .. } => {}
+        }
+    }
+    unsafe { context.page_table.activate() };
+}
+
+fn wait_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll {
+    const WAIT_WAKE_BUDGET: usize = 32;
+    for _ in 0..WAIT_WAKE_BUDGET {
+        if !service_one_process_termination(context) {
+            break;
+        }
+    }
+    for _ in 0..WAIT_WAKE_BUDGET {
+        if !service_one_wait_wake(context) {
+            break;
+        }
+    }
+    TaskPoll::Pending
+}
+
+fn service_one_process_termination(context: &mut KernelContext) -> bool {
+    let now_ns = context.timer.clock().now_ns();
+    let Some(wake) = context.process_terminations.next_wake(now_ns) else {
+        return false;
+    };
+    debug_assert_eq!(wake.kind, WaitKind::ProcessTermination);
+    let process_id = wake.key;
+    if let Some(process) = context.processes.get_mut(process_id) {
+        if process.termination_requested() {
+            process.mark_terminated();
+        }
+    }
+    synchronize_process_scheduler(context, process_id);
+    true
+}
+
+fn service_one_wait_wake(context: &mut KernelContext) -> bool {
+    let now_ns = context.timer.clock().now_ns();
+    let Some(wake) = context.waits.next_wake(now_ns) else {
+        return false;
+    };
+    let thread_ref = wake.key;
+    let Some(process) = context.processes.get_mut(thread_ref.process_id) else {
+        let _ = context
+            .user_scheduler
+            .cancel_donations_from(thread_ref, now_ns);
+        return true;
+    };
+    if !process.clear_blocked_wait_registration(thread_ref.thread_id, wake.token) {
+        return true;
+    }
+
+    if syscall::poll_blocked(process, thread_ref.thread_id, now_ns, &context.requests)
+        == syscall::BlockedPoll::Pending
+    {
+        let _ = arm_blocked_thread(context, thread_ref);
+        return true;
+    }
+
+    unsafe { process.address_space().activate() };
+    let _ = syscall::complete_blocked(process, thread_ref.thread_id, &mut context.frames);
+    unsafe { context.page_table.activate() };
+    let completed_ns = context.timer.clock().now_ns();
+    let _ = context
+        .user_scheduler
+        .cancel_donations_from(thread_ref, completed_ns);
+    record_process_scheduler_snapshots(context, thread_ref.process_id);
+    if let Some(snapshot) = context
+        .user_scheduler
+        .snapshot(thread_ref)
+        .filter(|snapshot| snapshot.state == SchedulerThreadState::Blocked)
+    {
+        let policy = context.user_scheduler.policy(snapshot.effective_class);
+        let service_deadline_ns =
+            if wake.cause == WakeCause::Deadline && wake.kind == WaitKind::Sleep {
+                wake.deadline_ns
+                    .unwrap_or(completed_ns)
+                    .saturating_add(policy.period_ns)
+            } else {
+                completed_ns.saturating_add(policy.wake_latency_target_ns)
+            };
+        let _ = context
+            .user_scheduler
+            .set_deadline(thread_ref, service_deadline_ns);
+        let _ = context.user_scheduler.wake(thread_ref, completed_ns);
+        if wake.cause == WakeCause::Deadline {
+            context.urgent_process_dispatch = true;
+        }
+    }
+    true
+}
+
+fn urgent_process_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
+    if !context.urgent_process_dispatch {
+        return TaskPoll::Pending;
+    }
+    context.urgent_process_dispatch = false;
+    let _ = process_task(context, state);
+    process_task(context, state)
+}
+
+fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll {
+    let now_ns = context.timer.clock().now_ns();
     let policy_dispatch = context.user_scheduler.next_dispatch(now_ns);
     let (selected, dispatch_quantum_ns, selected_by_policy) =
         if let Some(dispatch) = policy_dispatch {
             (dispatch.key, dispatch.quantum_ns, true)
-        } else if let Some(thread_ref) = context.processes.next_blocked_or_terminal_thread() {
+        } else if let Some(thread_ref) = context.processes.next_terminal_thread() {
             (thread_ref, 0, false)
         } else {
             return TaskPoll::Pending;
@@ -2479,6 +3494,7 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
         process_id,
         thread_id,
     } = selected;
+
     let child_slot_reserved = context.processes.prepare_insert().is_ok();
     let mut created_child = None;
     let mut dispatch_elapsed_ns = 0;
@@ -2508,15 +3524,24 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                     .thread_context(thread_id)
                     .expect("selected thread lost its context");
                 let started_ns = context.timer.clock().now_ns();
-                if context
-                    .timer
-                    .arm_one_shot(if selected_by_policy {
-                        dispatch_quantum_ns
-                    } else {
-                        process.limits().cpu_quantum_ns
-                    })
-                    .is_err()
-                {
+                let mut timer_slice_ns = if selected_by_policy {
+                    dispatch_quantum_ns
+                } else {
+                    process.limits().cpu_quantum_ns
+                };
+                let next_deadline_ns = match (
+                    context.waits.next_deadline_ns(),
+                    context.requests.next_deadline_ns(),
+                ) {
+                    (Some(wait), Some(request)) => Some(wait.min(request)),
+                    (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+                    (None, None) => None,
+                };
+                if let Some(deadline_ns) = next_deadline_ns {
+                    timer_slice_ns =
+                        timer_slice_ns.min(deadline_ns.saturating_sub(started_ns).max(1));
+                }
+                if context.timer.arm_one_shot(timer_slice_ns).is_err() {
                     process.fault_process(
                         thread_id,
                         ProcessFault::new(ProcessFaultReason::InvalidUserContext, 0),
@@ -2535,10 +3560,10 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                                 available_bytes: heap_available,
                                 growth_failures: context.kernel_heap.failed_growth_count(),
                             };
-                            #[cfg(ginkgo_memory_policy_smoke)]
                             let syscall_number = user_context.rax;
                             let mut sink = SerialDebugSink::new(&mut context.serial);
                             let outcome = syscall::dispatch(
+                                process_id,
                                 process,
                                 thread_id,
                                 &mut user_context,
@@ -2550,6 +3575,7 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                                 &mut context.fs,
                                 &mut context.audio,
                                 &mut context.entropy,
+                                &mut context.requests,
                                 !context.launch_quiesced,
                                 child_slot_reserved,
                                 &mut sink,
@@ -2567,6 +3593,14 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                             #[cfg(ginkgo_memory_policy_smoke)]
                             if syscall_number == 0 && matches!(outcome, SyscallOutcome::Yield) {
                                 memory_policy_explicit_yield = true;
+                            }
+                            if matches!(syscall_number, 0 | 55)
+                                && matches!(outcome, SyscallOutcome::Yield)
+                            {
+                                let _ = context.user_scheduler.clear_deadline(ThreadRef {
+                                    process_id,
+                                    thread_id,
+                                });
                             }
                             if let SyscallOutcome::ChildCreated(child) = outcome {
                                 created_child = Some(child);
@@ -2655,7 +3689,7 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
             }
             ThreadState::Blocked => {
                 let now_ns = context.timer.clock().now_ns();
-                if syscall::poll_blocked(process, thread_id, now_ns)
+                if syscall::poll_blocked(process, thread_id, now_ns, &context.requests)
                     == syscall::BlockedPoll::Complete
                 {
                     unsafe { process.address_space().activate() };
@@ -2686,18 +3720,66 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                 );
             }
             Some(ThreadState::Blocked) => {
+                let blocked_ns = context.timer.clock().now_ns();
                 let _ = context.user_scheduler.finish_dispatch(
                     thread_ref,
                     dispatch_elapsed_ns,
-                    context.timer.clock().now_ns(),
+                    blocked_ns,
                     RunDisposition::Blocked,
                 );
+                donate_for_blocked_join(context, thread_ref, blocked_ns);
+                let _ = arm_blocked_thread(context, thread_ref);
             }
             Some(ThreadState::Exited(_) | ThreadState::Faulted(_) | ThreadState::Terminated)
             | None => {
                 let _ = context
                     .user_scheduler
                     .remove_thread(thread_ref, context.timer.clock().now_ns());
+            }
+        }
+    }
+    synchronize_process_scheduler(context, process_id);
+    let mut terminal_request_owners = [None; ginkgo_kernel::process::MAX_THREADS_PER_PROCESS];
+    let mut terminal_request_owner_count = 0usize;
+    if let Some(process) = context.processes.get(process_id) {
+        for local_thread_id in process.thread_ids() {
+            if process
+                .thread_state(local_thread_id)
+                .is_some_and(ThreadState::is_terminal)
+            {
+                terminal_request_owners[terminal_request_owner_count] =
+                    Some(ginkgo_kernel::request::RequestOwner::new(
+                        process_id.raw(),
+                        local_thread_id.raw(),
+                    ));
+                terminal_request_owner_count += 1;
+            }
+        }
+    }
+    for owner in terminal_request_owners[..terminal_request_owner_count]
+        .iter()
+        .flatten()
+        .copied()
+    {
+        context
+            .requests
+            .terminate_thread(owner, context.timer.clock().now_ns());
+    }
+    notify_completed_joins(context, process_id);
+    if let Some(process) = context.processes.get(process_id) {
+        for local_thread_id in process.thread_ids() {
+            if process
+                .thread_state(local_thread_id)
+                .is_some_and(|state| state != ThreadState::Blocked)
+            {
+                let thread_ref = ThreadRef {
+                    process_id,
+                    thread_id: local_thread_id,
+                };
+                let _ = context.waits.cancel_key(thread_ref);
+                let _ = context
+                    .user_scheduler
+                    .cancel_donations_from(thread_ref, context.timer.clock().now_ns());
             }
         }
     }
@@ -2722,6 +3804,14 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
             process_id,
             thread_id: detached,
         };
+        let detached_owner =
+            ginkgo_kernel::request::RequestOwner::new(process_id.raw(), detached.raw());
+        context
+            .requests
+            .terminate_thread(detached_owner, context.timer.clock().now_ns());
+        if !context.requests.is_thread_drained(detached_owner) {
+            break;
+        }
         if context.user_scheduler.snapshot(detached_ref).is_some() {
             let _ = context
                 .user_scheduler
@@ -2749,10 +3839,11 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
         }
     }
     if let Some(child) = created_child {
-        context
+        let child_id = context
             .processes
             .insert(*child)
             .expect("reserved child process insertion must succeed");
+        synchronize_process_scheduler(context, child_id);
     }
     let Some(final_state) = context.processes.get(process_id).map(Process::state) else {
         return TaskPoll::Pending;
@@ -2762,6 +3853,12 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
     }
     if let Some(process) = context.processes.get(process_id) {
         process.publish_terminal_status();
+    }
+    context
+        .requests
+        .terminate_process(process_id.raw(), context.timer.clock().now_ns());
+    if !context.requests.is_process_drained(process_id.raw()) {
+        return TaskPoll::Pending;
     }
 
     #[cfg(ginkgo_memory_policy_smoke)]
@@ -2808,6 +3905,7 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
             }
         }
     }
+    let _ = context.process_terminations.cancel_key(process_id);
     let Some(process) = context.processes.take_for_retirement(process_id) else {
         return TaskPoll::Pending;
     };
@@ -2815,12 +3913,17 @@ fn process_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
         Ok(retired) => retired,
         Err(_) => halt_forever(),
     };
+    if context.focused_process_id == Some(process_id) {
+        context.focused_process_id = None;
+    }
     if let Some(index) = context
         .process_clients
         .iter()
         .position(|known| known.process_id == process_id)
     {
-        let client_id = context.process_clients.swap_remove(index).client_id;
+        let removed_client = context.process_clients.swap_remove(index);
+        removed_client.interactive_authority.revoke();
+        let client_id = removed_client.client_id;
         let removed_windows = context
             .desktop
             .as_mut()
@@ -2955,10 +4058,21 @@ fn power_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
     };
     let sequence = usize::try_from(info.sequence).unwrap_or(usize::MAX);
     let phase = power_state as usize;
-    let changed = state.get(0) != Some(sequence) || state.get(1) != Some(phase);
+    let sequence_changed = state.get(0) != Some(sequence);
+    let changed = sequence_changed || state.get(1) != Some(phase);
     if changed {
         state.set(0, sequence);
         state.set(1, phase);
+        if sequence_changed {
+            state.set(2, 0);
+            state.set(3, 0);
+        }
+        let mut sink = SerialDebugSink::new(&mut context.serial);
+        let _ = writeln!(
+            sink,
+            "power: state={power_state:?} sequence={} deadline={}\r",
+            info.sequence, info.deadline_ns
+        );
     }
 
     match power_state {
@@ -2982,9 +4096,6 @@ fn power_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
             }
             let now_ns = context.timer.clock().now_ns();
             if now_ns >= info.deadline_ns {
-                let force = info
-                    .power_flags()
-                    .contains(ginkgo_sysapi::SystemPowerFlags::FORCE);
                 let acpi_supported =
                     context
                         .acpi_power
@@ -2998,16 +4109,11 @@ fn power_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
                             }
                             None => false,
                         });
-                let filesystem_synced = context.fs.sync().is_ok();
-                let device_flushed = context.fs.disk_mut().flush().is_ok();
-                if !acpi_supported || ((!filesystem_synced || !device_flushed) && !force) {
+                if !acpi_supported {
                     context.power_control.fail(ginkgo_sysapi::Status::Io);
                     context.launch_quiesced = false;
                     let mut sink = SerialDebugSink::new(&mut context.serial);
-                    let _ = writeln!(
-                        sink,
-                        "power: preflight failed acpi={acpi_supported} filesystem={filesystem_synced} device={device_flushed}\r"
-                    );
+                    let _ = writeln!(sink, "power: preflight failed acpi=false\r");
                     redraw_desktop(context);
                     return TaskPoll::Pending;
                 }
@@ -3018,6 +4124,7 @@ fn power_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
                     .power_control
                     .begin_quiescing(now_ns.saturating_add(PROCESS_GRACE_NS))
                 {
+                    let canceled_requests = context.requests.begin_shutdown(now_ns);
                     let close_requested = context
                         .desktop
                         .as_mut()
@@ -3029,7 +4136,7 @@ fn power_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
                     let mut sink = SerialDebugSink::new(&mut context.serial);
                     let _ = writeln!(
                         sink,
-                        "power: launches quiesced orderly-close-requested={close_requested}\r"
+                        "power: launches quiesced orderly-close-requested={close_requested} requests-canceled={canceled_requests}\r"
                     );
                 }
             }
@@ -3051,7 +4158,10 @@ fn power_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
                     .processes
                     .len()
                     .saturating_sub(usize::from(retained_desktop.is_some()));
-                if non_desktop_processes == 0 && context.power_control.begin_synchronizing() {
+                if non_desktop_processes == 0
+                    && context.requests.is_system_drained()
+                    && context.power_control.begin_synchronizing()
+                {
                     context.ui.render_power_progress(
                         &mut context.screen,
                         "Synchronizing filesystem and storage...",
@@ -3060,31 +4170,122 @@ fn power_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
             }
         }
         ginkgo_sysapi::SystemPowerState::Synchronizing => {
+            const DRAIN_STEPS_PER_TURN: usize = 8;
             let force = info
                 .power_flags()
                 .contains(ginkgo_sysapi::SystemPowerFlags::FORCE);
-            let filesystem_synced = context.fs.sync().is_ok();
-            let device_flushed = context.fs.disk_mut().flush().is_ok();
-            if (!filesystem_synced || !device_flushed) && !force {
-                context.power_control.fail(ginkgo_sysapi::Status::Io);
-                context.launch_quiesced = false;
-                let mut sink = SerialDebugSink::new(&mut context.serial);
-                let _ = writeln!(sink, "power: synchronization failed\r");
-                drop(sink);
-                redraw_desktop(context);
-                return TaskPoll::Pending;
+            if state.get(3) != Some(1) {
+                let before = context.fs.disk().status();
+                {
+                    let mut sink = SerialDebugSink::new(&mut context.serial);
+                    let _ = writeln!(
+                        sink,
+                        "power: checkpoint start write={} requested={} durable={} dirty={}\r",
+                        before.write_sequence,
+                        before.requested_sequence,
+                        before.durable_sequence,
+                        before.dirty_count
+                    );
+                }
+                let filesystem_ticket = context.fs.sync_ticket();
+                let after_sync = context.fs.disk().status();
+                {
+                    let mut sink = SerialDebugSink::new(&mut context.serial);
+                    let _ = writeln!(
+                        sink,
+                        "power: checkpoint result={filesystem_ticket:?} write={} requested={} durable={} dirty={} failure={:?}\r",
+                        after_sync.write_sequence,
+                        after_sync.requested_sequence,
+                        after_sync.durable_sequence,
+                        after_sync.dirty_count,
+                        after_sync.failure
+                    );
+                }
+                let ticket = filesystem_ticket.and_then(|filesystem_ticket| {
+                    context
+                        .fs
+                        .disk_mut()
+                        .quiesce()
+                        .map(|cache_ticket| filesystem_ticket.max(cache_ticket))
+                        .map_err(|_| FsError::Io)
+                });
+                let after_quiesce = context.fs.disk().status();
+                {
+                    let mut sink = SerialDebugSink::new(&mut context.serial);
+                    let _ = writeln!(
+                        sink,
+                        "power: quiesce result={ticket:?} write={} requested={} durable={} dirty={} failure={:?}\r",
+                        after_quiesce.write_sequence,
+                        after_quiesce.requested_sequence,
+                        after_quiesce.durable_sequence,
+                        after_quiesce.dirty_count,
+                        after_quiesce.failure
+                    );
+                }
+                let ticket = match ticket {
+                    Ok(ticket) => ticket,
+                    Err(_) if force => context.fs.requested_flush_sequence(),
+                    Err(_) => {
+                        context.power_control.fail(ginkgo_sysapi::Status::Io);
+                        let mut sink = SerialDebugSink::new(&mut context.serial);
+                        let _ = writeln!(sink, "power: synchronization checkpoint failed\r");
+                        drop(sink);
+                        redraw_desktop(context);
+                        return TaskPoll::Pending;
+                    }
+                };
+                state.set(2, usize::try_from(ticket).unwrap_or(usize::MAX));
+                state.set(3, 1);
             }
+
+            let ticket = state.get(2).unwrap_or(0) as u64;
+            let report = context
+                .fs
+                .disk_mut()
+                .drain_ticket(ticket, DRAIN_STEPS_PER_TURN);
+            {
+                let status = context.fs.disk().status();
+                let mut sink = SerialDebugSink::new(&mut context.serial);
+                let _ = writeln!(
+                    sink,
+                    "power: drain ticket={ticket} report={report:?} write={} requested={} durable={} dirty={} failure={:?}\r",
+                    status.write_sequence,
+                    status.requested_sequence,
+                    status.durable_sequence,
+                    status.dirty_count,
+                    status.failure
+                );
+            }
+            let durable = match report {
+                Ok(report) if report.complete => true,
+                Ok(_) => return TaskPoll::Pending,
+                Err(_) if force => false,
+                Err(_) => {
+                    context.power_control.fail(ginkgo_sysapi::Status::Io);
+                    let status = context.fs.disk().status();
+                    let mut sink = SerialDebugSink::new(&mut context.serial);
+                    let _ = writeln!(
+                        sink,
+                        "power: synchronization failed ticket={ticket} durable={} dirty={} failure={:?}\r",
+                        status.durable_sequence,
+                        status.dirty_count,
+                        status.failure
+                    );
+                    drop(sink);
+                    redraw_desktop(context);
+                    return TaskPoll::Pending;
+                }
+            };
+            let status = context.fs.disk().status();
             let mut sink = SerialDebugSink::new(&mut context.serial);
             let _ = writeln!(
                 sink,
-                "power: synchronization complete filesystem={filesystem_synced} device={device_flushed}\r"
+                "power: synchronization complete ticket={ticket} durable={} dirty={} forced={force} verified={durable}\r",
+                status.durable_sequence,
+                status.dirty_count
             );
             let _ = writeln!(sink, "power: committing action={:?}\r", info.power_action());
             drop(sink);
-            let serial_deadline = context.timer.clock().now_ns().saturating_add(50_000_000);
-            while context.timer.clock().now_ns() < serial_deadline {
-                core::hint::spin_loop();
-            }
             let commit_deadline = context.timer.clock().now_ns().saturating_add(500_000_000);
             if !context.power_control.begin_committing(commit_deadline) {
                 return TaskPoll::Pending;
@@ -3110,6 +4311,8 @@ fn power_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
             if result.is_err() {
                 context.power_control.fail(ginkgo_sysapi::Status::Io);
                 context.launch_quiesced = false;
+                let _ = context.fs.disk_mut().resume_after_quiesce();
+                context.requests.resume_after_shutdown_cancel();
                 context
                     .ui
                     .render_power_progress(&mut context.screen, "Firmware power transition failed");
@@ -3121,6 +4324,8 @@ fn power_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
         }
         ginkgo_sysapi::SystemPowerState::Canceled => {
             context.launch_quiesced = false;
+            let _ = context.fs.disk_mut().resume_after_quiesce();
+            context.requests.resume_after_shutdown_cancel();
             if changed {
                 redraw_desktop(context);
                 let mut sink = SerialDebugSink::new(&mut context.serial);
@@ -3131,6 +4336,8 @@ fn power_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
             if context.timer.clock().now_ns() >= info.deadline_ns {
                 context.power_control.fail(ginkgo_sysapi::Status::TimedOut);
                 context.launch_quiesced = false;
+                let _ = context.fs.disk_mut().resume_after_quiesce();
+                context.requests.resume_after_shutdown_cancel();
                 let mut sink = SerialDebugSink::new(&mut context.serial);
                 let _ = writeln!(sink, "power: firmware transition timed out\r");
                 drop(sink);
@@ -3139,6 +4346,19 @@ fn power_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
         }
         ginkgo_sysapi::SystemPowerState::Failed => {}
     }
+    TaskPoll::Pending
+}
+
+fn writeback_task(context: &mut KernelContext, state: &mut TaskState) -> TaskPoll {
+    const WRITEBACK_INTERVAL_NS: u64 = 100_000_000;
+    let now_ns = context.timer.clock().now_ns();
+    let next_ns = state.get(0).unwrap_or(0) as u64;
+    if now_ns < next_ns {
+        return TaskPoll::Pending;
+    }
+    let _ = context.fs.disk_mut().writeback_step();
+    let next = now_ns.saturating_add(WRITEBACK_INTERVAL_NS);
+    state.set(0, usize::try_from(next).unwrap_or(usize::MAX));
     TaskPoll::Pending
 }
 
@@ -3374,20 +4594,31 @@ fn launch_program(
         Ok(handle) => handle,
         Err(_) => return reject_unstarted_client(context, client_id, process),
     };
-    process.set_start_arguments([
+    let (interactive_authority, interactive_control) = match process
+        .handles_mut()
+        .scheduling_authority_create(ginkgo_sysapi::ThreadSchedulingClass::Interactive, false)
+    {
+        Ok(authority) => authority,
+        Err(_) => return reject_unstarted_client(context, client_id, process),
+    };
+    process.set_start_arguments6([
         u64::from(channel.raw()),
         u64::from(filesystem.raw()),
         u64::from(startup.raw()),
         u64::from(auxiliary.raw()),
+        u64::from(interactive_authority.raw()),
+        0,
     ]);
     let process_id = context
         .processes
         .insert(process)
         .expect("prepared process insertion must succeed");
+    synchronize_process_scheduler(context, process_id);
     context.process_clients.push(ProcessClient {
         process_id,
         client_id,
         launch_authority: RegistryLaunchAuthority::for_program(program),
+        interactive_authority: interactive_control,
     });
     let mut sink = SerialDebugSink::new(&mut context.serial);
     let _ = writeln!(
@@ -3538,6 +4769,7 @@ fn spawn_memory_policy_smoke(context: &mut KernelContext) -> Result<(), ()> {
         .processes
         .insert(process)
         .expect("prepared memory policy smoke insertion must succeed");
+    synchronize_process_scheduler(context, process_id);
     if phase == MemoryPolicyPhase::Oom {
         context.frames.smoke_fail_next_unrestricted_allocation();
     }
@@ -3903,11 +5135,50 @@ fn spawn_process_capability_smoke(context: &mut KernelContext) -> Result<(), ()>
         .processes
         .insert(process)
         .expect("prepared process capability smoke insertion must succeed");
+    synchronize_process_scheduler(context, process_id);
     context.process_capability_smoke_id = Some(process_id);
     let mut sink = SerialDebugSink::new(&mut context.serial);
     let _ = writeln!(
         sink,
         "scheduler: process capability smoke started pid={}\r",
+        process_id.raw()
+    );
+    Ok(())
+}
+
+fn spawn_request_smoke(context: &mut KernelContext) -> Result<(), ()> {
+    context.processes.prepare_insert().map_err(|_| ())?;
+    let randomness = [
+        context.entropy.next_u64(),
+        context.entropy.next_u64(),
+        context.entropy.next_u64(),
+    ];
+    let mut process = Process::from_elf_randomized(
+        REQUEST_SMOKE_ELF,
+        &context.page_table,
+        &mut context.frames,
+        randomness,
+    )
+    .map_err(|_| ())?;
+    let root = match process.handles_mut().filesystem_root_create_with_rights(
+        ginkgo_sysapi::Rights::READ | ginkgo_sysapi::Rights::WRITE,
+    ) {
+        Ok(root) => root,
+        Err(_) => {
+            discard_unstarted_process(context, process);
+            return Err(());
+        }
+    };
+    process.set_start_arguments([u64::from(root.raw()), 0, 0, 0]);
+    let process_id = context
+        .processes
+        .insert(process)
+        .expect("prepared request smoke insertion must succeed");
+    synchronize_process_scheduler(context, process_id);
+    let mut sink = SerialDebugSink::new(&mut context.serial);
+    let _ = writeln!(
+        sink,
+        "scheduler: request smoke started pid={}\r",
         process_id.raw()
     );
     Ok(())
@@ -3944,6 +5215,7 @@ fn spawn_frame_reclaim_stress(context: &mut KernelContext) -> Result<(), ()> {
         .processes
         .insert(process)
         .expect("prepared frame-reclaim stress insertion must succeed");
+    synchronize_process_scheduler(context, process_id);
     let stress = context
         .frame_reclaim_stress
         .as_mut()
@@ -4060,6 +5332,74 @@ fn redraw_desktop(context: &mut KernelContext) {
     }
 }
 
+fn refresh_process_scheduler_classes(context: &mut KernelContext, process_id: ProcessId) {
+    let mut updates = [None; ginkgo_kernel::process::MAX_THREADS_PER_PROCESS];
+    let mut count = 0usize;
+    if let Some(process) = context.processes.get(process_id) {
+        for thread_id in process.thread_ids() {
+            updates[count] = process
+                .thread_scheduling_class(thread_id)
+                .map(|class| (thread_id, class));
+            count += 1;
+        }
+    }
+    let now_ns = context.timer.clock().now_ns();
+    for (thread_id, class) in updates[..count].iter().flatten().copied() {
+        let thread_ref = ThreadRef {
+            process_id,
+            thread_id,
+        };
+        if context.user_scheduler.snapshot(thread_ref).is_some() {
+            let _ = context.user_scheduler.set_base_class_with_authority(
+                thread_ref,
+                class,
+                scheduler_authority(class),
+                now_ns,
+            );
+        }
+    }
+}
+
+fn apply_focused_process_policy(context: &mut KernelContext, focused_client: Option<ClientId>) {
+    let focused = focused_client.and_then(|client_id| {
+        context
+            .process_clients
+            .iter()
+            .find(|known| known.client_id == client_id)
+            .map(|known| known.process_id)
+    });
+    if context.focused_process_id == focused {
+        return;
+    }
+    if let Some(previous) = context.focused_process_id.take() {
+        if let Some(client) = context
+            .process_clients
+            .iter()
+            .find(|known| known.process_id == previous)
+        {
+            client.interactive_authority.revoke();
+        }
+        if let Some(process) = context.processes.get_mut(previous) {
+            process.set_focused_interactive(false);
+        }
+        refresh_process_scheduler_classes(context, previous);
+    }
+    if let Some(current) = focused {
+        if let Some(client) = context
+            .process_clients
+            .iter()
+            .find(|known| known.process_id == current)
+        {
+            client.interactive_authority.activate();
+        }
+        if let Some(process) = context.processes.get_mut(current) {
+            process.set_focused_interactive(true);
+            context.focused_process_id = Some(current);
+        }
+        refresh_process_scheduler_classes(context, current);
+    }
+}
+
 fn desktop_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll {
     if context.launcher_toggle_pending {
         let result = context
@@ -4164,8 +5504,11 @@ fn desktop_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                     );
                 }
             }
-            DesktopRuntimeEvent::PlacementsChanged { .. }
-            | DesktopRuntimeEvent::WindowDestroyed { .. } => redraw_desktop(context),
+            DesktopRuntimeEvent::PlacementsChanged { focused_client, .. } => {
+                apply_focused_process_policy(context, focused_client);
+                redraw_desktop(context);
+            }
+            DesktopRuntimeEvent::WindowDestroyed { .. } => redraw_desktop(context),
             DesktopRuntimeEvent::PresentationQueued { window_id, .. } => {
                 context.ui.hide_cursor(&mut context.screen);
                 if let Some(desktop) = context.desktop.as_mut() {

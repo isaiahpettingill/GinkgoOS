@@ -26,7 +26,7 @@ ThreadRef { process_id, thread_id }
 
 Both generations must resolve before dispatch. Reaped slots increment their generation, so stale IDs cannot name replacements.
 
-The scheduler dispatches only ready threads. Blocked continuations are maintained separately and are returned to the scheduler only after completion. A selected thread installs its own supervisor RSP0 and syscall stack, address space, FS base, and extended CPU state. The CPU fallback stacks are restored before Rust scheduler code resumes, and the kernel CR3 is restored before reaping stacks or retiring a process.
+The scheduler dispatches only ready threads. Blocked continuations register with their waitable objects and the deadline heap, then return to the scheduler only after a targeted object, dependency, cancellation, or deadline notification. The kernel does not scan every blocked process. A selected thread installs its own supervisor RSP0 and syscall stack, address space, FS base, and extended CPU state. The CPU fallback stacks are restored before Rust scheduler code resumes, and the kernel CR3 is restored before reaping stacks or retiring a process.
 
 ## Lifecycle
 
@@ -37,11 +37,11 @@ Ready/Blocked -> Terminated
 Ready/Blocked -> process-wide Faulted
 ```
 
-`ThreadExit` exits only the caller. `ProcessExit` terminates siblings and publishes one process exit status. The last live thread finalizes the process. Fatal userspace faults terminate the complete process; recoverable user-stack growth faults affect only the faulting thread.
+`ThreadExit` exits only the caller. It also marks that thread's outstanding asynchronous requests owner-terminated and delays thread-slot reuse until their copied buffers, page pins, shared-memory leases, and device ownership have drained. `ProcessExit` does the same for every sibling and publishes one process exit status. The last live thread finalizes the process only after process-wide request drain. Fatal userspace faults terminate the complete process; recoverable user-stack growth faults affect only the faulting thread.
 
 A join claims one target. One caller may join a target, and timeout or caller cancellation releases the claim. Successful join copies terminal information before reaping; copy failure leaves the target joinable. Detach rejects an active join claim and causes terminal cleanup after the kernel CR3 and fallback entry stacks are restored. Process-wide exit clears every blocked continuation and join claim.
 
-Wake uses a one-bit permit. Waking a sleeping thread completes its sleep immediately. Waking before sleep stores one permit, preventing the usual wake-before-block race.
+Wake uses a one-bit permit. Waking a sleeping thread completes its sleep immediately. Waking before sleep stores one permit, preventing the usual wake-before-block race. External process termination has a separate boot-preallocated observer queue. A terminate capability notifies the owning process ID directly, so a process blocked on an unrelated object is stopped without polling all blocked processes.
 
 ## ABI
 

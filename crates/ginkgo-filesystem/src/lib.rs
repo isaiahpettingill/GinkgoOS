@@ -10,7 +10,7 @@
 //! RedoxFS exposes creation and modification times, Unix mode, uid, and gid;
 //! these are retained in [`NodeMetadata`]. `policy` is reserved for a future
 //! GinkgoOS access-policy identifier and is currently always zero. RedoxFS does
-//! not expose birth-time distinct from ctime or a device-cache flush operation.
+//! not expose birth-time distinct from ctime.
 
 extern crate alloc;
 
@@ -221,6 +221,10 @@ impl<D: Disk> RedoxFs<D> {
         self.inner.disk
     }
 
+    pub fn disk(&self) -> &D {
+        &self.inner.disk
+    }
+
     /// Exposes the owned backing disk for explicit device-cache synchronization.
     pub fn disk_mut(&mut self) -> &mut D {
         &mut self.inner.disk
@@ -289,11 +293,30 @@ impl<D: Disk> RedoxFs<D> {
         })
     }
 
-    /// Forces RedoxFS to checkpoint pending allocator state and write a fresh
-    /// header. Transactions are already committed before adapter methods
-    /// return. The RedoxFS `Disk` trait has no hardware-cache flush primitive.
+    /// Checkpoints allocator state, writes a fresh header, and requests a backing
+    /// device flush. Use [`Self::sync_ticket`] to track asynchronous durability.
     pub fn sync(&mut self) -> Result<(), FsError> {
-        self.inner.cleanup().map_err(map_error)
+        self.sync_ticket().map(|_| ())
+    }
+
+    /// Checkpoints allocator state, requests a backing-device flush, and returns
+    /// the sequence assigned to that flush request.
+    pub fn sync_ticket(&mut self) -> Result<u64, FsError> {
+        self.inner.cleanup().map_err(map_error)?;
+        self.inner.disk.flush().map_err(map_error)?;
+        Ok(self.requested_flush_sequence())
+    }
+
+    pub fn is_ticket_durable(&self, ticket: u64) -> bool {
+        self.durable_flush_sequence() >= ticket
+    }
+
+    pub fn requested_flush_sequence(&self) -> u64 {
+        self.inner.disk.requested_flush_sequence()
+    }
+
+    pub fn durable_flush_sequence(&self) -> u64 {
+        self.inner.disk.durable_flush_sequence()
     }
 
     pub fn root_directory(&mut self) -> Result<DirectoryHandle, FsError> {
@@ -993,6 +1016,89 @@ fn map_error(error: Error) -> FsError {
 mod tests {
     use super::*;
     use alloc::format;
+
+    struct AsyncTicketDisk {
+        inner: MemoryDisk,
+        requested: u64,
+        durable: u64,
+    }
+
+    impl AsyncTicketDisk {
+        fn zeroed(size: usize) -> Self {
+            Self {
+                inner: MemoryDisk::zeroed(size),
+                requested: 0,
+                durable: 0,
+            }
+        }
+
+        fn advance_durability(&mut self) {
+            self.durable = self.requested;
+        }
+    }
+
+    impl Disk for AsyncTicketDisk {
+        unsafe fn read_at(
+            &mut self,
+            block: u64,
+            buffer: &mut [u8],
+        ) -> syscall::error::Result<usize> {
+            self.inner.read_at(block, buffer)
+        }
+
+        unsafe fn write_at(&mut self, block: u64, buffer: &[u8]) -> syscall::error::Result<usize> {
+            self.inner.write_at(block, buffer)
+        }
+
+        fn flush(&mut self) -> syscall::error::Result<()> {
+            self.requested += 1;
+            Ok(())
+        }
+
+        fn requested_flush_sequence(&self) -> u64 {
+            self.requested
+        }
+
+        fn durable_flush_sequence(&self) -> u64 {
+            self.durable
+        }
+
+        fn size(&mut self) -> syscall::error::Result<u64> {
+            self.inner.size()
+        }
+    }
+
+    #[test]
+    fn async_flush_tickets_report_requested_and_durable_sequences() {
+        let disk = AsyncTicketDisk::zeroed(8 * 1024 * 1024);
+        let mut fs = RedoxFs::format_disk(disk).unwrap();
+
+        let ticket = fs.sync_ticket().unwrap();
+        assert_eq!(ticket, 1);
+        assert_eq!(fs.requested_flush_sequence(), ticket);
+        assert_eq!(fs.durable_flush_sequence(), 0);
+        assert!(!fs.is_ticket_durable(ticket));
+
+        fs.disk_mut().advance_durability();
+        assert_eq!(fs.durable_flush_sequence(), ticket);
+        assert!(fs.is_ticket_durable(ticket));
+
+        fs.sync().unwrap();
+        assert_eq!(fs.requested_flush_sequence(), ticket + 1);
+        assert!(!fs.is_ticket_durable(ticket + 1));
+    }
+
+    #[test]
+    fn synchronous_disk_uses_default_durable_ticket() {
+        let disk = MemoryDisk::zeroed(8 * 1024 * 1024);
+        let mut fs = RedoxFs::format_disk(disk).unwrap();
+
+        let ticket = fs.sync_ticket().unwrap();
+        assert_eq!(ticket, 0);
+        assert_eq!(fs.requested_flush_sequence(), 0);
+        assert_eq!(fs.durable_flush_sequence(), 0);
+        assert!(fs.is_ticket_durable(ticket));
+    }
 
     #[test]
     fn create_write_read_and_reopen() {

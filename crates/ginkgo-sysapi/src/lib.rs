@@ -27,6 +27,10 @@ pub const PROCESS_MAX_STARTUP_HANDLES: usize = 16;
 pub const RPC_HEADER_SIZE: usize = core::mem::size_of::<RpcHeader>();
 /// A wait deadline which never expires.
 pub const DEADLINE_INFINITE: i64 = i64::MAX;
+/// Maximum number of buffers described by one request.
+pub const REQUEST_MAX_BUFFERS: usize = 4;
+/// Maximum number of requests accepted by one batch submission.
+pub const REQUEST_MAX_BATCH: usize = 16;
 
 /// Stable syscall numbers. Existing discriminants must never be changed or reused.
 #[repr(u64)]
@@ -134,6 +138,18 @@ pub enum SyscallNumber {
     ThreadSetSchedulingClass = 63,
     /// Returns scheduling class, budget, latency, and throttling diagnostics.
     ThreadGetSchedulingInfo = 64,
+    /// Changes a thread's class using a revocable delegated scheduling capability.
+    ThreadSetSchedulingClassWithAuthority = 65,
+    /// Submits one operation through the generic request framework.
+    RequestSubmit = 66,
+    /// Requests cancellation through a request capability.
+    RequestCancel = 67,
+    /// Returns stable state and completion information for one request.
+    RequestGetInfo = 68,
+    /// Submits a bounded group of generic requests.
+    RequestSubmitBatch = 69,
+    /// Returns aggregate request queue and completion diagnostics.
+    RequestGetDiagnostics = 70,
 }
 
 /// An opaque process-local reference to a kernel object.
@@ -186,6 +202,8 @@ bitflags! {
         const INSPECT   = 1 << 8;
         const TERMINATE = 1 << 9;
         const EXECUTE   = 1 << 10;
+        /// Selects a privileged scheduling class within a delegated ceiling.
+        const SCHEDULE  = 1 << 11;
     }
 }
 
@@ -510,6 +528,8 @@ pub enum ObjectType {
     ApplicationData = 8,
     Directory = 9,
     SystemPower = 10,
+    SchedulingAuthority = 11,
+    Request = 12,
 }
 
 /// Stable syscall status values. Additional detail is returned in output structs.
@@ -545,6 +565,7 @@ pub enum Status {
     DirectoryNotEmpty = -26,
     AlreadyExists = -27,
     CrossDevice = -28,
+    Canceled = -29,
 }
 
 impl Status {
@@ -580,6 +601,7 @@ impl Status {
             -26 => Self::DirectoryNotEmpty,
             -27 => Self::AlreadyExists,
             -28 => Self::CrossDevice,
+            -29 => Self::Canceled,
             _ => return None,
         })
     }
@@ -673,6 +695,366 @@ impl Default for HandleOutput {
             reserved: 0,
         }
     }
+}
+
+/// Current generic request submission ABI version.
+pub const REQUEST_SUBMIT_ARGS_VERSION: u32 = 1;
+/// Current generic request information ABI version.
+pub const REQUEST_INFO_VERSION: u32 = 1;
+/// Current batch submission ABI version.
+pub const REQUEST_SUBMIT_BATCH_ARGS_VERSION: u32 = 1;
+/// Current request diagnostics ABI version.
+pub const REQUEST_DIAGNOSTICS_VERSION: u32 = 1;
+
+/// How a submitted request reports completion.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestCompletionMode {
+    /// Complete during the syscall or return [`Status::ShouldWait`].
+    InlineOnly = 1,
+    /// Block only the calling thread until the request reaches a terminal state.
+    Block = 2,
+    /// Return a waitable [`ObjectType::Request`] capability.
+    Handle = 3,
+}
+
+impl RequestCompletionMode {
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            1 => Some(Self::InlineOnly),
+            2 => Some(Self::Block),
+            3 => Some(Self::Handle),
+            _ => None,
+        }
+    }
+}
+
+/// Stable operation identifier interpreted with the target capability.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestOperation {
+    Nop = 0,
+    FilesystemRead = 1,
+    FilesystemWrite = 2,
+    FilesystemSync = 3,
+    AudioWrite = 4,
+    FilesystemOpen = 5,
+    FilesystemTruncate = 6,
+    FilesystemNamespace = 7,
+    /// Kernel test operation used to exercise completion and race paths.
+    Synthetic = 0xffff_ff00,
+}
+
+impl RequestOperation {
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Nop),
+            1 => Some(Self::FilesystemRead),
+            2 => Some(Self::FilesystemWrite),
+            3 => Some(Self::FilesystemSync),
+            4 => Some(Self::AudioWrite),
+            5 => Some(Self::FilesystemOpen),
+            6 => Some(Self::FilesystemTruncate),
+            7 => Some(Self::FilesystemNamespace),
+            0xffff_ff00 => Some(Self::Synthetic),
+            _ => None,
+        }
+    }
+}
+
+/// Ownership policy for one request buffer.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestBufferKind {
+    /// Copy the buffer into or out of bounded kernel storage.
+    Copy = 1,
+    /// Pin the validated userspace pages until completion.
+    Pinned = 2,
+    /// Lease a range of a shared-memory object until completion.
+    SharedMemory = 3,
+}
+
+impl RequestBufferKind {
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            1 => Some(Self::Copy),
+            2 => Some(Self::Pinned),
+            3 => Some(Self::SharedMemory),
+            _ => None,
+        }
+    }
+}
+
+bitflags! {
+    /// Direction in which the request service may access a buffer.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    pub struct RequestBufferFlags: u32 {
+        const READ  = 1 << 0;
+        const WRITE = 1 << 1;
+    }
+}
+
+bitflags! {
+    /// Submission behavior common to all request operations.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    pub struct RequestFlags: u32 {
+        /// Preserve submission order with other ordered requests on the target.
+        const ORDERED = 1 << 0;
+        /// Permit a successful completion after transferring fewer bytes than requested.
+        const ALLOW_PARTIAL = 1 << 1;
+    }
+}
+
+/// Stable externally observable request state.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestState {
+    Pending = 0,
+    Active = 1,
+    CancelPending = 2,
+    Completing = 3,
+    Completed = 4,
+    TimedOut = 5,
+    Canceled = 6,
+    Failed = 7,
+    OwnerTerminated = 8,
+}
+
+impl RequestState {
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Pending),
+            1 => Some(Self::Active),
+            2 => Some(Self::CancelPending),
+            3 => Some(Self::Completing),
+            4 => Some(Self::Completed),
+            5 => Some(Self::TimedOut),
+            6 => Some(Self::Canceled),
+            7 => Some(Self::Failed),
+            8 => Some(Self::OwnerTerminated),
+            _ => None,
+        }
+    }
+}
+
+bitflags! {
+    /// Stable facts attached to a terminal request result.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    pub struct RequestResultFlags: u32 {
+        /// Fewer bytes were transferred than the submitted buffers describe.
+        const PARTIAL = 1 << 0;
+        /// The service acknowledged cancellation before publishing the result.
+        const CANCEL_ACKNOWLEDGED = 1 << 1;
+        /// The absolute request deadline selected the terminal result.
+        const DEADLINE_EXPIRED = 1 << 2;
+    }
+}
+
+/// One fixed-layout request buffer descriptor.
+///
+/// Copy and pinned buffers use `address` and require `handle` and `offset` to be
+/// zero. Shared-memory buffers use `handle` and `offset` and require `address`
+/// to be zero. `length` applies to every kind. The descriptor array is copied
+/// and validated before a request can outlive the submission syscall.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq)]
+pub struct RequestBuffer {
+    pub kind: u32,
+    pub flags: u32,
+    pub address: u64,
+    pub length: u64,
+    pub handle: Handle,
+    pub reserved: u32,
+    pub offset: u64,
+}
+
+impl RequestBuffer {
+    pub const fn buffer_kind(self) -> Option<RequestBufferKind> {
+        RequestBufferKind::from_raw(self.kind)
+    }
+
+    pub const fn buffer_flags(self) -> RequestBufferFlags {
+        RequestBufferFlags::from_bits_retain(self.flags)
+    }
+}
+
+/// Versioned argument block for [`SyscallNumber::RequestSubmit`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq)]
+pub struct RequestSubmitArgs {
+    pub version: u32,
+    pub size: u32,
+    pub target: Handle,
+    pub operation: u32,
+    pub completion_mode: u32,
+    pub flags: u32,
+    /// Address of at most [`REQUEST_MAX_BUFFERS`] readable [`RequestBuffer`] values.
+    pub buffers_address: u64,
+    pub buffer_count: u32,
+    pub reserved: u32,
+    /// Operation-specific scalar, such as a filesystem byte offset.
+    pub operation_argument: u64,
+    /// Absolute monotonic deadline in nanoseconds, or [`DEADLINE_INFINITE`].
+    pub deadline_ns: i64,
+    /// Opaque value copied into [`RequestInfo`] without interpretation.
+    pub user_data: u64,
+}
+
+impl RequestSubmitArgs {
+    pub const SIZE: u32 = core::mem::size_of::<Self>() as u32;
+
+    pub const fn operation(self) -> Option<RequestOperation> {
+        RequestOperation::from_raw(self.operation)
+    }
+
+    pub const fn completion_mode(self) -> Option<RequestCompletionMode> {
+        RequestCompletionMode::from_raw(self.completion_mode)
+    }
+
+    pub const fn request_flags(self) -> RequestFlags {
+        RequestFlags::from_bits_retain(self.flags)
+    }
+}
+
+/// Immediate result of one request submission.
+///
+/// `request` is valid only for [`RequestCompletionMode::Handle`]. Raw state and
+/// result flag fields preserve forward compatibility with newer kernels.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq)]
+pub struct RequestSubmitOutput {
+    pub request: Handle,
+    pub state: u32,
+    /// A [`Status`] value describing the operation result.
+    pub result: i32,
+    pub result_flags: u32,
+    pub bytes_transferred: u64,
+}
+
+impl RequestSubmitOutput {
+    pub const fn request_state(self) -> Option<RequestState> {
+        RequestState::from_raw(self.state)
+    }
+
+    pub const fn result_status(self) -> Option<Status> {
+        Status::from_raw(self.result as i64)
+    }
+
+    pub const fn flags(self) -> RequestResultFlags {
+        RequestResultFlags::from_bits_retain(self.result_flags)
+    }
+}
+
+impl Default for RequestSubmitOutput {
+    fn default() -> Self {
+        Self {
+            request: Handle::INVALID,
+            state: RequestState::Pending as u32,
+            result: Status::Ok as i32,
+            result_flags: 0,
+            bytes_transferred: 0,
+        }
+    }
+}
+
+/// Versioned state and result returned by [`SyscallNumber::RequestGetInfo`].
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq,
+)]
+pub struct RequestInfo {
+    pub version: u32,
+    pub size: u32,
+    pub state: u32,
+    pub operation: u32,
+    pub request_flags: u32,
+    pub result_flags: u32,
+    /// A [`Status`] value describing the operation result.
+    pub result: i32,
+    pub reserved: u32,
+    pub bytes_transferred: u64,
+    pub deadline_ns: i64,
+    pub submitted_ns: u64,
+    pub started_ns: u64,
+    pub completed_ns: u64,
+    pub user_data: u64,
+}
+
+impl RequestInfo {
+    pub const SIZE: u32 = core::mem::size_of::<Self>() as u32;
+
+    pub const fn request_state(self) -> Option<RequestState> {
+        RequestState::from_raw(self.state)
+    }
+
+    pub const fn operation(self) -> Option<RequestOperation> {
+        RequestOperation::from_raw(self.operation)
+    }
+
+    pub const fn result_status(self) -> Option<Status> {
+        Status::from_raw(self.result as i64)
+    }
+
+    pub const fn flags(self) -> RequestFlags {
+        RequestFlags::from_bits_retain(self.request_flags)
+    }
+
+    pub const fn result_flags(self) -> RequestResultFlags {
+        RequestResultFlags::from_bits_retain(self.result_flags)
+    }
+}
+
+/// Versioned argument block for [`SyscallNumber::RequestSubmitBatch`].
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq,
+)]
+pub struct RequestSubmitBatchArgs {
+    pub version: u32,
+    pub size: u32,
+    /// Address of at most [`REQUEST_MAX_BATCH`] readable [`RequestSubmitArgs`] values.
+    pub submissions_address: u64,
+    pub submission_count: u32,
+    pub reserved: u32,
+    /// Address of `submission_count` writable [`RequestSubmitOutput`] values.
+    pub outputs_address: u64,
+}
+
+impl RequestSubmitBatchArgs {
+    pub const SIZE: u32 = core::mem::size_of::<Self>() as u32;
+}
+
+/// Versioned aggregate request queue and completion diagnostics.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq,
+)]
+pub struct RequestDiagnostics {
+    pub version: u32,
+    pub size: u32,
+    pub queue_depth: u64,
+    pub peak_queue_depth: u64,
+    pub active_requests: u64,
+    pub completed_requests: u64,
+    pub total_service_latency_ns: u64,
+    pub maximum_service_latency_ns: u64,
+    pub total_wait_latency_ns: u64,
+    pub maximum_wait_latency_ns: u64,
+    pub deadline_misses: u64,
+    pub cancellations: u64,
+    pub bytes_transferred: u64,
+    pub errors: u64,
+    pub rejected_requests: u64,
+    pub dropped_completions: u64,
+    /// Maximum concurrently active or device-owned requests.
+    pub peak_active_requests: u64,
+}
+
+impl RequestDiagnostics {
+    pub const SIZE: u32 = core::mem::size_of::<Self>() as u32;
 }
 
 /// How a handle is transferred in a channel write.
@@ -1461,6 +1843,12 @@ const _: () = {
     assert!(core::mem::size_of::<MonotonicTimeOutput>() == 8);
     assert!(core::mem::size_of::<HandleOutput>() == 8);
     assert!(core::mem::size_of::<HandleDisposition>() == 16);
+    assert!(core::mem::size_of::<RequestBuffer>() == 40);
+    assert!(core::mem::size_of::<RequestSubmitArgs>() == 64);
+    assert!(core::mem::size_of::<RequestSubmitOutput>() == 24);
+    assert!(core::mem::size_of::<RequestInfo>() == 80);
+    assert!(core::mem::size_of::<RequestSubmitBatchArgs>() == 32);
+    assert!(core::mem::size_of::<RequestDiagnostics>() == 128);
     assert!(core::mem::size_of::<ThreadId>() == 8);
     assert!(core::mem::size_of::<ThreadCreateArgs>() == 56);
     assert!(core::mem::size_of::<ThreadInfo>() == 64);
@@ -1574,6 +1962,15 @@ mod tests {
         assert_eq!(SyscallNumber::ThreadGetCurrent as u64, 62);
         assert_eq!(SyscallNumber::ThreadSetSchedulingClass as u64, 63);
         assert_eq!(SyscallNumber::ThreadGetSchedulingInfo as u64, 64);
+        assert_eq!(
+            SyscallNumber::ThreadSetSchedulingClassWithAuthority as u64,
+            65
+        );
+        assert_eq!(SyscallNumber::RequestSubmit as u64, 66);
+        assert_eq!(SyscallNumber::RequestCancel as u64, 67);
+        assert_eq!(SyscallNumber::RequestGetInfo as u64, 68);
+        assert_eq!(SyscallNumber::RequestSubmitBatch as u64, 69);
+        assert_eq!(SyscallNumber::RequestGetDiagnostics as u64, 70);
     }
 
     #[test]
@@ -1608,6 +2005,7 @@ mod tests {
             Status::DirectoryNotEmpty,
             Status::AlreadyExists,
             Status::CrossDevice,
+            Status::Canceled,
         ];
 
         for (index, status) in statuses.into_iter().enumerate() {
@@ -1637,6 +2035,9 @@ mod tests {
         assert_eq!(ObjectType::Process as u32, 7);
         assert_eq!(ObjectType::ApplicationData as u32, 8);
         assert_eq!(ObjectType::Directory as u32, 9);
+        assert_eq!(ObjectType::SystemPower as u32, 10);
+        assert_eq!(ObjectType::SchedulingAuthority as u32, 11);
+        assert_eq!(ObjectType::Request as u32, 12);
         assert_eq!(FilesystemEntryKind::File as u32, 1);
         assert_eq!(FilesystemEntryKind::Directory as u32, 2);
         assert_eq!(
@@ -1696,6 +2097,69 @@ mod tests {
         }
         assert_eq!(VirtualAreaKind::from_raw(0), None);
         assert_eq!(VirtualAreaKind::from_raw(7), None);
+
+        assert_eq!(RequestCompletionMode::InlineOnly as u32, 1);
+        assert_eq!(RequestCompletionMode::Block as u32, 2);
+        assert_eq!(RequestCompletionMode::Handle as u32, 3);
+        for raw in 1..=3 {
+            assert_eq!(
+                RequestCompletionMode::from_raw(raw).map(|mode| mode as u32),
+                Some(raw)
+            );
+        }
+        assert_eq!(RequestCompletionMode::from_raw(0), None);
+        assert_eq!(RequestCompletionMode::from_raw(4), None);
+        assert_eq!(RequestOperation::Nop as u32, 0);
+        assert_eq!(RequestOperation::FilesystemRead as u32, 1);
+        assert_eq!(RequestOperation::FilesystemWrite as u32, 2);
+        assert_eq!(RequestOperation::FilesystemSync as u32, 3);
+        assert_eq!(RequestOperation::AudioWrite as u32, 4);
+        assert_eq!(RequestOperation::FilesystemOpen as u32, 5);
+        assert_eq!(RequestOperation::FilesystemTruncate as u32, 6);
+        assert_eq!(RequestOperation::FilesystemNamespace as u32, 7);
+        assert_eq!(RequestOperation::Synthetic as u32, 0xffff_ff00);
+        for raw in 0..=7 {
+            assert_eq!(
+                RequestOperation::from_raw(raw).map(|operation| operation as u32),
+                Some(raw)
+            );
+        }
+        assert_eq!(
+            RequestOperation::from_raw(0xffff_ff00),
+            Some(RequestOperation::Synthetic)
+        );
+        assert_eq!(RequestOperation::from_raw(8), None);
+        assert_eq!(RequestBufferKind::Copy as u32, 1);
+        assert_eq!(RequestBufferKind::Pinned as u32, 2);
+        assert_eq!(RequestBufferKind::SharedMemory as u32, 3);
+        for raw in 1..=3 {
+            assert_eq!(
+                RequestBufferKind::from_raw(raw).map(|kind| kind as u32),
+                Some(raw)
+            );
+        }
+        assert_eq!(RequestBufferKind::from_raw(0), None);
+        assert_eq!(RequestBufferKind::from_raw(4), None);
+        for raw in 0..=8 {
+            assert_eq!(
+                RequestState::from_raw(raw).map(|state| state as u32),
+                Some(raw)
+            );
+        }
+        assert_eq!(RequestState::from_raw(9), None);
+    }
+
+    #[test]
+    fn request_bits_are_stable() {
+        assert_eq!(REQUEST_MAX_BUFFERS, 4);
+        assert_eq!(REQUEST_MAX_BATCH, 16);
+        assert_eq!(RequestBufferFlags::READ.bits(), 1);
+        assert_eq!(RequestBufferFlags::WRITE.bits(), 2);
+        assert_eq!(RequestFlags::ORDERED.bits(), 1);
+        assert_eq!(RequestFlags::ALLOW_PARTIAL.bits(), 2);
+        assert_eq!(RequestResultFlags::PARTIAL.bits(), 1);
+        assert_eq!(RequestResultFlags::CANCEL_ACKNOWLEDGED.bits(), 2);
+        assert_eq!(RequestResultFlags::DEADLINE_EXPIRED.bits(), 4);
     }
 
     #[test]
@@ -1704,6 +2168,88 @@ mod tests {
         assert_eq!(offset_of!(WaitManyArgs, deadline_ns), 16);
         assert_eq!(size_of::<MonotonicTimeOutput>(), 8);
         assert_eq!(offset_of!(MonotonicTimeOutput, now_ns), 0);
+
+        assert_eq!(size_of::<RequestBuffer>(), 40);
+        assert_eq!(align_of::<RequestBuffer>(), 8);
+        assert_eq!(offset_of!(RequestBuffer, kind), 0);
+        assert_eq!(offset_of!(RequestBuffer, flags), 4);
+        assert_eq!(offset_of!(RequestBuffer, address), 8);
+        assert_eq!(offset_of!(RequestBuffer, length), 16);
+        assert_eq!(offset_of!(RequestBuffer, handle), 24);
+        assert_eq!(offset_of!(RequestBuffer, reserved), 28);
+        assert_eq!(offset_of!(RequestBuffer, offset), 32);
+
+        assert_eq!(size_of::<RequestSubmitArgs>(), 64);
+        assert_eq!(align_of::<RequestSubmitArgs>(), 8);
+        assert_eq!(offset_of!(RequestSubmitArgs, version), 0);
+        assert_eq!(offset_of!(RequestSubmitArgs, size), 4);
+        assert_eq!(offset_of!(RequestSubmitArgs, target), 8);
+        assert_eq!(offset_of!(RequestSubmitArgs, operation), 12);
+        assert_eq!(offset_of!(RequestSubmitArgs, completion_mode), 16);
+        assert_eq!(offset_of!(RequestSubmitArgs, flags), 20);
+        assert_eq!(offset_of!(RequestSubmitArgs, buffers_address), 24);
+        assert_eq!(offset_of!(RequestSubmitArgs, buffer_count), 32);
+        assert_eq!(offset_of!(RequestSubmitArgs, reserved), 36);
+        assert_eq!(offset_of!(RequestSubmitArgs, operation_argument), 40);
+        assert_eq!(offset_of!(RequestSubmitArgs, deadline_ns), 48);
+        assert_eq!(offset_of!(RequestSubmitArgs, user_data), 56);
+
+        assert_eq!(size_of::<RequestSubmitOutput>(), 24);
+        assert_eq!(align_of::<RequestSubmitOutput>(), 8);
+        assert_eq!(offset_of!(RequestSubmitOutput, request), 0);
+        assert_eq!(offset_of!(RequestSubmitOutput, state), 4);
+        assert_eq!(offset_of!(RequestSubmitOutput, result), 8);
+        assert_eq!(offset_of!(RequestSubmitOutput, result_flags), 12);
+        assert_eq!(offset_of!(RequestSubmitOutput, bytes_transferred), 16);
+
+        assert_eq!(size_of::<RequestInfo>(), 80);
+        assert_eq!(align_of::<RequestInfo>(), 8);
+        assert_eq!(offset_of!(RequestInfo, version), 0);
+        assert_eq!(offset_of!(RequestInfo, size), 4);
+        assert_eq!(offset_of!(RequestInfo, state), 8);
+        assert_eq!(offset_of!(RequestInfo, operation), 12);
+        assert_eq!(offset_of!(RequestInfo, request_flags), 16);
+        assert_eq!(offset_of!(RequestInfo, result_flags), 20);
+        assert_eq!(offset_of!(RequestInfo, result), 24);
+        assert_eq!(offset_of!(RequestInfo, reserved), 28);
+        assert_eq!(offset_of!(RequestInfo, bytes_transferred), 32);
+        assert_eq!(offset_of!(RequestInfo, deadline_ns), 40);
+        assert_eq!(offset_of!(RequestInfo, submitted_ns), 48);
+        assert_eq!(offset_of!(RequestInfo, started_ns), 56);
+        assert_eq!(offset_of!(RequestInfo, completed_ns), 64);
+        assert_eq!(offset_of!(RequestInfo, user_data), 72);
+
+        assert_eq!(size_of::<RequestSubmitBatchArgs>(), 32);
+        assert_eq!(align_of::<RequestSubmitBatchArgs>(), 8);
+        assert_eq!(offset_of!(RequestSubmitBatchArgs, version), 0);
+        assert_eq!(offset_of!(RequestSubmitBatchArgs, size), 4);
+        assert_eq!(offset_of!(RequestSubmitBatchArgs, submissions_address), 8);
+        assert_eq!(offset_of!(RequestSubmitBatchArgs, submission_count), 16);
+        assert_eq!(offset_of!(RequestSubmitBatchArgs, reserved), 20);
+        assert_eq!(offset_of!(RequestSubmitBatchArgs, outputs_address), 24);
+
+        assert_eq!(size_of::<RequestDiagnostics>(), 128);
+        assert_eq!(align_of::<RequestDiagnostics>(), 8);
+        assert_eq!(offset_of!(RequestDiagnostics, version), 0);
+        assert_eq!(offset_of!(RequestDiagnostics, size), 4);
+        assert_eq!(offset_of!(RequestDiagnostics, queue_depth), 8);
+        assert_eq!(offset_of!(RequestDiagnostics, peak_queue_depth), 16);
+        assert_eq!(offset_of!(RequestDiagnostics, active_requests), 24);
+        assert_eq!(offset_of!(RequestDiagnostics, completed_requests), 32);
+        assert_eq!(offset_of!(RequestDiagnostics, total_service_latency_ns), 40);
+        assert_eq!(
+            offset_of!(RequestDiagnostics, maximum_service_latency_ns),
+            48
+        );
+        assert_eq!(offset_of!(RequestDiagnostics, total_wait_latency_ns), 56);
+        assert_eq!(offset_of!(RequestDiagnostics, maximum_wait_latency_ns), 64);
+        assert_eq!(offset_of!(RequestDiagnostics, peak_active_requests), 120);
+        assert_eq!(offset_of!(RequestDiagnostics, deadline_misses), 72);
+        assert_eq!(offset_of!(RequestDiagnostics, cancellations), 80);
+        assert_eq!(offset_of!(RequestDiagnostics, bytes_transferred), 88);
+        assert_eq!(offset_of!(RequestDiagnostics, errors), 96);
+        assert_eq!(offset_of!(RequestDiagnostics, rejected_requests), 104);
+        assert_eq!(offset_of!(RequestDiagnostics, dropped_completions), 112);
 
         assert_eq!(size_of::<ThreadCreateArgs>(), 56);
         assert_eq!(align_of::<ThreadCreateArgs>(), 8);

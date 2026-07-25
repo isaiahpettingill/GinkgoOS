@@ -143,6 +143,7 @@ pub enum DesktopRuntimeEvent {
     PlacementsChanged {
         window_count: usize,
         focused_window: Option<WindowId>,
+        focused_client: Option<ClientId>,
     },
     PresentationQueued {
         client_id: ClientId,
@@ -981,9 +982,16 @@ impl DesktopBroker {
             .find(|placement| placement.focused)
             .map(|placement| placement.window_id);
 
+        let focused_client = self.focused_window.and_then(|focused| {
+            self.windows
+                .iter()
+                .find(|window| window.window_id == focused)
+                .map(|window| window.client_id)
+        });
         Ok(DesktopRuntimeEvent::PlacementsChanged {
             window_count: placements.len(),
             focused_window: self.focused_window,
+            focused_client,
         })
     }
 

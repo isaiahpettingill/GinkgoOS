@@ -21,15 +21,20 @@ use ginkgo_ipc::{
     WaitItem, APPLICATION_DATA_MAX_APP_ID_LEN,
 };
 use ginkgo_sysapi::{
-    FilesystemDirectoryEntry, FilesystemOpenFlags, FilesystemRenameFlags, Handle, MapFlags,
-    MapProtection, MemoryInfo, ProcessInfo, ProcessMemoryPolicy, SharedMemoryMapArgs, Status,
-    SyscallNumber, SystemPowerAction, SystemPowerFlags, SystemPowerInfo, ThreadInfo,
-    ThreadSchedulingClass, ThreadSchedulingInfo, ThreadState as PublicThreadState, VirtualAreaInfo,
-    VirtualMapFileArgs, CHANNEL_MAX_BYTES, CHANNEL_MAX_HANDLES, DEADLINE_INFINITE,
-    FILESYSTEM_NAME_MAX, FILESYSTEM_READ_MAX_BYTES, MEMORY_INFO_V1_SIZE, MEMORY_INFO_VERSION,
-    MEMORY_INFO_VERSION_V1, PROCESS_MAX_STARTUP_BYTES, PROCESS_MAX_STARTUP_HANDLES,
-    PROCESS_MEMORY_POLICY_VERSION, RANDOM_MAX_BYTES, THREAD_CREATE_ARGS_VERSION,
-    THREAD_INFO_VERSION, THREAD_SCHEDULING_INFO_VERSION, VIRTUAL_AREA_INFO_VERSION,
+    FilesystemDirectoryEntry, FilesystemOpenFlags, FilesystemReadOutput, FilesystemRenameFlags,
+    Handle, MapFlags, MapProtection, MemoryInfo, ProcessInfo, ProcessMemoryPolicy, RequestBuffer,
+    RequestBufferFlags, RequestBufferKind, RequestCompletionMode, RequestDiagnostics, RequestFlags,
+    RequestInfo, RequestOperation, RequestResultFlags, RequestState, RequestSubmitArgs,
+    RequestSubmitBatchArgs, RequestSubmitOutput, SharedMemoryMapArgs, Status, SyscallNumber,
+    SystemPowerAction, SystemPowerFlags, SystemPowerInfo, ThreadInfo, ThreadSchedulingClass,
+    ThreadSchedulingInfo, ThreadState as PublicThreadState, VirtualAreaInfo, VirtualMapFileArgs,
+    CHANNEL_MAX_BYTES, CHANNEL_MAX_HANDLES, DEADLINE_INFINITE, FILESYSTEM_NAME_MAX,
+    FILESYSTEM_READ_MAX_BYTES, MEMORY_INFO_V1_SIZE, MEMORY_INFO_VERSION, MEMORY_INFO_VERSION_V1,
+    PROCESS_MAX_STARTUP_BYTES, PROCESS_MAX_STARTUP_HANDLES, PROCESS_MEMORY_POLICY_VERSION,
+    RANDOM_MAX_BYTES, REQUEST_DIAGNOSTICS_VERSION, REQUEST_INFO_VERSION, REQUEST_MAX_BATCH,
+    REQUEST_MAX_BUFFERS, REQUEST_SUBMIT_ARGS_VERSION, REQUEST_SUBMIT_BATCH_ARGS_VERSION,
+    THREAD_CREATE_ARGS_VERSION, THREAD_INFO_VERSION, THREAD_SCHEDULING_INFO_VERSION,
+    VIRTUAL_AREA_INFO_VERSION,
 };
 use redoxfs::Disk;
 use zerocopy::IntoBytes;
@@ -38,16 +43,21 @@ use crate::{
     arch::UserContext,
     audio::AudioDevice,
     entropy::EntropyPool,
-    memory::UsableFrameAllocator,
+    memory::{UsableFrameAllocator, PAGE_SIZE},
     paging::{
         address_space::{AddressSpaceError, UserAccess},
         ActivePageTable, MapError,
     },
     process::{
         file_max_protection, select_child_process_limits, BlockedKind, DirectStartupBlock,
-        ElfPageLoadError, PendingWaitMany, Process, ProcessCreateError, ProcessLimits,
-        SharedMappingError, ThreadCreateError, ThreadId, ThreadState, WaitDeadline,
-        WaitManyCompletion,
+        ElfPageLoadError, PendingRequest, PendingRequestCountOutput, PendingRequestOutput,
+        PendingWaitMany, Process, ProcessCreateError, ProcessId, ProcessLimits, SharedMappingError,
+        ThreadCreateError, ThreadId, ThreadState, WaitDeadline, WaitManyCompletion,
+    },
+    request::{RequestError, RequestId, RequestOwner, RequestTarget},
+    request_broker::{
+        BrokerError, BrokerPayload, FileCapabilityLease, PreparedBrokerRequest,
+        PreparedRequestBuffer, PreparedRequestTarget, RequestBroker,
     },
     shared_memory::{SharedFrameArena, SharedMemoryFactory},
 };
@@ -101,6 +111,15 @@ const SYSTEM_POWER_INFO_SIZE: usize = size_of::<SystemPowerInfo>();
 const VIRTUAL_AREA_INFO_SIZE: usize = size_of::<VirtualAreaInfo>();
 const SYSTEM_POWER_CANCELLATION_NS: u64 = 2_000_000_000;
 const APPLICATION_DATA_CREATE_ARGS_SIZE: usize = 32;
+const REQUEST_BUFFER_SIZE: usize = size_of::<RequestBuffer>();
+const REQUEST_SUBMIT_ARGS_SIZE: usize = size_of::<RequestSubmitArgs>();
+const REQUEST_SUBMIT_OUTPUT_SIZE: usize = size_of::<RequestSubmitOutput>();
+const REQUEST_INFO_SIZE: usize = size_of::<RequestInfo>();
+const REQUEST_SUBMIT_BATCH_ARGS_SIZE: usize = size_of::<RequestSubmitBatchArgs>();
+const REQUEST_DIAGNOSTICS_SIZE: usize = size_of::<RequestDiagnostics>();
+const REQUEST_TARGET_FILESYSTEM_ROOT: u64 = u64::MAX;
+const REQUEST_TARGET_AUDIO: u64 = u64::MAX - 1;
+const REQUEST_TARGET_SYNTHETIC_TAG: u64 = 0x5359_4e54_0000_0000;
 /// Heap values captured immediately before syscall dispatch.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct KernelHeapStats {
@@ -151,6 +170,7 @@ pub enum BlockedPoll {
 /// outcome leaves RAX untouched until [`complete_blocked`] runs. Unknown syscall
 /// numbers are decoded without converting an arbitrary integer into a Rust enum.
 pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
+    process_id: ProcessId,
     process: &mut Process,
     thread_id: ThreadId,
     context: &mut UserContext,
@@ -162,6 +182,7 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
     filesystem: &mut RedoxFs<B>,
     audio: &mut Option<AudioDevice>,
     entropy: &mut EntropyPool,
+    requests: &mut RequestBroker,
     process_creation_allowed: bool,
     child_slot_reserved: bool,
     debug_sink: &mut D,
@@ -203,6 +224,7 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
     } else {
         dispatch_non_exit(
             number,
+            process_id,
             process,
             thread_id,
             context,
@@ -214,6 +236,7 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
             filesystem,
             audio,
             entropy,
+            requests,
             process_creation_allowed,
             child_slot_reserved,
             debug_sink,
@@ -234,6 +257,7 @@ pub fn dispatch<D: DebugSink + ?Sized, B: Disk>(
 
 fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
     number: SyscallNumber,
+    process_id: ProcessId,
     process: &mut Process,
     thread_id: ThreadId,
     context: &UserContext,
@@ -245,6 +269,7 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
     filesystem: &mut RedoxFs<B>,
     audio: &mut Option<AudioDevice>,
     entropy: &mut EntropyPool,
+    requests: &mut RequestBroker,
     process_creation_allowed: bool,
     child_slot_reserved: bool,
     debug_sink: &mut D,
@@ -288,26 +313,46 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
         SyscallNumber::SharedMemoryUnmap => shared_memory_unmap(process, context.rdi, context.rsi),
         SyscallNumber::DebugWrite => debug_write(process, context.rdi, context.rsi, debug_sink),
         SyscallNumber::FilesystemOpen => {
-            filesystem_open(process, filesystem, context.rdi, context.rsi, context.rdx)
+            return filesystem_open_request(
+                process_id,
+                process,
+                thread_id,
+                filesystem,
+                requests,
+                context.rdi,
+                context.rsi,
+                context.rdx,
+                now_ns,
+            );
         }
-        SyscallNumber::FilesystemRead => filesystem_read(
-            process,
-            filesystem,
-            context.rdi,
-            context.rsi,
-            context.rdx,
-            context.r10,
-            context.r8,
-        ),
-        SyscallNumber::FilesystemWrite => filesystem_write(
-            process,
-            filesystem,
-            context.rdi,
-            context.rsi,
-            context.rdx,
-            context.r10,
-            context.r8,
-        ),
+        SyscallNumber::FilesystemRead => {
+            return filesystem_read_request(
+                process_id,
+                process,
+                thread_id,
+                requests,
+                context.rdi,
+                context.rsi,
+                context.rdx,
+                context.r10,
+                context.r8,
+                now_ns,
+            );
+        }
+        SyscallNumber::FilesystemWrite => {
+            return filesystem_write_request(
+                process_id,
+                process,
+                thread_id,
+                requests,
+                context.rdi,
+                context.rsi,
+                context.rdx,
+                context.r10,
+                context.r8,
+                now_ns,
+            );
+        }
         SyscallNumber::FilesystemStat => {
             filesystem_stat(process, filesystem, context.rdi, context.rsi)
         }
@@ -363,7 +408,16 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
             filesystem_remove_directory(process, filesystem, context.rdi)
         }
         SyscallNumber::FilesystemRename => filesystem_rename(process, filesystem, context.rdi),
-        SyscallNumber::FilesystemSync => filesystem_sync(process, filesystem, context.rdi),
+        SyscallNumber::FilesystemSync => {
+            return filesystem_sync_request(
+                process_id,
+                process,
+                thread_id,
+                requests,
+                context.rdi,
+                now_ns,
+            );
+        }
         SyscallNumber::FilesystemGetInfo => filesystem_get_info(process, filesystem, context.rdi),
         SyscallNumber::FilesystemGetMetadata => {
             filesystem_get_metadata(process, filesystem, context.rdi)
@@ -479,6 +533,40 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, B: Disk>(
         }
         SyscallNumber::ThreadGetSchedulingInfo => {
             thread_get_scheduling_info(process, context.rdi, context.rsi, context.rdx, context.r10)
+        }
+        SyscallNumber::ThreadSetSchedulingClassWithAuthority => {
+            thread_set_scheduling_class_with_authority(
+                process,
+                context.rdi,
+                context.rsi,
+                context.rdx,
+            )
+        }
+        SyscallNumber::RequestSubmit => {
+            return request_submit(
+                process_id,
+                process,
+                thread_id,
+                requests,
+                context.rdi,
+                context.rsi,
+                now_ns,
+            );
+        }
+        SyscallNumber::RequestCancel => request_cancel(process, requests, context.rdi, now_ns),
+        SyscallNumber::RequestGetInfo => {
+            request_get_info(process, context.rdi, context.rsi, context.rdx, context.r10)
+        }
+        SyscallNumber::RequestSubmitBatch => request_submit_batch(
+            process_id,
+            process,
+            thread_id,
+            requests,
+            context.rdi,
+            now_ns,
+        ),
+        SyscallNumber::RequestGetDiagnostics => {
+            request_get_diagnostics(process, requests, context.rdi, context.rsi, context.rdx)
         }
         SyscallNumber::ProcessCreate2 => {
             return match process_create(
@@ -629,6 +717,12 @@ const fn decode_syscall_number(raw: u64) -> Option<SyscallNumber> {
         62 => SyscallNumber::ThreadGetCurrent,
         63 => SyscallNumber::ThreadSetSchedulingClass,
         64 => SyscallNumber::ThreadGetSchedulingInfo,
+        65 => SyscallNumber::ThreadSetSchedulingClassWithAuthority,
+        66 => SyscallNumber::RequestSubmit,
+        67 => SyscallNumber::RequestCancel,
+        68 => SyscallNumber::RequestGetInfo,
+        69 => SyscallNumber::RequestSubmitBatch,
+        70 => SyscallNumber::RequestGetDiagnostics,
         _ => return None,
     })
 }
@@ -825,6 +919,31 @@ fn thread_set_scheduling_class(
     process.set_thread_scheduling_class(ThreadId::from_raw(raw_id), class)
 }
 
+fn thread_set_scheduling_class_with_authority(
+    process: &mut Process,
+    raw_id: u64,
+    raw_class: u64,
+    raw_authority: u64,
+) -> Result<(), Status> {
+    let public = ThreadSchedulingClass::from_raw(
+        u32::try_from(raw_class).map_err(|_| Status::InvalidArgument)?,
+    )
+    .ok_or(Status::InvalidArgument)?;
+    let class = match public {
+        ThreadSchedulingClass::Audio => crate::thread_scheduler::SchedulingClass::Audio,
+        ThreadSchedulingClass::Interactive => crate::thread_scheduler::SchedulingClass::Interactive,
+        ThreadSchedulingClass::Critical
+        | ThreadSchedulingClass::Normal
+        | ThreadSchedulingClass::Background => return Err(Status::AccessDenied),
+    };
+    let authority = decode_handle(raw_authority)?;
+    let lease = process
+        .handles()
+        .scheduling_authority_lease(authority, public)
+        .map_err(map_ipc_error)?;
+    process.set_thread_scheduling_class_with_authority(ThreadId::from_raw(raw_id), class, lease)
+}
+
 fn thread_get_scheduling_info(
     process: &Process,
     raw_id: u64,
@@ -883,6 +1002,857 @@ fn public_thread_fault(reason: crate::process::ProcessFaultReason) -> u32 {
         ProcessFaultReason::ResourceLimit => ginkgo_sysapi::ProcessFault::ResourceLimit as u32,
         ProcessFaultReason::OutOfMemory => ginkgo_sysapi::ProcessFault::OutOfMemory as u32,
         ProcessFaultReason::Other(_) => ginkgo_sysapi::ProcessFault::Other as u32,
+    }
+}
+
+struct ValidatedRequest {
+    args: RequestSubmitArgs,
+    operation: RequestOperation,
+    completion_mode: RequestCompletionMode,
+    flags: RequestFlags,
+    deadline_ns: Option<u64>,
+    target: RequestTarget,
+    target_lease: PreparedRequestTarget,
+    buffers: Vec<RequestBuffer>,
+}
+
+fn request_submit(
+    process_id: ProcessId,
+    process: &mut Process,
+    thread_id: ThreadId,
+    requests: &mut RequestBroker,
+    args_address: u64,
+    output_address: u64,
+    now_ns: u64,
+) -> DispatchResult {
+    let result = (|| {
+        validate_user_output(process, output_address, REQUEST_SUBMIT_OUTPUT_SIZE)?;
+        let request = copy_and_validate_request(process_id, process, args_address)?;
+        if request.operation == RequestOperation::Nop {
+            let output = completed_request_output(Status::Ok);
+            copy_to_user(process, output_address, output.as_bytes())?;
+            return Ok(DispatchResult::Complete(Status::Ok));
+        }
+
+        let owner = RequestOwner::new(process_id.raw(), thread_id.raw());
+        let mut prepared = prepare_broker_request(process, owner, &request, requests)?;
+        if request.completion_mode == RequestCompletionMode::InlineOnly {
+            rollback_prepared_buffers(process, &mut prepared.buffers);
+            return Ok(DispatchResult::Complete(Status::ShouldWait));
+        }
+
+        let output_pages = if request.completion_mode == RequestCompletionMode::Block {
+            match process.address_space_mut().pin_user_range(
+                output_address,
+                REQUEST_SUBMIT_OUTPUT_SIZE,
+                UserAccess::Write,
+            ) {
+                Ok(pages) => Some(pages),
+                Err(error) => {
+                    rollback_prepared_buffers(process, &mut prepared.buffers);
+                    return Err(map_address_space_error(error));
+                }
+            }
+        } else {
+            None
+        };
+
+        let submission = match requests.submit(prepared, now_ns) {
+            Ok(submission) => submission,
+            Err(mut failure) => {
+                rollback_prepared_buffers(process, &mut failure.request.buffers);
+                if let Some(pages) = output_pages.as_deref() {
+                    let _ = process.address_space_mut().unpin_user_pages(pages);
+                }
+                return Err(map_broker_error(failure.error));
+            }
+        };
+
+        match submission.completion_mode {
+            RequestCompletionMode::Handle => {
+                let request_handle =
+                    match process.handles_mut().request_install(&submission.control) {
+                        Ok(handle) => handle,
+                        Err(error) => {
+                            cancel_broker_submission(requests, submission.id, now_ns);
+                            return Err(map_ipc_error(error));
+                        }
+                    };
+                let Some(info) = requests.info(submission.id) else {
+                    close_handles(process, core::slice::from_ref(&request_handle));
+                    cancel_broker_submission(requests, submission.id, now_ns);
+                    return Err(Status::InvalidHandle);
+                };
+                let output = request_output_from_info(request_handle, info);
+                if let Err(status) = copy_to_user(process, output_address, output.as_bytes()) {
+                    close_handles(process, core::slice::from_ref(&request_handle));
+                    cancel_broker_submission(requests, submission.id, now_ns);
+                    return Err(status);
+                }
+                Ok(DispatchResult::Complete(Status::Ok))
+            }
+            RequestCompletionMode::Block => {
+                let output_pages = output_pages.expect("block output was not pinned");
+                let request_handle =
+                    match process.handles_mut().request_install(&submission.control) {
+                        Ok(handle) => handle,
+                        Err(error) => {
+                            let _ = process.address_space_mut().unpin_user_pages(&output_pages);
+                            cancel_broker_submission(requests, submission.id, now_ns);
+                            return Err(map_ipc_error(error));
+                        }
+                    };
+                process.block_thread_request(
+                    thread_id,
+                    PendingRequest {
+                        id: submission.id,
+                        output: Some(PendingRequestOutput {
+                            address: output_address,
+                            pages: output_pages,
+                        }),
+                        count_output: None,
+                        hidden_handle: request_handle,
+                        completion: None,
+                        return_operation_status: false,
+                        registration: None,
+                    },
+                );
+                Ok(DispatchResult::Blocked)
+            }
+            RequestCompletionMode::InlineOnly => {
+                unreachable!("inline-only requests are never submitted to the broker")
+            }
+        }
+    })();
+
+    match result {
+        Ok(result) => result,
+        Err(status) => DispatchResult::Complete(status),
+    }
+}
+
+fn request_cancel(
+    process: &Process,
+    requests: &mut RequestBroker,
+    raw_request: u64,
+    now_ns: u64,
+) -> Result<(), Status> {
+    let request = decode_handle(raw_request)?;
+    let (control, raw_id) = process
+        .handles()
+        .request_cancellation_control(request)
+        .map_err(map_ipc_error)?;
+    requests
+        .cancel(RequestId::from_raw(raw_id), now_ns)
+        .map_err(map_broker_error)?;
+    control.request_cancellation();
+    Ok(())
+}
+
+fn request_get_info(
+    process: &Process,
+    raw_request: u64,
+    output_address: u64,
+    output_size: u64,
+    version: u64,
+) -> Result<(), Status> {
+    if version != REQUEST_INFO_VERSION as u64 || output_size != REQUEST_INFO_SIZE as u64 {
+        return Err(Status::InvalidArgument);
+    }
+    validate_user_output(process, output_address, REQUEST_INFO_SIZE)?;
+    let request = decode_handle(raw_request)?;
+    let info = process
+        .handles()
+        .request_info(request)
+        .map_err(map_ipc_error)?;
+    copy_to_user(process, output_address, info.as_bytes())
+}
+
+fn request_get_diagnostics(
+    process: &Process,
+    requests: &RequestBroker,
+    output_address: u64,
+    output_size: u64,
+    version: u64,
+) -> Result<(), Status> {
+    if version != REQUEST_DIAGNOSTICS_VERSION as u64
+        || output_size != REQUEST_DIAGNOSTICS_SIZE as u64
+    {
+        return Err(Status::InvalidArgument);
+    }
+    validate_user_output(process, output_address, REQUEST_DIAGNOSTICS_SIZE)?;
+    copy_to_user(process, output_address, requests.diagnostics().as_bytes())
+}
+
+fn request_submit_batch(
+    process_id: ProcessId,
+    process: &mut Process,
+    thread_id: ThreadId,
+    requests: &mut RequestBroker,
+    args_address: u64,
+    now_ns: u64,
+) -> Result<(), Status> {
+    let raw_args = copy_block_from_user::<REQUEST_SUBMIT_BATCH_ARGS_SIZE>(process, args_address)?;
+    let version = read_u32(&raw_args, 0);
+    let size = read_u32(&raw_args, 4);
+    let submissions_address = read_u64(&raw_args, 8);
+    let submission_count = read_u32(&raw_args, 16);
+    let reserved = read_u32(&raw_args, 20);
+    let outputs_address = read_u64(&raw_args, 24);
+    if version != REQUEST_SUBMIT_BATCH_ARGS_VERSION
+        || size != RequestSubmitBatchArgs::SIZE
+        || reserved != 0
+        || submission_count == 0
+    {
+        return Err(Status::InvalidArgument);
+    }
+    let submissions_len = checked_array_bytes(
+        u64::from(submission_count),
+        REQUEST_SUBMIT_ARGS_SIZE,
+        REQUEST_MAX_BATCH as u64,
+        Status::ResourceLimit,
+    )?;
+    let outputs_len = checked_array_bytes(
+        u64::from(submission_count),
+        REQUEST_SUBMIT_OUTPUT_SIZE,
+        REQUEST_MAX_BATCH as u64,
+        Status::ResourceLimit,
+    )?;
+    if submissions_address == 0 || outputs_address == 0 {
+        return Err(Status::InvalidAddress);
+    }
+    validate_user_output(process, outputs_address, outputs_len)?;
+    let raw_submissions = copy_vec_from_user(process, submissions_address, submissions_len)?;
+
+    let count = submission_count as usize;
+    let mut validated = Vec::new();
+    validated
+        .try_reserve_exact(count)
+        .map_err(|_| Status::OutOfMemory)?;
+    for raw in raw_submissions.chunks_exact(REQUEST_SUBMIT_ARGS_SIZE) {
+        let request = parse_and_validate_request(process_id, process, raw)?;
+        if request.completion_mode == RequestCompletionMode::Block {
+            return Err(Status::InvalidArgument);
+        }
+        validated.push(request);
+    }
+    let limits = requests.limits();
+    for request in &validated {
+        preflight_request_resources(request, limits)?;
+    }
+
+    let owner = RequestOwner::new(process_id.raw(), thread_id.raw());
+    let mut outputs = Vec::new();
+    outputs
+        .try_reserve_exact(count)
+        .map_err(|_| Status::OutOfMemory)?;
+    outputs.resize(count, RequestSubmitOutput::default());
+    let mut broker_indices = Vec::new();
+    let mut prepared = Vec::new();
+    broker_indices
+        .try_reserve_exact(count)
+        .map_err(|_| Status::OutOfMemory)?;
+    prepared
+        .try_reserve_exact(count)
+        .map_err(|_| Status::OutOfMemory)?;
+
+    for (index, request) in validated.iter().enumerate() {
+        if request.operation == RequestOperation::Nop {
+            outputs[index] = completed_request_output(Status::Ok);
+            continue;
+        }
+        let mut broker_request = match prepare_broker_request(process, owner, request, requests) {
+            Ok(request) => request,
+            Err(status) => {
+                rollback_prepared_requests(process, &mut prepared);
+                return Err(status);
+            }
+        };
+        if request.completion_mode == RequestCompletionMode::InlineOnly {
+            rollback_prepared_buffers(process, &mut broker_request.buffers);
+            outputs[index] = pending_request_output(Handle::INVALID);
+        } else {
+            broker_indices.push(index);
+            prepared.push(broker_request);
+        }
+    }
+
+    if prepared.is_empty() {
+        return copy_to_user(process, outputs_address, outputs.as_slice().as_bytes());
+    }
+
+    let submissions = match requests.submit_batch(prepared, now_ns) {
+        Ok(submissions) => submissions,
+        Err(mut failure) => {
+            rollback_prepared_requests(process, &mut failure.requests);
+            return Err(map_broker_error(failure.error));
+        }
+    };
+
+    let mut installed = Vec::new();
+    installed
+        .try_reserve_exact(submissions.len())
+        .map_err(|_| {
+            cancel_broker_submissions(requests, &submissions, now_ns);
+            Status::OutOfMemory
+        })?;
+    for (submission, output_index) in submissions.iter().zip(broker_indices.iter().copied()) {
+        let handle = match process.handles_mut().request_install(&submission.control) {
+            Ok(handle) => handle,
+            Err(error) => {
+                close_handles(process, &installed);
+                cancel_broker_submissions(requests, &submissions, now_ns);
+                return Err(map_ipc_error(error));
+            }
+        };
+        installed.push(handle);
+        let Some(info) = requests.info(submission.id) else {
+            close_handles(process, &installed);
+            cancel_broker_submissions(requests, &submissions, now_ns);
+            return Err(Status::InvalidHandle);
+        };
+        outputs[output_index] = request_output_from_info(handle, info);
+    }
+
+    if let Err(status) = copy_to_user(process, outputs_address, outputs.as_slice().as_bytes()) {
+        close_handles(process, &installed);
+        cancel_broker_submissions(requests, &submissions, now_ns);
+        return Err(status);
+    }
+    Ok(())
+}
+
+fn copy_and_validate_request(
+    process_id: ProcessId,
+    process: &Process,
+    address: u64,
+) -> Result<ValidatedRequest, Status> {
+    let raw = copy_block_from_user::<REQUEST_SUBMIT_ARGS_SIZE>(process, address)?;
+    parse_and_validate_request(process_id, process, &raw)
+}
+
+fn parse_and_validate_request(
+    process_id: ProcessId,
+    process: &Process,
+    raw: &[u8],
+) -> Result<ValidatedRequest, Status> {
+    let args = parse_request_submit_args(raw)?;
+    let operation = args.operation().ok_or(Status::InvalidArgument)?;
+    let completion_mode = args.completion_mode().ok_or(Status::InvalidArgument)?;
+    let flags = RequestFlags::from_bits(args.flags).ok_or(Status::InvalidArgument)?;
+    let deadline_ns = parse_request_deadline(args.deadline_ns)?;
+    validate_public_request_operation(operation)?;
+    let buffer_bytes = checked_array_bytes(
+        u64::from(args.buffer_count),
+        REQUEST_BUFFER_SIZE,
+        REQUEST_MAX_BUFFERS as u64,
+        Status::ResourceLimit,
+    )?;
+    if (args.buffer_count == 0) != (args.buffers_address == 0) {
+        return Err(Status::InvalidArgument);
+    }
+    let raw_buffers = copy_vec_from_user(process, args.buffers_address, buffer_bytes)?;
+    let mut buffers = Vec::new();
+    buffers
+        .try_reserve_exact(args.buffer_count as usize)
+        .map_err(|_| Status::OutOfMemory)?;
+    for raw_buffer in raw_buffers.chunks_exact(REQUEST_BUFFER_SIZE) {
+        buffers.push(parse_request_buffer(raw_buffer)?);
+    }
+    validate_operation_buffers(operation, args.operation_argument, &buffers)?;
+    let (target, target_lease) = validate_request_target(
+        process_id,
+        process,
+        args.target,
+        operation,
+        args.operation_argument,
+    )?;
+    Ok(ValidatedRequest {
+        args,
+        operation,
+        completion_mode,
+        flags,
+        deadline_ns,
+        target,
+        target_lease,
+        buffers,
+    })
+}
+
+fn parse_request_submit_args(raw: &[u8]) -> Result<RequestSubmitArgs, Status> {
+    if raw.len() != REQUEST_SUBMIT_ARGS_SIZE {
+        return Err(Status::InvalidArgument);
+    }
+    let args = RequestSubmitArgs {
+        version: read_u32(raw, 0),
+        size: read_u32(raw, 4),
+        target: Handle::from_raw(read_u32(raw, 8)),
+        operation: read_u32(raw, 12),
+        completion_mode: read_u32(raw, 16),
+        flags: read_u32(raw, 20),
+        buffers_address: read_u64(raw, 24),
+        buffer_count: read_u32(raw, 32),
+        reserved: read_u32(raw, 36),
+        operation_argument: read_u64(raw, 40),
+        deadline_ns: read_i64(raw, 48),
+        user_data: read_u64(raw, 56),
+    };
+    if args.version != REQUEST_SUBMIT_ARGS_VERSION
+        || args.size != RequestSubmitArgs::SIZE
+        || args.reserved != 0
+    {
+        return Err(Status::InvalidArgument);
+    }
+    Ok(args)
+}
+
+fn parse_request_buffer(raw: &[u8]) -> Result<RequestBuffer, Status> {
+    if raw.len() != REQUEST_BUFFER_SIZE {
+        return Err(Status::InvalidArgument);
+    }
+    let buffer = RequestBuffer {
+        kind: read_u32(raw, 0),
+        flags: read_u32(raw, 4),
+        address: read_u64(raw, 8),
+        length: read_u64(raw, 16),
+        handle: Handle::from_raw(read_u32(raw, 24)),
+        reserved: read_u32(raw, 28),
+        offset: read_u64(raw, 32),
+    };
+    let kind = buffer.buffer_kind().ok_or(Status::InvalidArgument)?;
+    let flags = RequestBufferFlags::from_bits(buffer.flags).ok_or(Status::InvalidArgument)?;
+    if flags.is_empty() || buffer.length == 0 || buffer.reserved != 0 {
+        return Err(Status::InvalidArgument);
+    }
+    match kind {
+        RequestBufferKind::Copy | RequestBufferKind::Pinned => {
+            if buffer.address == 0 || buffer.handle.is_valid() || buffer.offset != 0 {
+                return Err(Status::InvalidArgument);
+            }
+        }
+        RequestBufferKind::SharedMemory => {
+            if buffer.address != 0 || !buffer.handle.is_valid() {
+                return Err(Status::InvalidArgument);
+            }
+        }
+    }
+    Ok(buffer)
+}
+
+fn parse_request_deadline(raw: i64) -> Result<Option<u64>, Status> {
+    if raw == DEADLINE_INFINITE {
+        Ok(None)
+    } else if raw < 0 {
+        Err(Status::InvalidArgument)
+    } else {
+        Ok(Some(raw as u64))
+    }
+}
+
+const fn validate_public_request_operation(operation: RequestOperation) -> Result<(), Status> {
+    match operation {
+        RequestOperation::FilesystemOpen
+        | RequestOperation::FilesystemTruncate
+        | RequestOperation::FilesystemNamespace => Err(Status::AccessDenied),
+        RequestOperation::Nop
+        | RequestOperation::FilesystemRead
+        | RequestOperation::FilesystemWrite
+        | RequestOperation::FilesystemSync
+        | RequestOperation::AudioWrite => Ok(()),
+        RequestOperation::Synthetic => {
+            #[cfg(ginkgo_request_smoke)]
+            {
+                Ok(())
+            }
+            #[cfg(not(ginkgo_request_smoke))]
+            {
+                Err(Status::AccessDenied)
+            }
+        }
+    }
+}
+
+fn validate_operation_buffers(
+    operation: RequestOperation,
+    operation_argument: u64,
+    buffers: &[RequestBuffer],
+) -> Result<(), Status> {
+    let exact_flags = |buffer: &RequestBuffer, expected: RequestBufferFlags| {
+        RequestBufferFlags::from_bits(buffer.flags) == Some(expected)
+    };
+    match operation {
+        RequestOperation::Nop => {
+            if !buffers.is_empty() || operation_argument != 0 {
+                return Err(Status::InvalidArgument);
+            }
+        }
+        RequestOperation::FilesystemRead => {
+            if buffers.len() != 1 || !exact_flags(&buffers[0], RequestBufferFlags::WRITE) {
+                return Err(Status::InvalidArgument);
+            }
+        }
+        RequestOperation::FilesystemWrite | RequestOperation::AudioWrite => {
+            if buffers.len() != 1 || !exact_flags(&buffers[0], RequestBufferFlags::READ) {
+                return Err(Status::InvalidArgument);
+            }
+        }
+        RequestOperation::FilesystemSync => {
+            if !buffers.is_empty() || operation_argument != 0 {
+                return Err(Status::InvalidArgument);
+            }
+        }
+        RequestOperation::FilesystemOpen
+        | RequestOperation::FilesystemTruncate
+        | RequestOperation::FilesystemNamespace => return Err(Status::AccessDenied),
+        RequestOperation::Synthetic => {}
+    }
+    Ok(())
+}
+
+fn validate_request_target(
+    process_id: ProcessId,
+    process: &Process,
+    target: Handle,
+    operation: RequestOperation,
+    operation_argument: u64,
+) -> Result<(RequestTarget, PreparedRequestTarget), Status> {
+    match operation {
+        RequestOperation::Nop => {
+            if target.is_valid() {
+                return Err(Status::InvalidArgument);
+            }
+            Ok((RequestTarget(0), PreparedRequestTarget::None))
+        }
+        RequestOperation::FilesystemRead => {
+            let file = process
+                .handles()
+                .filesystem_file(target, Rights::READ)
+                .map_err(map_ipc_error)?;
+            Ok((
+                filesystem_request_target(file.node_id(), file.generation()),
+                PreparedRequestTarget::File(FileCapabilityLease::new(file)),
+            ))
+        }
+        RequestOperation::FilesystemWrite => {
+            let file = process
+                .handles()
+                .filesystem_file(target, Rights::WRITE)
+                .map_err(map_ipc_error)?;
+            Ok((
+                filesystem_request_target(file.node_id(), file.generation()),
+                PreparedRequestTarget::File(FileCapabilityLease::new(file)),
+            ))
+        }
+        RequestOperation::FilesystemSync => {
+            let object_type = process
+                .handles()
+                .object_type(target)
+                .map_err(map_ipc_error)?;
+            match object_type {
+                ObjectType::FilesystemRoot => {
+                    process
+                        .handles()
+                        .filesystem_root(target, Rights::WRITE)
+                        .map_err(map_ipc_error)?;
+                    Ok((
+                        RequestTarget(REQUEST_TARGET_FILESYSTEM_ROOT),
+                        PreparedRequestTarget::FilesystemSync,
+                    ))
+                }
+                ObjectType::Directory => {
+                    let directory = process
+                        .handles()
+                        .filesystem_directory(target, Rights::WRITE)
+                        .map_err(map_ipc_error)?;
+                    Ok((
+                        filesystem_request_target(directory.node_id(), directory.generation()),
+                        PreparedRequestTarget::FilesystemSync,
+                    ))
+                }
+                ObjectType::File => {
+                    let file = process
+                        .handles()
+                        .filesystem_file(target, Rights::WRITE)
+                        .map_err(map_ipc_error)?;
+                    Ok((
+                        filesystem_request_target(file.node_id(), file.generation()),
+                        PreparedRequestTarget::FilesystemSync,
+                    ))
+                }
+                _ => Err(Status::WrongObjectType),
+            }
+        }
+        RequestOperation::AudioWrite => {
+            if target.is_valid() {
+                return Err(Status::InvalidArgument);
+            }
+            Ok((
+                RequestTarget(REQUEST_TARGET_AUDIO),
+                PreparedRequestTarget::None,
+            ))
+        }
+        RequestOperation::FilesystemOpen
+        | RequestOperation::FilesystemTruncate
+        | RequestOperation::FilesystemNamespace => Err(Status::AccessDenied),
+        RequestOperation::Synthetic => {
+            if target.is_valid() {
+                return Err(Status::InvalidArgument);
+            }
+            let identity = process_id.raw()
+                ^ REQUEST_TARGET_SYNTHETIC_TAG
+                ^ operation_argument.rotate_left(17);
+            Ok((
+                RequestTarget(if identity == 0 {
+                    REQUEST_TARGET_SYNTHETIC_TAG
+                } else {
+                    identity
+                }),
+                PreparedRequestTarget::None,
+            ))
+        }
+    }
+}
+
+fn filesystem_request_target(node_id: u32, generation: u32) -> RequestTarget {
+    RequestTarget((u64::from(generation) << 32) | u64::from(node_id))
+}
+
+fn prepare_broker_request(
+    process: &mut Process,
+    owner: RequestOwner,
+    request: &ValidatedRequest,
+    requests: &RequestBroker,
+) -> Result<PreparedBrokerRequest, Status> {
+    let limits = requests.limits();
+    preflight_request_resources(request, limits)?;
+    let mut buffers = Vec::new();
+    buffers
+        .try_reserve_exact(request.buffers.len())
+        .map_err(|_| Status::OutOfMemory)?;
+    for descriptor in &request.buffers {
+        let prepared = match prepare_request_buffer(process, owner, descriptor) {
+            Ok(buffer) => buffer,
+            Err(status) => {
+                rollback_prepared_buffers(process, &mut buffers);
+                return Err(status);
+            }
+        };
+        buffers.push(prepared);
+    }
+    let mut prepared = PreparedBrokerRequest {
+        owner,
+        target: request.target,
+        target_lease: copy_prepared_request_target(&request.target_lease),
+        device: None,
+        operation: request.operation,
+        completion_mode: request.completion_mode,
+        payload: BrokerPayload {
+            operation_argument: request.args.operation_argument,
+            user_data: request.args.user_data,
+            request_flags: request.flags,
+        },
+        deadline_ns: request.deadline_ns,
+        buffers,
+    };
+    #[cfg(ginkgo_request_smoke)]
+    if request.operation == RequestOperation::Synthetic {
+        let raw_device = request.target.0 as u32;
+        prepared.device = Some(crate::request::RequestDevice(if raw_device == 0 {
+            u32::MAX
+        } else {
+            raw_device
+        }));
+    }
+    if let Err(error) = prepared.resources() {
+        rollback_prepared_buffers(process, &mut prepared.buffers);
+        return Err(map_broker_error(error));
+    }
+    Ok(prepared)
+}
+
+fn copy_prepared_request_target(target: &PreparedRequestTarget) -> PreparedRequestTarget {
+    match target {
+        PreparedRequestTarget::None => PreparedRequestTarget::None,
+        PreparedRequestTarget::File(lease) => {
+            PreparedRequestTarget::File(FileCapabilityLease::new(*lease.file()))
+        }
+        PreparedRequestTarget::Directory {
+            directory,
+            is_root,
+            rights,
+        } => PreparedRequestTarget::Directory {
+            directory: *directory,
+            is_root: *is_root,
+            rights: *rights,
+        },
+        PreparedRequestTarget::FilesystemSync => PreparedRequestTarget::FilesystemSync,
+    }
+}
+
+fn preflight_request_resources(
+    request: &ValidatedRequest,
+    limits: crate::request::RequestLimits,
+) -> Result<(), Status> {
+    let mut copied_bytes = 0usize;
+    let mut pinned_pages = 0usize;
+    let mut shared_bytes = 0usize;
+    for descriptor in &request.buffers {
+        let length = usize::try_from(descriptor.length).map_err(|_| Status::OutOfRange)?;
+        match descriptor.buffer_kind().ok_or(Status::InvalidArgument)? {
+            RequestBufferKind::Copy => {
+                descriptor
+                    .address
+                    .checked_add(descriptor.length - 1)
+                    .ok_or(Status::OutOfRange)?;
+                copied_bytes = copied_bytes.checked_add(length).ok_or(Status::OutOfRange)?;
+            }
+            RequestBufferKind::Pinned => {
+                let end = descriptor
+                    .address
+                    .checked_add(descriptor.length - 1)
+                    .ok_or(Status::OutOfRange)?;
+                let first_page = descriptor.address / PAGE_SIZE;
+                let final_page = end / PAGE_SIZE;
+                let pages =
+                    usize::try_from(final_page - first_page + 1).map_err(|_| Status::OutOfRange)?;
+                pinned_pages = pinned_pages.checked_add(pages).ok_or(Status::OutOfRange)?;
+            }
+            RequestBufferKind::SharedMemory => {
+                descriptor
+                    .offset
+                    .checked_add(descriptor.length)
+                    .ok_or(Status::OutOfRange)?;
+                shared_bytes = shared_bytes.checked_add(length).ok_or(Status::OutOfRange)?;
+            }
+        }
+    }
+    if copied_bytes > limits.copied_bytes_per_request
+        || pinned_pages > limits.pinned_pages_per_request
+        || shared_bytes > limits.shared_bytes_per_request
+    {
+        return Err(Status::ResourceLimit);
+    }
+    Ok(())
+}
+
+fn prepare_request_buffer(
+    process: &mut Process,
+    owner: RequestOwner,
+    descriptor: &RequestBuffer,
+) -> Result<PreparedRequestBuffer, Status> {
+    let flags = RequestBufferFlags::from_bits(descriptor.flags).ok_or(Status::InvalidArgument)?;
+    let length = usize::try_from(descriptor.length).map_err(|_| Status::OutOfRange)?;
+    match descriptor.buffer_kind().ok_or(Status::InvalidArgument)? {
+        RequestBufferKind::Copy => {
+            if flags.contains(RequestBufferFlags::WRITE) {
+                validate_user_output(process, descriptor.address, length)?;
+            }
+            let bytes = if flags.contains(RequestBufferFlags::READ) {
+                copy_vec_from_user(process, descriptor.address, length)?
+            } else {
+                zeroed_vec(length)?
+            };
+            Ok(PreparedRequestBuffer::Copied {
+                flags,
+                user_address: descriptor.address,
+                bytes,
+            })
+        }
+        RequestBufferKind::Pinned => {
+            let access = if flags.contains(RequestBufferFlags::WRITE) {
+                UserAccess::Write
+            } else {
+                UserAccess::Read
+            };
+            let pages = process
+                .address_space_mut()
+                .pin_user_range(descriptor.address, length, access)
+                .map_err(map_address_space_error)?;
+            Ok(PreparedRequestBuffer::Pinned {
+                flags,
+                owner_process_id: owner.process_id,
+                pages,
+            })
+        }
+        RequestBufferKind::SharedMemory => {
+            let offset = usize::try_from(descriptor.offset).map_err(|_| Status::OutOfRange)?;
+            let rights = request_buffer_rights(flags);
+            let lease = process
+                .handles()
+                .shared_memory_request_lease(descriptor.handle, offset, length, rights)
+                .map_err(map_ipc_error)?;
+            Ok(PreparedRequestBuffer::SharedMemory { flags, lease })
+        }
+    }
+}
+
+fn request_buffer_rights(flags: RequestBufferFlags) -> Rights {
+    let mut rights = Rights::empty();
+    if flags.contains(RequestBufferFlags::READ) {
+        rights |= Rights::READ;
+    }
+    if flags.contains(RequestBufferFlags::WRITE) {
+        rights |= Rights::WRITE;
+    }
+    rights
+}
+
+fn rollback_prepared_requests(process: &mut Process, requests: &mut Vec<PreparedBrokerRequest>) {
+    while let Some(mut request) = requests.pop() {
+        rollback_prepared_buffers(process, &mut request.buffers);
+    }
+}
+
+fn rollback_prepared_buffers(process: &mut Process, buffers: &mut Vec<PreparedRequestBuffer>) {
+    while let Some(buffer) = buffers.pop() {
+        if let PreparedRequestBuffer::Pinned { pages, .. } = buffer {
+            let result = process.address_space_mut().unpin_user_pages(&pages);
+            debug_assert!(result.is_ok(), "prepared request pin rollback failed");
+        }
+    }
+}
+
+fn cancel_broker_submission(requests: &mut RequestBroker, id: RequestId, now_ns: u64) {
+    let _ = requests.cancel(id, now_ns);
+}
+
+fn cancel_broker_submissions(
+    requests: &mut RequestBroker,
+    submissions: &[crate::request_broker::BrokerSubmission],
+    now_ns: u64,
+) {
+    for submission in submissions {
+        cancel_broker_submission(requests, submission.id, now_ns);
+    }
+}
+
+fn completed_request_output(status: Status) -> RequestSubmitOutput {
+    RequestSubmitOutput {
+        request: Handle::INVALID,
+        state: RequestState::Completed as u32,
+        result: status.raw(),
+        result_flags: RequestResultFlags::empty().bits(),
+        bytes_transferred: 0,
+    }
+}
+
+fn pending_request_output(request: Handle) -> RequestSubmitOutput {
+    RequestSubmitOutput {
+        request,
+        state: RequestState::Pending as u32,
+        result: Status::ShouldWait.raw(),
+        result_flags: RequestResultFlags::empty().bits(),
+        bytes_transferred: 0,
+    }
+}
+
+fn request_output_from_info(request: Handle, info: RequestInfo) -> RequestSubmitOutput {
+    RequestSubmitOutput {
+        request,
+        state: info.state,
+        result: info.result,
+        result_flags: info.result_flags,
+        bytes_transferred: info.bytes_transferred,
     }
 }
 
@@ -998,6 +1968,7 @@ fn submit_wait_many(
             output_address,
             deadline,
             completion: None,
+            registration: None,
         },
     );
     Ok(DispatchResult::Blocked)
@@ -1020,7 +1991,12 @@ fn resolve_wait_completion(
 /// A [`BlockedPoll::Complete`] result leaves the completion staged in `process`.
 /// The scheduler must activate that process's address space and immediately call
 /// [`complete_blocked`] before scheduling the process again.
-pub fn poll_blocked(process: &mut Process, thread_id: ThreadId, now_ns: u64) -> BlockedPoll {
+pub fn poll_blocked(
+    process: &mut Process,
+    thread_id: ThreadId,
+    now_ns: u64,
+    requests: &RequestBroker,
+) -> BlockedPoll {
     match process.blocked_kind(thread_id) {
         Some(BlockedKind::Sleep) => {
             return if process.poll_sleep(thread_id, now_ns) == Some(true) {
@@ -1035,6 +2011,26 @@ pub fn poll_blocked(process: &mut Process, thread_id: ThreadId, now_ns: u64) -> 
             } else {
                 BlockedPoll::Pending
             };
+        }
+        Some(BlockedKind::Request) => {
+            let Some(id) = process.blocked_request_id(thread_id) else {
+                return BlockedPoll::Pending;
+            };
+            let output = match requests.info(id) {
+                Some(info) if request_state_is_terminal(info.state) => {
+                    request_output_from_info(Handle::INVALID, info)
+                }
+                Some(_) => return BlockedPoll::Pending,
+                None => RequestSubmitOutput {
+                    request: Handle::INVALID,
+                    state: RequestState::Failed as u32,
+                    result: Status::InvalidHandle.raw(),
+                    result_flags: 0,
+                    bytes_transferred: 0,
+                },
+            };
+            process.stage_request_completion(thread_id, id, output);
+            return BlockedPoll::Complete;
         }
         Some(BlockedKind::WaitMany) => {}
         None => return BlockedPoll::Pending,
@@ -1074,6 +2070,78 @@ pub fn complete_blocked(
             .complete_sleep(thread_id)
             .err()
             .unwrap_or(Status::Ok);
+    }
+    if process.blocked_kind(thread_id) == Some(BlockedKind::Request) {
+        let mut request = match process.take_completed_request(thread_id) {
+            Ok(request) => request,
+            Err(status) => return status,
+        };
+        let completion = request
+            .completion
+            .expect("blocked request completion was not staged by poll_blocked");
+        let operation_status = completion.result_status().unwrap_or(Status::InvalidMessage);
+        let mut completion_copy_status = Status::Ok;
+        if let Some(mut pending_output) = request.output.take() {
+            completion_copy_status = if process.address_space().is_active() {
+                copy_to_user(process, pending_output.address, completion.as_bytes())
+                    .err()
+                    .unwrap_or(Status::Ok)
+            } else {
+                Status::InvalidAddress
+            };
+            if process
+                .address_space_mut()
+                .unpin_user_pages(&pending_output.pages)
+                .is_err()
+                && completion_copy_status == Status::Ok
+            {
+                completion_copy_status = Status::InvalidAddress;
+            }
+            pending_output.pages.clear();
+        }
+        if let Some(mut count_output) = request.count_output.take() {
+            debug_assert!(request.return_operation_status);
+            let output = FilesystemReadOutput {
+                count: completion.bytes_transferred,
+            };
+            let count_copy_status = if process.address_space().is_active() {
+                copy_to_user(process, count_output.address, &output.count.to_le_bytes())
+                    .err()
+                    .unwrap_or(Status::Ok)
+            } else {
+                Status::InvalidAddress
+            };
+            if completion_copy_status == Status::Ok {
+                completion_copy_status = count_copy_status;
+            }
+            if process
+                .address_space_mut()
+                .unpin_user_pages(&count_output.pages)
+                .is_err()
+                && completion_copy_status == Status::Ok
+            {
+                completion_copy_status = Status::InvalidAddress;
+            }
+            count_output.pages.clear();
+        }
+        let mut status = blocked_request_return_status(
+            request.return_operation_status,
+            operation_status,
+            completion_copy_status,
+        );
+        let _ = process.handles_mut().handle_close(request.hidden_handle);
+        if let Err(finish_status) = process.finish_request(thread_id) {
+            if status == Status::Ok {
+                status = finish_status;
+            }
+        }
+        set_status(
+            process
+                .thread_context_mut(thread_id)
+                .expect("requesting thread disappeared before completion"),
+            status,
+        );
+        return status;
     }
     if process.blocked_kind(thread_id) == Some(BlockedKind::Join) {
         let join = match process.take_completed_join(thread_id) {
@@ -1133,6 +2201,31 @@ pub fn complete_blocked(
     );
     process.resume_thread_from_block(thread_id);
     status
+}
+
+const fn blocked_request_return_status(
+    return_operation_status: bool,
+    operation_status: Status,
+    completion_copy_status: Status,
+) -> Status {
+    if return_operation_status {
+        operation_status
+    } else {
+        completion_copy_status
+    }
+}
+
+fn request_state_is_terminal(raw_state: u32) -> bool {
+    matches!(
+        RequestState::from_raw(raw_state),
+        Some(
+            RequestState::Completed
+                | RequestState::TimedOut
+                | RequestState::Canceled
+                | RequestState::Failed
+                | RequestState::OwnerTerminated
+        )
+    )
 }
 
 fn copy_wait_items_to_user(process: &Process, wait: &mut PendingWaitMany) -> Result<(), Status> {
@@ -1708,21 +2801,20 @@ fn debug_write<D: DebugSink + ?Sized>(
     Ok(())
 }
 
-fn filesystem_open<B: Disk>(
-    process: &mut Process,
-    filesystem: &mut RedoxFs<B>,
-    raw_anchor: u64,
-    args_address: u64,
-    output_address: u64,
-) -> Result<(), Status> {
-    let anchor_handle = decode_handle(raw_anchor)?;
-    let raw = copy_block_from_user::<FILESYSTEM_OPEN_ARGS_SIZE>(process, args_address)?;
-    let path_address = read_u64(&raw, 0);
-    let path_length = read_u64(&raw, 8);
-    let flags =
-        FilesystemOpenFlags::from_bits(read_u32(&raw, 16)).ok_or(Status::InvalidArgument)?;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ParsedFilesystemOpenArgs {
+    path_address: u64,
+    path_length: u64,
+    flags: FilesystemOpenFlags,
+}
+
+fn parse_filesystem_open_args(raw: &[u8]) -> Result<ParsedFilesystemOpenArgs, Status> {
+    if raw.len() != FILESYSTEM_OPEN_ARGS_SIZE {
+        return Err(Status::InvalidArgument);
+    }
+    let flags = FilesystemOpenFlags::from_bits(read_u32(raw, 16)).ok_or(Status::InvalidArgument)?;
     let execute = flags.contains(FilesystemOpenFlags::EXECUTE);
-    if read_u32(&raw, 20) != 0
+    if read_u32(raw, 20) != 0
         || !flags.intersects(FilesystemOpenFlags::READ | FilesystemOpenFlags::WRITE)
         || (flags.intersects(FilesystemOpenFlags::CREATE | FilesystemOpenFlags::TRUNCATE)
             && !flags.contains(FilesystemOpenFlags::WRITE))
@@ -1736,10 +2828,16 @@ fn filesystem_open<B: Disk>(
     {
         return Err(Status::InvalidArgument);
     }
-    validate_user_output(process, output_address, HANDLE_OUTPUT_SIZE)?;
-    let path = copy_filesystem_path(process, path_address, path_length)?;
+    Ok(ParsedFilesystemOpenArgs {
+        path_address: read_u64(raw, 0),
+        path_length: read_u64(raw, 8),
+        flags,
+    })
+}
+
+fn filesystem_open_required_rights(flags: FilesystemOpenFlags) -> Rights {
     let mut required = Rights::READ;
-    if execute {
+    if flags.contains(FilesystemOpenFlags::EXECUTE) {
         required |= Rights::EXECUTE;
     }
     if flags.intersects(
@@ -1747,6 +2845,125 @@ fn filesystem_open<B: Disk>(
     ) {
         required |= Rights::WRITE;
     }
+    required
+}
+
+fn directory_request_target(directory: Option<DirectoryHandle>) -> RequestTarget {
+    match directory {
+        Some(directory) => filesystem_request_target(directory.node_id(), directory.generation()),
+        None => RequestTarget(REQUEST_TARGET_FILESYSTEM_ROOT),
+    }
+}
+
+fn prepare_filesystem_open_broker_request(
+    owner: RequestOwner,
+    anchor: DirectoryAnchor,
+    flags: FilesystemOpenFlags,
+    buffers: Vec<PreparedRequestBuffer>,
+) -> PreparedBrokerRequest {
+    let directory = if anchor.is_root {
+        None
+    } else {
+        Some(anchor.directory)
+    };
+    PreparedBrokerRequest {
+        owner,
+        target: directory_request_target(directory),
+        target_lease: PreparedRequestTarget::Directory {
+            directory,
+            is_root: anchor.is_root,
+            rights: anchor.rights,
+        },
+        device: None,
+        operation: RequestOperation::FilesystemOpen,
+        completion_mode: RequestCompletionMode::Block,
+        payload: BrokerPayload {
+            operation_argument: u64::from(flags.bits()),
+            user_data: 0,
+            request_flags: RequestFlags::empty(),
+        },
+        deadline_ns: None,
+        buffers,
+    }
+}
+
+fn filesystem_open_request<B: Disk>(
+    process_id: ProcessId,
+    process: &mut Process,
+    thread_id: ThreadId,
+    filesystem: &mut RedoxFs<B>,
+    requests: &mut RequestBroker,
+    raw_anchor: u64,
+    args_address: u64,
+    output_address: u64,
+    now_ns: u64,
+) -> DispatchResult {
+    let result = (|| {
+        let anchor_handle = decode_handle(raw_anchor)?;
+        let raw = copy_block_from_user::<FILESYSTEM_OPEN_ARGS_SIZE>(process, args_address)?;
+        let args = parse_filesystem_open_args(&raw)?;
+        validate_user_output(process, output_address, HANDLE_OUTPUT_SIZE)?;
+        let path = copy_filesystem_path(process, args.path_address, args.path_length)?;
+        let required = filesystem_open_required_rights(args.flags);
+        let anchor = resolve_directory_anchor(process, filesystem, anchor_handle, required)?;
+        if anchor.is_root && required.contains(Rights::WRITE) && is_protected_system_path(&path) {
+            return Err(Status::AccessDenied);
+        }
+
+        let mut buffers = Vec::new();
+        buffers
+            .try_reserve_exact(2)
+            .map_err(|_| Status::OutOfMemory)?;
+        buffers.push(PreparedRequestBuffer::Copied {
+            flags: RequestBufferFlags::READ,
+            user_address: args.path_address,
+            bytes: path.into_bytes(),
+        });
+        let output_pages = process
+            .address_space_mut()
+            .pin_user_range(output_address, HANDLE_OUTPUT_SIZE, UserAccess::Write)
+            .map_err(map_address_space_error)?;
+        buffers.push(PreparedRequestBuffer::Pinned {
+            flags: RequestBufferFlags::WRITE,
+            owner_process_id: process_id.raw(),
+            pages: output_pages,
+        });
+
+        submit_legacy_filesystem_request(
+            process,
+            thread_id,
+            requests,
+            prepare_filesystem_open_broker_request(
+                RequestOwner::new(process_id.raw(), thread_id.raw()),
+                anchor,
+                args.flags,
+                buffers,
+            ),
+            None,
+            now_ns,
+        )
+    })();
+    result.unwrap_or_else(DispatchResult::Complete)
+}
+
+#[allow(dead_code)]
+fn filesystem_open<B: Disk>(
+    process: &mut Process,
+    filesystem: &mut RedoxFs<B>,
+    raw_anchor: u64,
+    args_address: u64,
+    output_address: u64,
+) -> Result<(), Status> {
+    let anchor_handle = decode_handle(raw_anchor)?;
+    let raw = copy_block_from_user::<FILESYSTEM_OPEN_ARGS_SIZE>(process, args_address)?;
+    let args = parse_filesystem_open_args(&raw)?;
+    let path_address = args.path_address;
+    let path_length = args.path_length;
+    let flags = args.flags;
+    let execute = flags.contains(FilesystemOpenFlags::EXECUTE);
+    validate_user_output(process, output_address, HANDLE_OUTPUT_SIZE)?;
+    let path = copy_filesystem_path(process, path_address, path_length)?;
+    let required = filesystem_open_required_rights(flags);
     let anchor = resolve_directory_anchor(process, filesystem, anchor_handle, required)?;
     if anchor.is_root && required.contains(Rights::WRITE) && is_protected_system_path(&path) {
         return Err(Status::AccessDenied);
@@ -1796,6 +3013,268 @@ fn filesystem_open<B: Disk>(
     Ok(())
 }
 
+fn filesystem_read_request(
+    process_id: ProcessId,
+    process: &mut Process,
+    thread_id: ThreadId,
+    requests: &mut RequestBroker,
+    raw_file: u64,
+    offset: u64,
+    output_address: u64,
+    raw_length: u64,
+    count_address: u64,
+    now_ns: u64,
+) -> DispatchResult {
+    let result = (|| {
+        let handle = decode_handle(raw_file)?;
+        let length = checked_array_bytes(
+            raw_length,
+            1,
+            FILESYSTEM_READ_MAX_BYTES as u64,
+            Status::OutOfRange,
+        )?;
+        let file = process
+            .handles()
+            .filesystem_file(handle, Rights::READ)
+            .map_err(map_ipc_error)?;
+        let mut buffers = Vec::new();
+        buffers
+            .try_reserve_exact(1)
+            .map_err(|_| Status::OutOfMemory)?;
+        let output_pages = process
+            .address_space_mut()
+            .pin_user_range(output_address, length, UserAccess::Write)
+            .map_err(map_address_space_error)?;
+        buffers.push(PreparedRequestBuffer::Pinned {
+            flags: RequestBufferFlags::WRITE,
+            owner_process_id: process_id.raw(),
+            pages: output_pages,
+        });
+        let count_output = match pin_pending_request_count_output(process, count_address) {
+            Ok(output) => output,
+            Err(status) => {
+                rollback_prepared_buffers(process, &mut buffers);
+                return Err(status);
+            }
+        };
+        submit_legacy_filesystem_request(
+            process,
+            thread_id,
+            requests,
+            PreparedBrokerRequest {
+                owner: RequestOwner::new(process_id.raw(), thread_id.raw()),
+                target: filesystem_request_target(file.node_id(), file.generation()),
+                target_lease: PreparedRequestTarget::File(FileCapabilityLease::new(file)),
+                device: None,
+                operation: RequestOperation::FilesystemRead,
+                completion_mode: RequestCompletionMode::Block,
+                payload: BrokerPayload {
+                    operation_argument: offset,
+                    user_data: count_address,
+                    request_flags: RequestFlags::ALLOW_PARTIAL,
+                },
+                deadline_ns: None,
+                buffers,
+            },
+            Some(count_output),
+            now_ns,
+        )
+    })();
+    result.unwrap_or_else(DispatchResult::Complete)
+}
+
+fn filesystem_write_request(
+    process_id: ProcessId,
+    process: &mut Process,
+    thread_id: ThreadId,
+    requests: &mut RequestBroker,
+    raw_file: u64,
+    offset: u64,
+    input_address: u64,
+    raw_length: u64,
+    count_address: u64,
+    now_ns: u64,
+) -> DispatchResult {
+    let result = (|| {
+        let handle = decode_handle(raw_file)?;
+        let length = checked_array_bytes(
+            raw_length,
+            1,
+            FILESYSTEM_READ_MAX_BYTES as u64,
+            Status::OutOfRange,
+        )?;
+        let file = process
+            .handles()
+            .filesystem_file(handle, Rights::WRITE)
+            .map_err(map_ipc_error)?;
+        let bytes = copy_vec_from_user(process, input_address, length)?;
+        let mut buffers = Vec::new();
+        buffers
+            .try_reserve_exact(1)
+            .map_err(|_| Status::OutOfMemory)?;
+        buffers.push(PreparedRequestBuffer::Copied {
+            flags: RequestBufferFlags::READ,
+            user_address: input_address,
+            bytes,
+        });
+        let count_output = pin_pending_request_count_output(process, count_address)?;
+        submit_legacy_filesystem_request(
+            process,
+            thread_id,
+            requests,
+            PreparedBrokerRequest {
+                owner: RequestOwner::new(process_id.raw(), thread_id.raw()),
+                target: filesystem_request_target(file.node_id(), file.generation()),
+                target_lease: PreparedRequestTarget::File(FileCapabilityLease::new(file)),
+                device: None,
+                operation: RequestOperation::FilesystemWrite,
+                completion_mode: RequestCompletionMode::Block,
+                payload: BrokerPayload {
+                    operation_argument: offset,
+                    user_data: count_address,
+                    request_flags: RequestFlags::ALLOW_PARTIAL,
+                },
+                deadline_ns: None,
+                buffers,
+            },
+            Some(count_output),
+            now_ns,
+        )
+    })();
+    result.unwrap_or_else(DispatchResult::Complete)
+}
+
+fn filesystem_sync_request(
+    process_id: ProcessId,
+    process: &mut Process,
+    thread_id: ThreadId,
+    requests: &mut RequestBroker,
+    args_address: u64,
+    now_ns: u64,
+) -> DispatchResult {
+    let result = (|| {
+        let raw = copy_block_from_user::<FILESYSTEM_SYNC_ARGS_SIZE>(process, args_address)?;
+        let handle = Handle::from_raw(read_u32(&raw, 0));
+        if read_u32(&raw, 4) != 0 {
+            return Err(Status::InvalidArgument);
+        }
+        let target = match process
+            .handles()
+            .object_type(handle)
+            .map_err(map_ipc_error)?
+        {
+            ObjectType::FilesystemRoot => {
+                process
+                    .handles()
+                    .filesystem_root(handle, Rights::WRITE)
+                    .map_err(map_ipc_error)?;
+                RequestTarget(REQUEST_TARGET_FILESYSTEM_ROOT)
+            }
+            ObjectType::Directory => {
+                let directory = process
+                    .handles()
+                    .filesystem_directory(handle, Rights::WRITE)
+                    .map_err(map_ipc_error)?;
+                filesystem_request_target(directory.node_id(), directory.generation())
+            }
+            ObjectType::File => {
+                let file = process
+                    .handles()
+                    .filesystem_file(handle, Rights::WRITE)
+                    .map_err(map_ipc_error)?;
+                filesystem_request_target(file.node_id(), file.generation())
+            }
+            _ => return Err(Status::WrongObjectType),
+        };
+        submit_legacy_filesystem_request(
+            process,
+            thread_id,
+            requests,
+            PreparedBrokerRequest {
+                owner: RequestOwner::new(process_id.raw(), thread_id.raw()),
+                target,
+                target_lease: PreparedRequestTarget::FilesystemSync,
+                device: None,
+                operation: RequestOperation::FilesystemSync,
+                completion_mode: RequestCompletionMode::Block,
+                payload: BrokerPayload {
+                    operation_argument: 0,
+                    user_data: 0,
+                    request_flags: RequestFlags::empty(),
+                },
+                deadline_ns: None,
+                buffers: Vec::new(),
+            },
+            None,
+            now_ns,
+        )
+    })();
+    result.unwrap_or_else(DispatchResult::Complete)
+}
+
+fn pin_pending_request_count_output(
+    process: &mut Process,
+    address: u64,
+) -> Result<PendingRequestCountOutput, Status> {
+    let pages = process
+        .address_space_mut()
+        .pin_user_range(address, FILESYSTEM_READ_OUTPUT_SIZE, UserAccess::Write)
+        .map_err(map_address_space_error)?;
+    Ok(PendingRequestCountOutput { address, pages })
+}
+
+fn rollback_pending_request_count_output(
+    process: &mut Process,
+    count_output: &mut Option<PendingRequestCountOutput>,
+) {
+    let Some(mut output) = count_output.take() else {
+        return;
+    };
+    let result = process.address_space_mut().unpin_user_pages(&output.pages);
+    debug_assert!(result.is_ok(), "request count pin rollback failed");
+    output.pages.clear();
+}
+
+fn submit_legacy_filesystem_request(
+    process: &mut Process,
+    thread_id: ThreadId,
+    requests: &mut RequestBroker,
+    request: PreparedBrokerRequest,
+    mut count_output: Option<PendingRequestCountOutput>,
+    now_ns: u64,
+) -> Result<DispatchResult, Status> {
+    let submission = match requests.submit(request, now_ns) {
+        Ok(submission) => submission,
+        Err(mut failure) => {
+            rollback_prepared_buffers(process, &mut failure.request.buffers);
+            rollback_pending_request_count_output(process, &mut count_output);
+            return Err(map_broker_error(failure.error));
+        }
+    };
+    let hidden_handle = match process.handles_mut().request_install(&submission.control) {
+        Ok(handle) => handle,
+        Err(error) => {
+            cancel_broker_submission(requests, submission.id, now_ns);
+            rollback_pending_request_count_output(process, &mut count_output);
+            return Err(map_ipc_error(error));
+        }
+    };
+    process.block_thread_request(
+        thread_id,
+        PendingRequest {
+            id: submission.id,
+            output: None,
+            count_output,
+            hidden_handle,
+            completion: None,
+            return_operation_status: true,
+            registration: None,
+        },
+    );
+    Ok(DispatchResult::Blocked)
+}
+
+#[allow(dead_code)]
 fn filesystem_read<B: Disk>(
     process: &mut Process,
     filesystem: &mut RedoxFs<B>,
@@ -1826,6 +3305,7 @@ fn filesystem_read<B: Disk>(
     copy_to_user(process, count_address, &(count as u64).to_le_bytes())
 }
 
+#[allow(dead_code)]
 fn filesystem_write<B: Disk>(
     process: &mut Process,
     filesystem: &mut RedoxFs<B>,
@@ -2089,6 +3569,7 @@ fn filesystem_rename<B: Disk>(
         .map_err(map_fs_error)
 }
 
+#[allow(dead_code)]
 fn filesystem_sync<B: Disk>(
     process: &Process,
     filesystem: &mut RedoxFs<B>,
@@ -3139,6 +4620,42 @@ const fn map_ipc_error(error: IpcError) -> Status {
     error.status()
 }
 
+const fn map_request_error(error: RequestError) -> Status {
+    match error {
+        RequestError::OutOfMemory => Status::OutOfMemory,
+        RequestError::Quiescing | RequestError::CompletionQueueFull => Status::ShouldWait,
+        RequestError::EmptyBatch | RequestError::InvalidLimits | RequestError::InvalidState => {
+            Status::InvalidArgument
+        }
+        RequestError::BatchTooLarge
+        | RequestError::SystemFull
+        | RequestError::OwnerLimit
+        | RequestError::TargetLimit
+        | RequestError::CopiedBytesLimit
+        | RequestError::PinnedPagesLimit
+        | RequestError::SharedBytesLimit => Status::ResourceLimit,
+        RequestError::OutputTooSmall => Status::BufferTooSmall,
+        RequestError::InvalidRequest => Status::InvalidHandle,
+        RequestError::ReleaseNotDispatched => Status::ShouldWait,
+    }
+}
+
+const fn map_broker_error(error: BrokerError) -> Status {
+    match error {
+        BrokerError::Runtime(error) => map_request_error(error),
+        BrokerError::Control(error) => map_ipc_error(error),
+        BrokerError::OutOfMemory => Status::OutOfMemory,
+        BrokerError::TooManyBuffers => Status::ResourceLimit,
+        BrokerError::ResourceOverflow => Status::OutOfRange,
+        BrokerError::InvalidDeadline | BrokerError::PinnedPageOwnerMismatch => {
+            Status::InvalidArgument
+        }
+        BrokerError::InvalidRequest => Status::InvalidHandle,
+        BrokerError::ReleaseNotDispatched => Status::ShouldWait,
+        BrokerError::ResourcesAlreadyTaken | BrokerError::ActionMismatch => Status::InvalidArgument,
+    }
+}
+
 const fn map_map_error(error: MapError) -> Status {
     match error {
         MapError::AlreadyMapped => Status::AlreadyMapped,
@@ -3155,6 +4672,7 @@ const fn map_address_space_error(error: AddressSpaceError) -> Status {
     match error {
         AddressSpaceError::AlreadyMapped(_) => Status::AlreadyMapped,
         AddressSpaceError::PermissionDenied { .. } => Status::AccessDenied,
+        AddressSpaceError::PinnedMapping(_) => Status::ShouldWait,
         AddressSpaceError::OutOfMemory
         | AddressSpaceError::OutOfFrames
         | AddressSpaceError::FrameAllocator(_) => Status::OutOfMemory,
@@ -3329,6 +4847,12 @@ mod tests {
             SyscallNumber::ThreadGetCurrent,
             SyscallNumber::ThreadSetSchedulingClass,
             SyscallNumber::ThreadGetSchedulingInfo,
+            SyscallNumber::ThreadSetSchedulingClassWithAuthority,
+            SyscallNumber::RequestSubmit,
+            SyscallNumber::RequestCancel,
+            SyscallNumber::RequestGetInfo,
+            SyscallNumber::RequestSubmitBatch,
+            SyscallNumber::RequestGetDiagnostics,
         ];
         for number in expected {
             assert_eq!(decode_syscall_number(number as u64), Some(number));
@@ -3396,8 +4920,549 @@ mod tests {
             Some(SyscallNumber::ProcessCreate2)
         );
         assert_eq!(decode_syscall_number(52), Some(SyscallNumber::VirtualQuery));
-        assert_eq!(decode_syscall_number(65), None);
+        assert_eq!(
+            decode_syscall_number(65),
+            Some(SyscallNumber::ThreadSetSchedulingClassWithAuthority)
+        );
+        assert_eq!(
+            decode_syscall_number(66),
+            Some(SyscallNumber::RequestSubmit)
+        );
+        assert_eq!(
+            decode_syscall_number(70),
+            Some(SyscallNumber::RequestGetDiagnostics)
+        );
+        assert_eq!(decode_syscall_number(71), None);
         assert_eq!(decode_syscall_number(u64::MAX), None);
+    }
+
+    fn request_args(
+        operation: RequestOperation,
+        completion_mode: RequestCompletionMode,
+    ) -> RequestSubmitArgs {
+        RequestSubmitArgs {
+            version: REQUEST_SUBMIT_ARGS_VERSION,
+            size: RequestSubmitArgs::SIZE,
+            target: Handle::INVALID,
+            operation: operation as u32,
+            completion_mode: completion_mode as u32,
+            flags: RequestFlags::empty().bits(),
+            buffers_address: 0,
+            buffer_count: 0,
+            reserved: 0,
+            operation_argument: 0,
+            deadline_ns: DEADLINE_INFINITE,
+            user_data: 0,
+        }
+    }
+
+    fn request_buffer(kind: RequestBufferKind, flags: RequestBufferFlags) -> RequestBuffer {
+        let shared = kind == RequestBufferKind::SharedMemory;
+        RequestBuffer {
+            kind: kind as u32,
+            flags: flags.bits(),
+            address: if shared { 0 } else { 0x4000 },
+            length: 16,
+            handle: if shared {
+                Handle::from_raw(1 << 12)
+            } else {
+                Handle::INVALID
+            },
+            reserved: 0,
+            offset: 0,
+        }
+    }
+
+    fn filesystem_open_args(flags: u32, reserved: u32) -> [u8; FILESYSTEM_OPEN_ARGS_SIZE] {
+        let mut raw = [0u8; FILESYSTEM_OPEN_ARGS_SIZE];
+        put_u64(&mut raw, 0, 0x4000);
+        put_u64(&mut raw, 8, 12);
+        put_u32(&mut raw, 16, flags);
+        put_u32(&mut raw, 20, reserved);
+        raw
+    }
+
+    #[test]
+    fn filesystem_open_argument_and_rights_validation_matches_the_legacy_contract() {
+        let read = FilesystemOpenFlags::READ;
+        let write = FilesystemOpenFlags::WRITE;
+        let execute = FilesystemOpenFlags::EXECUTE;
+        let create = FilesystemOpenFlags::CREATE;
+        let truncate = FilesystemOpenFlags::TRUNCATE;
+
+        for flags in [
+            read,
+            write,
+            read | write,
+            write | create,
+            write | truncate,
+            read | execute,
+        ] {
+            let parsed =
+                parse_filesystem_open_args(&filesystem_open_args(flags.bits(), 0)).unwrap();
+            assert_eq!(parsed.path_address, 0x4000);
+            assert_eq!(parsed.path_length, 12);
+            assert_eq!(parsed.flags, flags);
+        }
+        for flags in [
+            FilesystemOpenFlags::empty(),
+            create,
+            truncate,
+            execute,
+            read | write | execute,
+            read | execute | create,
+            read | execute | truncate,
+        ] {
+            assert_eq!(
+                parse_filesystem_open_args(&filesystem_open_args(flags.bits(), 0)),
+                Err(Status::InvalidArgument)
+            );
+        }
+        assert_eq!(
+            parse_filesystem_open_args(&filesystem_open_args(read.bits(), 1)),
+            Err(Status::InvalidArgument)
+        );
+        assert_eq!(
+            parse_filesystem_open_args(&filesystem_open_args(1 << 31, 0)),
+            Err(Status::InvalidArgument)
+        );
+        assert_eq!(
+            parse_filesystem_open_args(&filesystem_open_args(read.bits(), 0)[..23]),
+            Err(Status::InvalidArgument)
+        );
+
+        assert_eq!(filesystem_open_required_rights(read), Rights::READ);
+        assert_eq!(
+            filesystem_open_required_rights(read | execute),
+            Rights::READ | Rights::EXECUTE
+        );
+        assert_eq!(
+            filesystem_open_required_rights(write | create | truncate),
+            Rights::READ | Rights::WRITE
+        );
+    }
+
+    #[test]
+    fn public_request_submit_rejects_internal_filesystem_operations() {
+        for operation in [
+            RequestOperation::FilesystemOpen,
+            RequestOperation::FilesystemTruncate,
+            RequestOperation::FilesystemNamespace,
+        ] {
+            assert_eq!(
+                validate_public_request_operation(operation),
+                Err(Status::AccessDenied)
+            );
+            assert_eq!(
+                validate_operation_buffers(operation, 0, &[]),
+                Err(Status::AccessDenied)
+            );
+        }
+        for operation in [
+            RequestOperation::Nop,
+            RequestOperation::FilesystemRead,
+            RequestOperation::FilesystemWrite,
+            RequestOperation::FilesystemSync,
+            RequestOperation::AudioWrite,
+        ] {
+            assert_eq!(validate_public_request_operation(operation), Ok(()));
+        }
+        #[cfg(ginkgo_request_smoke)]
+        assert_eq!(
+            validate_public_request_operation(RequestOperation::Synthetic),
+            Ok(())
+        );
+        #[cfg(not(ginkgo_request_smoke))]
+        assert_eq!(
+            validate_public_request_operation(RequestOperation::Synthetic),
+            Err(Status::AccessDenied)
+        );
+    }
+
+    #[test]
+    fn request_argument_layout_rejects_version_size_and_reserved_changes() {
+        let valid = request_args(RequestOperation::Nop, RequestCompletionMode::InlineOnly);
+        assert_eq!(parse_request_submit_args(valid.as_bytes()), Ok(valid));
+
+        let mut malformed = valid;
+        malformed.version += 1;
+        assert_eq!(
+            parse_request_submit_args(malformed.as_bytes()),
+            Err(Status::InvalidArgument)
+        );
+        malformed = valid;
+        malformed.size -= 8;
+        assert_eq!(
+            parse_request_submit_args(malformed.as_bytes()),
+            Err(Status::InvalidArgument)
+        );
+        malformed = valid;
+        malformed.reserved = 1;
+        assert_eq!(
+            parse_request_submit_args(malformed.as_bytes()),
+            Err(Status::InvalidArgument)
+        );
+        assert_eq!(
+            parse_request_submit_args(&valid.as_bytes()[..REQUEST_SUBMIT_ARGS_SIZE - 1]),
+            Err(Status::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn request_buffer_layout_rejects_unknown_empty_and_cross_kind_fields() {
+        for kind in [
+            RequestBufferKind::Copy,
+            RequestBufferKind::Pinned,
+            RequestBufferKind::SharedMemory,
+        ] {
+            let valid = request_buffer(kind, RequestBufferFlags::READ);
+            assert_eq!(parse_request_buffer(valid.as_bytes()), Ok(valid));
+        }
+
+        let mut malformed = request_buffer(RequestBufferKind::Copy, RequestBufferFlags::READ);
+        malformed.kind = 0;
+        assert_eq!(
+            parse_request_buffer(malformed.as_bytes()),
+            Err(Status::InvalidArgument)
+        );
+        malformed = request_buffer(RequestBufferKind::Copy, RequestBufferFlags::READ);
+        malformed.flags = 1 << 31;
+        assert_eq!(
+            parse_request_buffer(malformed.as_bytes()),
+            Err(Status::InvalidArgument)
+        );
+        malformed = request_buffer(RequestBufferKind::Pinned, RequestBufferFlags::READ);
+        malformed.length = 0;
+        assert_eq!(
+            parse_request_buffer(malformed.as_bytes()),
+            Err(Status::InvalidArgument)
+        );
+        malformed = request_buffer(RequestBufferKind::SharedMemory, RequestBufferFlags::WRITE);
+        malformed.address = 0x8000;
+        assert_eq!(
+            parse_request_buffer(malformed.as_bytes()),
+            Err(Status::InvalidArgument)
+        );
+        malformed = request_buffer(RequestBufferKind::Copy, RequestBufferFlags::WRITE);
+        malformed.handle = Handle::from_raw(1 << 12);
+        assert_eq!(
+            parse_request_buffer(malformed.as_bytes()),
+            Err(Status::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn request_operation_layout_and_array_limits_are_bounded() {
+        assert_eq!(
+            validate_operation_buffers(RequestOperation::Nop, 0, &[]),
+            Ok(())
+        );
+        assert_eq!(
+            validate_operation_buffers(
+                RequestOperation::Nop,
+                0,
+                &[request_buffer(
+                    RequestBufferKind::Copy,
+                    RequestBufferFlags::READ
+                )]
+            ),
+            Err(Status::InvalidArgument)
+        );
+        assert_eq!(
+            validate_operation_buffers(
+                RequestOperation::FilesystemRead,
+                0,
+                &[request_buffer(
+                    RequestBufferKind::Copy,
+                    RequestBufferFlags::WRITE
+                )]
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_operation_buffers(
+                RequestOperation::FilesystemRead,
+                0,
+                &[request_buffer(
+                    RequestBufferKind::Copy,
+                    RequestBufferFlags::READ
+                )]
+            ),
+            Err(Status::InvalidArgument)
+        );
+        assert_eq!(
+            checked_array_bytes(
+                REQUEST_MAX_BUFFERS as u64 + 1,
+                REQUEST_BUFFER_SIZE,
+                REQUEST_MAX_BUFFERS as u64,
+                Status::ResourceLimit
+            ),
+            Err(Status::ResourceLimit)
+        );
+        assert_eq!(
+            checked_array_bytes(
+                REQUEST_MAX_BATCH as u64 + 1,
+                REQUEST_SUBMIT_ARGS_SIZE,
+                REQUEST_MAX_BATCH as u64,
+                Status::ResourceLimit
+            ),
+            Err(Status::ResourceLimit)
+        );
+
+        let limits = crate::request::RequestLimits::default_policy();
+        let mut oversized = request_buffer(RequestBufferKind::Copy, RequestBufferFlags::WRITE);
+        oversized.length = limits.copied_bytes_per_request as u64 + 1;
+        let validated = ValidatedRequest {
+            args: request_args(RequestOperation::Synthetic, RequestCompletionMode::Handle),
+            operation: RequestOperation::Synthetic,
+            completion_mode: RequestCompletionMode::Handle,
+            flags: RequestFlags::empty(),
+            deadline_ns: None,
+            target: RequestTarget(1),
+            target_lease: PreparedRequestTarget::None,
+            buffers: vec![oversized],
+        };
+        assert_eq!(
+            preflight_request_resources(&validated, limits),
+            Err(Status::ResourceLimit)
+        );
+
+        let mut too_many_pages =
+            request_buffer(RequestBufferKind::Pinned, RequestBufferFlags::WRITE);
+        too_many_pages.length = limits.pinned_pages_per_request as u64 * PAGE_SIZE + 1;
+        let validated = ValidatedRequest {
+            buffers: vec![too_many_pages],
+            ..validated
+        };
+        assert_eq!(
+            preflight_request_resources(&validated, limits),
+            Err(Status::ResourceLimit)
+        );
+    }
+
+    #[test]
+    fn inline_nop_and_pending_outputs_have_stable_results() {
+        let completed = completed_request_output(Status::Ok);
+        assert_eq!(completed.request, Handle::INVALID);
+        assert_eq!(completed.request_state(), Some(RequestState::Completed));
+        assert_eq!(completed.result_status(), Some(Status::Ok));
+        assert_eq!(completed.bytes_transferred, 0);
+
+        let pending = pending_request_output(Handle::INVALID);
+        assert_eq!(pending.request_state(), Some(RequestState::Pending));
+        assert_eq!(pending.result_status(), Some(Status::ShouldWait));
+    }
+
+    #[test]
+    fn blocked_request_modes_select_the_documented_syscall_status() {
+        assert_eq!(
+            blocked_request_return_status(true, Status::Io, Status::Ok),
+            Status::Io
+        );
+        assert_eq!(
+            blocked_request_return_status(false, Status::Io, Status::Ok),
+            Status::Ok
+        );
+        assert_eq!(
+            blocked_request_return_status(false, Status::Ok, Status::InvalidAddress),
+            Status::InvalidAddress
+        );
+    }
+
+    #[test]
+    fn prepared_filesystem_open_freezes_anchor_flags_and_buffers() {
+        let mut filesystem = RedoxFs::new().unwrap();
+        let root = filesystem.root_directory().unwrap();
+        let directory = filesystem
+            .create_directory_at(root, "syscall-open-request-target")
+            .unwrap();
+        let flags = FilesystemOpenFlags::READ | FilesystemOpenFlags::WRITE;
+        let owner = RequestOwner::new(7, 11);
+        let request = prepare_filesystem_open_broker_request(
+            owner,
+            DirectoryAnchor {
+                directory,
+                rights: Rights::READ | Rights::WRITE | Rights::TRANSFER,
+                is_root: false,
+            },
+            flags,
+            vec![
+                PreparedRequestBuffer::Copied {
+                    flags: RequestBufferFlags::READ,
+                    user_address: 0x4000,
+                    bytes: b"folder/file".to_vec(),
+                },
+                PreparedRequestBuffer::Pinned {
+                    flags: RequestBufferFlags::WRITE,
+                    owner_process_id: owner.process_id,
+                    pages: vec![crate::paging::address_space::PinnedUserPage {
+                        virtual_start: 0x8000,
+                        physical_start: 0xc000,
+                        page_offset: 0,
+                        byte_length: HANDLE_OUTPUT_SIZE,
+                        permissions: crate::paging::address_space::UserPagePermissions::READ_WRITE,
+                        access: UserAccess::Write,
+                    }],
+                },
+            ],
+        );
+
+        assert_eq!(request.owner, owner);
+        assert_eq!(request.target, directory_request_target(Some(directory)));
+        assert_eq!(request.operation, RequestOperation::FilesystemOpen);
+        assert_eq!(request.completion_mode, RequestCompletionMode::Block);
+        assert_eq!(request.payload.operation_argument, u64::from(flags.bits()));
+        assert_eq!(request.payload.user_data, 0);
+        assert_eq!(request.payload.request_flags, RequestFlags::empty());
+        assert_eq!(request.buffers.len(), 2);
+        assert!(matches!(
+            &request.buffers[0],
+            PreparedRequestBuffer::Copied {
+                flags: RequestBufferFlags::READ,
+                user_address: 0x4000,
+                bytes,
+            } if bytes == b"folder/file"
+        ));
+        assert!(matches!(
+            &request.buffers[1],
+            PreparedRequestBuffer::Pinned {
+                flags: RequestBufferFlags::WRITE,
+                owner_process_id: 7,
+                pages,
+            } if pages.len() == 1 && pages[0].byte_length == HANDLE_OUTPUT_SIZE
+        ));
+        let expected_target = PreparedRequestTarget::Directory {
+            directory: Some(directory),
+            is_root: false,
+            rights: Rights::READ | Rights::WRITE | Rights::TRANSFER,
+        };
+        assert_eq!(request.target_lease, expected_target);
+        assert_eq!(
+            copy_prepared_request_target(&request.target_lease),
+            expected_target
+        );
+        assert!(request.resources().is_ok());
+
+        let root_request = prepare_filesystem_open_broker_request(
+            owner,
+            DirectoryAnchor {
+                directory: root,
+                rights: Rights::READ | Rights::WRITE,
+                is_root: true,
+            },
+            FilesystemOpenFlags::WRITE,
+            Vec::new(),
+        );
+        assert_eq!(
+            root_request.target,
+            RequestTarget(REQUEST_TARGET_FILESYSTEM_ROOT)
+        );
+        assert!(matches!(
+            root_request.target_lease,
+            PreparedRequestTarget::Directory {
+                directory: None,
+                is_root: true,
+                rights,
+            } if rights == Rights::READ | Rights::WRITE
+        ));
+    }
+
+    #[test]
+    fn prepared_filesystem_targets_match_broker_validation() {
+        let mut filesystem = RedoxFs::new().unwrap();
+        let file = filesystem.create("/syscall-request-target").unwrap();
+        let target = filesystem_request_target(file.node_id(), file.generation());
+        let read = PreparedBrokerRequest {
+            owner: RequestOwner::new(1, 2),
+            target,
+            target_lease: PreparedRequestTarget::File(FileCapabilityLease::new(file)),
+            device: None,
+            operation: RequestOperation::FilesystemRead,
+            completion_mode: RequestCompletionMode::Block,
+            payload: BrokerPayload {
+                operation_argument: 17,
+                user_data: 0x8000,
+                request_flags: RequestFlags::ALLOW_PARTIAL,
+            },
+            deadline_ns: None,
+            buffers: vec![PreparedRequestBuffer::Pinned {
+                flags: RequestBufferFlags::WRITE,
+                owner_process_id: 1,
+                pages: vec![crate::paging::address_space::PinnedUserPage {
+                    virtual_start: 0x4000,
+                    physical_start: 0x8000,
+                    page_offset: 0,
+                    byte_length: 8,
+                    permissions: crate::paging::address_space::UserPagePermissions::READ_WRITE,
+                    access: UserAccess::Write,
+                }],
+            }],
+        };
+        assert!(read.resources().is_ok());
+
+        let sync = PreparedBrokerRequest {
+            owner: RequestOwner::new(1, 2),
+            target: RequestTarget(REQUEST_TARGET_FILESYSTEM_ROOT),
+            target_lease: PreparedRequestTarget::FilesystemSync,
+            device: None,
+            operation: RequestOperation::FilesystemSync,
+            completion_mode: RequestCompletionMode::Block,
+            payload: BrokerPayload {
+                operation_argument: 0,
+                user_data: 0,
+                request_flags: RequestFlags::empty(),
+            },
+            deadline_ns: None,
+            buffers: Vec::new(),
+        };
+        assert!(sync.resources().is_ok());
+    }
+
+    #[test]
+    fn request_buffer_flags_map_to_exact_data_rights() {
+        assert_eq!(
+            request_buffer_rights(RequestBufferFlags::READ),
+            Rights::READ
+        );
+        assert_eq!(
+            request_buffer_rights(RequestBufferFlags::WRITE),
+            Rights::WRITE
+        );
+        assert_eq!(
+            request_buffer_rights(RequestBufferFlags::READ | RequestBufferFlags::WRITE),
+            Rights::READ | Rights::WRITE
+        );
+    }
+
+    #[test]
+    fn request_deadlines_and_error_mappings_are_stable() {
+        assert_eq!(parse_request_deadline(DEADLINE_INFINITE), Ok(None));
+        assert_eq!(parse_request_deadline(0), Ok(Some(0)));
+        assert_eq!(parse_request_deadline(-1), Err(Status::InvalidArgument));
+        assert_eq!(
+            map_request_error(RequestError::CopiedBytesLimit),
+            Status::ResourceLimit
+        );
+        assert_eq!(
+            map_request_error(RequestError::CompletionQueueFull),
+            Status::ShouldWait
+        );
+        assert_eq!(
+            map_broker_error(BrokerError::Runtime(RequestError::InvalidRequest)),
+            Status::InvalidHandle
+        );
+        assert_eq!(
+            map_broker_error(BrokerError::PinnedPageOwnerMismatch),
+            Status::InvalidArgument
+        );
+        assert_eq!(
+            map_broker_error(BrokerError::ActionMismatch),
+            Status::InvalidArgument
+        );
+        assert_eq!(
+            map_address_space_error(AddressSpaceError::PinnedMapping(0x4000)),
+            Status::ShouldWait
+        );
     }
 
     #[test]

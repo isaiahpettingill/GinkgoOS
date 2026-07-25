@@ -78,6 +78,14 @@ impl UserPagePermissions {
         self.executable
     }
 
+    pub const fn permits(self, access: UserAccess) -> bool {
+        match access {
+            UserAccess::Read => true,
+            UserAccess::Write => self.writable,
+            UserAccess::Execute => self.executable,
+        }
+    }
+
     fn page_table_flags(self) -> PageTableFlags {
         let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
         if self.writable {
@@ -113,6 +121,7 @@ pub enum AddressSpaceError {
         address: u64,
         access: UserAccess,
     },
+    PinnedMapping(u64),
     CorruptPageTable,
     HugePageConflict,
     FrameAlreadyOwned(PhysFrame<Size4KiB>),
@@ -151,6 +160,33 @@ pub struct UserPageMapping {
     pub frame: PhysFrame<Size4KiB>,
     pub backing: UserMappingBacking,
     pub permissions: UserPagePermissions,
+    pub pin_count: u16,
+}
+
+/// Stable metadata for one page in a pinned user byte range.
+///
+/// `virtual_start` and `physical_start` are page-aligned. `page_offset` and
+/// `byte_length` describe only the bytes from the requested range that lie in
+/// this page. `permissions` are the effective permissions observed across the
+/// complete page-table walk when the page was pinned, and `access` records the
+/// access that was validated for the lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PinnedUserPage {
+    pub virtual_start: u64,
+    pub physical_start: u64,
+    pub page_offset: usize,
+    pub byte_length: usize,
+    pub permissions: UserPagePermissions,
+    pub access: UserAccess,
+}
+
+/// Failure to release a batch of page pins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnpinUserPagesError {
+    /// At least one page has fewer live references than the batch would release.
+    PinCountUnderflow(u64),
+    /// The supplied metadata no longer identifies the pinned mapping exactly.
+    StalePinnedPage(u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -339,6 +375,7 @@ fn reclaim_category<R: FrameReclaimer>(
 /// Failure to clean up an address space that must no longer be active.
 pub enum InactiveAddressSpaceCleanupError {
     Active(AddressSpace),
+    Pinned(AddressSpace, u64),
     Reclaim(RetiredAddressSpaceReclaimError),
 }
 
@@ -348,6 +385,11 @@ impl core::fmt::Debug for InactiveAddressSpaceCleanupError {
             Self::Active(address_space) => formatter
                 .debug_tuple("Active")
                 .field(&address_space.root_frame())
+                .finish(),
+            Self::Pinned(address_space, address) => formatter
+                .debug_struct("Pinned")
+                .field("root", &address_space.root_frame())
+                .field("address", address)
                 .finish(),
             Self::Reclaim(error) => formatter.debug_tuple("Reclaim").field(error).finish(),
         }
@@ -502,6 +544,22 @@ impl AddressSpace {
 
     pub fn mappings(&self) -> &[UserPageMapping] {
         &self.mappings
+    }
+
+    /// Number of mapped pages with at least one active pin.
+    pub fn pinned_page_count(&self) -> usize {
+        self.mappings
+            .iter()
+            .filter(|mapping| mapping.pin_count != 0)
+            .count()
+    }
+
+    /// Total active pin references, including nested pins of the same page.
+    pub fn pinned_page_references(&self) -> usize {
+        self.mappings
+            .iter()
+            .map(|mapping| usize::from(mapping.pin_count))
+            .sum()
     }
 
     #[cfg(ginkgo_memory_policy_smoke)]
@@ -737,11 +795,197 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Pins a nonempty page-aligned range after validating `access` on every page.
+    ///
+    /// This is atomic with respect to validation, allocation failure, and pin-count
+    /// overflow: no count changes unless metadata for the complete range is ready.
+    pub fn pin_user_page_range(
+        &mut self,
+        address: u64,
+        length: usize,
+        access: UserAccess,
+    ) -> Result<Vec<PinnedUserPage>, AddressSpaceError> {
+        validate_exact_user_page_range(address, length)?;
+        self.pin_user_range(address, length, access)
+    }
+
+    /// Pins every page touched by an arbitrary user byte range.
+    ///
+    /// Empty ranges return an empty vector. For nonempty ranges, the complete
+    /// range, effective permissions, tracked mapping metadata, backing ownership,
+    /// output allocation, and all pin-count increments are preflighted before any
+    /// count changes. Pinned mappings cannot be unmapped or reprotected.
+    pub fn pin_user_range(
+        &mut self,
+        address: u64,
+        length: usize,
+        access: UserAccess,
+    ) -> Result<Vec<PinnedUserPage>, AddressSpaceError> {
+        let Some((start, end)) = checked_user_range(address, length)? else {
+            return Ok(Vec::new());
+        };
+        let first_page = start & !(PAGE_SIZE - 1);
+        let final_page = end & !(PAGE_SIZE - 1);
+        let page_count = usize::try_from((final_page - first_page) / PAGE_SIZE + 1)
+            .map_err(|_| AddressSpaceError::AddressOverflow)?;
+        let mut pinned = Vec::new();
+        pinned
+            .try_reserve_exact(page_count)
+            .map_err(|_| AddressSpaceError::OutOfMemory)?;
+
+        let mut page_address = first_page;
+        loop {
+            let walked = match self.walk_user_page(page_address)? {
+                WalkResult::Unmapped => return Err(AddressSpaceError::NotMapped(page_address)),
+                WalkResult::Mapped(mapping) => mapping,
+            };
+            let tracked = self
+                .mappings
+                .iter()
+                .find(|mapping| mapping.virtual_address == page_address)
+                .ok_or(AddressSpaceError::UntrackedMapping(page_address))?;
+            self.validate_tracked_mapping(tracked, walked)?;
+            if tracked.pin_count == u16::MAX {
+                return Err(AddressSpaceError::PinnedMapping(page_address));
+            }
+            if !walked.permits(access) {
+                return Err(AddressSpaceError::PermissionDenied {
+                    address: page_address,
+                    access,
+                });
+            }
+            let permissions = walked.permissions()?;
+            let covered_start = core::cmp::max(start, page_address);
+            let page_end = page_address
+                .checked_add(PAGE_SIZE - 1)
+                .ok_or(AddressSpaceError::AddressOverflow)?;
+            let covered_end = core::cmp::min(end, page_end);
+            pinned.push(PinnedUserPage {
+                virtual_start: page_address,
+                physical_start: walked.frame.start_address().as_u64(),
+                page_offset: usize::try_from(covered_start - page_address)
+                    .map_err(|_| AddressSpaceError::AddressOverflow)?,
+                byte_length: usize::try_from(covered_end - covered_start + 1)
+                    .map_err(|_| AddressSpaceError::AddressOverflow)?,
+                permissions,
+                access,
+            });
+            if page_address == final_page {
+                break;
+            }
+            page_address = page_address
+                .checked_add(PAGE_SIZE)
+                .ok_or(AddressSpaceError::AddressOverflow)?;
+        }
+
+        for page in &pinned {
+            let mapping = self
+                .mappings
+                .iter_mut()
+                .find(|mapping| mapping.virtual_address == page.virtual_start)
+                .expect("pin range was completely preflighted");
+            mapping.pin_count += 1;
+        }
+        Ok(pinned)
+    }
+
+    /// Releases exactly the page references described by `pages`.
+    ///
+    /// The complete batch is checked before any count changes. A missing or
+    /// replaced mapping, changed effective permissions, altered descriptor, or
+    /// insufficient pin count leaves every count unchanged.
+    pub fn unpin_user_pages(
+        &mut self,
+        pages: &[PinnedUserPage],
+    ) -> Result<(), UnpinUserPagesError> {
+        for (index, page) in pages.iter().enumerate() {
+            if page.virtual_start % PAGE_SIZE != 0
+                || page.physical_start % PAGE_SIZE != 0
+                || page.page_offset >= PAGE_SIZE as usize
+                || page.byte_length == 0
+                || page
+                    .page_offset
+                    .checked_add(page.byte_length)
+                    .map_or(true, |end| end > PAGE_SIZE as usize)
+                || !page.permissions.permits(page.access)
+            {
+                return Err(UnpinUserPagesError::StalePinnedPage(page.virtual_start));
+            }
+            if pages[..index]
+                .iter()
+                .any(|previous| previous.virtual_start == page.virtual_start)
+            {
+                continue;
+            }
+            if pages
+                .iter()
+                .any(|candidate| candidate.virtual_start == page.virtual_start && candidate != page)
+            {
+                return Err(UnpinUserPagesError::StalePinnedPage(page.virtual_start));
+            }
+            let reference_count = pages
+                .iter()
+                .filter(|candidate| candidate.virtual_start == page.virtual_start)
+                .count();
+            let reference_count = u16::try_from(reference_count)
+                .map_err(|_| UnpinUserPagesError::PinCountUnderflow(page.virtual_start))?;
+            let tracked = self
+                .mappings
+                .iter()
+                .find(|mapping| mapping.virtual_address == page.virtual_start)
+                .ok_or(UnpinUserPagesError::StalePinnedPage(page.virtual_start))?;
+            if tracked.pin_count < reference_count {
+                return Err(UnpinUserPagesError::PinCountUnderflow(page.virtual_start));
+            }
+            let walked = match self
+                .walk_user_page(page.virtual_start)
+                .map_err(|_| UnpinUserPagesError::StalePinnedPage(page.virtual_start))?
+            {
+                WalkResult::Unmapped => {
+                    return Err(UnpinUserPagesError::StalePinnedPage(page.virtual_start))
+                }
+                WalkResult::Mapped(mapping) => mapping,
+            };
+            self.validate_tracked_mapping(tracked, walked)
+                .map_err(|_| UnpinUserPagesError::StalePinnedPage(page.virtual_start))?;
+            let current_permissions = walked
+                .permissions()
+                .map_err(|_| UnpinUserPagesError::StalePinnedPage(page.virtual_start))?;
+            if walked.frame.start_address().as_u64() != page.physical_start
+                || current_permissions != page.permissions
+                || !walked.permits(page.access)
+            {
+                return Err(UnpinUserPagesError::StalePinnedPage(page.virtual_start));
+            }
+        }
+
+        for (index, page) in pages.iter().enumerate() {
+            if pages[..index]
+                .iter()
+                .any(|previous| previous.virtual_start == page.virtual_start)
+            {
+                continue;
+            }
+            let reference_count = pages
+                .iter()
+                .filter(|candidate| candidate.virtual_start == page.virtual_start)
+                .count() as u16;
+            let mapping = self
+                .mappings
+                .iter_mut()
+                .find(|mapping| mapping.virtual_address == page.virtual_start)
+                .expect("unpin batch was completely preflighted");
+            mapping.pin_count -= reference_count;
+        }
+        Ok(())
+    }
+
     /// Removes one tracked user mapping and returns non-owning backing metadata.
     ///
     /// Owned private frames move to retirement accounting. Shared aliases simply
     /// disappear from this address space; their physical frames remain entirely
-    /// under the external owner's control.
+    /// under the external owner's control. Pinned mappings are rejected before
+    /// any PTE or metadata change.
     pub fn unmap_user_4k(&mut self, address: u64) -> Result<UserPageMapping, AddressSpaceError> {
         let mut mappings = self.unmap_user_range(address, PAGE_SIZE as usize)?;
         Ok(mappings.pop().expect("one-page unmap returned no metadata"))
@@ -749,9 +993,9 @@ impl AddressSpace {
 
     /// Preflights several discontiguous mapped ranges before a compound operation.
     ///
-    /// Every range is validated before the caller changes any PTE, preventing a
-    /// later hole or untracked mapping from turning a semantic multi-range update
-    /// into a partial operation.
+    /// Every range and its lack of pins is validated before the caller changes
+    /// any PTE, preventing a later hole, untracked page, or pinned mapping from
+    /// turning a semantic multi-range update into a partial operation.
     pub fn preflight_mapped_user_ranges(
         &self,
         ranges: &[(u64, usize)],
@@ -774,22 +1018,9 @@ impl AddressSpace {
                     .iter()
                     .find(|mapping| mapping.virtual_address == page_address)
                     .ok_or(AddressSpaceError::UntrackedMapping(page_address))?;
-                if tracked.frame != walked.frame {
-                    return Err(AddressSpaceError::CorruptPageTable);
-                }
-                match tracked.backing {
-                    UserMappingBacking::OwnedPrivate => {
-                        if !self.owned_data_frames.contains(&tracked.frame) {
-                            return Err(AddressSpaceError::MappedFrameNotOwned(tracked.frame));
-                        }
-                    }
-                    UserMappingBacking::SharedAlias => {
-                        if self.owned_data_frames.contains(&tracked.frame)
-                            || self.retired_data_frames.contains(&tracked.frame)
-                        {
-                            return Err(AddressSpaceError::CorruptPageTable);
-                        }
-                    }
+                self.validate_tracked_mapping(tracked, walked)?;
+                if tracked.pin_count != 0 {
+                    return Err(AddressSpaceError::PinnedMapping(page_address));
                 }
                 if page_address == end {
                     break;
@@ -833,14 +1064,14 @@ impl AddressSpace {
     /// Unmaps exactly `length` bytes of page-aligned user mappings.
     ///
     /// Both the start and length must be 4 KiB aligned and `length` must be
-    /// nonzero. The complete range and all output and retirement capacity are
-    /// reserved before any PTE is changed.
+    /// nonzero. The complete range, including the absence of pins, and all output
+    /// and retirement capacity are preflighted before any PTE is changed.
     pub fn unmap_user_range(
         &mut self,
         address: u64,
         length: usize,
     ) -> Result<Vec<UserPageMapping>, AddressSpaceError> {
-        validate_exact_user_page_range(address, length)?;
+        self.preflight_mapped_user_ranges(&[(address, length)])?;
         #[cfg(test)]
         if core::mem::take(&mut self.fail_next_metadata_reservation) {
             return Err(AddressSpaceError::OutOfMemory);
@@ -875,22 +1106,9 @@ impl AddressSpace {
                 .find(|mapping| mapping.virtual_address == page_address)
                 .copied()
                 .ok_or(AddressSpaceError::UntrackedMapping(page_address))?;
-            if tracked.frame != walked.frame {
-                return Err(AddressSpaceError::CorruptPageTable);
-            }
-            match tracked.backing {
-                UserMappingBacking::OwnedPrivate => {
-                    if !self.owned_data_frames.contains(&tracked.frame) {
-                        return Err(AddressSpaceError::MappedFrameNotOwned(tracked.frame));
-                    }
-                }
-                UserMappingBacking::SharedAlias => {
-                    if self.owned_data_frames.contains(&tracked.frame)
-                        || self.retired_data_frames.contains(&tracked.frame)
-                    {
-                        return Err(AddressSpaceError::CorruptPageTable);
-                    }
-                }
+            self.validate_tracked_mapping(&tracked, walked)?;
+            if tracked.pin_count != 0 {
+                return Err(AddressSpaceError::PinnedMapping(page_address));
             }
             planned.push(tracked);
             if page_address == end {
@@ -917,6 +1135,16 @@ impl AddressSpace {
     }
 
     fn unmap_planned(&mut self, planned: &[UserPageMapping]) -> Result<(), AddressSpaceError> {
+        for tracked in planned {
+            let current = self
+                .mappings
+                .iter()
+                .find(|mapping| mapping.virtual_address == tracked.virtual_address)
+                .ok_or(AddressSpaceError::UntrackedMapping(tracked.virtual_address))?;
+            if current.pin_count != 0 {
+                return Err(AddressSpaceError::PinnedMapping(tracked.virtual_address));
+            }
+        }
         for tracked in planned {
             let page = Page::from_start_address(VirtAddr::new(tracked.virtual_address))
                 .map_err(|_| AddressSpaceError::UnalignedAddress(tracked.virtual_address))?;
@@ -956,6 +1184,9 @@ impl AddressSpace {
     }
 
     /// Applies one permission set to several mapped ranges after complete preflight.
+    ///
+    /// Pinned pages are rejected even when the requested permissions match. This
+    /// keeps each pin lease's effective permissions stable until it is released.
     pub fn protect_user_ranges(
         &mut self,
         ranges: &[(u64, usize)],
@@ -968,8 +1199,10 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// Returns all private frames retired by successful unmaps or failed mappings.
-    /// The complete batch remains owned by this address space if reclamation fails.
+    /// Applies one permission set to a mapped range.
+    ///
+    /// The complete range is checked for holes, untracked pages, and pins before
+    /// any PTE changes. Pinned pages cannot be reprotected until they are unpinned.
     pub fn protect_user_range(
         &mut self,
         address: u64,
@@ -979,15 +1212,18 @@ impl AddressSpace {
         let (_, end) = validate_exact_user_page_range(address, length)?;
         let mut page_address = address;
         loop {
-            if matches!(self.walk_user_page(page_address)?, WalkResult::Unmapped) {
-                return Err(AddressSpaceError::NotMapped(page_address));
-            }
-            if !self
+            let walked = match self.walk_user_page(page_address)? {
+                WalkResult::Unmapped => return Err(AddressSpaceError::NotMapped(page_address)),
+                WalkResult::Mapped(mapping) => mapping,
+            };
+            let tracked = self
                 .mappings
                 .iter()
-                .any(|mapping| mapping.virtual_address == page_address)
-            {
-                return Err(AddressSpaceError::UntrackedMapping(page_address));
+                .find(|mapping| mapping.virtual_address == page_address)
+                .ok_or(AddressSpaceError::UntrackedMapping(page_address))?;
+            self.validate_tracked_mapping(tracked, walked)?;
+            if tracked.pin_count != 0 {
+                return Err(AddressSpaceError::PinnedMapping(page_address));
             }
             if page_address == end {
                 break;
@@ -1144,6 +1380,14 @@ impl AddressSpace {
         if self.is_active() {
             return Err(InactiveAddressSpaceCleanupError::Active(self));
         }
+        if let Some(address) = self
+            .mappings
+            .iter()
+            .find(|mapping| mapping.pin_count != 0)
+            .map(|mapping| mapping.virtual_address)
+        {
+            return Err(InactiveAddressSpaceCleanupError::Pinned(self, address));
+        }
         let retired = unsafe { self.retire() };
         retired
             .reclaim(allocator)
@@ -1152,9 +1396,9 @@ impl AddressSpace {
 
     /// Converts this inactive address space into explicit ownership records.
     ///
-    /// The caller must first switch CR3 away from this root on every CPU and
-    /// ensure no other CPU can use it. Reclamation is then performed by
-    /// [`RetiredAddressSpace::reclaim`].
+    /// The caller must first switch CR3 away from this root on every CPU, ensure
+    /// no other CPU can use it, and release every page pin. Reclamation is then
+    /// performed by [`RetiredAddressSpace::reclaim`].
     pub unsafe fn retire(self) -> RetiredAddressSpace {
         let Self {
             root,
@@ -1230,6 +1474,7 @@ impl AddressSpace {
                     frame,
                     backing,
                     permissions,
+                    pin_count: 0,
                 });
                 Ok(())
             }
@@ -1250,6 +1495,34 @@ impl AddressSpace {
         self.owned_data_frames.contains(&frame)
             || self.retired_data_frames.contains(&frame)
             || self.owned_page_table_frames.contains(&frame)
+    }
+
+    fn validate_tracked_mapping(
+        &self,
+        tracked: &UserPageMapping,
+        walked: PageMapping,
+    ) -> Result<(), AddressSpaceError> {
+        if tracked.frame != walked.frame
+            || (walked.writable && !tracked.permissions.is_writable())
+            || (walked.executable && !tracked.permissions.is_executable())
+        {
+            return Err(AddressSpaceError::CorruptPageTable);
+        }
+        match tracked.backing {
+            UserMappingBacking::OwnedPrivate => {
+                if !self.owned_data_frames.contains(&tracked.frame) {
+                    return Err(AddressSpaceError::MappedFrameNotOwned(tracked.frame));
+                }
+            }
+            UserMappingBacking::SharedAlias => {
+                if self.owned_data_frames.contains(&tracked.frame)
+                    || self.retired_data_frames.contains(&tracked.frame)
+                {
+                    return Err(AddressSpaceError::CorruptPageTable);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn zero_frame(&self, frame: PhysFrame<Size4KiB>) -> Result<(), AddressSpaceError> {
@@ -1369,6 +1642,24 @@ struct PageMapping {
     user_accessible: bool,
     writable: bool,
     executable: bool,
+}
+
+impl PageMapping {
+    const fn permits(self, access: UserAccess) -> bool {
+        self.user_accessible
+            && match access {
+                UserAccess::Read => true,
+                UserAccess::Write => self.writable,
+                UserAccess::Execute => self.executable,
+            }
+    }
+
+    fn permissions(self) -> Result<UserPagePermissions, AddressSpaceError> {
+        if !self.user_accessible {
+            return Err(AddressSpaceError::CorruptPageTable);
+        }
+        UserPagePermissions::new(self.writable, self.executable)
+    }
 }
 
 enum WalkResult {
@@ -1522,6 +1813,7 @@ mod tests {
                 frame: frame(0x3000),
                 backing: UserMappingBacking::SharedAlias,
                 permissions: UserPagePermissions::READ_WRITE,
+                pin_count: 0,
             }],
             page_table_frames: alloc::vec![root, frame(0x6000)],
         }
@@ -1814,6 +2106,7 @@ mod tests {
                 frame: writable,
                 backing: UserMappingBacking::OwnedPrivate,
                 permissions: UserPagePermissions::READ_WRITE,
+                pin_count: 0,
             })
         );
         assert_eq!(
@@ -1823,6 +2116,349 @@ mod tests {
         assert_eq!(address_space.accounting().mapped_data_frames, 2);
         assert_eq!(address_space.accounting().retired_data_frames, 1);
         assert!(address_space.accounting().page_table_frames >= 4);
+    }
+
+    #[test]
+    fn cross_page_pin_returns_exact_byte_and_frame_metadata() {
+        let mut address_space = fake_address_space();
+        let mut allocator = FakeFrameAllocator::new();
+        let first_frame = allocator.allocate_frame().unwrap();
+        let second_frame = allocator.allocate_frame().unwrap();
+        unsafe {
+            address_space
+                .map_user_4k_with_allocator(
+                    0x1000,
+                    first_frame,
+                    UserPagePermissions::READ_ONLY,
+                    UserMappingBacking::OwnedPrivate,
+                    &mut allocator,
+                )
+                .unwrap();
+            address_space
+                .map_user_4k_with_allocator(
+                    0x2000,
+                    second_frame,
+                    UserPagePermissions::READ_WRITE,
+                    UserMappingBacking::OwnedPrivate,
+                    &mut allocator,
+                )
+                .unwrap();
+        }
+
+        let pinned = address_space
+            .pin_user_range(0x1ffe, 4, UserAccess::Read)
+            .unwrap();
+
+        assert_eq!(
+            pinned,
+            alloc::vec![
+                PinnedUserPage {
+                    virtual_start: 0x1000,
+                    physical_start: first_frame.start_address().as_u64(),
+                    page_offset: 0xffe,
+                    byte_length: 2,
+                    permissions: UserPagePermissions::READ_ONLY,
+                    access: UserAccess::Read,
+                },
+                PinnedUserPage {
+                    virtual_start: 0x2000,
+                    physical_start: second_frame.start_address().as_u64(),
+                    page_offset: 0,
+                    byte_length: 2,
+                    permissions: UserPagePermissions::READ_WRITE,
+                    access: UserAccess::Read,
+                },
+            ]
+        );
+        assert_eq!(address_space.pinned_page_count(), 2);
+        assert_eq!(address_space.pinned_page_references(), 2);
+        address_space.unpin_user_pages(&pinned).unwrap();
+        assert_eq!(address_space.pinned_page_count(), 0);
+        assert_eq!(address_space.pinned_page_references(), 0);
+    }
+
+    #[test]
+    fn pin_rejects_missing_effective_read_or_write_permission_without_changes() {
+        let mut address_space = fake_address_space();
+        let mut allocator = FakeFrameAllocator::new();
+        let writable = allocator.allocate_frame().unwrap();
+        let read_only = allocator.allocate_frame().unwrap();
+        unsafe {
+            address_space
+                .map_user_4k_with_allocator(
+                    0x2000,
+                    writable,
+                    UserPagePermissions::READ_WRITE,
+                    UserMappingBacking::OwnedPrivate,
+                    &mut allocator,
+                )
+                .unwrap();
+            address_space
+                .map_user_4k_with_allocator(
+                    0x3000,
+                    read_only,
+                    UserPagePermissions::READ_ONLY,
+                    UserMappingBacking::OwnedPrivate,
+                    &mut allocator,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            address_space.pin_user_page_range(0x2000, (PAGE_SIZE * 2) as usize, UserAccess::Write,),
+            Err(AddressSpaceError::PermissionDenied {
+                address: 0x3000,
+                access: UserAccess::Write,
+            })
+        );
+        let original_p4_flags = address_space.mapper.level_4_table()[0].flags();
+        address_space.mapper.level_4_table_mut()[0]
+            .set_flags(original_p4_flags & !PageTableFlags::USER_ACCESSIBLE);
+        assert_eq!(
+            address_space.pin_user_range(0x3000, 1, UserAccess::Read),
+            Err(AddressSpaceError::PermissionDenied {
+                address: 0x3000,
+                access: UserAccess::Read,
+            })
+        );
+        assert_eq!(address_space.pinned_page_count(), 0);
+        assert_eq!(address_space.pinned_page_references(), 0);
+    }
+
+    #[test]
+    fn pinned_later_range_rejects_multi_range_unmap_atomically_then_unpins() {
+        let mut address_space = fake_address_space();
+        let mut allocator = FakeFrameAllocator::new();
+        let first_frame = allocator.allocate_frame().unwrap();
+        let second_frame = allocator.allocate_frame().unwrap();
+        unsafe {
+            address_space
+                .map_user_4k_with_allocator(
+                    0x7000,
+                    first_frame,
+                    UserPagePermissions::READ_WRITE,
+                    UserMappingBacking::OwnedPrivate,
+                    &mut allocator,
+                )
+                .unwrap();
+            address_space
+                .map_user_4k_with_allocator(
+                    0x9000,
+                    second_frame,
+                    UserPagePermissions::READ_WRITE,
+                    UserMappingBacking::OwnedPrivate,
+                    &mut allocator,
+                )
+                .unwrap();
+        }
+        let pinned = address_space
+            .pin_user_page_range(0x9000, PAGE_SIZE as usize, UserAccess::Write)
+            .unwrap();
+        let ranges = [(0x7000, PAGE_SIZE as usize), (0x9000, PAGE_SIZE as usize)];
+
+        assert_eq!(
+            address_space.unmap_user_ranges(&ranges),
+            Err(AddressSpaceError::PinnedMapping(0x9000))
+        );
+        assert!(matches!(
+            address_space.walk_user_page(0x7000),
+            Ok(WalkResult::Mapped(mapping)) if mapping.frame == first_frame
+        ));
+        assert!(matches!(
+            address_space.walk_user_page(0x9000),
+            Ok(WalkResult::Mapped(mapping)) if mapping.frame == second_frame
+        ));
+        assert!(address_space.retired_data_frames().is_empty());
+
+        address_space.unpin_user_pages(&pinned).unwrap();
+        assert_eq!(address_space.unmap_user_ranges(&ranges).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn nested_pins_require_matching_unpins_before_unmap() {
+        let mut address_space = fake_address_space();
+        let mut allocator = FakeFrameAllocator::new();
+        let data = allocator.allocate_frame().unwrap();
+        unsafe {
+            address_space
+                .map_user_4k_with_allocator(
+                    0x4000,
+                    data,
+                    UserPagePermissions::READ_WRITE,
+                    UserMappingBacking::OwnedPrivate,
+                    &mut allocator,
+                )
+                .unwrap();
+        }
+
+        let first = address_space
+            .pin_user_page_range(0x4000, PAGE_SIZE as usize, UserAccess::Read)
+            .unwrap();
+        let second = address_space
+            .pin_user_page_range(0x4000, PAGE_SIZE as usize, UserAccess::Read)
+            .unwrap();
+        assert_eq!(address_space.pinned_page_count(), 1);
+        assert_eq!(address_space.pinned_page_references(), 2);
+
+        address_space.unpin_user_pages(&first).unwrap();
+        assert_eq!(address_space.pinned_page_references(), 1);
+        assert_eq!(
+            address_space.unmap_user_4k(0x4000),
+            Err(AddressSpaceError::PinnedMapping(0x4000))
+        );
+        address_space.unpin_user_pages(&second).unwrap();
+        assert_eq!(address_space.pinned_page_references(), 0);
+        assert!(address_space.unmap_user_4k(0x4000).is_ok());
+    }
+
+    #[test]
+    fn pin_count_rejects_overflow_without_wrapping() {
+        let mut address_space = fake_address_space();
+        let mut allocator = FakeFrameAllocator::new();
+        let data = allocator.allocate_frame().unwrap();
+        unsafe {
+            address_space
+                .map_user_4k_with_allocator(
+                    0x6000,
+                    data,
+                    UserPagePermissions::READ_ONLY,
+                    UserMappingBacking::OwnedPrivate,
+                    &mut allocator,
+                )
+                .unwrap();
+        }
+        address_space
+            .mappings
+            .iter_mut()
+            .find(|mapping| mapping.virtual_address == 0x6000)
+            .unwrap()
+            .pin_count = u16::MAX;
+
+        assert_eq!(
+            address_space.pin_user_range(0x6000, 1, UserAccess::Read),
+            Err(AddressSpaceError::PinnedMapping(0x6000))
+        );
+        assert_eq!(address_space.mappings()[0].pin_count, u16::MAX);
+    }
+
+    #[test]
+    fn stale_or_underflowing_unpin_batch_leaves_all_counts_unchanged() {
+        let mut address_space = fake_address_space();
+        let mut allocator = FakeFrameAllocator::new();
+        let first_frame = allocator.allocate_frame().unwrap();
+        let second_frame = allocator.allocate_frame().unwrap();
+        unsafe {
+            address_space
+                .map_user_4k_with_allocator(
+                    0xa000,
+                    first_frame,
+                    UserPagePermissions::READ_ONLY,
+                    UserMappingBacking::OwnedPrivate,
+                    &mut allocator,
+                )
+                .unwrap();
+            address_space
+                .map_user_4k_with_allocator(
+                    0xb000,
+                    second_frame,
+                    UserPagePermissions::READ_ONLY,
+                    UserMappingBacking::OwnedPrivate,
+                    &mut allocator,
+                )
+                .unwrap();
+        }
+        let pinned = address_space
+            .pin_user_page_range(0xa000, (PAGE_SIZE * 2) as usize, UserAccess::Read)
+            .unwrap();
+        let mut stale = pinned.clone();
+        stale[1].physical_start = first_frame.start_address().as_u64();
+
+        assert_eq!(
+            address_space.unpin_user_pages(&stale),
+            Err(UnpinUserPagesError::StalePinnedPage(0xb000))
+        );
+        assert_eq!(address_space.pinned_page_references(), 2);
+
+        address_space.unpin_user_pages(&pinned[..1]).unwrap();
+        assert_eq!(
+            address_space.unpin_user_pages(&pinned),
+            Err(UnpinUserPagesError::PinCountUnderflow(0xa000))
+        );
+        assert_eq!(address_space.pinned_page_references(), 1);
+        address_space.unpin_user_pages(&pinned[1..]).unwrap();
+    }
+
+    #[test]
+    fn pinned_page_cannot_be_reprotected() {
+        let mut address_space = fake_address_space();
+        let mut allocator = FakeFrameAllocator::new();
+        let data = allocator.allocate_frame().unwrap();
+        unsafe {
+            address_space
+                .map_user_4k_with_allocator(
+                    0xc000,
+                    data,
+                    UserPagePermissions::READ_WRITE,
+                    UserMappingBacking::OwnedPrivate,
+                    &mut allocator,
+                )
+                .unwrap();
+        }
+        let pinned = address_space
+            .pin_user_range(0xc000, 1, UserAccess::Write)
+            .unwrap();
+
+        assert_eq!(
+            address_space.protect_user_range(
+                0xc000,
+                PAGE_SIZE as usize,
+                UserPagePermissions::READ_ONLY,
+            ),
+            Err(AddressSpaceError::PinnedMapping(0xc000))
+        );
+        assert_eq!(
+            address_space.validate_user_range(0xc000, 1, UserAccess::Write),
+            Ok(())
+        );
+        address_space.unpin_user_pages(&pinned).unwrap();
+    }
+
+    #[test]
+    fn shared_alias_mapping_can_be_pinned_without_becoming_owned() {
+        let mut address_space = fake_address_space();
+        let mut allocator = FakeFrameAllocator::new();
+        let mut backing_allocator = FakeFrameAllocator::new();
+        let shared = backing_allocator.allocate_frame().unwrap();
+        unsafe {
+            address_space
+                .map_user_4k_with_allocator(
+                    0xd000,
+                    shared,
+                    UserPagePermissions::READ_EXECUTE,
+                    UserMappingBacking::SharedAlias,
+                    &mut allocator,
+                )
+                .unwrap();
+        }
+
+        let pinned = address_space
+            .pin_user_range(0xd080, 16, UserAccess::Execute)
+            .unwrap();
+        assert_eq!(pinned[0].physical_start, shared.start_address().as_u64());
+        assert_eq!(pinned[0].page_offset, 0x80);
+        assert_eq!(pinned[0].byte_length, 16);
+        assert_eq!(address_space.accounting().mapped_data_frames, 0);
+        assert_eq!(address_space.accounting().shared_alias_mappings, 1);
+        assert_eq!(
+            address_space.unmap_user_4k(0xd000),
+            Err(AddressSpaceError::PinnedMapping(0xd000))
+        );
+
+        address_space.unpin_user_pages(&pinned).unwrap();
+        let unmapped = address_space.unmap_user_4k(0xd000).unwrap();
+        assert_eq!(unmapped.backing, UserMappingBacking::SharedAlias);
+        assert_eq!(unmapped.pin_count, 0);
+        assert!(address_space.retired_data_frames().is_empty());
     }
 
     #[test]
@@ -2007,12 +2643,14 @@ mod tests {
                     frame: private,
                     backing: UserMappingBacking::OwnedPrivate,
                     permissions: UserPagePermissions::READ_WRITE,
+                    pin_count: 0,
                 },
                 UserPageMapping {
                     virtual_address: 0x4000,
                     frame: shared,
                     backing: UserMappingBacking::SharedAlias,
                     permissions: UserPagePermissions::READ_WRITE,
+                    pin_count: 0,
                 },
             ])
         );
@@ -2032,6 +2670,7 @@ mod tests {
                 frame: shared,
                 backing: UserMappingBacking::SharedAlias,
                 permissions: UserPagePermissions::READ_EXECUTE,
+                pin_count: 0,
             })
         );
         assert!(second.retired_data_frames().is_empty());

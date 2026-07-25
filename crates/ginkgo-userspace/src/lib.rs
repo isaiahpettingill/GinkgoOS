@@ -522,6 +522,24 @@ pub fn thread_set_scheduling_class(
     })
 }
 
+pub fn thread_set_scheduling_class_with_authority(
+    thread: ThreadId,
+    class: ThreadSchedulingClass,
+    authority: Handle,
+) -> SyscallResult<()> {
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::ThreadSetSchedulingClassWithAuthority,
+            thread.0,
+            class as u64,
+            u64::from(authority.raw()),
+            0,
+            0,
+            0,
+        )
+    })
+}
+
 pub fn thread_get_scheduling_info(thread: ThreadId) -> SyscallResult<ThreadSchedulingInfo> {
     let mut info = ThreadSchedulingInfo::default();
     status_result(unsafe {
@@ -536,6 +554,126 @@ pub fn thread_get_scheduling_info(thread: ThreadId) -> SyscallResult<ThreadSched
         )
     })?;
     Ok(info)
+}
+
+/// Submits one generic request using the selected completion mode.
+///
+/// Buffer descriptors contain integer userspace addresses. The kernel copies
+/// and validates all descriptors before this syscall can block or return a
+/// request handle. Pinned and shared-memory leases remain owned by the request
+/// until it reaches a terminal state.
+#[allow(clippy::too_many_arguments)]
+pub fn request_submit(
+    target: Handle,
+    operation: RequestOperation,
+    completion_mode: RequestCompletionMode,
+    flags: RequestFlags,
+    buffers: &[RequestBuffer],
+    operation_argument: u64,
+    deadline_ns: i64,
+    user_data: u64,
+) -> SyscallResult<RequestSubmitOutput> {
+    let args = request_submit_args(
+        target,
+        operation,
+        completion_mode,
+        flags,
+        buffers,
+        operation_argument,
+        deadline_ns,
+        user_data,
+    )?;
+    let mut output = RequestSubmitOutput::default();
+    // SAFETY: args and output remain valid, and the bounded descriptor slice
+    // remains readable until the syscall returns.
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::RequestSubmit,
+            pointer_address(&args),
+            mut_pointer_address(&mut output),
+            0,
+            0,
+            0,
+            0,
+        )
+    })?;
+    Ok(output)
+}
+
+/// Requests cancellation through a request capability.
+pub fn request_cancel(request: Handle) -> SyscallResult<()> {
+    // SAFETY: RequestCancel receives only an integer handle value.
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::RequestCancel,
+            u64::from(request.raw()),
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    })
+}
+
+/// Returns the latest stable state and result for one request.
+pub fn request_get_info(request: Handle) -> SyscallResult<RequestInfo> {
+    let mut info = RequestInfo::default();
+    // SAFETY: info is writable and remains alive until the syscall returns.
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::RequestGetInfo,
+            u64::from(request.raw()),
+            mut_pointer_address(&mut info),
+            u64::from(RequestInfo::SIZE),
+            u64::from(REQUEST_INFO_VERSION),
+            0,
+            0,
+        )
+    })?;
+    Ok(info)
+}
+
+/// Submits a bounded group of generic requests.
+///
+/// Each submission already contains integer addresses for its own buffer
+/// descriptors. `outputs` must have exactly one entry per submission.
+pub fn request_submit_batch(
+    submissions: &[RequestSubmitArgs],
+    outputs: &mut [RequestSubmitOutput],
+) -> SyscallResult<()> {
+    let args = request_submit_batch_args(submissions, outputs)?;
+    // SAFETY: args remains readable and both equally sized bounded arrays remain
+    // valid for the duration of the syscall.
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::RequestSubmitBatch,
+            pointer_address(&args),
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    })
+}
+
+/// Returns aggregate request queue and completion diagnostics.
+pub fn request_get_diagnostics() -> SyscallResult<RequestDiagnostics> {
+    let mut diagnostics = RequestDiagnostics::default();
+    // SAFETY: diagnostics is writable and remains alive until the syscall returns.
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::RequestGetDiagnostics,
+            mut_pointer_address(&mut diagnostics),
+            u64::from(RequestDiagnostics::SIZE),
+            u64::from(REQUEST_DIAGNOSTICS_VERSION),
+            0,
+            0,
+            0,
+        )
+    })?;
+    Ok(diagnostics)
 }
 
 /// Writes bytes to the kernel's initial bounded serial debug sink.
@@ -1439,6 +1577,65 @@ fn debug_write_args(bytes: &[u8]) -> (u64, u64) {
     (slice_address(bytes), bytes.len() as u64)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn request_submit_args(
+    target: Handle,
+    operation: RequestOperation,
+    completion_mode: RequestCompletionMode,
+    flags: RequestFlags,
+    buffers: &[RequestBuffer],
+    operation_argument: u64,
+    deadline_ns: i64,
+    user_data: u64,
+) -> SyscallResult<RequestSubmitArgs> {
+    if buffers.len() > REQUEST_MAX_BUFFERS {
+        return Err(Status::ResourceLimit);
+    }
+
+    Ok(RequestSubmitArgs {
+        version: REQUEST_SUBMIT_ARGS_VERSION,
+        size: RequestSubmitArgs::SIZE,
+        target,
+        operation: operation as u32,
+        completion_mode: completion_mode as u32,
+        flags: flags.bits(),
+        buffers_address: slice_address(buffers),
+        buffer_count: buffers.len() as u32,
+        reserved: 0,
+        operation_argument,
+        deadline_ns,
+        user_data,
+    })
+}
+
+fn request_submit_batch_args(
+    submissions: &[RequestSubmitArgs],
+    outputs: &mut [RequestSubmitOutput],
+) -> SyscallResult<RequestSubmitBatchArgs> {
+    if submissions.len() != outputs.len() {
+        return Err(Status::InvalidArgument);
+    }
+    if submissions.len() > REQUEST_MAX_BATCH {
+        return Err(Status::ResourceLimit);
+    }
+    if submissions.iter().any(|submission| {
+        submission.version != REQUEST_SUBMIT_ARGS_VERSION
+            || submission.size != RequestSubmitArgs::SIZE
+            || submission.buffer_count as usize > REQUEST_MAX_BUFFERS
+    }) {
+        return Err(Status::InvalidArgument);
+    }
+
+    Ok(RequestSubmitBatchArgs {
+        version: REQUEST_SUBMIT_BATCH_ARGS_VERSION,
+        size: RequestSubmitBatchArgs::SIZE,
+        submissions_address: slice_address(submissions),
+        submission_count: submissions.len() as u32,
+        reserved: 0,
+        outputs_address: mut_slice_address(outputs),
+    })
+}
+
 fn filesystem_open_args(name: &str, flags: FilesystemOpenFlags) -> FilesystemOpenArgs {
     FilesystemOpenArgs {
         name_address: slice_address(name.as_bytes()),
@@ -1654,6 +1851,7 @@ mod tests {
             Status::DirectoryNotEmpty,
             Status::AlreadyExists,
             Status::CrossDevice,
+            Status::Canceled,
         ] {
             assert_eq!(status_result(status.raw().into()), Err(status));
         }
@@ -1670,6 +1868,131 @@ mod tests {
         let (empty_address, empty_length) = debug_write_args(&[]);
         assert_eq!(empty_address, 0);
         assert_eq!(empty_length, 0);
+    }
+
+    #[test]
+    fn request_submit_arguments_preserve_mode_buffers_and_metadata() {
+        let buffers = [RequestBuffer {
+            kind: RequestBufferKind::Pinned as u32,
+            flags: RequestBufferFlags::WRITE.bits(),
+            address: 0x1000,
+            length: 4096,
+            handle: Handle::INVALID,
+            reserved: 0,
+            offset: 0,
+        }];
+        let args = request_submit_args(
+            Handle::from_raw(17),
+            RequestOperation::FilesystemRead,
+            RequestCompletionMode::Handle,
+            RequestFlags::ORDERED,
+            &buffers,
+            512,
+            99_000,
+            0xfeed,
+        )
+        .unwrap();
+
+        assert_eq!(args.version, REQUEST_SUBMIT_ARGS_VERSION);
+        assert_eq!(args.size, RequestSubmitArgs::SIZE);
+        assert_eq!(args.target, Handle::from_raw(17));
+        assert_eq!(args.operation(), Some(RequestOperation::FilesystemRead));
+        assert_eq!(args.completion_mode(), Some(RequestCompletionMode::Handle));
+        assert_eq!(args.request_flags(), RequestFlags::ORDERED);
+        assert_eq!(args.buffers_address, pointer_address(buffers.as_ptr()));
+        assert_eq!(args.buffer_count, 1);
+        assert_eq!(args.reserved, 0);
+        assert_eq!(args.operation_argument, 512);
+        assert_eq!(args.deadline_ns, 99_000);
+        assert_eq!(args.user_data, 0xfeed);
+    }
+
+    #[test]
+    fn request_submit_arguments_enforce_buffer_bound_and_null_empty_address() {
+        let empty = request_submit_args(
+            Handle::INVALID,
+            RequestOperation::Nop,
+            RequestCompletionMode::InlineOnly,
+            RequestFlags::empty(),
+            &[],
+            0,
+            DEADLINE_INFINITE,
+            0,
+        )
+        .unwrap();
+        assert_eq!(empty.buffers_address, 0);
+        assert_eq!(empty.buffer_count, 0);
+
+        let too_many = [RequestBuffer {
+            kind: RequestBufferKind::Copy as u32,
+            flags: RequestBufferFlags::READ.bits(),
+            address: 1,
+            length: 1,
+            handle: Handle::INVALID,
+            reserved: 0,
+            offset: 0,
+        }; REQUEST_MAX_BUFFERS + 1];
+        assert_eq!(
+            request_submit_args(
+                Handle::INVALID,
+                RequestOperation::Synthetic,
+                RequestCompletionMode::Block,
+                RequestFlags::empty(),
+                &too_many,
+                0,
+                DEADLINE_INFINITE,
+                0,
+            ),
+            Err(Status::ResourceLimit)
+        );
+    }
+
+    #[test]
+    fn request_batch_arguments_preserve_arrays_and_enforce_bounds() {
+        let submissions = [request_submit_args(
+            Handle::INVALID,
+            RequestOperation::Nop,
+            RequestCompletionMode::InlineOnly,
+            RequestFlags::empty(),
+            &[],
+            0,
+            DEADLINE_INFINITE,
+            7,
+        )
+        .unwrap()];
+        let mut outputs = [RequestSubmitOutput::default()];
+        let outputs_address = pointer_address(outputs.as_mut_ptr());
+        let args = request_submit_batch_args(&submissions, &mut outputs).unwrap();
+        assert_eq!(args.version, REQUEST_SUBMIT_BATCH_ARGS_VERSION);
+        assert_eq!(args.size, RequestSubmitBatchArgs::SIZE);
+        assert_eq!(
+            args.submissions_address,
+            pointer_address(submissions.as_ptr())
+        );
+        assert_eq!(args.submission_count, 1);
+        assert_eq!(args.reserved, 0);
+        assert_eq!(args.outputs_address, outputs_address);
+
+        let mut no_outputs: [RequestSubmitOutput; 0] = [];
+        assert_eq!(
+            request_submit_batch_args(&submissions, &mut no_outputs),
+            Err(Status::InvalidArgument)
+        );
+
+        let valid = submissions[0];
+        let too_many = [valid; REQUEST_MAX_BATCH + 1];
+        let mut too_many_outputs = [RequestSubmitOutput::default(); REQUEST_MAX_BATCH + 1];
+        assert_eq!(
+            request_submit_batch_args(&too_many, &mut too_many_outputs),
+            Err(Status::ResourceLimit)
+        );
+
+        let empty_submissions: [RequestSubmitArgs; 0] = [];
+        let mut empty_outputs: [RequestSubmitOutput; 0] = [];
+        let empty = request_submit_batch_args(&empty_submissions, &mut empty_outputs).unwrap();
+        assert_eq!(empty.submissions_address, 0);
+        assert_eq!(empty.outputs_address, 0);
+        assert_eq!(empty.submission_count, 0);
     }
 
     #[test]

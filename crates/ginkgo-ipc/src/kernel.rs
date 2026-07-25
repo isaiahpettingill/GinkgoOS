@@ -7,7 +7,12 @@
 //! cooperative scheduler; a future syscall layer can block around exposed object
 //! signals without changing these semantics.
 
-use alloc::{collections::VecDeque, string::String, sync::Arc, vec::Vec};
+use alloc::{
+    collections::VecDeque,
+    string::String,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::{
     mem,
     sync::atomic::{AtomicUsize, Ordering},
@@ -16,8 +21,9 @@ use core::{
 use ginkgo_filesystem::{DirectoryHandle, FileHandle};
 use ginkgo_sysapi::{
     Handle, MessageInfo, ObjectType, ProcessFault, ProcessInfo, ProcessState,
-    ProcessTerminationCause, Rights, Signals, Status, SystemPowerAction, SystemPowerFlags,
-    SystemPowerInfo, SystemPowerState, WaitItem, CHANNEL_MAX_BYTES, CHANNEL_MAX_HANDLES,
+    ProcessTerminationCause, RequestInfo, RequestState, Rights, Signals, Status, SystemPowerAction,
+    SystemPowerFlags, SystemPowerInfo, SystemPowerState, ThreadSchedulingClass, WaitItem,
+    CHANNEL_MAX_BYTES, CHANNEL_MAX_HANDLES,
 };
 use spinning_top::Spinlock;
 
@@ -25,6 +31,8 @@ use spinning_top::Spinlock;
 pub const CHANNEL_QUEUE_CAPACITY: usize = 64;
 /// Maximum number of live or vacant slots retained by one handle table.
 pub const HANDLE_TABLE_CAPACITY: usize = 256;
+/// Maximum number of direct wait registrations retained by one object facet.
+pub const WAITERS_PER_FACET_LIMIT: usize = 256;
 /// Required allocation and mapping alignment for shared-memory backing.
 pub const SHARED_MEMORY_PAGE_SIZE: usize = 4096;
 /// Default number of equal shared-memory slots owned by [`HandleTable::window_create`].
@@ -46,6 +54,43 @@ static SHARED_MEMORY_LOGICAL_BYTES: AtomicUsize = AtomicUsize::new(0);
 static SHARED_MEMORY_MAPPED_ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
 static SHARED_MEMORY_CUMULATIVE_CREATIONS: AtomicUsize = AtomicUsize::new(0);
 static SHARED_MEMORY_CUMULATIVE_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+/// A nonzero generation-tagged identity for one kernel wait operation.
+///
+/// The kernel treats the raw value as opaque. The wait owner is responsible for
+/// changing its generation before reusing a slot so late notifications can be
+/// rejected.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct WaitToken(u64);
+
+impl WaitToken {
+    /// Validates and wraps a raw wait token. Zero is reserved as invalid.
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        if raw == 0 {
+            None
+        } else {
+            Some(Self(raw))
+        }
+    }
+
+    /// Returns the opaque generation-tagged value.
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// Receives direct object-signal notifications without exposing scheduler identity.
+pub trait SignalObserver: Send + Sync {
+    fn notify(&self, token: WaitToken);
+}
+
+struct SignalWaiter {
+    token: WaitToken,
+    wait_for: Signals,
+    observer: Weak<dyn SignalObserver>,
+    notifying: bool,
+}
 
 /// Global shared-memory backing allocation diagnostics.
 ///
@@ -108,6 +153,13 @@ const PROCESS_DEFAULT_RIGHTS: Rights = Rights::from_bits_retain(
         | Rights::DUPLICATE.bits()
         | Rights::TRANSFER.bits(),
 );
+const REQUEST_DEFAULT_RIGHTS: Rights = Rights::from_bits_retain(
+    Rights::WAIT.bits()
+        | Rights::INSPECT.bits()
+        | Rights::MANAGE.bits()
+        | Rights::DUPLICATE.bits()
+        | Rights::TRANSFER.bits(),
+);
 
 fn handle_from_parts(index: usize, generation: u32) -> Handle {
     debug_assert!(index < HANDLE_TABLE_CAPACITY);
@@ -133,6 +185,8 @@ pub enum IpcError {
     CyclicTransfer,
     MessageTooLarge,
     HandleTableFull,
+    /// One waitable object facet already retains its maximum waiter count.
+    WaiterLimit,
     InvalidMessage,
     AlreadyExists,
     OutOfMemory,
@@ -155,6 +209,7 @@ impl IpcError {
             Self::CyclicTransfer => Status::CyclicTransfer,
             Self::MessageTooLarge => Status::MessageTooLarge,
             Self::HandleTableFull => Status::HandleTableFull,
+            Self::WaiterLimit => Status::ResourceLimit,
             Self::InvalidMessage => Status::InvalidMessage,
             Self::AlreadyExists => Status::AlreadyExists,
             Self::OutOfMemory => Status::OutOfMemory,
@@ -200,8 +255,10 @@ enum KernelObject {
     SharedMemory(SharedMemoryObject),
     Window(WindowEndpoint),
     Process(ProcessControl),
+    Request(RequestControl),
     ApplicationData(ApplicationDataScope),
     SystemPower(SystemPowerControl),
+    SchedulingAuthority(SchedulingAuthorityControl),
     FilesystemRoot,
     Directory(DirectoryHandle),
     File(FileHandle),
@@ -328,6 +385,183 @@ impl SystemPowerControl {
     }
 }
 
+/// Revocable authority to select a privileged userspace scheduling class.
+#[derive(Clone)]
+pub struct SchedulingAuthorityControl {
+    state: Arc<Spinlock<SchedulingAuthorityState>>,
+}
+
+#[derive(Clone, Copy)]
+struct SchedulingAuthorityState {
+    maximum_class: ThreadSchedulingClass,
+    active: bool,
+    generation: u64,
+}
+
+#[derive(Clone)]
+pub struct SchedulingAuthorityLease {
+    control: SchedulingAuthorityControl,
+    generation: u64,
+}
+
+impl SchedulingAuthorityLease {
+    pub fn authorizes(&self, requested: ThreadSchedulingClass) -> bool {
+        self.control.generation() == self.generation && self.control.authorize(requested).is_ok()
+    }
+}
+
+impl SchedulingAuthorityControl {
+    pub fn new(maximum_class: ThreadSchedulingClass, active: bool) -> Result<Self, IpcError> {
+        if !matches!(
+            maximum_class,
+            ThreadSchedulingClass::Audio | ThreadSchedulingClass::Interactive
+        ) {
+            return Err(IpcError::InvalidMessage);
+        }
+        let state = Arc::try_new(Spinlock::new(SchedulingAuthorityState {
+            maximum_class,
+            active,
+            generation: 1,
+        }))
+        .map_err(|_| IpcError::OutOfMemory)?;
+        Ok(Self { state })
+    }
+
+    pub fn activate(&self) {
+        let mut state = self.state.lock();
+        if !state.active {
+            state.active = true;
+            state.generation = state.generation.saturating_add(1);
+        }
+    }
+
+    pub fn revoke(&self) {
+        let mut state = self.state.lock();
+        if state.active {
+            state.active = false;
+            state.generation = state.generation.saturating_add(1);
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.state.lock().active
+    }
+
+    pub fn maximum_class(&self) -> ThreadSchedulingClass {
+        self.state.lock().maximum_class
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.state.lock().generation
+    }
+
+    fn authorize(&self, requested: ThreadSchedulingClass) -> Result<(), IpcError> {
+        let state = self.state.lock();
+        if !state.active {
+            return Err(IpcError::AccessDenied);
+        }
+        let allowed = match state.maximum_class {
+            ThreadSchedulingClass::Audio => matches!(
+                requested,
+                ThreadSchedulingClass::Audio | ThreadSchedulingClass::Interactive
+            ),
+            ThreadSchedulingClass::Interactive => requested == ThreadSchedulingClass::Interactive,
+            ThreadSchedulingClass::Critical
+            | ThreadSchedulingClass::Normal
+            | ThreadSchedulingClass::Background => false,
+        };
+        allowed.then_some(()).ok_or(IpcError::AccessDenied)
+    }
+}
+
+/// Kernel-owner control of one waitable asynchronous request.
+///
+/// The caller supplies a nonzero generation-tagged `request_id`; this layer stores
+/// the value without interpreting its slot or generation fields. Request services
+/// retain a control clone independently of handles and publish at most one terminal
+/// [`RequestInfo`]. Closing a handle does not request cancellation.
+#[derive(Clone)]
+pub struct RequestControl {
+    state: Arc<Spinlock<RequestControlState>>,
+}
+
+struct RequestControlState {
+    request_id: u64,
+    info: RequestInfo,
+    cancel_requested: bool,
+    waiters: Vec<SignalWaiter>,
+}
+
+impl RequestControl {
+    /// Creates request state without installing a handle.
+    ///
+    /// Zero is not a valid generation-tagged request identity. The initial info
+    /// must describe a known nonterminal state.
+    pub fn new(request_id: u64, info: RequestInfo) -> Result<Self, IpcError> {
+        if request_id == 0 || !request_state_is_nonterminal(info.request_state()) {
+            return Err(IpcError::InvalidMessage);
+        }
+        let state = Arc::try_new(Spinlock::new(RequestControlState {
+            request_id,
+            info,
+            cancel_requested: false,
+            waiters: Vec::new(),
+        }))
+        .map_err(|_| IpcError::OutOfMemory)?;
+        Ok(Self { state })
+    }
+
+    /// Returns the opaque generation-tagged identity selected by the request owner.
+    pub fn request_id(&self) -> u64 {
+        self.state.lock().request_id
+    }
+
+    /// Returns the current stable request snapshot without requiring a handle.
+    pub fn info(&self) -> RequestInfo {
+        self.state.lock().info
+    }
+
+    /// Reports whether cancellation was requested through a managing capability.
+    pub fn cancel_requested(&self) -> bool {
+        self.state.lock().cancel_requested
+    }
+
+    /// Marks cancellation requested unless a terminal outcome already won the race.
+    ///
+    /// Repeated requests are harmless and do not change terminal publication rules.
+    pub fn request_cancellation(&self) -> bool {
+        let mut state = self.state.lock();
+        if request_state_is_terminal(state.info.request_state()) {
+            return false;
+        }
+        state.cancel_requested = true;
+        true
+    }
+
+    /// Publishes the first valid terminal snapshot and wakes matching waiters.
+    ///
+    /// `Completed`, `TimedOut`, `Canceled`, `Failed`, and `OwnerTerminated` are
+    /// terminal. A nonterminal or unknown state is rejected without changing state.
+    pub fn publish_terminal(&self, info: RequestInfo) -> bool {
+        if !request_state_is_terminal(info.request_state()) {
+            return false;
+        }
+        {
+            let mut state = self.state.lock();
+            if request_state_is_terminal(state.info.request_state()) {
+                return false;
+            }
+            state.info = info;
+        }
+        notify_request_waiters(&self.state);
+        true
+    }
+
+    fn signals(&self) -> Signals {
+        request_signals(&self.state.lock())
+    }
+}
+
 /// Scheduler-facing ownership of a waitable process object's persistent state.
 ///
 /// This control is independent of the scheduler's process representation. The
@@ -339,10 +573,11 @@ pub struct ProcessControl {
     state: Arc<Spinlock<ProcessControlState>>,
 }
 
-#[derive(Clone, Copy)]
 struct ProcessControlState {
     info: ProcessInfo,
     terminate_requested: bool,
+    termination_observer: Option<(WaitToken, Weak<dyn SignalObserver>)>,
+    waiters: Vec<SignalWaiter>,
 }
 
 impl ProcessControl {
@@ -359,6 +594,8 @@ impl ProcessControl {
         let state = Arc::try_new(Spinlock::new(ProcessControlState {
             info,
             terminate_requested: false,
+            termination_observer: None,
+            waiters: Vec::new(),
         }))
         .map_err(|_| IpcError::OutOfMemory)?;
         Ok(Self { state })
@@ -372,6 +609,23 @@ impl ProcessControl {
     /// Reports whether a holder of `TERMINATE` has requested scheduler teardown.
     pub fn terminate_requested(&self) -> bool {
         self.state.lock().terminate_requested
+    }
+
+    /// Registers the scheduler queue notified when external termination is requested.
+    ///
+    /// One process has one scheduler owner, so replacing an existing observer is
+    /// rejected. The observer is weak and cannot keep kernel scheduler state alive.
+    pub fn register_termination_observer(
+        &self,
+        token: WaitToken,
+        observer: &Arc<dyn SignalObserver>,
+    ) -> Result<(), IpcError> {
+        let mut state = self.state.lock();
+        if state.termination_observer.is_some() {
+            return Err(IpcError::AlreadyExists);
+        }
+        state.termination_observer = Some((token, Arc::downgrade(observer)));
+        Ok(())
     }
 
     /// Records normal process exit unless another terminal outcome won the race.
@@ -417,28 +671,36 @@ impl ProcessControl {
     }
 
     fn request_terminate(&self) -> bool {
-        let mut state = self.state.lock();
-        if state.info.state == ProcessState::Terminated as u32 {
-            return false;
+        let notification = {
+            let mut state = self.state.lock();
+            if state.info.state == ProcessState::Terminated as u32 || state.terminate_requested {
+                return false;
+            }
+            state.terminate_requested = true;
+            state
+                .termination_observer
+                .as_ref()
+                .and_then(|(token, observer)| observer.upgrade().map(|observer| (*token, observer)))
+        };
+        if let Some((token, observer)) = notification {
+            observer.notify(token);
         }
-        state.terminate_requested = true;
         true
     }
 
     fn signals(&self) -> Signals {
-        if self.state.lock().info.state == ProcessState::Terminated as u32 {
-            Signals::TERMINATED
-        } else {
-            Signals::empty()
-        }
+        process_signals(&self.state.lock())
     }
 
     fn mark_terminal(&self, info: ProcessInfo) -> bool {
-        let mut state = self.state.lock();
-        if state.info.state == ProcessState::Terminated as u32 {
-            return false;
+        {
+            let mut state = self.state.lock();
+            if state.info.state == ProcessState::Terminated as u32 {
+                return false;
+            }
+            state.info = info;
         }
-        state.info = info;
+        notify_process_waiters(&self.state);
         true
     }
 }
@@ -557,40 +819,7 @@ struct WindowEndpoint {
 
 impl WindowEndpoint {
     fn signals(&self) -> Signals {
-        let state = self.state.lock();
-        match self.role {
-            WindowRole::Client => {
-                let mut signals = Signals::empty();
-                if state.release.is_some() {
-                    signals |= Signals::READABLE;
-                }
-                if !state.manager_open {
-                    signals |= Signals::PEER_CLOSED;
-                }
-                if !state.retired
-                    && state.manager_open
-                    && state.release.is_none()
-                    && state.pending.is_none()
-                    && state
-                        .buffers
-                        .iter()
-                        .any(|buffer| matches!(buffer, WindowBufferState::ClientOwned))
-                {
-                    signals |= Signals::WRITABLE;
-                }
-                signals
-            }
-            WindowRole::Manager => {
-                let mut signals = Signals::empty();
-                if state.pending.is_some() {
-                    signals |= Signals::READABLE;
-                }
-                if !state.client_open {
-                    signals |= Signals::PEER_CLOSED;
-                }
-                signals
-            }
-        }
+        window_signals(&self.state.lock(), self.role)
     }
 }
 
@@ -606,6 +835,7 @@ struct WindowState {
     retired: bool,
     client_open: bool,
     manager_open: bool,
+    waiters: [Vec<SignalWaiter>; 2],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -618,11 +848,15 @@ enum WindowBufferState {
 
 impl Drop for WindowEndpoint {
     fn drop(&mut self) {
-        let mut state = self.state.lock();
-        match self.role {
-            WindowRole::Client => state.client_open = false,
-            WindowRole::Manager => state.manager_open = false,
+        {
+            let mut state = self.state.lock();
+            match self.role {
+                WindowRole::Client => state.client_open = false,
+                WindowRole::Manager => state.manager_open = false,
+            }
         }
+        notify_window_waiters(&self.state, WindowRole::Client);
+        notify_window_waiters(&self.state, WindowRole::Manager);
     }
 }
 
@@ -633,18 +867,7 @@ struct ChannelEndpoint {
 
 impl ChannelEndpoint {
     fn signals(&self) -> Signals {
-        let state = self.state.lock();
-        let peer = 1 - self.side;
-        let mut signals = Signals::empty();
-        if !state.queues[self.side].is_empty() {
-            signals |= Signals::READABLE;
-        }
-        if !state.open[peer] {
-            signals |= Signals::PEER_CLOSED;
-        } else if state.queues[peer].len() < CHANNEL_QUEUE_CAPACITY {
-            signals |= Signals::WRITABLE;
-        }
-        signals
+        channel_signals(&self.state.lock(), self.side)
     }
 }
 
@@ -658,6 +881,8 @@ impl Drop for ChannelEndpoint {
             // taking this channel's spinlock.
             mem::take(&mut state.queues[self.side])
         };
+        notify_channel_waiters(&self.state, self.side);
+        notify_channel_waiters(&self.state, 1 - self.side);
         drop(discarded);
     }
 }
@@ -665,6 +890,302 @@ impl Drop for ChannelEndpoint {
 struct ChannelState {
     open: [bool; 2],
     queues: [VecDeque<KernelMessage>; 2],
+    waiters: [Vec<SignalWaiter>; 2],
+}
+
+fn request_state_is_nonterminal(state: Option<RequestState>) -> bool {
+    matches!(
+        state,
+        Some(
+            RequestState::Pending
+                | RequestState::Active
+                | RequestState::CancelPending
+                | RequestState::Completing
+        )
+    )
+}
+
+fn request_state_is_terminal(state: Option<RequestState>) -> bool {
+    matches!(
+        state,
+        Some(
+            RequestState::Completed
+                | RequestState::TimedOut
+                | RequestState::Canceled
+                | RequestState::Failed
+                | RequestState::OwnerTerminated
+        )
+    )
+}
+
+fn request_signals(state: &RequestControlState) -> Signals {
+    if request_state_is_terminal(state.info.request_state()) {
+        Signals::SIGNALED
+    } else {
+        Signals::empty()
+    }
+}
+
+fn process_signals(state: &ProcessControlState) -> Signals {
+    if state.info.state == ProcessState::Terminated as u32 {
+        Signals::TERMINATED
+    } else {
+        Signals::empty()
+    }
+}
+
+fn window_role_index(role: WindowRole) -> usize {
+    match role {
+        WindowRole::Client => 0,
+        WindowRole::Manager => 1,
+    }
+}
+
+fn window_signals(state: &WindowState, role: WindowRole) -> Signals {
+    match role {
+        WindowRole::Client => {
+            let mut signals = Signals::empty();
+            if state.release.is_some() {
+                signals |= Signals::READABLE;
+            }
+            if !state.manager_open {
+                signals |= Signals::PEER_CLOSED;
+            }
+            if !state.retired
+                && state.manager_open
+                && state.release.is_none()
+                && state.pending.is_none()
+                && state
+                    .buffers
+                    .iter()
+                    .any(|buffer| matches!(buffer, WindowBufferState::ClientOwned))
+            {
+                signals |= Signals::WRITABLE;
+            }
+            signals
+        }
+        WindowRole::Manager => {
+            let mut signals = Signals::empty();
+            if state.pending.is_some() {
+                signals |= Signals::READABLE;
+            }
+            if !state.client_open {
+                signals |= Signals::PEER_CLOSED;
+            }
+            signals
+        }
+    }
+}
+
+fn channel_signals(state: &ChannelState, side: usize) -> Signals {
+    let peer = 1 - side;
+    let mut signals = Signals::empty();
+    if !state.queues[side].is_empty() {
+        signals |= Signals::READABLE;
+    }
+    if !state.open[peer] {
+        signals |= Signals::PEER_CLOSED;
+    } else if state.queues[peer].len() < CHANNEL_QUEUE_CAPACITY {
+        signals |= Signals::WRITABLE;
+    }
+    signals
+}
+
+fn register_signal_waiter(
+    waiters: &mut Vec<SignalWaiter>,
+    token: WaitToken,
+    wait_for: Signals,
+    observer: &Weak<dyn SignalObserver>,
+) -> Result<(), IpcError> {
+    if waiters.len() >= WAITERS_PER_FACET_LIMIT {
+        return Err(IpcError::WaiterLimit);
+    }
+    waiters
+        .try_reserve_exact(1)
+        .map_err(|_| IpcError::OutOfMemory)?;
+    waiters.push(SignalWaiter {
+        token,
+        wait_for,
+        observer: Weak::clone(observer),
+        notifying: false,
+    });
+    Ok(())
+}
+
+fn mark_matching_waiters(waiters: &mut [SignalWaiter], current: Signals) {
+    for waiter in waiters {
+        waiter.notifying |= current.intersects(waiter.wait_for);
+    }
+}
+
+fn take_notifying_waiter(waiters: &mut Vec<SignalWaiter>) -> Option<SignalWaiter> {
+    let index = waiters.iter().position(|waiter| waiter.notifying)?;
+    Some(waiters.swap_remove(index))
+}
+
+fn notify_one_waiter(waiter: SignalWaiter) {
+    if let Some(observer) = waiter.observer.upgrade() {
+        observer.notify(waiter.token);
+    }
+}
+
+// The full matching batch is marked under the state lock before any callback can
+// change the signal level. Marked records are then removed one at a time, so the
+// bounded waiter Vec itself provides snapshot storage and notification allocates no
+// temporary memory. Every callback runs after unlock and may safely reenter objects.
+fn notify_process_waiters(state: &Arc<Spinlock<ProcessControlState>>) {
+    {
+        let mut state = state.lock();
+        let current = process_signals(&state);
+        mark_matching_waiters(&mut state.waiters, current);
+    }
+    loop {
+        let waiter = take_notifying_waiter(&mut state.lock().waiters);
+        let Some(waiter) = waiter else {
+            break;
+        };
+        notify_one_waiter(waiter);
+    }
+}
+
+fn notify_request_waiters(state: &Arc<Spinlock<RequestControlState>>) {
+    {
+        let mut state = state.lock();
+        let current = request_signals(&state);
+        mark_matching_waiters(&mut state.waiters, current);
+    }
+    loop {
+        let waiter = take_notifying_waiter(&mut state.lock().waiters);
+        let Some(waiter) = waiter else {
+            break;
+        };
+        notify_one_waiter(waiter);
+    }
+}
+
+fn notify_window_waiters(state: &Arc<Spinlock<WindowState>>, role: WindowRole) {
+    let index = window_role_index(role);
+    {
+        let mut state = state.lock();
+        let current = window_signals(&state, role);
+        mark_matching_waiters(&mut state.waiters[index], current);
+    }
+    loop {
+        let waiter = take_notifying_waiter(&mut state.lock().waiters[index]);
+        let Some(waiter) = waiter else {
+            break;
+        };
+        notify_one_waiter(waiter);
+    }
+}
+
+fn notify_channel_waiters(state: &Arc<Spinlock<ChannelState>>, side: usize) {
+    {
+        let mut state = state.lock();
+        let current = channel_signals(&state, side);
+        mark_matching_waiters(&mut state.waiters[side], current);
+    }
+    loop {
+        let waiter = take_notifying_waiter(&mut state.lock().waiters[side]);
+        let Some(waiter) = waiter else {
+            break;
+        };
+        notify_one_waiter(waiter);
+    }
+}
+
+enum WaitFacet {
+    Channel {
+        state: Arc<Spinlock<ChannelState>>,
+        side: usize,
+    },
+    Window {
+        state: Arc<Spinlock<WindowState>>,
+        role: WindowRole,
+    },
+    Process {
+        state: Arc<Spinlock<ProcessControlState>>,
+    },
+    Request {
+        state: Arc<Spinlock<RequestControlState>>,
+    },
+}
+
+impl WaitFacet {
+    fn register(
+        &self,
+        token: WaitToken,
+        wait_for: Signals,
+        observer: &Weak<dyn SignalObserver>,
+    ) -> Result<bool, IpcError> {
+        match self {
+            Self::Channel { state, side } => {
+                let mut state = state.lock();
+                if channel_signals(&state, *side).intersects(wait_for) {
+                    return Ok(false);
+                }
+                register_signal_waiter(&mut state.waiters[*side], token, wait_for, observer)?;
+            }
+            Self::Window { state, role } => {
+                let mut state = state.lock();
+                if window_signals(&state, *role).intersects(wait_for) {
+                    return Ok(false);
+                }
+                register_signal_waiter(
+                    &mut state.waiters[window_role_index(*role)],
+                    token,
+                    wait_for,
+                    observer,
+                )?;
+            }
+            Self::Process { state } => {
+                let mut state = state.lock();
+                if process_signals(&state).intersects(wait_for) {
+                    return Ok(false);
+                }
+                register_signal_waiter(&mut state.waiters, token, wait_for, observer)?;
+            }
+            Self::Request { state } => {
+                let mut state = state.lock();
+                if request_signals(&state).intersects(wait_for) {
+                    return Ok(false);
+                }
+                register_signal_waiter(&mut state.waiters, token, wait_for, observer)?;
+            }
+        }
+        Ok(true)
+    }
+
+    fn unregister(&self, token: WaitToken) {
+        match self {
+            Self::Channel { state, side } => {
+                state.lock().waiters[*side].retain(|waiter| waiter.token != token)
+            }
+            Self::Window { state, role } => state.lock().waiters[window_role_index(*role)]
+                .retain(|waiter| waiter.token != token),
+            Self::Process { state } => state.lock().waiters.retain(|waiter| waiter.token != token),
+            Self::Request { state } => state.lock().waiters.retain(|waiter| waiter.token != token),
+        }
+    }
+}
+
+/// RAII ownership of retained direct-wait object facets.
+///
+/// This type pins only object state, not channel or window endpoint objects. Closing
+/// the final endpoint handle therefore still publishes peer closure while a wait is
+/// registered. Dropping the registration cancels every waiter still retained for its
+/// token; facets already removed by one-shot notification or teardown are harmless.
+pub struct WaitSetRegistration {
+    token: WaitToken,
+    facets: Vec<WaitFacet>,
+}
+
+impl Drop for WaitSetRegistration {
+    fn drop(&mut self) {
+        for facet in &self.facets {
+            facet.unregister(self.token);
+        }
+    }
 }
 
 struct KernelMessage {
@@ -715,6 +1236,28 @@ impl HandleOperationDisposition {
             operation: HandleOperation::Duplicate,
             rights,
         }
+    }
+}
+
+/// Owning filesystem file capability retained by an asynchronous request.
+///
+/// The lease freezes the copied file identity and exact requested rights at
+/// acquisition while retaining the underlying kernel object across handle close or
+/// transfer.
+#[derive(Clone)]
+pub struct FileCapabilityLease {
+    _object: Arc<KernelObject>,
+    file: FileHandle,
+    rights: Rights,
+}
+
+impl FileCapabilityLease {
+    pub const fn file(&self) -> FileHandle {
+        self.file
+    }
+
+    pub const fn rights(&self) -> Rights {
+        self.rights
     }
 }
 
@@ -781,6 +1324,65 @@ impl SharedMemoryMappingLease {
 
     pub const fn effective_rights(&self) -> Rights {
         self.effective_rights
+    }
+}
+
+/// Owning, bounds-checked shared-memory access retained by an asynchronous request.
+///
+/// This lease is separate from a mapping lease: it exposes no physical pages or raw
+/// pointers and does not require [`Rights::MAP`]. All offsets passed to [`Self::read`]
+/// and [`Self::write`] are relative to the range selected when the lease was created.
+#[derive(Clone)]
+pub struct SharedMemoryRequestLease {
+    object: Arc<KernelObject>,
+    offset: usize,
+    len: usize,
+    rights: Rights,
+}
+
+impl SharedMemoryRequestLease {
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub const fn rights(&self) -> Rights {
+        self.rights
+    }
+
+    /// Copies bytes from a checked range relative to this lease.
+    pub fn read(&self, offset: usize, output: &mut [u8]) -> Result<(), IpcError> {
+        if !self.rights.contains(Rights::READ) {
+            return Err(IpcError::AccessDenied);
+        }
+        let relative = checked_range(offset, output.len(), self.len)?;
+        let absolute = self
+            .offset
+            .checked_add(relative.start)
+            .ok_or(IpcError::InvalidMessage)?;
+        shared_memory_object(&self.object)?
+            .backing
+            .storage
+            .read(absolute, output)
+    }
+
+    /// Copies bytes into a checked range relative to this lease.
+    pub fn write(&self, offset: usize, input: &[u8]) -> Result<(), IpcError> {
+        if !self.rights.contains(Rights::WRITE) {
+            return Err(IpcError::AccessDenied);
+        }
+        let relative = checked_range(offset, input.len(), self.len)?;
+        let absolute = self
+            .offset
+            .checked_add(relative.start)
+            .ok_or(IpcError::InvalidMessage)?;
+        shared_memory_object(&self.object)?
+            .backing
+            .storage
+            .write(absolute, input)
     }
 }
 
@@ -862,6 +1464,35 @@ impl HandleTable {
         Ok(())
     }
 
+    /// Installs a default-rights handle for existing request control state.
+    pub fn request_install(&mut self, request: &RequestControl) -> Result<Handle, IpcError> {
+        let object = Arc::try_new(KernelObject::Request(request.clone()))
+            .map_err(|_| IpcError::OutOfMemory)?;
+        let slot = self.reserve_slots(1)?[0];
+        Ok(self.insert_reserved(slot, object, REQUEST_DEFAULT_RIGHTS))
+    }
+
+    /// Returns persistent request status. The handle must carry [`Rights::INSPECT`].
+    pub fn request_info(&self, handle: Handle) -> Result<RequestInfo, IpcError> {
+        let object = self.object_with_rights(handle, Rights::INSPECT)?;
+        Ok(request_control(&object)?.info())
+    }
+
+    /// Retrieves cancellation control and its opaque identity through `MANAGE`.
+    ///
+    /// Retrieving control does not itself request cancellation. The caller can
+    /// validate owner and operation policy before calling
+    /// [`RequestControl::request_cancellation`].
+    pub fn request_cancellation_control(
+        &self,
+        handle: Handle,
+    ) -> Result<(RequestControl, u64), IpcError> {
+        let object = self.object_with_rights(handle, Rights::MANAGE)?;
+        let control = request_control(&object)?.clone();
+        let request_id = control.request_id();
+        Ok((control, request_id))
+    }
+
     /// Installs a non-transferable system-power capability over shared global control state.
     pub fn system_power_install(
         &mut self,
@@ -899,6 +1530,39 @@ impl HandleTable {
         let object = self.object_with_rights(handle, Rights::INSPECT)?;
         match object.as_ref() {
             KernelObject::SystemPower(control) => Ok(control.info()),
+            _ => Err(IpcError::WrongObjectType),
+        }
+    }
+
+    /// Installs a non-transferable revocable scheduling capability.
+    pub fn scheduling_authority_create(
+        &mut self,
+        maximum_class: ThreadSchedulingClass,
+        active: bool,
+    ) -> Result<(Handle, SchedulingAuthorityControl), IpcError> {
+        let control = SchedulingAuthorityControl::new(maximum_class, active)?;
+        let object = Arc::try_new(KernelObject::SchedulingAuthority(control.clone()))
+            .map_err(|_| IpcError::OutOfMemory)?;
+        let slot = self.reserve_slots(1)?[0];
+        let handle = self.insert_reserved(slot, object, Rights::SCHEDULE | Rights::INSPECT);
+        Ok((handle, control))
+    }
+
+    /// Retains a revocation-sensitive lease for an authorized scheduling class.
+    pub fn scheduling_authority_lease(
+        &self,
+        handle: Handle,
+        requested: ThreadSchedulingClass,
+    ) -> Result<SchedulingAuthorityLease, IpcError> {
+        let object = self.object_with_rights(handle, Rights::SCHEDULE)?;
+        match object.as_ref() {
+            KernelObject::SchedulingAuthority(authority) => {
+                authority.authorize(requested)?;
+                Ok(SchedulingAuthorityLease {
+                    control: authority.clone(),
+                    generation: authority.generation(),
+                })
+            }
             _ => Err(IpcError::WrongObjectType),
         }
     }
@@ -1048,6 +1712,28 @@ impl HandleTable {
         }
     }
 
+    /// Retains a file capability with exactly the requested effective rights.
+    ///
+    /// Rights and object type are checked in the same order as
+    /// [`Self::filesystem_file`]. The returned lease remains valid if the source
+    /// handle is later closed or transferred.
+    pub fn filesystem_file_lease(
+        &self,
+        handle: Handle,
+        required_rights: Rights,
+    ) -> Result<FileCapabilityLease, IpcError> {
+        let object = self.object_with_rights(handle, required_rights)?;
+        let file = match object.as_ref() {
+            KernelObject::File(file) => *file,
+            _ => return Err(IpcError::WrongObjectType),
+        };
+        Ok(FileCapabilityLease {
+            _object: object,
+            file,
+            rights: required_rights,
+        })
+    }
+
     /// Creates shared memory from externally owned, page-backed storage.
     ///
     /// Production storage is supplied by the kernel so this capability layer never
@@ -1131,6 +1817,33 @@ impl HandleTable {
         })
     }
 
+    /// Retains a checked shared-memory range for asynchronous kernel work.
+    ///
+    /// `rights` must contain `READ`, `WRITE`, or both, and no unrelated rights.
+    /// The source handle must carry every requested right. The returned lease keeps
+    /// the backing alive after handle close, duplication, or transfer.
+    pub fn shared_memory_request_lease(
+        &self,
+        handle: Handle,
+        offset: usize,
+        length: usize,
+        rights: Rights,
+    ) -> Result<SharedMemoryRequestLease, IpcError> {
+        let allowed = Rights::READ | Rights::WRITE;
+        if rights.is_empty() || !allowed.contains(rights) {
+            return Err(IpcError::InvalidRights);
+        }
+        let object = self.object_with_rights(handle, rights)?;
+        let backing = &shared_memory_object(&object)?.backing;
+        checked_range(offset, length, backing.logical_len)?;
+        Ok(SharedMemoryRequestLease {
+            object,
+            offset,
+            len: length,
+            rights,
+        })
+    }
+
     /// Creates a generation-1 window over two equal shared-memory buffers.
     pub fn window_create(&mut self, shared_memory: Handle) -> Result<(Handle, Handle), IpcError> {
         self.window_create_with_generation_and_buffer_count(
@@ -1179,6 +1892,7 @@ impl HandleTable {
             retired: false,
             client_open: true,
             manager_open: true,
+            waiters: [Vec::new(), Vec::new()],
         }))
         .map_err(|_| IpcError::OutOfMemory)?;
         let client = Arc::try_new(KernelObject::Window(WindowEndpoint {
@@ -1260,6 +1974,9 @@ impl HandleTable {
         state.next_serial = next_serial;
         state.buffers[index] = WindowBufferState::Pending;
         state.pending = Some(presentation);
+        drop(state);
+        notify_window_waiters(&endpoint.state, WindowRole::Client);
+        notify_window_waiters(&endpoint.state, WindowRole::Manager);
         Ok(presentation)
     }
 
@@ -1284,6 +2001,9 @@ impl HandleTable {
         }
         state.release = None;
         state.buffers[index] = WindowBufferState::ClientOwned;
+        drop(state);
+        notify_window_waiters(&endpoint.state, WindowRole::Client);
+        notify_window_waiters(&endpoint.state, WindowRole::Manager);
         Ok(release)
     }
 
@@ -1404,6 +2124,9 @@ impl HandleTable {
         state.buffers[displayed_index] = WindowBufferState::Displayed;
         state.pending = None;
         state.displayed = Some(presentation);
+        drop(state);
+        notify_window_waiters(&endpoint.state, WindowRole::Client);
+        notify_window_waiters(&endpoint.state, WindowRole::Manager);
         Ok(())
     }
 
@@ -1448,6 +2171,9 @@ impl HandleTable {
             state.displayed = None;
         }
         state.retired = true;
+        drop(state);
+        notify_window_waiters(&endpoint.state, WindowRole::Client);
+        notify_window_waiters(&endpoint.state, WindowRole::Manager);
         Ok(())
     }
 
@@ -1634,6 +2360,9 @@ impl HandleTable {
             bytes: message_bytes,
             handles: message_handles,
         });
+        drop(state);
+        drop(_graph);
+        notify_channel_waiters(&endpoint.state, peer);
         Ok(())
     }
 
@@ -1679,6 +2408,9 @@ impl HandleTable {
         {
             *output = self.insert_reserved(slot, entry.object, entry.rights);
         }
+        let peer = 1 - endpoint.side;
+        drop(state);
+        notify_channel_waiters(&endpoint.state, peer);
         Ok(info)
     }
 
@@ -1719,8 +2451,10 @@ impl HandleTable {
             KernelObject::RandomSource => Ok(ObjectType::RandomSource),
             KernelObject::Window(_) => Ok(ObjectType::Window),
             KernelObject::Process(_) => Ok(ObjectType::Process),
+            KernelObject::Request(_) => Ok(ObjectType::Request),
             KernelObject::ApplicationData(_) => Ok(ObjectType::ApplicationData),
             KernelObject::SystemPower(_) => Ok(ObjectType::SystemPower),
+            KernelObject::SchedulingAuthority(_) => Ok(ObjectType::SchedulingAuthority),
             KernelObject::FilesystemRoot => Ok(ObjectType::FilesystemRoot),
             KernelObject::Directory(_) => Ok(ObjectType::Directory),
             KernelObject::File(_) => Ok(ObjectType::File),
@@ -1735,12 +2469,79 @@ impl HandleTable {
             KernelObject::SharedMemory(_) | KernelObject::RandomSource => Ok(Signals::empty()),
             KernelObject::Window(endpoint) => Ok(endpoint.signals()),
             KernelObject::Process(process) => Ok(process.signals()),
+            KernelObject::Request(request) => Ok(request.signals()),
             KernelObject::ApplicationData(_)
             | KernelObject::SystemPower(_)
+            | KernelObject::SchedulingAuthority(_)
             | KernelObject::FilesystemRoot
             | KernelObject::Directory(_)
             | KernelObject::File(_) => Ok(Signals::empty()),
         }
+    }
+
+    /// Registers direct level-triggered notification for a set of waitable handles.
+    ///
+    /// Every item requires [`Rights::WAIT`] and must name a channel side, window role,
+    /// process, or request. Registration and the current-level check share the object's state
+    /// lock. Already-ready facets are not retained and cause one coalescible callback
+    /// after every item has registered successfully. Any error drops and unregisters
+    /// all earlier retained facets before it is returned.
+    pub fn register_wait_many(
+        &self,
+        items: &[WaitItem],
+        token: WaitToken,
+        observer: &Arc<dyn SignalObserver>,
+    ) -> Result<WaitSetRegistration, IpcError> {
+        let mut registration = WaitSetRegistration {
+            token,
+            facets: try_vec_with_capacity(items.len())?,
+        };
+        let observer = Arc::downgrade(observer);
+        let mut already_ready = false;
+
+        for item in items {
+            let entry = self.entry(item.handle)?;
+            if !entry.rights.contains(Rights::WAIT) {
+                return Err(IpcError::AccessDenied);
+            }
+            let facet = match entry.object.as_ref() {
+                KernelObject::Channel(endpoint) => WaitFacet::Channel {
+                    state: Arc::clone(&endpoint.state),
+                    side: endpoint.side,
+                },
+                KernelObject::Window(endpoint) => WaitFacet::Window {
+                    state: Arc::clone(&endpoint.state),
+                    role: endpoint.role,
+                },
+                KernelObject::Process(process) => WaitFacet::Process {
+                    state: Arc::clone(&process.state),
+                },
+                KernelObject::Request(request) => WaitFacet::Request {
+                    state: Arc::clone(&request.state),
+                },
+                KernelObject::SharedMemory(_)
+                | KernelObject::ApplicationData(_)
+                | KernelObject::SystemPower(_)
+                | KernelObject::SchedulingAuthority(_)
+                | KernelObject::FilesystemRoot
+                | KernelObject::Directory(_)
+                | KernelObject::File(_)
+                | KernelObject::RandomSource => return Err(IpcError::WrongObjectType),
+            };
+            if facet.register(token, item.wait_for, &observer)? {
+                registration.facets.push(facet);
+            } else {
+                already_ready = true;
+            }
+        }
+
+        if already_ready {
+            observer
+                .upgrade()
+                .expect("registration observer disappeared while borrowed")
+                .notify(token);
+        }
+        Ok(registration)
     }
 
     /// Scans wait items in order and returns the first ready index.
@@ -1973,6 +2774,7 @@ fn new_channel_objects() -> Result<[Arc<KernelObject>; 2], IpcError> {
     let state = Arc::try_new(Spinlock::new(ChannelState {
         open: [true, true],
         queues: [left_queue, right_queue],
+        waiters: [Vec::new(), Vec::new()],
     }))
     .map_err(|_| IpcError::OutOfMemory)?;
     let left = Arc::try_new(KernelObject::Channel(ChannelEndpoint {
@@ -1992,8 +2794,10 @@ fn channel_endpoint(object: &Arc<KernelObject>) -> Result<&ChannelEndpoint, IpcE
         | KernelObject::RandomSource
         | KernelObject::Window(_)
         | KernelObject::Process(_)
+        | KernelObject::Request(_)
         | KernelObject::ApplicationData(_)
         | KernelObject::SystemPower(_)
+        | KernelObject::SchedulingAuthority(_)
         | KernelObject::FilesystemRoot
         | KernelObject::Directory(_)
         | KernelObject::File(_) => Err(IpcError::WrongObjectType),
@@ -2007,8 +2811,10 @@ fn shared_memory_object(object: &Arc<KernelObject>) -> Result<&SharedMemoryObjec
         | KernelObject::RandomSource
         | KernelObject::Window(_)
         | KernelObject::Process(_)
+        | KernelObject::Request(_)
         | KernelObject::ApplicationData(_)
         | KernelObject::SystemPower(_)
+        | KernelObject::SchedulingAuthority(_)
         | KernelObject::FilesystemRoot
         | KernelObject::Directory(_)
         | KernelObject::File(_) => Err(IpcError::WrongObjectType),
@@ -2022,8 +2828,10 @@ fn window_endpoint(object: &Arc<KernelObject>) -> Result<&WindowEndpoint, IpcErr
         | KernelObject::SharedMemory(_)
         | KernelObject::RandomSource
         | KernelObject::Process(_)
+        | KernelObject::Request(_)
         | KernelObject::ApplicationData(_)
         | KernelObject::SystemPower(_)
+        | KernelObject::SchedulingAuthority(_)
         | KernelObject::FilesystemRoot
         | KernelObject::Directory(_)
         | KernelObject::File(_) => Err(IpcError::WrongObjectType),
@@ -2037,8 +2845,27 @@ fn process_control(object: &Arc<KernelObject>) -> Result<&ProcessControl, IpcErr
         | KernelObject::SharedMemory(_)
         | KernelObject::RandomSource
         | KernelObject::Window(_)
+        | KernelObject::Request(_)
         | KernelObject::ApplicationData(_)
         | KernelObject::SystemPower(_)
+        | KernelObject::SchedulingAuthority(_)
+        | KernelObject::FilesystemRoot
+        | KernelObject::Directory(_)
+        | KernelObject::File(_) => Err(IpcError::WrongObjectType),
+    }
+}
+
+fn request_control(object: &Arc<KernelObject>) -> Result<&RequestControl, IpcError> {
+    match object.as_ref() {
+        KernelObject::Request(request) => Ok(request),
+        KernelObject::Channel(_)
+        | KernelObject::SharedMemory(_)
+        | KernelObject::RandomSource
+        | KernelObject::Window(_)
+        | KernelObject::Process(_)
+        | KernelObject::ApplicationData(_)
+        | KernelObject::SystemPower(_)
+        | KernelObject::SchedulingAuthority(_)
         | KernelObject::FilesystemRoot
         | KernelObject::Directory(_)
         | KernelObject::File(_) => Err(IpcError::WrongObjectType),
@@ -2242,8 +3069,69 @@ unsafe impl SharedMemoryStorage for TestSharedMemoryStorage {
 #[cfg(test)]
 mod tests {
     use alloc::vec;
+    use core::sync::atomic::AtomicU64;
 
     use super::*;
+
+    struct CountingObserver {
+        notifications: AtomicUsize,
+        last_token: AtomicU64,
+    }
+
+    impl CountingObserver {
+        const fn new() -> Self {
+            Self {
+                notifications: AtomicUsize::new(0),
+                last_token: AtomicU64::new(0),
+            }
+        }
+
+        fn count(&self) -> usize {
+            self.notifications.load(Ordering::Relaxed)
+        }
+
+        fn last_token(&self) -> u64 {
+            self.last_token.load(Ordering::Relaxed)
+        }
+    }
+
+    impl SignalObserver for CountingObserver {
+        fn notify(&self, token: WaitToken) {
+            self.last_token.store(token.raw(), Ordering::Relaxed);
+            self.notifications.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct DrainingChannelObserver {
+        state: Arc<Spinlock<ChannelState>>,
+        side: usize,
+    }
+
+    impl SignalObserver for DrainingChannelObserver {
+        fn notify(&self, _token: WaitToken) {
+            let message = self.state.lock().queues[self.side].pop_front();
+            drop(message);
+        }
+    }
+
+    fn counting_observer() -> (Arc<CountingObserver>, Arc<dyn SignalObserver>) {
+        let observer = Arc::new(CountingObserver::new());
+        let sink: Arc<dyn SignalObserver> = observer.clone();
+        (observer, sink)
+    }
+
+    fn wait_token(raw: u64) -> WaitToken {
+        WaitToken::from_raw(raw).unwrap()
+    }
+
+    fn request_info(state: RequestState) -> RequestInfo {
+        RequestInfo {
+            version: 1,
+            size: RequestInfo::SIZE,
+            state: state as u32,
+            ..RequestInfo::default()
+        }
+    }
 
     struct FixedPageStorage {
         bytes: Spinlock<Vec<u8>>,
@@ -2318,7 +3206,19 @@ mod tests {
         let terminate = table.handle_duplicate(process, Rights::TERMINATE).unwrap();
         assert_eq!(table.process_info(terminate), Err(IpcError::AccessDenied));
         assert_eq!(table.object_signals(terminate), Err(IpcError::AccessDenied));
+        let (termination_observer, termination_sink) = counting_observer();
+        control
+            .register_termination_observer(wait_token(300), &termination_sink)
+            .unwrap();
+        assert_eq!(
+            control.register_termination_observer(wait_token(301), &termination_sink),
+            Err(IpcError::AlreadyExists)
+        );
         table.process_terminate(terminate).unwrap();
+        assert_eq!(termination_observer.count(), 1);
+        assert_eq!(termination_observer.last_token(), 300);
+        table.process_terminate(terminate).unwrap();
+        assert_eq!(termination_observer.count(), 1);
         assert!(control.terminate_requested());
         assert_eq!(control.info().process_state(), Some(ProcessState::Running));
         assert_eq!(table.object_signals(process), Ok(Signals::empty()));
@@ -2471,6 +3371,190 @@ mod tests {
             control.info().process_state(),
             Some(ProcessState::Terminated)
         );
+    }
+
+    #[test]
+    fn request_default_rights_object_type_and_operations_are_gated() {
+        assert!(matches!(
+            RequestControl::new(0, request_info(RequestState::Pending)),
+            Err(IpcError::InvalidMessage)
+        ));
+        assert!(matches!(
+            RequestControl::new(1, request_info(RequestState::Completed)),
+            Err(IpcError::InvalidMessage)
+        ));
+
+        let mut table = HandleTable::new();
+        let request_id = 0x0007_0000_0000_002a;
+        let control = RequestControl::new(request_id, request_info(RequestState::Pending)).unwrap();
+        let request = table.request_install(&control).unwrap();
+        assert_eq!(table.object_type(request), Ok(ObjectType::Request));
+        assert_eq!(table.handle_rights(request), Ok(REQUEST_DEFAULT_RIGHTS));
+        assert_eq!(
+            REQUEST_DEFAULT_RIGHTS,
+            Rights::WAIT | Rights::INSPECT | Rights::MANAGE | Rights::DUPLICATE | Rights::TRANSFER
+        );
+
+        let inspect = table.handle_duplicate(request, Rights::INSPECT).unwrap();
+        assert_eq!(table.request_info(inspect), Ok(control.info()));
+        assert_eq!(table.object_signals(inspect), Err(IpcError::AccessDenied));
+        assert!(matches!(
+            table.request_cancellation_control(inspect),
+            Err(IpcError::AccessDenied)
+        ));
+
+        let wait = table.handle_duplicate(request, Rights::WAIT).unwrap();
+        assert_eq!(table.object_signals(wait), Ok(Signals::empty()));
+        assert_eq!(table.request_info(wait), Err(IpcError::AccessDenied));
+        assert!(matches!(
+            table.request_cancellation_control(wait),
+            Err(IpcError::AccessDenied)
+        ));
+
+        let manage = table.handle_duplicate(request, Rights::MANAGE).unwrap();
+        let (cancel_control, returned_id) = table.request_cancellation_control(manage).unwrap();
+        assert_eq!(returned_id, request_id);
+        assert_eq!(cancel_control.request_id(), request_id);
+        assert!(!control.cancel_requested());
+        assert!(cancel_control.request_cancellation());
+        assert!(control.cancel_requested());
+        assert_eq!(table.request_info(manage), Err(IpcError::AccessDenied));
+        assert_eq!(table.object_signals(manage), Err(IpcError::AccessDenied));
+
+        let power = SystemPowerControl::new().unwrap();
+        let power = table.system_power_install(&power).unwrap();
+        assert_eq!(table.request_info(power), Err(IpcError::WrongObjectType));
+        assert!(matches!(
+            table.request_cancellation_control(power),
+            Err(IpcError::WrongObjectType)
+        ));
+    }
+
+    #[test]
+    fn request_waits_before_and_after_exactly_once_terminal_publication() {
+        let mut table = HandleTable::new();
+        let request_id = 0x0009_0000_0000_0003;
+        let control = RequestControl::new(request_id, request_info(RequestState::Active)).unwrap();
+        let request = table.request_install(&control).unwrap();
+        let (observer, sink) = counting_observer();
+        let before = table
+            .register_wait_many(
+                &[WaitItem::new(request, Signals::SIGNALED)],
+                wait_token(501),
+                &sink,
+            )
+            .unwrap();
+        assert_eq!(observer.count(), 0);
+
+        let mut completed = request_info(RequestState::Completed);
+        completed.bytes_transferred = 37;
+        completed.completed_ns = 700;
+        assert!(control.publish_terminal(completed));
+        assert_eq!(observer.count(), 1);
+        assert_eq!(observer.last_token(), 501);
+        assert_eq!(table.object_signals(request), Ok(Signals::SIGNALED));
+        assert_eq!(table.request_info(request), Ok(completed));
+
+        let mut late_failure = request_info(RequestState::Failed);
+        late_failure.result = Status::Io.raw();
+        late_failure.completed_ns = 701;
+        assert!(!control.publish_terminal(late_failure));
+        assert!(!control.publish_terminal(request_info(RequestState::Completing)));
+        assert_eq!(control.info(), completed);
+        assert_eq!(observer.count(), 1);
+        drop(before);
+
+        let after = table
+            .register_wait_many(
+                &[WaitItem::new(request, Signals::SIGNALED)],
+                wait_token(502),
+                &sink,
+            )
+            .unwrap();
+        assert_eq!(observer.count(), 2);
+        assert_eq!(observer.last_token(), 502);
+        assert!(after.facets.is_empty());
+        drop(after);
+        assert!(!control.request_cancellation());
+        assert!(!control.cancel_requested());
+    }
+
+    #[test]
+    fn request_close_duplicate_and_transfer_preserve_lifetime_without_canceling() {
+        let mut source = HandleTable::new();
+        let mut destination = HandleTable::new();
+        let request_id = 0x0011_0000_0000_0008;
+        let control = RequestControl::new(request_id, request_info(RequestState::Pending)).unwrap();
+        let request = source.request_install(&control).unwrap();
+        let duplicate = source
+            .handle_duplicate(request, REQUEST_DEFAULT_RIGHTS)
+            .unwrap();
+
+        source.handle_close(request).unwrap();
+        assert!(!control.cancel_requested());
+        assert_eq!(source.object_type(duplicate), Ok(ObjectType::Request));
+        let transferred = handle_move_between(
+            &mut source,
+            &mut destination,
+            duplicate,
+            REQUEST_DEFAULT_RIGHTS,
+        )
+        .unwrap();
+        assert_eq!(source.object_type(duplicate), Err(IpcError::InvalidHandle));
+        assert_eq!(
+            destination.object_type(transferred),
+            Ok(ObjectType::Request)
+        );
+        let inspect = destination
+            .handle_duplicate(transferred, Rights::INSPECT | Rights::WAIT)
+            .unwrap();
+        let (retained, returned_id) = destination
+            .request_cancellation_control(transferred)
+            .unwrap();
+        assert_eq!(returned_id, request_id);
+
+        destination.handle_close(transferred).unwrap();
+        assert!(!retained.cancel_requested());
+        let mut terminal = request_info(RequestState::OwnerTerminated);
+        terminal.result = Status::PeerClosed.raw();
+        terminal.completed_ns = 900;
+        assert!(control.publish_terminal(terminal));
+        assert_eq!(destination.request_info(inspect), Ok(terminal));
+        assert_eq!(destination.object_signals(inspect), Ok(Signals::SIGNALED));
+        destination.handle_close(inspect).unwrap();
+        assert!(!retained.cancel_requested());
+        assert_eq!(retained.info(), terminal);
+    }
+
+    #[test]
+    fn request_direct_wait_registration_is_bounded() {
+        let mut table = HandleTable::new();
+        let control = RequestControl::new(77, request_info(RequestState::Pending)).unwrap();
+        let request = table.request_install(&control).unwrap();
+        let (_, sink) = counting_observer();
+        let mut registrations = Vec::new();
+        for raw in 1..=WAITERS_PER_FACET_LIMIT as u64 {
+            registrations.push(
+                table
+                    .register_wait_many(
+                        &[WaitItem::new(request, Signals::SIGNALED)],
+                        wait_token(raw),
+                        &sink,
+                    )
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            table
+                .register_wait_many(
+                    &[WaitItem::new(request, Signals::SIGNALED)],
+                    wait_token(10_000),
+                    &sink,
+                )
+                .err(),
+            Some(IpcError::WaiterLimit)
+        );
+        drop(registrations);
     }
 
     #[test]
@@ -2693,6 +3777,95 @@ mod tests {
                 ..baseline
             }
         );
+    }
+
+    #[test]
+    fn shared_memory_request_lease_retains_checked_access_after_handle_close() {
+        let _shared_memory_test = SHARED_MEMORY_TEST_LOCK.lock();
+        let baseline = shared_memory_backing_stats();
+        let mut table = HandleTable::new();
+        let memory = table.shared_memory_create(8).unwrap();
+        table.shared_memory_write(memory, 0, b"01234567").unwrap();
+
+        let read_only = table
+            .shared_memory_request_lease(memory, 2, 4, Rights::READ)
+            .unwrap();
+        let read_write = table
+            .shared_memory_request_lease(memory, 1, 6, Rights::READ | Rights::WRITE)
+            .unwrap();
+        assert_eq!(read_only.len(), 4);
+        assert!(!read_only.is_empty());
+        assert_eq!(read_only.rights(), Rights::READ);
+        assert_eq!(read_only.write(0, b"x"), Err(IpcError::AccessDenied));
+        assert!(matches!(
+            table.shared_memory_request_lease(memory, 0, 1, Rights::empty()),
+            Err(IpcError::InvalidRights)
+        ));
+        assert!(matches!(
+            table.shared_memory_request_lease(memory, 0, 1, Rights::READ | Rights::MAP),
+            Err(IpcError::InvalidRights)
+        ));
+        assert!(matches!(
+            table.shared_memory_request_lease(memory, 7, 2, Rights::READ),
+            Err(IpcError::InvalidMessage)
+        ));
+        assert!(matches!(
+            table.shared_memory_request_lease(memory, usize::MAX, 1, Rights::READ),
+            Err(IpcError::InvalidMessage)
+        ));
+
+        table.handle_close(memory).unwrap();
+        assert_eq!(table.object_type(memory), Err(IpcError::InvalidHandle));
+        let mut bytes = [0; 4];
+        read_only.read(0, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"2345");
+        assert_eq!(
+            read_only.read(3, &mut [0; 2]),
+            Err(IpcError::InvalidMessage)
+        );
+        assert_eq!(read_write.write(6, b"x"), Err(IpcError::InvalidMessage));
+        read_write.write(1, b"AB").unwrap();
+        let mut retained = [0; 6];
+        read_write.read(0, &mut retained).unwrap();
+        assert_eq!(&retained, b"1AB456");
+        assert_eq!(
+            shared_memory_backing_stats().cumulative_drops,
+            baseline.cumulative_drops
+        );
+        drop(read_only);
+        drop(read_write);
+        assert_eq!(
+            shared_memory_backing_stats(),
+            SharedMemoryBackingStats {
+                cumulative_creations: baseline.cumulative_creations + 1,
+                cumulative_drops: baseline.cumulative_drops + 1,
+                ..baseline
+            }
+        );
+    }
+
+    #[test]
+    fn shared_memory_request_lease_enforces_source_handle_rights() {
+        let _shared_memory_test = SHARED_MEMORY_TEST_LOCK.lock();
+        let mut table = HandleTable::new();
+        let memory = table.shared_memory_create(4).unwrap();
+        let read = table.handle_duplicate(memory, Rights::READ).unwrap();
+        let write = table.handle_duplicate(memory, Rights::WRITE).unwrap();
+
+        assert!(table
+            .shared_memory_request_lease(read, 0, 4, Rights::READ)
+            .is_ok());
+        assert!(table
+            .shared_memory_request_lease(write, 0, 4, Rights::WRITE)
+            .is_ok());
+        assert!(matches!(
+            table.shared_memory_request_lease(read, 0, 4, Rights::WRITE),
+            Err(IpcError::AccessDenied)
+        ));
+        assert!(matches!(
+            table.shared_memory_request_lease(write, 0, 4, Rights::READ),
+            Err(IpcError::AccessDenied)
+        ));
     }
 
     #[test]
@@ -3098,6 +4271,86 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_file_lease_freezes_exact_rights_and_rejects_escalation_or_wrong_type() {
+        let mut filesystem = ginkgo_filesystem::RedoxFs::new().unwrap();
+        let file = filesystem.create("/ipc-file-lease-rights").unwrap();
+        let mut table = HandleTable::new();
+        let full_rights = Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER;
+        let handle = table.filesystem_file_create(file, full_rights).unwrap();
+
+        let read = table.filesystem_file_lease(handle, Rights::READ).unwrap();
+        assert_eq!(read.file(), file);
+        assert_eq!(read.rights(), Rights::READ);
+        let no_rights = table
+            .filesystem_file_lease(handle, Rights::empty())
+            .unwrap();
+        assert_eq!(no_rights.file(), file);
+        assert_eq!(no_rights.rights(), Rights::empty());
+
+        let attenuated = table.handle_duplicate(handle, Rights::READ).unwrap();
+        assert!(matches!(
+            table.filesystem_file_lease(attenuated, Rights::READ | Rights::WRITE),
+            Err(IpcError::AccessDenied)
+        ));
+        assert_eq!(table.handle_rights(attenuated), Ok(Rights::READ));
+
+        let root = table.filesystem_root_create().unwrap();
+        assert!(matches!(
+            table.filesystem_file_lease(root, Rights::READ),
+            Err(IpcError::WrongObjectType)
+        ));
+        assert!(matches!(
+            table.filesystem_file_lease(root, Rights::EXECUTE),
+            Err(IpcError::AccessDenied)
+        ));
+    }
+
+    #[test]
+    fn filesystem_file_lease_survives_close_duplicate_and_transfer() {
+        let mut filesystem = ginkgo_filesystem::RedoxFs::new().unwrap();
+        let file = filesystem.create("/ipc-file-lease-lifetime").unwrap();
+        let mut source = HandleTable::new();
+        let mut destination = HandleTable::new();
+        let full_rights = Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER;
+        let original = source.filesystem_file_create(file, full_rights).unwrap();
+        let close_lease = source
+            .filesystem_file_lease(original, Rights::READ)
+            .unwrap();
+
+        let duplicate = source
+            .handle_duplicate(original, Rights::READ | Rights::DUPLICATE)
+            .unwrap();
+        let duplicate_lease = source
+            .filesystem_file_lease(duplicate, Rights::READ)
+            .unwrap();
+        source.handle_close(duplicate).unwrap();
+        assert_eq!(duplicate_lease.file(), file);
+        assert_eq!(duplicate_lease.rights(), Rights::READ);
+
+        let moving = source
+            .handle_duplicate(original, Rights::WRITE | Rights::TRANSFER)
+            .unwrap();
+        let transfer_lease = source.filesystem_file_lease(moving, Rights::WRITE).unwrap();
+        source.handle_close(original).unwrap();
+        let moved =
+            handle_move_between(&mut source, &mut destination, moving, Rights::WRITE).unwrap();
+        assert_eq!(source.object_type(moving), Err(IpcError::InvalidHandle));
+        assert_eq!(destination.object_type(moved), Ok(ObjectType::File));
+        assert_eq!(close_lease.file(), file);
+        assert_eq!(close_lease.rights(), Rights::READ);
+        assert_eq!(transfer_lease.file(), file);
+        assert_eq!(transfer_lease.rights(), Rights::WRITE);
+
+        let destination_lease = destination
+            .filesystem_file_lease(moved, Rights::WRITE)
+            .unwrap();
+        destination.handle_close(moved).unwrap();
+        assert_eq!(destination_lease.file(), file);
+        assert_eq!(destination_lease.rights(), Rights::WRITE);
+        assert_eq!(transfer_lease.file(), destination_lease.file());
+    }
+
+    #[test]
     fn filesystem_file_creation_supports_read_only_executable_transfer() {
         let mut filesystem = ginkgo_filesystem::RedoxFs::new().unwrap();
         let file = filesystem.create("/ipc-executable-rights").unwrap();
@@ -3197,6 +4450,49 @@ mod tests {
             table.handle_duplicate(source, Rights::READ),
             Err(IpcError::AccessDenied)
         );
+    }
+
+    #[test]
+    fn scheduling_authority_is_nontransferable_bounded_and_revocable() {
+        let mut table = HandleTable::new();
+        let (handle, control) = table
+            .scheduling_authority_create(ThreadSchedulingClass::Audio, true)
+            .unwrap();
+        assert_eq!(
+            table.object_type(handle),
+            Ok(ObjectType::SchedulingAuthority)
+        );
+        assert_eq!(
+            table.handle_rights(handle),
+            Ok(Rights::SCHEDULE | Rights::INSPECT)
+        );
+        assert_eq!(
+            table.handle_duplicate(handle, Rights::SCHEDULE),
+            Err(IpcError::AccessDenied)
+        );
+        assert!(table
+            .scheduling_authority_lease(handle, ThreadSchedulingClass::Audio)
+            .unwrap()
+            .authorizes(ThreadSchedulingClass::Interactive));
+        assert!(matches!(
+            table.scheduling_authority_lease(handle, ThreadSchedulingClass::Critical),
+            Err(IpcError::AccessDenied)
+        ));
+
+        let lease = table
+            .scheduling_authority_lease(handle, ThreadSchedulingClass::Interactive)
+            .unwrap();
+        control.revoke();
+        assert!(!lease.authorizes(ThreadSchedulingClass::Interactive));
+        assert!(matches!(
+            table.scheduling_authority_lease(handle, ThreadSchedulingClass::Interactive),
+            Err(IpcError::AccessDenied)
+        ));
+        control.activate();
+        assert!(!lease.authorizes(ThreadSchedulingClass::Interactive));
+        assert!(table
+            .scheduling_authority_lease(handle, ThreadSchedulingClass::Interactive)
+            .is_ok());
     }
 
     #[test]
@@ -4732,5 +6028,396 @@ mod tests {
         table.handle_close(first_peer).unwrap();
         items[0].wait_for = Signals::PEER_CLOSED;
         assert_eq!(table.poll_wait_many(&mut items).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn direct_wait_registers_before_signal_and_handles_duplicate_items() {
+        let mut table = HandleTable::new();
+        let (sender, receiver) = table.channel_create().unwrap();
+        let (observer, sink) = counting_observer();
+        let token = wait_token(0x0001_0000_0000_0001);
+        let items = [
+            WaitItem::new(receiver, Signals::READABLE),
+            WaitItem::new(receiver, Signals::READABLE),
+        ];
+        let registration = table.register_wait_many(&items, token, &sink).unwrap();
+
+        assert_eq!(observer.count(), 0);
+        table.channel_write(sender, b"wake", &[]).unwrap();
+        assert_eq!(observer.count(), 2);
+        assert_eq!(observer.last_token(), token.raw());
+        drop(registration);
+    }
+
+    #[test]
+    fn direct_wait_snapshots_all_matches_before_reentrant_callbacks() {
+        let mut table = HandleTable::new();
+        let (sender, receiver) = table.channel_create().unwrap();
+        let (state, side) = {
+            let object = table.object_with_rights(receiver, Rights::WAIT).unwrap();
+            let endpoint = channel_endpoint(&object).unwrap();
+            (Arc::clone(&endpoint.state), endpoint.side)
+        };
+        let draining: Arc<dyn SignalObserver> = Arc::new(DrainingChannelObserver { state, side });
+        let (observer, sink) = counting_observer();
+        let draining_registration = table
+            .register_wait_many(
+                &[WaitItem::new(receiver, Signals::READABLE)],
+                wait_token(11),
+                &draining,
+            )
+            .unwrap();
+        let counting_registration = table
+            .register_wait_many(
+                &[WaitItem::new(receiver, Signals::READABLE)],
+                wait_token(12),
+                &sink,
+            )
+            .unwrap();
+
+        table
+            .channel_write(sender, b"drained in callback", &[])
+            .unwrap();
+        assert_eq!(observer.count(), 1);
+        assert_eq!(observer.last_token(), 12);
+        assert!(!table
+            .object_signals(receiver)
+            .unwrap()
+            .contains(Signals::READABLE));
+        drop(draining_registration);
+        drop(counting_registration);
+    }
+
+    #[test]
+    fn direct_wait_notifies_already_ready_without_retaining_the_facet() {
+        assert_eq!(WaitToken::from_raw(0), None);
+        let token = wait_token(0x0002_0000_0000_0001);
+        assert_eq!(WaitToken::from_raw(token.raw()), Some(token));
+
+        let mut table = HandleTable::new();
+        let (channel, _peer) = table.channel_create().unwrap();
+        let (observer, sink) = counting_observer();
+        let registration = table
+            .register_wait_many(&[WaitItem::new(channel, Signals::WRITABLE)], token, &sink)
+            .unwrap();
+
+        assert_eq!(observer.count(), 1);
+        assert_eq!(observer.last_token(), token.raw());
+
+        let no_wait = table.handle_duplicate(channel, Rights::READ).unwrap();
+        assert_eq!(
+            table
+                .register_wait_many(
+                    &[WaitItem::new(no_wait, Signals::READABLE)],
+                    wait_token(13),
+                    &sink,
+                )
+                .err(),
+            Some(IpcError::AccessDenied)
+        );
+        assert_eq!(observer.count(), 1);
+        drop(registration);
+    }
+
+    #[test]
+    fn direct_wait_discards_stale_weak_observers_on_notification() {
+        let mut table = HandleTable::new();
+        let (sender, receiver) = table.channel_create().unwrap();
+        let (state, side) = {
+            let object = table.object_with_rights(receiver, Rights::WAIT).unwrap();
+            let endpoint = channel_endpoint(&object).unwrap();
+            (Arc::clone(&endpoint.state), endpoint.side)
+        };
+        let (_, sink) = counting_observer();
+        let registration = table
+            .register_wait_many(
+                &[WaitItem::new(receiver, Signals::READABLE)],
+                wait_token(3),
+                &sink,
+            )
+            .unwrap();
+        drop(sink);
+
+        table.channel_write(sender, b"wake stale", &[]).unwrap();
+        assert!(state.lock().waiters[side].is_empty());
+        drop(registration);
+    }
+
+    #[test]
+    fn direct_wait_registration_drop_cancels_notifications() {
+        let mut table = HandleTable::new();
+        let (sender, receiver) = table.channel_create().unwrap();
+        let (observer, sink) = counting_observer();
+        let registration = table
+            .register_wait_many(
+                &[WaitItem::new(receiver, Signals::READABLE)],
+                wait_token(4),
+                &sink,
+            )
+            .unwrap();
+        drop(registration);
+
+        table.channel_write(sender, b"canceled", &[]).unwrap();
+        assert_eq!(observer.count(), 0);
+    }
+
+    #[test]
+    fn direct_wait_capacity_failure_rolls_back_earlier_facets() {
+        let mut table = HandleTable::new();
+        let (full, _full_peer) = table.channel_create().unwrap();
+        let (rollback, _rollback_peer) = table.channel_create().unwrap();
+        let (_, sink) = counting_observer();
+        let mut full_registrations = Vec::new();
+        for raw in 1..=WAITERS_PER_FACET_LIMIT as u64 {
+            full_registrations.push(
+                table
+                    .register_wait_many(
+                        &[WaitItem::new(full, Signals::READABLE)],
+                        wait_token(raw),
+                        &sink,
+                    )
+                    .unwrap(),
+            );
+        }
+
+        let failed = table.register_wait_many(
+            &[
+                WaitItem::new(rollback, Signals::READABLE),
+                WaitItem::new(full, Signals::READABLE),
+            ],
+            wait_token(10_000),
+            &sink,
+        );
+        assert_eq!(failed.err(), Some(IpcError::WaiterLimit));
+        assert_eq!(IpcError::WaiterLimit.status(), Status::ResourceLimit);
+
+        let mut rollback_registrations = Vec::new();
+        for raw in 20_000..20_000 + WAITERS_PER_FACET_LIMIT as u64 {
+            rollback_registrations.push(
+                table
+                    .register_wait_many(
+                        &[WaitItem::new(rollback, Signals::READABLE)],
+                        wait_token(raw),
+                        &sink,
+                    )
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            table
+                .register_wait_many(
+                    &[WaitItem::new(rollback, Signals::READABLE)],
+                    wait_token(30_000),
+                    &sink,
+                )
+                .err(),
+            Some(IpcError::WaiterLimit)
+        );
+        drop(rollback_registrations);
+        drop(full_registrations);
+    }
+
+    #[test]
+    fn direct_channel_waits_cover_readable_writable_and_peer_close() {
+        let mut table = HandleTable::new();
+        let (left, right) = table.channel_create().unwrap();
+        let (observer, sink) = counting_observer();
+        let readable = table
+            .register_wait_many(
+                &[WaitItem::new(right, Signals::READABLE)],
+                wait_token(101),
+                &sink,
+            )
+            .unwrap();
+        table.channel_write(left, b"first", &[]).unwrap();
+        assert_eq!(observer.count(), 1);
+        drop(readable);
+
+        for _ in 1..CHANNEL_QUEUE_CAPACITY {
+            table.channel_write(left, b"fill", &[]).unwrap();
+        }
+        assert!(!table
+            .object_signals(left)
+            .unwrap()
+            .contains(Signals::WRITABLE));
+        let writable = table
+            .register_wait_many(
+                &[WaitItem::new(left, Signals::WRITABLE)],
+                wait_token(102),
+                &sink,
+            )
+            .unwrap();
+        table.channel_read(right, &mut [0; 5], &mut []).unwrap();
+        assert_eq!(observer.count(), 2);
+        assert_eq!(observer.last_token(), 102);
+        drop(writable);
+
+        let peer_closed = table
+            .register_wait_many(
+                &[WaitItem::new(left, Signals::PEER_CLOSED)],
+                wait_token(103),
+                &sink,
+            )
+            .unwrap();
+        table.handle_close(right).unwrap();
+        assert_eq!(observer.count(), 3);
+        assert_eq!(observer.last_token(), 103);
+        drop(peer_closed);
+    }
+
+    #[test]
+    fn direct_window_waits_cover_role_signal_mutations() {
+        let _shared_memory_test = SHARED_MEMORY_TEST_LOCK.lock();
+        let mut table = HandleTable::new();
+        let memory = table.shared_memory_create(8).unwrap();
+        let (client, manager) = table.window_create(memory).unwrap();
+        let (observer, sink) = counting_observer();
+
+        let manager_readable = table
+            .register_wait_many(
+                &[WaitItem::new(manager, Signals::READABLE)],
+                wait_token(201),
+                &sink,
+            )
+            .unwrap();
+        let first = table.window_present(client, 0, 1).unwrap();
+        assert_eq!(observer.last_token(), 201);
+        drop(manager_readable);
+
+        let client_writable = table
+            .register_wait_many(
+                &[WaitItem::new(client, Signals::WRITABLE)],
+                wait_token(202),
+                &sink,
+            )
+            .unwrap();
+        table.window_manager_complete(manager, first, true).unwrap();
+        assert_eq!(observer.last_token(), 202);
+        drop(client_writable);
+
+        let second = table.window_present(client, 1, 1).unwrap();
+        let client_readable = table
+            .register_wait_many(
+                &[WaitItem::new(client, Signals::READABLE)],
+                wait_token(203),
+                &sink,
+            )
+            .unwrap();
+        table
+            .window_manager_complete(manager, second, true)
+            .unwrap();
+        assert_eq!(observer.last_token(), 203);
+        drop(client_readable);
+
+        let release_writable = table
+            .register_wait_many(
+                &[WaitItem::new(client, Signals::WRITABLE)],
+                wait_token(204),
+                &sink,
+            )
+            .unwrap();
+        table.window_read_release(client).unwrap();
+        assert_eq!(observer.last_token(), 204);
+        drop(release_writable);
+
+        let retire_readable = table
+            .register_wait_many(
+                &[WaitItem::new(client, Signals::READABLE)],
+                wait_token(205),
+                &sink,
+            )
+            .unwrap();
+        table.window_manager_retire(manager).unwrap();
+        assert_eq!(observer.last_token(), 205);
+        drop(retire_readable);
+
+        let manager_peer_closed = table
+            .register_wait_many(
+                &[WaitItem::new(manager, Signals::PEER_CLOSED)],
+                wait_token(206),
+                &sink,
+            )
+            .unwrap();
+        table.handle_close(client).unwrap();
+        assert_eq!(observer.last_token(), 206);
+        assert_eq!(observer.count(), 6);
+        drop(manager_peer_closed);
+    }
+
+    #[test]
+    fn direct_process_wait_notifies_terminal_publication() {
+        let mut table = HandleTable::new();
+        let (process, control) = table.process_create().unwrap();
+        let (observer, sink) = counting_observer();
+        let registration = table
+            .register_wait_many(
+                &[WaitItem::new(process, Signals::TERMINATED)],
+                wait_token(301),
+                &sink,
+            )
+            .unwrap();
+
+        assert!(control.mark_exited(17));
+        assert_eq!(observer.count(), 1);
+        assert_eq!(observer.last_token(), 301);
+        assert!(!control.mark_terminated());
+        assert_eq!(observer.count(), 1);
+        drop(registration);
+    }
+
+    #[test]
+    fn direct_wait_state_facets_do_not_keep_endpoint_roles_open() {
+        let mut table = HandleTable::new();
+        let (left, right) = table.channel_create().unwrap();
+        let (channel_observer, channel_sink) = counting_observer();
+        let left_registration = table
+            .register_wait_many(
+                &[WaitItem::new(left, Signals::READABLE)],
+                wait_token(401),
+                &channel_sink,
+            )
+            .unwrap();
+        let right_registration = table
+            .register_wait_many(
+                &[WaitItem::new(right, Signals::PEER_CLOSED)],
+                wait_token(402),
+                &channel_sink,
+            )
+            .unwrap();
+        table.handle_close(left).unwrap();
+        assert_eq!(channel_observer.last_token(), 402);
+        assert!(table
+            .object_signals(right)
+            .unwrap()
+            .contains(Signals::PEER_CLOSED));
+        drop(left_registration);
+        drop(right_registration);
+
+        let _shared_memory_test = SHARED_MEMORY_TEST_LOCK.lock();
+        let memory = table.shared_memory_create(8).unwrap();
+        let (client, manager) = table.window_create(memory).unwrap();
+        let (window_observer, window_sink) = counting_observer();
+        let client_registration = table
+            .register_wait_many(
+                &[WaitItem::new(client, Signals::READABLE)],
+                wait_token(403),
+                &window_sink,
+            )
+            .unwrap();
+        let manager_registration = table
+            .register_wait_many(
+                &[WaitItem::new(manager, Signals::PEER_CLOSED)],
+                wait_token(404),
+                &window_sink,
+            )
+            .unwrap();
+        table.handle_close(client).unwrap();
+        assert_eq!(window_observer.last_token(), 404);
+        assert!(table
+            .object_signals(manager)
+            .unwrap()
+            .contains(Signals::PEER_CLOSED));
+        drop(client_registration);
+        drop(manager_registration);
     }
 }

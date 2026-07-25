@@ -1,18 +1,20 @@
 //! User process ownership, ELF construction, and shared-memory mappings.
 
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 use core::{fmt, mem, ptr};
 
 use ginkgo_filesystem::FileHandle;
 use ginkgo_ipc::{
-    Handle, HandleTable, IpcError, ProcessControl, SharedMemoryMappingAccess,
-    SharedMemoryMappingInfo, SharedMemoryMappingLease, WaitItem,
+    Handle, HandleTable, IpcError, ProcessControl, SchedulingAuthorityLease,
+    SharedMemoryMappingAccess, SharedMemoryMappingInfo, SharedMemoryMappingLease, SignalObserver,
+    Signals, WaitItem, WaitSetRegistration, WaitToken,
 };
 use ginkgo_sysapi::Rights;
 use ginkgo_sysapi::{
-    MapFlags, MapProtection, ProcessFault as PublicProcessFault, SharedMemoryMapArgs, Status,
-    VirtualAreaInfo, VirtualAreaKind, VirtualMapFileArgs, PROCESS_MAX_ARGS,
-    PROCESS_MAX_STARTUP_BYTES, PROCESS_MAX_STARTUP_HANDLES, VIRTUAL_AREA_INFO_VERSION,
+    MapFlags, MapProtection, ProcessFault as PublicProcessFault, RequestSubmitOutput,
+    SharedMemoryMapArgs, Status, ThreadSchedulingClass, VirtualAreaInfo, VirtualAreaKind,
+    VirtualMapFileArgs, PROCESS_MAX_ARGS, PROCESS_MAX_STARTUP_BYTES, PROCESS_MAX_STARTUP_HANDLES,
+    VIRTUAL_AREA_INFO_VERSION,
 };
 use x86_64::{
     structures::paging::{PhysFrame, Size4KiB},
@@ -25,11 +27,12 @@ use crate::{
     memory::{UsableFrameAllocator, PAGE_SIZE},
     paging::{
         address_space::{
-            AddressSpace, AddressSpaceError, FrameReclaimStats, RetiredAddressSpace, UserAccess,
-            UserPagePermissions,
+            AddressSpace, AddressSpaceError, FrameReclaimStats, PinnedUserPage,
+            RetiredAddressSpace, UserAccess, UserPagePermissions,
         },
         ActivePageTable,
     },
+    request::RequestId,
     thread_scheduler::{SchedulingClass, ThreadMetrics as SchedulerMetrics, ThreadSnapshot},
 };
 
@@ -58,6 +61,16 @@ const STACK_GROWTH_INVARIANT_REASON: u16 = 2;
 const STACK_GROWTH_INVARIANT_CODE: u64 = 0x5354_0001;
 const PAGE_FAULT_PRESENT: u64 = 1 << 0;
 const PAGE_FAULT_USER: u64 = 1 << 2;
+
+fn public_scheduling_class(class: SchedulingClass) -> ThreadSchedulingClass {
+    match class {
+        SchedulingClass::Critical => ThreadSchedulingClass::Critical,
+        SchedulingClass::Audio => ThreadSchedulingClass::Audio,
+        SchedulingClass::Interactive => ThreadSchedulingClass::Interactive,
+        SchedulingClass::Normal => ThreadSchedulingClass::Normal,
+        SchedulingClass::Background => ThreadSchedulingClass::Background,
+    }
+}
 
 /// Magic (`GKSP`) and version for the direct-process startup block passed in RDI.
 ///
@@ -255,6 +268,11 @@ pub(crate) enum WaitManyCompletion {
 ///
 /// User memory is represented only by validated virtual-address integers. No
 /// userspace pointer or Rust borrow survives syscall dispatch.
+pub(crate) struct BlockedWaitRegistration {
+    pub(crate) token: WaitToken,
+    pub(crate) objects: Option<WaitSetRegistration>,
+}
+
 pub(crate) struct PendingWaitMany {
     pub(crate) items: Vec<WaitItem>,
     pub(crate) encoded_items: Vec<u8>,
@@ -262,10 +280,12 @@ pub(crate) struct PendingWaitMany {
     pub(crate) output_address: u64,
     pub(crate) deadline: WaitDeadline,
     pub(crate) completion: Option<WaitManyCompletion>,
+    pub(crate) registration: Option<BlockedWaitRegistration>,
 }
 
 pub(crate) struct PendingSleep {
     pub(crate) deadline_ns: u64,
+    pub(crate) registration: Option<BlockedWaitRegistration>,
 }
 
 pub(crate) struct PendingJoin {
@@ -273,19 +293,42 @@ pub(crate) struct PendingJoin {
     pub(crate) deadline: WaitDeadline,
     pub(crate) output_address: u64,
     pub(crate) completion: Option<Status>,
+    pub(crate) registration: Option<BlockedWaitRegistration>,
+}
+
+pub(crate) struct PendingRequestOutput {
+    pub(crate) address: u64,
+    pub(crate) pages: Vec<PinnedUserPage>,
+}
+
+pub(crate) struct PendingRequestCountOutput {
+    pub(crate) address: u64,
+    pub(crate) pages: Vec<PinnedUserPage>,
+}
+
+pub(crate) struct PendingRequest {
+    pub(crate) id: RequestId,
+    pub(crate) output: Option<PendingRequestOutput>,
+    pub(crate) count_output: Option<PendingRequestCountOutput>,
+    pub(crate) hidden_handle: Handle,
+    pub(crate) completion: Option<RequestSubmitOutput>,
+    pub(crate) return_operation_status: bool,
+    pub(crate) registration: Option<BlockedWaitRegistration>,
 }
 
 pub(crate) enum BlockedSyscall {
     WaitMany(PendingWaitMany),
     Sleep(PendingSleep),
     Join(PendingJoin),
+    Request(PendingRequest),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BlockedKind {
+pub enum BlockedKind {
     WaitMany,
     Sleep,
     Join,
+    Request,
 }
 
 /// Fully allocated direct-process startup bytes awaiting child-local handles.
@@ -1060,7 +1103,10 @@ pub struct Thread {
     detached: bool,
     join_claimed_by: Option<ThreadId>,
     wake_permit: bool,
-    scheduling_class: SchedulingClass,
+    fallback_scheduling_class: SchedulingClass,
+    kernel_scheduling_class: Option<SchedulingClass>,
+    delegated_scheduling_class: Option<(SchedulingClass, SchedulingAuthorityLease)>,
+    focused_interactive: bool,
     effective_class: SchedulingClass,
     scheduler_budget_remaining_ns: u64,
     scheduler_metrics: SchedulerMetrics,
@@ -1082,8 +1128,21 @@ impl Thread {
         self.preemption_count
     }
 
-    pub const fn scheduling_class(&self) -> SchedulingClass {
-        self.scheduling_class
+    pub fn scheduling_class(&self) -> SchedulingClass {
+        if let Some(class) = self.kernel_scheduling_class {
+            return class;
+        }
+        if let Some((class, authority)) = &self.delegated_scheduling_class {
+            if authority.authorizes(public_scheduling_class(*class)) {
+                return *class;
+            }
+        }
+        if self.focused_interactive && self.fallback_scheduling_class != SchedulingClass::Background
+        {
+            SchedulingClass::Interactive
+        } else {
+            self.fallback_scheduling_class
+        }
     }
 
     pub const fn scheduler_metrics(&self) -> SchedulerMetrics {
@@ -1541,7 +1600,10 @@ impl Process {
             detached: false,
             join_claimed_by: None,
             wake_permit: false,
-            scheduling_class: SchedulingClass::Normal,
+            fallback_scheduling_class: SchedulingClass::Normal,
+            kernel_scheduling_class: None,
+            delegated_scheduling_class: None,
+            focused_interactive: false,
             effective_class: SchedulingClass::Normal,
             scheduler_budget_remaining_ns: 0,
             scheduler_metrics: SchedulerMetrics::default(),
@@ -1669,7 +1731,7 @@ impl Process {
     )> {
         self.thread(id).map(|thread| {
             (
-                thread.scheduling_class,
+                thread.scheduling_class(),
                 thread.effective_class,
                 thread.scheduler_budget_remaining_ns,
                 thread.scheduler_metrics,
@@ -1686,9 +1748,26 @@ impl Process {
         if !matches!(class, SchedulingClass::Normal | SchedulingClass::Background) {
             return Err(Status::AccessDenied);
         }
+        let thread = self.thread_mut(id).ok_or(Status::InvalidHandle)?;
+        thread.fallback_scheduling_class = class;
+        thread.delegated_scheduling_class = None;
+        Ok(())
+    }
+
+    pub fn set_thread_scheduling_class_with_authority(
+        &mut self,
+        id: ThreadId,
+        class: SchedulingClass,
+        authority: SchedulingAuthorityLease,
+    ) -> Result<(), Status> {
+        if !matches!(class, SchedulingClass::Audio | SchedulingClass::Interactive)
+            || !authority.authorizes(public_scheduling_class(class))
+        {
+            return Err(Status::AccessDenied);
+        }
         self.thread_mut(id)
             .ok_or(Status::InvalidHandle)?
-            .scheduling_class = class;
+            .delegated_scheduling_class = Some((class, authority));
         Ok(())
     }
 
@@ -1699,8 +1778,16 @@ impl Process {
     ) -> Result<(), Status> {
         self.thread_mut(id)
             .ok_or(Status::InvalidHandle)?
-            .scheduling_class = class;
+            .kernel_scheduling_class = Some(class);
         Ok(())
+    }
+
+    pub fn set_focused_interactive(&mut self, focused: bool) {
+        for slot in &mut self.threads.slots {
+            if let Some(thread) = slot.thread.as_mut() {
+                thread.focused_interactive = focused;
+            }
+        }
     }
 
     pub fn record_scheduler_snapshot(&mut self, id: ThreadId, snapshot: ThreadSnapshot) {
@@ -1877,7 +1964,10 @@ impl Process {
                 detached: false,
                 join_claimed_by: None,
                 wake_permit: false,
-                scheduling_class: SchedulingClass::Normal,
+                fallback_scheduling_class: SchedulingClass::Normal,
+                kernel_scheduling_class: None,
+                delegated_scheduling_class: None,
+                focused_interactive: false,
                 effective_class: SchedulingClass::Normal,
                 scheduler_budget_remaining_ns: 0,
                 scheduler_metrics: SchedulerMetrics::default(),
@@ -1967,6 +2057,18 @@ impl Process {
         self.control = Some(control);
     }
 
+    pub fn register_termination_observer(
+        &self,
+        token: WaitToken,
+        observer: &Arc<dyn SignalObserver>,
+    ) -> Result<bool, IpcError> {
+        let Some(control) = &self.control else {
+            return Ok(false);
+        };
+        control.register_termination_observer(token, observer)?;
+        Ok(true)
+    }
+
     pub fn termination_requested(&self) -> bool {
         self.control
             .as_ref()
@@ -1977,12 +2079,12 @@ impl Process {
         if self.terminal_state.is_some() {
             return;
         }
+        self.cancel_all_blocked_syscalls();
         for slot in &mut self.threads.slots {
             let Some(thread) = slot.thread.as_mut() else {
                 continue;
             };
             if !thread.state.is_terminal() {
-                thread.blocked_syscall = None;
                 thread.state = ThreadState::Terminated;
             }
         }
@@ -2335,7 +2437,7 @@ impl Process {
             .expect("blocked thread lost its syscall continuation")
         {
             BlockedSyscall::WaitMany(wait) => wait,
-            BlockedSyscall::Sleep(_) | BlockedSyscall::Join(_) => {
+            BlockedSyscall::Sleep(_) | BlockedSyscall::Join(_) | BlockedSyscall::Request(_) => {
                 panic!("blocked thread does not own a wait-many continuation")
             }
         };
@@ -2355,10 +2457,82 @@ impl Process {
             .expect("blocked thread lost its syscall continuation")
         {
             BlockedSyscall::WaitMany(wait) => wait,
-            BlockedSyscall::Sleep(_) | BlockedSyscall::Join(_) => {
+            BlockedSyscall::Sleep(_) | BlockedSyscall::Join(_) | BlockedSyscall::Request(_) => {
                 panic!("blocked thread does not own a wait-many continuation")
             }
         }
+    }
+
+    pub(crate) fn block_thread_request(&mut self, thread_id: ThreadId, pending: PendingRequest) {
+        let thread = self
+            .thread_mut(thread_id)
+            .expect("request caller thread disappeared");
+        assert_eq!(
+            thread.state,
+            ThreadState::Ready,
+            "only a ready thread can block"
+        );
+        assert!(
+            thread.blocked_syscall.is_none(),
+            "ready thread retained a blocked syscall"
+        );
+        thread.blocked_syscall = Some(BlockedSyscall::Request(pending));
+        thread.state = ThreadState::Blocked;
+    }
+
+    pub fn blocked_request_id(&self, thread_id: ThreadId) -> Option<RequestId> {
+        let BlockedSyscall::Request(request) = self.thread(thread_id)?.blocked_syscall.as_ref()?
+        else {
+            return None;
+        };
+        Some(request.id)
+    }
+
+    pub fn stage_request_completion(
+        &mut self,
+        thread_id: ThreadId,
+        id: RequestId,
+        output: RequestSubmitOutput,
+    ) -> bool {
+        let Some(BlockedSyscall::Request(request)) = self
+            .thread_mut(thread_id)
+            .and_then(|thread| thread.blocked_syscall.as_mut())
+        else {
+            return false;
+        };
+        if request.id != id || request.completion.is_some() {
+            return false;
+        }
+        request.completion = Some(output);
+        true
+    }
+
+    pub(crate) fn take_completed_request(
+        &mut self,
+        thread_id: ThreadId,
+    ) -> Result<PendingRequest, Status> {
+        let thread = self.thread_mut(thread_id).ok_or(Status::InvalidHandle)?;
+        let Some(blocked) = thread.blocked_syscall.take() else {
+            return Err(Status::InvalidArgument);
+        };
+        let BlockedSyscall::Request(request) = blocked else {
+            thread.blocked_syscall = Some(blocked);
+            return Err(Status::InvalidArgument);
+        };
+        if request.completion.is_none() {
+            thread.blocked_syscall = Some(BlockedSyscall::Request(request));
+            return Err(Status::ShouldWait);
+        }
+        Ok(request)
+    }
+
+    pub(crate) fn finish_request(&mut self, thread_id: ThreadId) -> Result<(), Status> {
+        let thread = self.thread_mut(thread_id).ok_or(Status::InvalidHandle)?;
+        if thread.state != ThreadState::Blocked || thread.blocked_syscall.is_some() {
+            return Err(Status::InvalidArgument);
+        }
+        thread.state = ThreadState::Ready;
+        Ok(())
     }
 
     pub(crate) fn resume_thread_from_block(&mut self, thread_id: ThreadId) {
@@ -2443,24 +2617,35 @@ impl Process {
         if thread.state != ThreadState::Ready || thread.blocked_syscall.is_some() {
             return Err(Status::InvalidArgument);
         }
-        thread.blocked_syscall = Some(BlockedSyscall::Sleep(PendingSleep { deadline_ns }));
+        thread.blocked_syscall = Some(BlockedSyscall::Sleep(PendingSleep {
+            deadline_ns,
+            registration: None,
+        }));
         thread.state = ThreadState::Blocked;
         Ok(true)
     }
 
     pub fn wake_thread(&mut self, thread_id: ThreadId) -> Result<(), Status> {
-        let thread = self.thread_mut(thread_id).ok_or(Status::InvalidHandle)?;
-        if thread.state.is_terminal() {
-            return Err(Status::InvalidHandle);
-        }
-        if matches!(thread.blocked_syscall, Some(BlockedSyscall::Sleep(_))) {
-            thread.blocked_syscall = None;
+        let sleeping = {
+            let thread = self.thread(thread_id).ok_or(Status::InvalidHandle)?;
+            if thread.state.is_terminal() {
+                return Err(Status::InvalidHandle);
+            }
+            matches!(thread.blocked_syscall, Some(BlockedSyscall::Sleep(_)))
+        };
+        if sleeping {
+            self.cancel_blocked_syscall(thread_id);
+            let thread = self
+                .thread_mut(thread_id)
+                .expect("validated sleeping thread disappeared");
             thread
                 .context
                 .set_syscall_return(Status::Ok.raw() as i64 as u64);
             thread.state = ThreadState::Ready;
         } else {
-            thread.wake_permit = true;
+            self.thread_mut(thread_id)
+                .expect("validated thread disappeared")
+                .wake_permit = true;
         }
         Ok(())
     }
@@ -2470,14 +2655,202 @@ impl Process {
             BlockedSyscall::WaitMany(_) => Some(BlockedKind::WaitMany),
             BlockedSyscall::Sleep(_) => Some(BlockedKind::Sleep),
             BlockedSyscall::Join(_) => Some(BlockedKind::Join),
+            BlockedSyscall::Request(_) => Some(BlockedKind::Request),
         }
+    }
+
+    pub fn blocked_wait_spec(
+        &self,
+        thread_id: ThreadId,
+    ) -> Option<(BlockedKind, Option<u64>, Option<WaitToken>)> {
+        let blocked = self.thread(thread_id)?.blocked_syscall.as_ref()?;
+        let (kind, deadline, registration) = match blocked {
+            BlockedSyscall::WaitMany(wait) => (
+                BlockedKind::WaitMany,
+                match wait.deadline {
+                    WaitDeadline::Infinite => None,
+                    WaitDeadline::At(deadline) => Some(deadline),
+                },
+                wait.registration.as_ref(),
+            ),
+            BlockedSyscall::Sleep(sleep) => (
+                BlockedKind::Sleep,
+                Some(sleep.deadline_ns),
+                sleep.registration.as_ref(),
+            ),
+            BlockedSyscall::Join(join) => (
+                BlockedKind::Join,
+                match join.deadline {
+                    WaitDeadline::Infinite => None,
+                    WaitDeadline::At(deadline) => Some(deadline),
+                },
+                join.registration.as_ref(),
+            ),
+            BlockedSyscall::Request(request) => {
+                (BlockedKind::Request, None, request.registration.as_ref())
+            }
+        };
+        Some((
+            kind,
+            deadline,
+            registration.map(|registration| registration.token),
+        ))
+    }
+
+    pub fn install_blocked_wait_registration(
+        &mut self,
+        thread_id: ThreadId,
+        token: WaitToken,
+        observer: &Arc<dyn SignalObserver>,
+    ) -> Result<(), IpcError> {
+        let handles =
+            self.handles
+                .as_ref()
+                .expect("live process lost its handle table") as *const HandleTable;
+        let thread = self
+            .thread_mut(thread_id)
+            .expect("blocked wait thread disappeared");
+        assert_eq!(thread.state, ThreadState::Blocked, "thread is not blocked");
+        let blocked = thread
+            .blocked_syscall
+            .as_mut()
+            .expect("blocked thread lost its syscall continuation");
+        match blocked {
+            BlockedSyscall::WaitMany(wait) => {
+                assert!(wait.registration.is_none(), "wait was registered twice");
+                wait.registration = Some(BlockedWaitRegistration {
+                    token,
+                    objects: None,
+                });
+                // SAFETY: `handles` and `threads` are disjoint process fields and the
+                // handle table is not moved while this method runs.
+                let objects =
+                    unsafe { &*handles }.register_wait_many(&wait.items, token, observer)?;
+                wait.registration
+                    .as_mut()
+                    .expect("wait registration disappeared")
+                    .objects = Some(objects);
+            }
+            BlockedSyscall::Sleep(sleep) => {
+                assert!(sleep.registration.is_none(), "sleep was registered twice");
+                sleep.registration = Some(BlockedWaitRegistration {
+                    token,
+                    objects: None,
+                });
+            }
+            BlockedSyscall::Join(join) => {
+                assert!(join.registration.is_none(), "join was registered twice");
+                join.registration = Some(BlockedWaitRegistration {
+                    token,
+                    objects: None,
+                });
+            }
+            BlockedSyscall::Request(request) => {
+                assert!(
+                    request.registration.is_none(),
+                    "request was registered twice"
+                );
+                request.registration = Some(BlockedWaitRegistration {
+                    token,
+                    objects: None,
+                });
+                let item = WaitItem::new(request.hidden_handle, Signals::SIGNALED);
+                // SAFETY: `handles` and `threads` are disjoint process fields and the
+                // handle table is not moved while this method runs.
+                let objects = unsafe { &*handles }.register_wait_many(&[item], token, observer)?;
+                request
+                    .registration
+                    .as_mut()
+                    .expect("request registration disappeared")
+                    .objects = Some(objects);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn fail_blocked_wait_registration(&mut self, thread_id: ThreadId, status: Status) -> bool {
+        let kind = self.blocked_kind(thread_id);
+        match kind {
+            Some(BlockedKind::WaitMany) => {
+                let (_, wait) = self.blocked_thread_wait_many_parts(thread_id);
+                wait.completion = Some(WaitManyCompletion::Failed(status));
+                true
+            }
+            Some(BlockedKind::Join) => {
+                let target = {
+                    let Some(thread) = self.thread_mut(thread_id) else {
+                        return false;
+                    };
+                    let Some(BlockedSyscall::Join(join)) = thread.blocked_syscall.as_mut() else {
+                        return false;
+                    };
+                    join.completion = Some(status);
+                    join.target
+                };
+                self.release_join_claim(target, thread_id);
+                true
+            }
+            Some(BlockedKind::Sleep | BlockedKind::Request) => {
+                self.cancel_blocked_syscall(thread_id);
+                let Some(thread) = self.thread_mut(thread_id) else {
+                    return false;
+                };
+                thread
+                    .context
+                    .set_syscall_return(status.raw() as i64 as u64);
+                thread.state = ThreadState::Ready;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn clear_blocked_wait_registration(
+        &mut self,
+        thread_id: ThreadId,
+        token: WaitToken,
+    ) -> bool {
+        let Some(blocked) = self
+            .thread_mut(thread_id)
+            .and_then(|thread| thread.blocked_syscall.as_mut())
+        else {
+            return false;
+        };
+        let registration = match blocked {
+            BlockedSyscall::WaitMany(wait) => &mut wait.registration,
+            BlockedSyscall::Sleep(sleep) => &mut sleep.registration,
+            BlockedSyscall::Join(join) => &mut join.registration,
+            BlockedSyscall::Request(request) => &mut request.registration,
+        };
+        if registration
+            .as_ref()
+            .is_some_and(|registration| registration.token == token)
+        {
+            *registration = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn blocked_join_target(&self, caller: ThreadId) -> Option<ThreadId> {
+        let BlockedSyscall::Join(join) = self.thread(caller)?.blocked_syscall.as_ref()? else {
+            return None;
+        };
+        Some(join.target)
+    }
+
+    pub fn blocked_join_claimant(&self, target: ThreadId) -> Option<ThreadId> {
+        self.thread(target)?.join_claimed_by
     }
 
     pub fn poll_sleep(&mut self, thread_id: ThreadId, now_ns: u64) -> Option<bool> {
         let thread = self.thread_mut(thread_id)?;
         match thread.blocked_syscall.as_ref()? {
             BlockedSyscall::Sleep(sleep) => Some(now_ns >= sleep.deadline_ns),
-            BlockedSyscall::WaitMany(_) | BlockedSyscall::Join(_) => None,
+            BlockedSyscall::WaitMany(_) | BlockedSyscall::Join(_) | BlockedSyscall::Request(_) => {
+                None
+            }
         }
     }
 
@@ -2533,6 +2906,7 @@ impl Process {
             deadline,
             output_address,
             completion: None,
+            registration: None,
         }));
         caller_thread.state = ThreadState::Blocked;
         Ok(true)
@@ -2598,12 +2972,44 @@ impl Process {
         }
     }
 
+    fn release_pending_request(&mut self, mut request: PendingRequest) {
+        if let Some(output) = request.output.as_mut() {
+            if let Some(address_space) = self.address_space.as_mut() {
+                let _ = address_space.unpin_user_pages(&output.pages);
+            }
+            output.pages.clear();
+        }
+        if let Some(count_output) = request.count_output.as_mut() {
+            if let Some(address_space) = self.address_space.as_mut() {
+                let _ = address_space.unpin_user_pages(&count_output.pages);
+            }
+            count_output.pages.clear();
+        }
+        if let Some(handles) = self.handles.as_mut() {
+            let _ = handles.handle_close(request.hidden_handle);
+        }
+        request.hidden_handle = Handle::INVALID;
+    }
+
     fn cancel_blocked_syscall(&mut self, thread_id: ThreadId) {
         let blocked = self
             .thread_mut(thread_id)
             .and_then(|thread| thread.blocked_syscall.take());
-        if let Some(BlockedSyscall::Join(join)) = blocked {
-            self.release_join_claim(join.target, thread_id);
+        match blocked {
+            Some(BlockedSyscall::Join(join)) => {
+                self.release_join_claim(join.target, thread_id);
+            }
+            Some(BlockedSyscall::Request(request)) => self.release_pending_request(request),
+            Some(BlockedSyscall::WaitMany(_) | BlockedSyscall::Sleep(_)) | None => {}
+        }
+    }
+
+    fn cancel_all_blocked_syscalls(&mut self) {
+        for index in 0..self.threads.slots.len() {
+            let generation = self.threads.slots[index].generation;
+            if self.threads.slots[index].thread.is_some() {
+                self.cancel_blocked_syscall(ThreadId::from_parts(index as u32, generation));
+            }
         }
     }
 
@@ -2718,9 +3124,9 @@ impl Process {
         if self.terminal_state.is_some() {
             return;
         }
+        self.cancel_all_blocked_syscalls();
         for slot in &mut self.threads.slots {
             if let Some(thread) = slot.thread.as_mut() {
-                thread.blocked_syscall = None;
                 thread.join_claimed_by = None;
                 thread.state = if thread.state.is_terminal() {
                     thread.state
@@ -2745,9 +3151,9 @@ impl Process {
         if self.terminal_state.is_some() {
             return;
         }
+        self.cancel_all_blocked_syscalls();
         for slot in &mut self.threads.slots {
             if let Some(thread) = slot.thread.as_mut() {
-                thread.blocked_syscall = None;
                 thread.join_claimed_by = None;
                 thread.state = if thread.state.is_terminal() {
                     thread.state
@@ -2833,11 +3239,18 @@ impl Process {
 
     /// Sets the first four System V AMD64 arguments for the initial user entry.
     pub fn set_start_arguments(&mut self, [rdi, rsi, rdx, rcx]: [u64; 4]) {
+        self.set_start_arguments6([rdi, rsi, rdx, rcx, 0, 0]);
+    }
+
+    /// Sets all six integer System V AMD64 arguments for the initial user entry.
+    pub fn set_start_arguments6(&mut self, [rdi, rsi, rdx, rcx, r8, r9]: [u64; 6]) {
         let context = &mut self.main_thread_mut().context;
         context.rdi = rdi;
         context.rsi = rsi;
         context.rdx = rdx;
         context.rcx = rcx;
+        context.r8 = r8;
+        context.r9 = r9;
     }
 
     pub fn context_mut(&mut self) -> &mut UserContext {
@@ -3822,6 +4235,7 @@ impl Process {
             return Err(ProcessRetireError { process: self });
         }
 
+        self.cancel_all_blocked_syscalls();
         let final_state = self.state();
         let context = self.retirement_context;
         let address_space = self
@@ -5276,6 +5690,23 @@ impl ProcessTable {
         None
     }
 
+    pub fn next_terminal_thread(&mut self) -> Option<ThreadRef> {
+        let process_count = self.inner.len;
+        for _ in 0..process_count {
+            let process_id = self.inner.next_id()?;
+            let process = self.inner.get_mut(process_id)?;
+            if process.state().is_terminal() {
+                let thread_id = process.thread_ids().next()?;
+                return Some(ThreadRef {
+                    process_id,
+                    thread_id,
+                });
+            }
+        }
+        None
+    }
+
+    #[cfg(test)]
     pub fn next_blocked_or_terminal_thread(&mut self) -> Option<ThreadRef> {
         let process_count = self.inner.len;
         for _ in 0..process_count {
@@ -5332,6 +5763,8 @@ mod tests {
     };
 
     use ginkgo_filesystem::{MemoryDisk, RedoxFs};
+    use ginkgo_ipc::RequestControl;
+    use ginkgo_sysapi::{RequestInfo, RequestState};
 
     use super::*;
     use crate::shared_memory::test_support::TestSharedMemoryContext;
@@ -5539,7 +5972,10 @@ mod tests {
             detached: false,
             join_claimed_by: None,
             wake_permit: false,
-            scheduling_class: SchedulingClass::Normal,
+            fallback_scheduling_class: SchedulingClass::Normal,
+            kernel_scheduling_class: None,
+            delegated_scheduling_class: None,
+            focused_interactive: false,
             effective_class: SchedulingClass::Normal,
             scheduler_budget_remaining_ns: 0,
             scheduler_metrics: SchedulerMetrics::default(),
@@ -6957,7 +7393,295 @@ mod tests {
             output_address: 0x2000,
             deadline,
             completion: None,
+            registration: None,
         }
+    }
+
+    struct RequestObserver(AtomicUsize);
+
+    impl SignalObserver for RequestObserver {
+        fn notify(&self, _token: WaitToken) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn pending_request(
+        process: &mut Process,
+        allocator: &mut UsableFrameAllocator<'_>,
+        id: RequestId,
+    ) -> (PendingRequest, RequestControl) {
+        let output_address = process
+            .map_anonymous(
+                PAGE_SIZE,
+                MapProtection::READ | MapProtection::WRITE,
+                allocator,
+            )
+            .unwrap();
+        let output_pages = process
+            .address_space_mut()
+            .pin_user_range(
+                output_address,
+                mem::size_of::<RequestSubmitOutput>(),
+                UserAccess::Write,
+            )
+            .unwrap();
+        let control = RequestControl::new(
+            id.raw(),
+            RequestInfo {
+                state: RequestState::Pending as u32,
+                ..RequestInfo::default()
+            },
+        )
+        .unwrap();
+        let hidden_handle = process.handles_mut().request_install(&control).unwrap();
+        (
+            PendingRequest {
+                id,
+                output: Some(PendingRequestOutput {
+                    address: output_address,
+                    pages: output_pages,
+                }),
+                count_output: None,
+                hidden_handle,
+                completion: None,
+                return_operation_status: false,
+                registration: None,
+            },
+            control,
+        )
+    }
+
+    fn outputless_pending_request(
+        process: &mut Process,
+        id: RequestId,
+    ) -> (PendingRequest, RequestControl) {
+        let control = RequestControl::new(
+            id.raw(),
+            RequestInfo {
+                state: RequestState::Pending as u32,
+                ..RequestInfo::default()
+            },
+        )
+        .unwrap();
+        let hidden_handle = process.handles_mut().request_install(&control).unwrap();
+        (
+            PendingRequest {
+                id,
+                output: None,
+                count_output: None,
+                hidden_handle,
+                completion: None,
+                return_operation_status: true,
+                registration: None,
+            },
+            control,
+        )
+    }
+
+    #[test]
+    fn request_block_stage_take_and_finish_preserve_completion_resources() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(96);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let thread_id = process.main_thread_id();
+        let id = RequestId::from_raw(0x0000_0001_0000_0001);
+        let other_id = RequestId::from_raw(0x0000_0001_0000_0002);
+        let (pending, _control) = pending_request(&mut process, &mut allocator, id);
+        let hidden_handle = pending.hidden_handle;
+        let output_address = pending.output.as_ref().unwrap().address;
+
+        process.block_thread_request(thread_id, pending);
+        assert_eq!(process.blocked_request_id(thread_id), Some(id));
+        assert_eq!(process.blocked_kind(thread_id), Some(BlockedKind::Request));
+        assert!(matches!(
+            process.take_completed_request(thread_id),
+            Err(Status::ShouldWait)
+        ));
+
+        let output = RequestSubmitOutput {
+            request: Handle::from_raw(77),
+            state: RequestState::Completed as u32,
+            result: Status::Ok as i32,
+            result_flags: 3,
+            bytes_transferred: 41,
+        };
+        assert!(!process.stage_request_completion(thread_id, other_id, output));
+        assert!(process.stage_request_completion(thread_id, id, output));
+        assert!(!process.stage_request_completion(thread_id, id, output));
+
+        let completed = process.take_completed_request(thread_id).unwrap();
+        assert_eq!(completed.id, id);
+        let completed_output = completed.output.as_ref().unwrap();
+        assert_eq!(completed_output.address, output_address);
+        assert_eq!(completed.completion, Some(output));
+        assert!(!completed.return_operation_status);
+        process
+            .address_space_mut()
+            .unpin_user_pages(&completed_output.pages)
+            .unwrap();
+        process.handles_mut().handle_close(hidden_handle).unwrap();
+        process.finish_request(thread_id).unwrap();
+        assert_eq!(process.thread_state(thread_id), Some(ThreadState::Ready));
+
+        process.mark_exited(0);
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+    }
+
+    #[test]
+    fn outputless_request_cancellation_closes_handle_without_releasing_other_pins() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(96);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let thread_id = process.main_thread_id();
+        let unrelated_address = process
+            .map_anonymous(
+                PAGE_SIZE,
+                MapProtection::READ | MapProtection::WRITE,
+                &mut allocator,
+            )
+            .unwrap();
+        let unrelated_pages = process
+            .address_space_mut()
+            .pin_user_range(unrelated_address, 1, UserAccess::Write)
+            .unwrap();
+        let id = RequestId::from_raw(0x0000_0005_0000_0001);
+        let (pending, _control) = outputless_pending_request(&mut process, id);
+        let hidden_handle = pending.hidden_handle;
+        assert!(pending.output.is_none());
+        assert!(pending.return_operation_status);
+        process.block_thread_request(thread_id, pending);
+
+        process.cancel_blocked_syscall(thread_id);
+        assert_eq!(process.address_space().pinned_page_references(), 1);
+        assert_eq!(
+            process.handles().handle_rights(hidden_handle),
+            Err(IpcError::InvalidHandle)
+        );
+        process
+            .address_space_mut()
+            .unpin_user_pages(&unrelated_pages)
+            .unwrap();
+
+        process.mark_exited(0);
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+    }
+
+    #[test]
+    fn blocked_request_registers_hidden_signaled_handle() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(96);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let thread_id = process.main_thread_id();
+        let id = RequestId::from_raw(0x0000_0002_0000_0001);
+        let (pending, control) = pending_request(&mut process, &mut allocator, id);
+        process.block_thread_request(thread_id, pending);
+
+        let token = WaitToken::from_raw(9).unwrap();
+        let observer = Arc::new(RequestObserver(AtomicUsize::new(0)));
+        let sink: Arc<dyn SignalObserver> = observer.clone();
+        process
+            .install_blocked_wait_registration(thread_id, token, &sink)
+            .unwrap();
+        assert_eq!(
+            process.blocked_wait_spec(thread_id),
+            Some((BlockedKind::Request, None, Some(token)))
+        );
+
+        assert!(control.publish_terminal(RequestInfo {
+            state: RequestState::Completed as u32,
+            ..RequestInfo::default()
+        }));
+        assert_eq!(observer.0.load(Ordering::Relaxed), 1);
+        assert!(process.clear_blocked_wait_registration(thread_id, token));
+        assert_eq!(
+            process.blocked_wait_spec(thread_id),
+            Some((BlockedKind::Request, None, None))
+        );
+
+        process.mark_exited(0);
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+    }
+
+    #[test]
+    fn blocked_request_cancellation_unpins_output_and_closes_hidden_handle_once() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(96);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let thread_id = process.main_thread_id();
+        let id = RequestId::from_raw(0x0000_0003_0000_0001);
+        let (pending, _control) = pending_request(&mut process, &mut allocator, id);
+        let hidden_handle = pending.hidden_handle;
+        assert_eq!(process.address_space().pinned_page_references(), 1);
+        assert!(process.handles().handle_rights(hidden_handle).is_ok());
+        process.block_thread_request(thread_id, pending);
+
+        process.cancel_blocked_syscall(thread_id);
+        assert_eq!(process.address_space().pinned_page_references(), 0);
+        assert_eq!(
+            process.handles().handle_rights(hidden_handle),
+            Err(IpcError::InvalidHandle)
+        );
+        assert!(process.thread(thread_id).unwrap().blocked_syscall.is_none());
+        process.cancel_blocked_syscall(thread_id);
+        assert_eq!(process.address_space().pinned_page_references(), 0);
+
+        process.mark_exited(0);
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+    }
+
+    #[test]
+    fn blocked_request_cancellation_unpins_count_output_once_alongside_output() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(128);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let thread_id = process.main_thread_id();
+        let id = RequestId::from_raw(0x0000_0006_0000_0001);
+        let (mut pending, _control) = pending_request(&mut process, &mut allocator, id);
+        let count_address = process
+            .map_anonymous(
+                PAGE_SIZE,
+                MapProtection::READ | MapProtection::WRITE,
+                &mut allocator,
+            )
+            .unwrap();
+        let count_pages = process
+            .address_space_mut()
+            .pin_user_range(count_address, mem::size_of::<u64>(), UserAccess::Write)
+            .unwrap();
+        pending.count_output = Some(PendingRequestCountOutput {
+            address: count_address,
+            pages: count_pages,
+        });
+        assert_eq!(
+            pending.count_output.as_ref().unwrap().address,
+            count_address
+        );
+        assert_eq!(process.address_space().pinned_page_references(), 2);
+        process.block_thread_request(thread_id, pending);
+
+        process.cancel_blocked_syscall(thread_id);
+        assert_eq!(process.address_space().pinned_page_references(), 0);
+        process.cancel_blocked_syscall(thread_id);
+        assert_eq!(process.address_space().pinned_page_references(), 0);
+
+        process.mark_exited(0);
+        process.retire().unwrap().reclaim(&mut allocator).unwrap();
+    }
+
+    #[test]
+    fn process_teardown_releases_blocked_request_resources_before_retirement() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(96);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let thread_id = process.main_thread_id();
+        let id = RequestId::from_raw(0x0000_0004_0000_0001);
+        let (pending, _control) = pending_request(&mut process, &mut allocator, id);
+        let hidden_handle = pending.hidden_handle;
+        process.block_thread_request(thread_id, pending);
+
+        process.mark_exited(7);
+        assert_eq!(process.address_space().pinned_page_references(), 0);
+        assert_eq!(
+            process.handles().handle_rights(hidden_handle),
+            Err(IpcError::InvalidHandle)
+        );
+        assert!(process.thread(thread_id).unwrap().blocked_syscall.is_none());
+        let reclaimed = process.retire().unwrap().reclaim(&mut allocator).unwrap();
+        assert_eq!(reclaimed.teardown.handles_closed, 0);
     }
 
     #[test]
@@ -7189,6 +7913,55 @@ mod tests {
         assert!(process
             .thread(ThreadId::from_raw(id.slot() as u64))
             .is_none());
+    }
+
+    #[test]
+    fn delegated_and_focus_classes_restore_the_user_fallback_on_revocation() {
+        let (_region, mut allocator) = TestFrameRegion::allocator(64);
+        let mut process = construct_test_process(&mut allocator).unwrap();
+        let main = process.main_thread_id();
+        process
+            .set_thread_scheduling_class(main, SchedulingClass::Background)
+            .unwrap();
+        assert_eq!(
+            process.thread_scheduling_class(main),
+            Some(SchedulingClass::Background)
+        );
+
+        let (handle, control) = process
+            .handles_mut()
+            .scheduling_authority_create(ThreadSchedulingClass::Audio, true)
+            .unwrap();
+        let lease = process
+            .handles()
+            .scheduling_authority_lease(handle, ThreadSchedulingClass::Audio)
+            .unwrap();
+        process
+            .set_thread_scheduling_class_with_authority(main, SchedulingClass::Audio, lease)
+            .unwrap();
+        assert_eq!(
+            process.thread_scheduling_class(main),
+            Some(SchedulingClass::Audio)
+        );
+        control.revoke();
+        assert_eq!(
+            process.thread_scheduling_class(main),
+            Some(SchedulingClass::Background)
+        );
+
+        process
+            .set_thread_scheduling_class(main, SchedulingClass::Normal)
+            .unwrap();
+        process.set_focused_interactive(true);
+        assert_eq!(
+            process.thread_scheduling_class(main),
+            Some(SchedulingClass::Interactive)
+        );
+        process.set_focused_interactive(false);
+        assert_eq!(
+            process.thread_scheduling_class(main),
+            Some(SchedulingClass::Normal)
+        );
     }
 
     #[test]

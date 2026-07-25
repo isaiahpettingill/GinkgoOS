@@ -266,10 +266,11 @@ impl<D: BlockDevice> Disk for Volume<D> {
         let relative_lba = redox_lba::<D::Error>(block).map_err(syscall_error)?;
         self.write_sectors(relative_lba, buffer)
             .map_err(syscall_error)?;
-        if !buffer.is_empty() {
-            self.flush().map_err(syscall_error)?;
-        }
         Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> SyscallResult<()> {
+        Volume::flush(self).map_err(syscall_error)
     }
 
     fn size(&mut self) -> SyscallResult<u64> {
@@ -773,13 +774,16 @@ mod tests {
     }
 
     #[test]
-    fn redoxfs_write_flushes_and_propagates_flush_failure() {
+    fn redoxfs_writes_batch_until_an_explicit_durable_flush() {
         let mut volume = Volume::whole_disk(FakeDisk::zeroed(32)).unwrap();
         unsafe { Disk::write_at(&mut volume, 0, &[7; SECTOR_SIZE]).unwrap() };
+        unsafe { Disk::write_at(&mut volume, 1, &[8; SECTOR_SIZE]).unwrap() };
+        assert_eq!(volume.device().flushes, 0);
+        Disk::flush(&mut volume).unwrap();
         assert_eq!(volume.device().flushes, 1);
 
         volume.device_mut().fail_flush = true;
-        let result = unsafe { Disk::write_at(&mut volume, 0, &[8; SECTOR_SIZE]) };
+        let result = Disk::flush(&mut volume);
         assert_eq!(result.unwrap_err().errno, EIO);
         assert_eq!(volume.device().flushes, 2);
     }

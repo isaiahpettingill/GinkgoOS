@@ -21,6 +21,10 @@ use x86_64::instructions::port::Port;
 
 static NEXT_AML_MUTEX: AtomicU32 = AtomicU32::new(1);
 
+const PCI_RESET_CONTROL_PORT: u16 = 0xcf9;
+const PCI_RESET_CPU: u8 = 1 << 1;
+const PCI_RESET_FULL: u8 = 1 << 2;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PowerError {
     MissingRsdp,
@@ -358,7 +362,7 @@ impl AcpiPower {
     }
 
     pub const fn supports_reboot(&self) -> bool {
-        self.reset_register.is_some()
+        true
     }
 
     pub const fn sleep_types(&self) -> (u8, u8) {
@@ -385,8 +389,18 @@ impl AcpiPower {
     }
 
     pub fn reboot(&self) -> Result<(), PowerError> {
-        let reset = self.reset_register.ok_or(PowerError::ResetUnsupported)?;
-        write_gas(&self.handler, reset, u64::from(self.reset_value))
+        if let Some(reset) = self.reset_register {
+            return write_gas(&self.handler, reset, u64::from(self.reset_value));
+        }
+
+        let mut reset = Port::<u8>::new(PCI_RESET_CONTROL_PORT);
+        let current = unsafe { reset.read() };
+        let (cpu_reset, full_reset) = pci_reset_values(current);
+        unsafe {
+            reset.write(cpu_reset);
+            reset.write(full_reset);
+        }
+        Ok(())
     }
 
     fn ensure_acpi_mode(&self) -> Result<(), PowerError> {
@@ -514,6 +528,14 @@ fn write_gas(
     Ok(())
 }
 
+const fn pci_reset_values(current: u8) -> (u8, u8) {
+    let preserved = current & !(PCI_RESET_CPU | PCI_RESET_FULL);
+    (
+        preserved | PCI_RESET_CPU,
+        preserved | PCI_RESET_CPU | PCI_RESET_FULL,
+    )
+}
+
 fn write_sleep_control(
     handler: &AcpiHandler,
     register: GenericAddress,
@@ -543,6 +565,12 @@ mod tests {
             access_size,
             address,
         }
+    }
+
+    #[test]
+    fn pci_reset_fallback_preserves_unrelated_bits_and_requests_full_reset() {
+        assert_eq!(pci_reset_values(0xa5), (0xa3, 0xa7));
+        assert_eq!(pci_reset_values(0x06), (0x02, 0x06));
     }
 
     #[test]

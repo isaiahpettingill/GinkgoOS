@@ -7,6 +7,7 @@ members = [
     "ginkgo-text-editor",
     "ginkgo-terminal",
     "ginkgo-process-capability-smoke",
+    "ginkgo-request-smoke",
     "ginkgo-thread-smoke",
 ]
 exclude = ["validator"]

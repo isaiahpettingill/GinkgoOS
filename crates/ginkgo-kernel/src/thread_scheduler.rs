@@ -167,9 +167,11 @@ impl SchedulerConfig {
                     starvation_ns: 4_000_000,
                     wake_latency_target_ns: 1_000_000,
                 },
+                // One System-admitted Interactive thread may reserve a full frame period.
+                // Its admission remains revocable through the existing authority controls.
                 ClassPolicy {
                     quantum_ns: 2_000_000,
-                    budget_ns: 6_000_000,
+                    budget_ns: 16_000_000,
                     period_ns: 16_000_000,
                     starvation_ns: 8_000_000,
                     wake_latency_target_ns: 2_000_000,
@@ -336,6 +338,7 @@ struct Thread {
     pending_wake_ns: Option<u64>,
     throttled_since_ns: Option<u64>,
     deadline_ns: Option<u64>,
+    deadline_miss_recorded: bool,
     metrics: ThreadMetrics,
 }
 
@@ -459,6 +462,7 @@ impl<K: SchedulerKey> ThreadScheduler<K> {
                     pending_wake_ns: None,
                     throttled_since_ns: None,
                     deadline_ns: None,
+                    deadline_miss_recorded: false,
                     metrics: ThreadMetrics::default(),
                 },
             ),
@@ -467,12 +471,12 @@ impl<K: SchedulerKey> ThreadScheduler<K> {
         Ok(())
     }
 
-    /// Removes a thread and every donation rooted at it, as required on exit or disconnect.
+    /// Removes a thread and every donation rooted at it or containing it.
     pub fn remove_thread(&mut self, key: K, now_ns: u64) -> Result<ThreadMetrics, SchedulerError> {
         let index = self
             .thread_index(key)
             .map_err(|_| SchedulerError::UnknownKey)?;
-        self.cancel_donations_from(key, now_ns);
+        self.cancel_donations_touching(key, now_ns);
         self.remove_from_all_queues(key);
         Ok(self.threads.remove(index).1.metrics)
     }
@@ -490,6 +494,22 @@ impl<K: SchedulerKey> ThreadScheduler<K> {
             deadline_ns: thread.deadline_ns,
             metrics: thread.metrics,
         })
+    }
+
+    pub fn set_base_class_with_authority(
+        &mut self,
+        key: K,
+        class: SchedulingClass,
+        authority: Authority,
+        now_ns: u64,
+    ) -> Result<(), SchedulerError> {
+        if !authority.allows(class) {
+            return Err(SchedulerError::UnauthorizedClass(class));
+        }
+        self.thread_mut(key)
+            .ok_or(SchedulerError::UnknownKey)?
+            .authority = authority;
+        self.set_base_class(key, class, now_ns)
     }
 
     pub fn set_base_class(
@@ -516,22 +536,25 @@ impl<K: SchedulerKey> ThreadScheduler<K> {
     }
 
     pub fn set_deadline(&mut self, key: K, deadline_ns: u64) -> Result<(), SchedulerError> {
-        self.thread_mut(key)
-            .ok_or(SchedulerError::UnknownKey)?
-            .deadline_ns = Some(deadline_ns);
+        let thread = self.thread_mut(key).ok_or(SchedulerError::UnknownKey)?;
+        thread.deadline_ns = Some(deadline_ns);
+        thread.deadline_miss_recorded = false;
         Ok(())
     }
 
     pub fn clear_deadline(&mut self, key: K) -> Result<(), SchedulerError> {
-        self.thread_mut(key)
-            .ok_or(SchedulerError::UnknownKey)?
-            .deadline_ns = None;
+        let thread = self.thread_mut(key).ok_or(SchedulerError::UnknownKey)?;
+        thread.deadline_ns = None;
+        thread.deadline_miss_recorded = false;
         Ok(())
     }
 
     pub fn record_deadline_miss(&mut self, key: K) -> Result<(), SchedulerError> {
         let thread = self.thread_mut(key).ok_or(SchedulerError::UnknownKey)?;
-        thread.metrics.deadline_misses = thread.metrics.deadline_misses.saturating_add(1);
+        if thread.deadline_ns.is_some() && !thread.deadline_miss_recorded {
+            thread.metrics.deadline_misses = thread.metrics.deadline_misses.saturating_add(1);
+            thread.deadline_miss_recorded = true;
+        }
         Ok(())
     }
 
@@ -569,20 +592,33 @@ impl<K: SchedulerKey> ThreadScheduler<K> {
             }
         };
         if runnable {
-            self.queues[class.index()].push_back(key);
+            // A direct event wake receives one dispatch opportunity ahead of CPU-bound
+            // peers in the same class. FIFO rotation after that dispatch preserves
+            // fairness while preventing a Normal input/service wake from sitting behind
+            // every runnable hog in its class.
+            self.queues[class.index()].push_front(key);
         }
         Ok(())
     }
 
     /// Runs expiry and replenishment maintenance, then selects one thread.
     ///
-    /// Normally the strongest nonempty class wins. If one or more class heads have
-    /// exceeded their starvation bound, the weakest aged class wins. This is
-    /// deterministic and preserves FIFO order inside every class.
+    /// Runnable deadline jobs are selected earliest-deadline-first before aging or
+    /// class order, with key then class as deterministic tie breaks. Without one,
+    /// the strongest nonempty class normally wins. If one or more class heads have
+    /// exceeded their starvation bound, the weakest aged class wins.
     pub fn next_dispatch(&mut self, now_ns: u64) -> Option<Dispatch<K>> {
         self.maintain(now_ns);
-        let class = self.select_class(now_ns)?;
-        let key = self.queues[class.index()].pop_front()?;
+        let (class, key) = if let Some((class, key)) = self.select_deadline_thread() {
+            let key = self
+                .take_from_queue(class, key)
+                .expect("selected deadline key must remain queued");
+            (class, key)
+        } else {
+            let class = self.select_class(now_ns)?;
+            let key = self.queues[class.index()].pop_front()?;
+            (class, key)
+        };
         let policy = self.policy(class);
         let thread = self.thread_mut(key).expect("run queue key must be live");
         debug_assert_eq!(thread.state, ThreadState::Runnable);
@@ -606,9 +642,11 @@ impl<K: SchedulerKey> ThreadScheduler<K> {
                     thread.metrics.wake_latency_target_misses.saturating_add(1);
             }
         }
-        if thread.deadline_ns.is_some_and(|deadline| now_ns > deadline) {
+        if thread.deadline_ns.is_some_and(|deadline| now_ns > deadline)
+            && !thread.deadline_miss_recorded
+        {
             thread.metrics.deadline_misses = thread.metrics.deadline_misses.saturating_add(1);
-            thread.deadline_ns = None;
+            thread.deadline_miss_recorded = true;
         }
         thread.state = ThreadState::Running;
         thread.metrics.context_switches = thread.metrics.context_switches.saturating_add(1);
@@ -742,6 +780,22 @@ impl<K: SchedulerKey> ThreadScheduler<K> {
         true
     }
 
+    /// Unwinds every chain rooted at or passing through an exiting thread.
+    pub fn cancel_donations_touching(&mut self, key: K, now_ns: u64) -> usize {
+        let mut removed = 0usize;
+        loop {
+            let token = self
+                .donations
+                .iter()
+                .find(|donation| donation.root == key || donation.recipients().contains(&key))
+                .map(|donation| donation.token);
+            let Some(token) = token else {
+                return removed;
+            };
+            removed = removed.saturating_add(usize::from(self.cancel_donation(token, now_ns)));
+        }
+    }
+
     /// Unwinds all chains rooted at a disconnected, cancelled, or exiting donor.
     pub fn cancel_donations_from(&mut self, donor: K, now_ns: u64) -> usize {
         let Some(token) = self
@@ -812,6 +866,23 @@ impl<K: SchedulerKey> ThreadScheduler<K> {
         Ok(())
     }
 
+    fn select_deadline_thread(&self) -> Option<(SchedulingClass, K)> {
+        let mut selected = None;
+        for class in SchedulingClass::ALL {
+            for key in &self.queues[class.index()] {
+                let thread = self.thread(*key).expect("run queue key must be live");
+                let Some(deadline_ns) = thread.deadline_ns else {
+                    continue;
+                };
+                let candidate = (deadline_ns, *key, class);
+                if selected.map_or(true, |current| candidate < current) {
+                    selected = Some(candidate);
+                }
+            }
+        }
+        selected.map(|(_, key, class)| (class, key))
+    }
+
     fn select_class(&self, now_ns: u64) -> Option<SchedulingClass> {
         for class in SchedulingClass::AGING_ORDER {
             let Some(key) = self.queues[class.index()].front() else {
@@ -828,7 +899,7 @@ impl<K: SchedulerKey> ThreadScheduler<K> {
             .find(|class| !self.queues[class.index()].is_empty())
     }
 
-    fn policy(&self, class: SchedulingClass) -> ClassPolicy {
+    pub fn policy(&self, class: SchedulingClass) -> ClassPolicy {
         self.config.classes[class.index()]
     }
 
@@ -875,6 +946,12 @@ impl<K: SchedulerKey> ThreadScheduler<K> {
             self.remove_from_queue(old_class, key);
             self.queues[new_class.index()].push_back(key);
         }
+    }
+
+    fn take_from_queue(&mut self, class: SchedulingClass, key: K) -> Option<K> {
+        let queue = &mut self.queues[class.index()];
+        let index = queue.iter().position(|queued| *queued == key)?;
+        queue.remove(index)
     }
 
     fn remove_from_queue(&mut self, class: SchedulingClass, key: K) {
@@ -977,6 +1054,179 @@ mod tests {
             .finish_dispatch(key(1), 1, 50_000_000, RunDisposition::Runnable)
             .unwrap();
         assert_eq!(scheduler.next_dispatch(50_000_000).unwrap().key, key(2));
+    }
+
+    #[test]
+    fn deadline_audio_beats_multiple_aged_normal_and_background_threads() {
+        let mut scheduler = ThreadScheduler::try_with_default_policy(64).unwrap();
+        add(
+            &mut scheduler,
+            1,
+            SchedulingClass::Audio,
+            Authority::System,
+            0,
+        );
+        for slot in [2, 3] {
+            add(
+                &mut scheduler,
+                slot,
+                SchedulingClass::Normal,
+                Authority::User,
+                0,
+            );
+        }
+        for slot in [4, 5] {
+            add(
+                &mut scheduler,
+                slot,
+                SchedulingClass::Background,
+                Authority::User,
+                0,
+            );
+        }
+        scheduler.set_deadline(key(1), 60_000_000).unwrap();
+
+        assert_eq!(scheduler.next_dispatch(50_000_000).unwrap().key, key(1));
+    }
+
+    #[test]
+    fn deadline_job_remains_preferred_until_it_blocks() {
+        let mut scheduler = ThreadScheduler::try_with_default_policy(64).unwrap();
+        add(
+            &mut scheduler,
+            1,
+            SchedulingClass::Critical,
+            Authority::Kernel,
+            0,
+        );
+        add(
+            &mut scheduler,
+            2,
+            SchedulingClass::Background,
+            Authority::User,
+            0,
+        );
+        scheduler.set_deadline(key(2), 10_000_000).unwrap();
+
+        for now_ns in [0, 1] {
+            let dispatch = scheduler.next_dispatch(now_ns).unwrap();
+            assert_eq!(dispatch.key, key(2));
+            scheduler
+                .finish_dispatch(dispatch.key, 1, now_ns + 1, RunDisposition::Runnable)
+                .unwrap();
+        }
+        scheduler.block(key(2)).unwrap();
+        assert_eq!(scheduler.next_dispatch(2).unwrap().key, key(1));
+    }
+
+    #[test]
+    fn deadline_miss_is_counted_once_per_active_job() {
+        let mut scheduler = ThreadScheduler::try_with_default_policy(64).unwrap();
+        add(
+            &mut scheduler,
+            1,
+            SchedulingClass::Normal,
+            Authority::User,
+            0,
+        );
+        scheduler.set_deadline(key(1), 10).unwrap();
+
+        for now_ns in [11, 12] {
+            let dispatch = scheduler.next_dispatch(now_ns).unwrap();
+            scheduler
+                .finish_dispatch(dispatch.key, 1, now_ns + 1, RunDisposition::Runnable)
+                .unwrap();
+        }
+        let first_job = scheduler.snapshot(key(1)).unwrap();
+        assert_eq!(first_job.deadline_ns, Some(10));
+        assert_eq!(first_job.metrics.deadline_misses, 1);
+
+        scheduler.set_deadline(key(1), 12).unwrap();
+        let dispatch = scheduler.next_dispatch(13).unwrap();
+        scheduler
+            .finish_dispatch(dispatch.key, 1, 14, RunDisposition::Runnable)
+            .unwrap();
+        assert_eq!(
+            scheduler.snapshot(key(1)).unwrap().metrics.deadline_misses,
+            2
+        );
+
+        scheduler.clear_deadline(key(1)).unwrap();
+        scheduler.record_deadline_miss(key(1)).unwrap();
+        assert_eq!(
+            scheduler.snapshot(key(1)).unwrap().metrics.deadline_misses,
+            2
+        );
+    }
+
+    #[test]
+    fn measured_interactive_frame_load_is_not_throttled_and_lower_classes_run() {
+        let mut scheduler = ThreadScheduler::try_with_default_policy(64).unwrap();
+        add(
+            &mut scheduler,
+            1,
+            SchedulingClass::Interactive,
+            Authority::System,
+            0,
+        );
+        add(
+            &mut scheduler,
+            2,
+            SchedulingClass::Normal,
+            Authority::User,
+            0,
+        );
+        add(
+            &mut scheduler,
+            3,
+            SchedulingClass::Background,
+            Authority::User,
+            0,
+        );
+        let interactive_policy = scheduler.policy(SchedulingClass::Interactive);
+        assert_eq!(interactive_policy.quantum_ns, 2_000_000);
+        assert_eq!(interactive_policy.budget_ns, 16_000_000);
+        assert_eq!(interactive_policy.period_ns, 16_000_000);
+
+        for frame_start_ns in [0, 16_000_000, 32_000_000] {
+            if frame_start_ns != 0 {
+                scheduler.wake(key(1), frame_start_ns).unwrap();
+            }
+            let mut now_ns = frame_start_ns;
+            for (index, elapsed_ns) in [2_000_000_u64, 2_000_000, 2_000_000, 1_500_000]
+                .into_iter()
+                .enumerate()
+            {
+                let dispatch = scheduler.next_dispatch(now_ns).unwrap();
+                assert_eq!(dispatch.key, key(1));
+                assert_eq!(dispatch.quantum_ns, 2_000_000);
+                now_ns += elapsed_ns;
+                let disposition = if index == 3 {
+                    RunDisposition::Blocked
+                } else {
+                    RunDisposition::Runnable
+                };
+                scheduler
+                    .finish_dispatch(dispatch.key, elapsed_ns, now_ns, disposition)
+                    .unwrap();
+            }
+            let interactive = scheduler.snapshot(key(1)).unwrap();
+            assert_eq!(interactive.state, ThreadState::Blocked);
+            assert_eq!(interactive.metrics.throttling_events, 0);
+
+            if frame_start_ns == 0 {
+                let normal = scheduler.next_dispatch(now_ns).unwrap();
+                assert_eq!(normal.key, key(2));
+                scheduler
+                    .finish_dispatch(normal.key, 1, now_ns + 1, RunDisposition::Blocked)
+                    .unwrap();
+                let background = scheduler.next_dispatch(now_ns + 1).unwrap();
+                assert_eq!(background.key, key(3));
+                scheduler
+                    .finish_dispatch(background.key, 1, now_ns + 2, RunDisposition::Blocked)
+                    .unwrap();
+            }
+        }
     }
 
     #[test]
@@ -1201,7 +1451,19 @@ mod tests {
         scheduler
             .add_thread(old, SchedulingClass::Normal, Authority::User, 0)
             .unwrap();
-        scheduler.remove_thread(old, 0).unwrap();
+        scheduler
+            .set_base_class_with_authority(old, SchedulingClass::Interactive, Authority::System, 1)
+            .unwrap();
+        let promoted = scheduler.snapshot(old).unwrap();
+        assert_eq!(promoted.base_class, SchedulingClass::Interactive);
+        assert_eq!(promoted.authority, Authority::System);
+        scheduler
+            .set_base_class_with_authority(old, SchedulingClass::Normal, Authority::User, 2)
+            .unwrap();
+        let revoked = scheduler.snapshot(old).unwrap();
+        assert_eq!(revoked.base_class, SchedulingClass::Normal);
+        assert_eq!(revoked.authority, Authority::User);
+        scheduler.remove_thread(old, 2).unwrap();
         scheduler
             .add_thread(replacement, SchedulingClass::Normal, Authority::User, 0)
             .unwrap();
