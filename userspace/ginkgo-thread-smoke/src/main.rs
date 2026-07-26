@@ -6,10 +6,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use ginkgo_userspace::{
     anonymous_map, audio_write, channel_create, channel_read, channel_write, debug_write,
     filesystem_open, filesystem_sync, filesystem_write, handle_close, monotonic_time_ns,
-    process_yield, thread_create, thread_current, thread_exit, thread_get_scheduling_info,
+    process_yield, storage_get_diagnostics, thread_create, thread_current, thread_exit,
+    thread_get_scheduling_info,
     thread_join, thread_set_scheduling_class, thread_set_scheduling_class_with_authority,
     thread_sleep_until, thread_wake, FilesystemOpenFlags, Handle, MapProtection, Signals, Status,
-    ThreadId, ThreadSchedulingClass, ThreadState, WaitItem, DEADLINE_INFINITE,
+    StorageDiagnostics, ThreadId, ThreadSchedulingClass, ThreadState, WaitItem, DEADLINE_INFINITE,
+    FILESYSTEM_IO_MAX_BYTES,
 };
 
 static STARTED: AtomicU64 = AtomicU64::new(0);
@@ -52,9 +54,10 @@ const AUDIO_CHUNK_BYTES: usize = 441 * 2 * 2;
 const INPUT_PERIOD_NS: u64 = 20_000_000;
 const INPUT_EVENT_COUNT: u64 = 100;
 const FILE_BYTES: u64 = 1024 * 1024;
-const FILE_CHUNK_BYTES: usize = 16 * 1024;
+const FILE_CHUNK_BYTES: usize = FILESYSTEM_IO_MAX_BYTES;
 const SILENT_AUDIO: [u8; AUDIO_CHUNK_BYTES] = [0; AUDIO_CHUNK_BYTES];
 const FILE_CHUNK: [u8; FILE_CHUNK_BYTES] = [0x35; FILE_CHUNK_BYTES];
+
 
 ginkgo_runtime::entry6!(process_main);
 
@@ -86,6 +89,12 @@ extern "C" fn process_main(
     run_donation_checks(main_thread, scheduling_authority);
 
     let _ = debug_write(b"ginkgo-scheduler-smoke: donation PASS\n");
+    let storage = scheduler_must(
+        storage_get_diagnostics(),
+        b"ginkgo-scheduler-smoke: FAIL storage diagnostics\n",
+    );
+    print_storage_metrics(storage);
+    validate_storage_diagnostics(storage);
     print_metrics(metrics);
     let _ = debug_write(b"ginkgo-scheduler-smoke: PASS\n");
     let _ = debug_write(b"ginkgo-thread-smoke: PASS\n");
@@ -480,6 +489,10 @@ extern "C" fn hog_worker(index: u64) -> ! {
     exit_thread(23 + index as i32)
 }
 
+
+
+
+
 extern "C" fn background_worker(argument: u64) -> ! {
     wait_for_workload_start();
     let root = Handle::from_raw(argument as u32);
@@ -833,6 +846,54 @@ fn scheduler_must<T>(result: Result<T, Status>, message: &'static [u8]) -> T {
         Ok(value) => value,
         Err(_) => fail_scheduler(message),
     }
+}
+
+fn validate_storage_diagnostics(metrics: StorageDiagnostics) {
+    if metrics.mode != 1
+        || metrics.in_flight_high_water < 2
+        || metrics.failed_requests != 0
+        || metrics.io_errors != 0
+        || metrics.unsupported_operations != 0
+        || metrics.bounce_in_flight != 0
+        || metrics.bounce_quarantined != 0
+        || metrics.bytes_transferred == 0
+        || metrics.requested_write_sequence != metrics.durable_write_sequence
+    {
+        fail_scheduler(b"ginkgo-scheduler-smoke: FAIL storage diagnostics invariant\n");
+    }
+}
+
+fn print_storage_metrics(metrics: StorageDiagnostics) {
+    let mut line = OutputLine::new();
+    line.push(b"ginkgo-scheduler-smoke: storage");
+    line.push(b" driver=");
+    line.push_u64(u64::from(metrics.driver));
+    line.push(b" queue_hwm=");
+    line.push_u64(metrics.queue_high_water);
+    line.push(b" in_flight_hwm=");
+    line.push_u64(metrics.in_flight_high_water);
+    line.push(b" bytes=");
+    line.push_u64(metrics.bytes_transferred);
+    line.push(b" failures=");
+    line.push_u64(metrics.failed_requests);
+    line.push(b" io_errors=");
+    line.push_u64(metrics.io_errors);
+    line.push(b" bounce_in_flight=");
+    line.push_u64(metrics.bounce_in_flight);
+    line.push(b" bounce_quarantined=");
+    line.push_u64(metrics.bounce_quarantined);
+    line.push(b" cache_hits=");
+    line.push_u64(metrics.cache_read_hits);
+    line.push(b" cache_misses=");
+    line.push_u64(metrics.cache_read_misses);
+    line.push(b" writeback_bytes=");
+    line.push_u64(metrics.bytes_written_back);
+    line.push(b" requested=");
+    line.push_u64(metrics.requested_write_sequence);
+    line.push(b" durable=");
+    line.push_u64(metrics.durable_write_sequence);
+    line.push(b"\n");
+    let _ = debug_write(line.as_bytes());
 }
 
 fn print_metrics(metrics: Metrics) {

@@ -207,6 +207,11 @@ impl MmioRegion {
         self.write(offset, value)
     }
 
+    pub(crate) fn u32_address(&self, offset: usize) -> Result<u64, IoError> {
+        let pointer = self.checked_pointer::<u32>(offset)?;
+        Ok(pointer.as_ptr() as usize as u64)
+    }
+
     fn read<T: Copy>(&mut self, offset: usize) -> Result<T, IoError> {
         let pointer = self.checked_pointer::<T>(offset)?;
         Ok(unsafe { VolatilePtr::new(pointer) }.read())

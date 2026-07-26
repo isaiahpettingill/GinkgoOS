@@ -170,6 +170,8 @@ static GINKGO_VIRTIO_BLK_INTERRUPT_PENDING: AtomicU8 = AtomicU8::new(0);
 #[no_mangle]
 static GINKGO_AHCI_INTERRUPT_PENDING: AtomicU8 = AtomicU8::new(0);
 #[no_mangle]
+static GINKGO_AHCI_PORT_IE: AtomicU64 = AtomicU64::new(0);
+#[no_mangle]
 static GINKGO_EXTERNAL_INTERRUPT_EOI: AtomicU64 = AtomicU64::new(0);
 
 /// Consumes the coalescing xHCI interrupt-pending flag.
@@ -194,6 +196,41 @@ pub fn take_virtio_blk_interrupt_pending() -> bool {
 /// interrupts before one call intentionally coalesce into a single `true` result.
 pub fn take_ahci_interrupt_pending() -> bool {
     GINKGO_AHCI_INTERRUPT_PENDING.swap(0, Ordering::AcqRel) != 0
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AhciInterruptRegisterError {
+    InvalidAddress,
+    AlreadyRegistered,
+    RegistrationMismatch,
+}
+
+/// Publishes the selected AHCI port's interrupt-enable register to the assembly ISR.
+///
+/// # Safety
+///
+/// `address` must remain mapped, writable, supervisor-only, uncached, and point to the selected
+/// port's `PxIE` register until it is unregistered after both the source and PCI MSI are disabled.
+pub unsafe fn register_ahci_port_ie(address: u64) -> Result<(), AhciInterruptRegisterError> {
+    if address < 0xffff_8000_0000_0000 || !is_canonical_address(address) || address & 3 != 0 {
+        return Err(AhciInterruptRegisterError::InvalidAddress);
+    }
+    GINKGO_AHCI_PORT_IE
+        .compare_exchange(0, address, Ordering::Release, Ordering::Acquire)
+        .map(|_| GINKGO_AHCI_INTERRUPT_PENDING.store(0, Ordering::Relaxed))
+        .map_err(|_| AhciInterruptRegisterError::AlreadyRegistered)
+}
+
+/// Removes the exact `PxIE` registration after hardware interrupt delivery is disabled.
+///
+/// # Safety
+///
+/// The caller must have masked the AHCI source and disabled PCI MSI before unregistering.
+pub unsafe fn unregister_ahci_port_ie(address: u64) -> Result<(), AhciInterruptRegisterError> {
+    GINKGO_AHCI_PORT_IE
+        .compare_exchange(address, 0, Ordering::AcqRel, Ordering::Acquire)
+        .map(|_| GINKGO_AHCI_INTERRUPT_PENDING.store(0, Ordering::Release))
+        .map_err(|_| AhciInterruptRegisterError::RegistrationMismatch)
 }
 
 /// Aligned extended state area. XSAVE-capable CPUs preserve enabled AVX state;
@@ -999,6 +1036,7 @@ pub unsafe fn initialize_cpu_with_external_interrupts(
     GINKGO_XHCI_INTERRUPT_PENDING.store(0, Ordering::Relaxed);
     GINKGO_VIRTIO_BLK_INTERRUPT_PENDING.store(0, Ordering::Relaxed);
     GINKGO_AHCI_INTERRUPT_PENDING.store(0, Ordering::Relaxed);
+    GINKGO_AHCI_PORT_IE.store(0, Ordering::Relaxed);
     GINKGO_EXTERNAL_INTERRUPT_EOI.store(external.local_apic_eoi, Ordering::Release);
     unsafe { state.tss.set_stack_tops(stacks) };
 
@@ -1704,10 +1742,16 @@ ginkgo_x86_virtio_blk_interrupt:
     popq %rax
     iretq
 
-// The AHCI MSI only records pending work and acknowledges the local APIC. Device
-// status and command completion processing remain outside the interrupt handler.
+// Mask the selected AHCI port before acknowledging the local APIC. This coalesces
+// level status while preserving PxIS for deferred error and completion processing.
 ginkgo_x86_ahci_interrupt:
     pushq %rax
+    movq GINKGO_AHCI_PORT_IE(%rip), %rax
+    testq %rax, %rax
+    jz .Lginkgo_ahci_mask_complete
+    movl $0, (%rax)
+    movl (%rax), %eax
+.Lginkgo_ahci_mask_complete:
     movb $1, GINKGO_AHCI_INTERRUPT_PENDING(%rip)
     movq GINKGO_EXTERNAL_INTERRUPT_EOI(%rip), %rax
     testq %rax, %rax
@@ -2758,12 +2802,22 @@ mod tests {
     }
 
     #[test]
-    fn ahci_pending_flag_coalesces_and_is_consumed() {
-        GINKGO_AHCI_INTERRUPT_PENDING.store(0, Ordering::Relaxed);
+    fn ahci_registration_preserves_the_owner_pending_flag_on_conflict() {
+        const FIRST: u64 = 0xffff_8000_0000_1000;
+        const SECOND: u64 = 0xffff_8000_0000_2000;
+
+        GINKGO_AHCI_PORT_IE.store(0, Ordering::Relaxed);
+        GINKGO_AHCI_INTERRUPT_PENDING.store(1, Ordering::Relaxed);
+        assert_eq!(unsafe { register_ahci_port_ie(FIRST) }, Ok(()));
         assert!(!take_ahci_interrupt_pending());
+
         GINKGO_AHCI_INTERRUPT_PENDING.store(1, Ordering::Release);
-        GINKGO_AHCI_INTERRUPT_PENDING.store(1, Ordering::Release);
+        assert_eq!(
+            unsafe { register_ahci_port_ie(SECOND) },
+            Err(AhciInterruptRegisterError::AlreadyRegistered)
+        );
         assert!(take_ahci_interrupt_pending());
+        assert_eq!(unsafe { unregister_ahci_port_ie(FIRST) }, Ok(()));
         assert!(!take_ahci_interrupt_pending());
     }
 

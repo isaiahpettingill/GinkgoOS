@@ -15,10 +15,15 @@ use redoxfs::Disk;
 use syscall::error::{Error, Result, EAGAIN, EINVAL, EIO, ENOSPC, EROFS};
 
 pub const WRITEBACK_BLOCK_SIZE: usize = 4096;
+const READ_AHEAD_BLOCKS: usize = 4;
+const DEFAULT_WRITEBACK_BATCH_BLOCKS: usize = 2;
+const MAX_WRITEBACK_BATCH_BLOCKS: usize = 4;
+const READ_AHEAD_BYTES: usize = READ_AHEAD_BLOCKS * WRITEBACK_BLOCK_SIZE;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WriteBackConfigError {
     ZeroCapacity,
+    InvalidWritebackBatch,
     CapacityOverflow,
     AllocationFailed,
 }
@@ -74,6 +79,8 @@ pub struct WriteBackMetrics {
     pub underlying_reads: u64,
     pub read_errors: u64,
     pub read_cache_admission_failures: u64,
+    pub read_ahead_requests: u64,
+    pub read_ahead_blocks: u64,
     pub write_requests: u64,
     pub write_blocks_accepted: u64,
     pub coalesced_writes: u64,
@@ -114,6 +121,7 @@ pub struct WriteBackStatus {
     pub lookup_allocation_capacity: usize,
     pub flush_ticket_allocation_capacity: usize,
     pub lookup_tombstones: usize,
+    pub writeback_batch_blocks: usize,
     pub async_writeback_enabled: bool,
     pub quiesced: bool,
     pub read_only: bool,
@@ -172,12 +180,14 @@ pub struct WriteBackDisk<D: Disk> {
     entries: Vec<CacheEntry>,
     lookup: Vec<LookupSlot>,
     lookup_mask: usize,
+    read_ahead: Vec<u8>,
     flush_tickets: Vec<u64>,
     flush_ticket_head: usize,
     flush_ticket_len: usize,
     resident_count: usize,
     dirty_count: usize,
     lookup_tombstones: usize,
+    writeback_batch_blocks: usize,
     access_clock: u64,
     write_sequence: u64,
     requested_sequence: u64,
@@ -199,8 +209,19 @@ impl<D: Disk> WriteBackDisk<D> {
         inner: D,
         entry_count: usize,
     ) -> core::result::Result<Self, WriteBackConfigError> {
+        Self::try_new_with_writeback_batch(inner, entry_count, DEFAULT_WRITEBACK_BATCH_BLOCKS)
+    }
+
+    pub fn try_new_with_writeback_batch(
+        inner: D,
+        entry_count: usize,
+        writeback_batch_blocks: usize,
+    ) -> core::result::Result<Self, WriteBackConfigError> {
         if entry_count == 0 {
             return Err(WriteBackConfigError::ZeroCapacity);
+        }
+        if writeback_batch_blocks == 0 || writeback_batch_blocks > MAX_WRITEBACK_BATCH_BLOCKS {
+            return Err(WriteBackConfigError::InvalidWritebackBatch);
         }
         let lookup_count = entry_count
             .checked_mul(2)
@@ -226,6 +247,12 @@ impl<D: Disk> WriteBackDisk<D> {
             lookup.push(LookupSlot::Empty);
         }
 
+        let mut read_ahead = Vec::new();
+        read_ahead
+            .try_reserve_exact(READ_AHEAD_BYTES)
+            .map_err(|_| WriteBackConfigError::AllocationFailed)?;
+        read_ahead.resize(READ_AHEAD_BYTES, 0);
+
         let mut flush_tickets = Vec::new();
         flush_tickets
             .try_reserve_exact(flush_ticket_count)
@@ -239,12 +266,14 @@ impl<D: Disk> WriteBackDisk<D> {
             entries,
             lookup,
             lookup_mask: lookup_count - 1,
+            read_ahead,
             flush_tickets,
             flush_ticket_head: 0,
             flush_ticket_len: 0,
             resident_count: 0,
             dirty_count: 0,
             lookup_tombstones: 0,
+            writeback_batch_blocks,
             access_clock: 0,
             write_sequence: 0,
             requested_sequence: 0,
@@ -343,6 +372,7 @@ impl<D: Disk> WriteBackDisk<D> {
             lookup_allocation_capacity: self.lookup.capacity(),
             flush_ticket_allocation_capacity: self.flush_tickets.capacity(),
             lookup_tombstones: self.lookup_tombstones,
+            writeback_batch_blocks: self.writeback_batch_blocks,
             async_writeback_enabled: self.async_writeback_enabled,
             quiesced: self.quiesced,
             read_only: self.is_read_only(),
@@ -418,7 +448,8 @@ impl<D: Disk> WriteBackDisk<D> {
         }
 
         let dirty = self.lowest_sequence_dirty();
-        if let Some(ticket) = self.current_flush_ticket() {
+        let ticket = self.current_flush_ticket();
+        if let Some(ticket) = ticket {
             let ticket_ready = dirty
                 .map(|index| self.entries[index].first_sequence > ticket)
                 .unwrap_or(true);
@@ -430,7 +461,7 @@ impl<D: Disk> WriteBackDisk<D> {
         let Some(entry_index) = dirty else {
             return Ok(WriteBackProgress::Idle);
         };
-        self.write_back_entry(entry_index)
+        self.write_back_run(entry_index, ticket)
     }
 
     fn request_durability(&mut self) -> Result<u64> {
@@ -480,20 +511,65 @@ impl<D: Disk> WriteBackDisk<D> {
         }
     }
 
-    fn write_back_entry(&mut self, entry_index: usize) -> Result<WriteBackProgress> {
-        let block = self.entries[entry_index].block;
-        let first_sequence = self.entries[entry_index].first_sequence;
-        let last_sequence = self.entries[entry_index].last_sequence;
-        let result = unsafe { self.inner.write_at(block, &self.entries[entry_index].data) };
+    fn write_back_run(
+        &mut self,
+        first_entry: usize,
+        ticket: Option<u64>,
+    ) -> Result<WriteBackProgress> {
+        let mut run = [usize::MAX; MAX_WRITEBACK_BATCH_BLOCKS];
+        run[0] = first_entry;
+        let mut run_len = 1;
+        while run_len < self.writeback_batch_blocks {
+            let previous = &self.entries[run[run_len - 1]];
+            let next = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| {
+                    entry.state == EntryState::Dirty
+                        && entry.first_sequence > previous.first_sequence
+                })
+                .min_by_key(|(_, entry)| entry.first_sequence);
+            let Some((index, entry)) = next else {
+                break;
+            };
+            if entry.block != previous.block.saturating_add(1)
+                || ticket.is_some_and(|ticket| entry.first_sequence > ticket)
+            {
+                break;
+            }
+            run[run_len] = index;
+            run_len += 1;
+        }
+
+        let block = self.entries[first_entry].block;
+        let first_sequence = self.entries[first_entry].first_sequence;
+        let last_sequence = run[..run_len]
+            .iter()
+            .map(|entry_index| self.entries[*entry_index].last_sequence)
+            .max()
+            .unwrap_or(first_sequence);
+        for (offset, entry_index) in run[..run_len].iter().copied().enumerate() {
+            let start = offset * WRITEBACK_BLOCK_SIZE;
+            self.read_ahead[start..start + WRITEBACK_BLOCK_SIZE]
+                .copy_from_slice(&self.entries[entry_index].data);
+        }
+        let byte_len = run_len * WRITEBACK_BLOCK_SIZE;
+        let result = unsafe { self.inner.write_at(block, &self.read_ahead[..byte_len]) };
         match result {
-            Ok(WRITEBACK_BLOCK_SIZE) => {
-                self.entries[entry_index].state = EntryState::Clean;
-                self.dirty_count -= 1;
-                bump(&mut self.metrics.blocks_written_back);
+            Ok(written) if written == byte_len => {
+                for entry_index in run[..run_len].iter().copied() {
+                    self.entries[entry_index].state = EntryState::Clean;
+                }
+                self.dirty_count -= run_len;
+                self.metrics.blocks_written_back = self
+                    .metrics
+                    .blocks_written_back
+                    .saturating_add(run_len as u64);
                 self.metrics.bytes_written_back = self
                     .metrics
                     .bytes_written_back
-                    .saturating_add(WRITEBACK_BLOCK_SIZE as u64);
+                    .saturating_add(byte_len as u64);
                 Ok(WriteBackProgress::WroteBlock {
                     block,
                     first_sequence,
@@ -594,6 +670,9 @@ impl<D: Disk> WriteBackDisk<D> {
         let mut reusable = self.reusable_count(block, end);
         let pressure_steps = new_entries.saturating_sub(reusable);
         for _ in 0..pressure_steps {
+            if reusable >= new_entries {
+                break;
+            }
             let before = reusable;
             bump(&mut self.metrics.pressure_writeback_steps);
             self.writeback_step()?;
@@ -604,7 +683,10 @@ impl<D: Disk> WriteBackDisk<D> {
                 bump(&mut self.metrics.pressure_stalls);
                 return Err(Error::new(EAGAIN));
             }
-            bump(&mut self.metrics.pressure_entries_freed);
+            self.metrics.pressure_entries_freed = self
+                .metrics
+                .pressure_entries_freed
+                .saturating_add((reusable - before) as u64);
         }
         if new_entries > reusable {
             bump(&mut self.metrics.rejected_writes);
@@ -796,7 +878,8 @@ impl<D: Disk> Disk for WriteBackDisk<D> {
         bump(&mut self.metrics.read_requests);
         self.metrics.read_blocks = self.metrics.read_blocks.saturating_add(block_count as u64);
 
-        for offset in 0..block_count {
+        let mut offset = 0;
+        while offset < block_count {
             let target = block + offset as u64;
             let start = offset * WRITEBACK_BLOCK_SIZE;
             let end = start + WRITEBACK_BLOCK_SIZE;
@@ -815,14 +898,82 @@ impl<D: Disk> Disk for WriteBackDisk<D> {
                 } else {
                     bump(&mut self.metrics.clean_read_hits);
                 }
+                offset += 1;
                 continue;
             }
 
-            bump(&mut self.metrics.read_misses);
+            let run_start = offset;
+            let mut run_end = run_start + 1;
+            while run_end < block_count && self.lookup_entry(block + run_end as u64).is_none() {
+                run_end += 1;
+            }
+            let run_blocks = run_end - run_start;
+            let byte_start = run_start * WRITEBACK_BLOCK_SIZE;
+            let byte_end = run_end * WRITEBACK_BLOCK_SIZE;
+            self.metrics.read_misses = self.metrics.read_misses.saturating_add(run_blocks as u64);
             bump(&mut self.metrics.underlying_reads);
-            match self.inner.read_at(target, &mut buffer[start..end]) {
-                Ok(WRITEBACK_BLOCK_SIZE) => {
-                    self.admit_clean(target, &buffer[start..end]);
+
+            if run_blocks == 1 {
+                let backing_bytes = self.inner.size().map_err(|error| {
+                    bump(&mut self.metrics.read_errors);
+                    error
+                })?;
+                let backing_blocks = backing_bytes / WRITEBACK_BLOCK_SIZE as u64;
+                let target = block + run_start as u64;
+                let read_ahead_blocks = usize::try_from(backing_blocks.saturating_sub(target))
+                    .unwrap_or(usize::MAX)
+                    .min(READ_AHEAD_BLOCKS)
+                    .min(self.entries.len());
+
+                if read_ahead_blocks > 1 {
+                    let read_ahead_bytes = read_ahead_blocks * WRITEBACK_BLOCK_SIZE;
+                    match self
+                        .inner
+                        .read_at(target, &mut self.read_ahead[..read_ahead_bytes])
+                    {
+                        Ok(bytes) if bytes == read_ahead_bytes => {
+                            buffer[byte_start..byte_end]
+                                .copy_from_slice(&self.read_ahead[..WRITEBACK_BLOCK_SIZE]);
+                            for ahead in (1..read_ahead_blocks).chain(core::iter::once(0)) {
+                                let start = ahead * WRITEBACK_BLOCK_SIZE;
+                                let end = start + WRITEBACK_BLOCK_SIZE;
+                                let mut block_data = [0; WRITEBACK_BLOCK_SIZE];
+                                block_data.copy_from_slice(&self.read_ahead[start..end]);
+                                self.admit_clean(target + ahead as u64, &block_data);
+                            }
+                            bump(&mut self.metrics.read_ahead_requests);
+                            self.metrics.read_ahead_blocks = self
+                                .metrics
+                                .read_ahead_blocks
+                                .saturating_add(read_ahead_blocks as u64);
+                            offset = run_end;
+                            continue;
+                        }
+                        Ok(_) => {
+                            bump(&mut self.metrics.read_errors);
+                            return Err(Error::new(EIO));
+                        }
+                        Err(error) => {
+                            bump(&mut self.metrics.read_errors);
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+
+            match self
+                .inner
+                .read_at(block + run_start as u64, &mut buffer[byte_start..byte_end])
+            {
+                Ok(bytes) if bytes == byte_end - byte_start => {
+                    for admitted in run_start..run_end {
+                        let admitted_start = admitted * WRITEBACK_BLOCK_SIZE;
+                        let admitted_end = admitted_start + WRITEBACK_BLOCK_SIZE;
+                        self.admit_clean(
+                            block + admitted as u64,
+                            &buffer[admitted_start..admitted_end],
+                        );
+                    }
                 }
                 Ok(_) => {
                     bump(&mut self.metrics.read_errors);
@@ -833,6 +984,7 @@ impl<D: Disk> Disk for WriteBackDisk<D> {
                     return Err(error);
                 }
             }
+            offset = run_end;
         }
         Ok(buffer.len())
     }
@@ -981,6 +1133,32 @@ mod tests {
     }
 
     #[test]
+    fn writeback_batch_limit_is_bounded_and_configurable() {
+        assert!(matches!(
+            WriteBackDisk::try_new_with_writeback_batch(FakeDisk::new(4), 2, 0),
+            Err(WriteBackConfigError::InvalidWritebackBatch)
+        ));
+        assert!(matches!(
+            WriteBackDisk::try_new_with_writeback_batch(
+                FakeDisk::new(4),
+                2,
+                MAX_WRITEBACK_BATCH_BLOCKS + 1,
+            ),
+            Err(WriteBackConfigError::InvalidWritebackBatch)
+        ));
+
+        let mut disk = WriteBackDisk::try_new_with_writeback_batch(FakeDisk::new(4), 2, 1).unwrap();
+        unsafe {
+            disk.write_at(0, &vec![0x77; 2 * WRITEBACK_BLOCK_SIZE])
+                .unwrap()
+        };
+        disk.writeback_step().unwrap();
+        assert_eq!(disk.status().writeback_batch_blocks, 1);
+        assert_eq!(disk.dirty_count(), 1);
+        assert_eq!(disk.inner().events, vec![Event::Write(0, 0x77)]);
+    }
+
+    #[test]
     fn reads_miss_then_hit_and_dirty_data_wins() {
         let mut disk = WriteBackDisk::new(FakeDisk::new(8), 2).unwrap();
         let mut output = block(0xff);
@@ -997,6 +1175,47 @@ mod tests {
         assert_eq!(metrics.read_misses, 1);
         assert_eq!(metrics.clean_read_hits, 1);
         assert_eq!(metrics.dirty_read_hits, 1);
+    }
+
+    #[test]
+    fn single_block_miss_reads_a_bounded_adjacent_window() {
+        let mut disk = WriteBackDisk::new(FakeDisk::new(8), 4).unwrap();
+        let mut output = block(0xff);
+
+        unsafe { disk.read_at(0, &mut output).unwrap() };
+        assert!(output.iter().all(|byte| *byte == 0));
+        assert_eq!(disk.inner().reads, 1);
+        assert_eq!(disk.metrics().read_ahead_requests, 1);
+        assert_eq!(disk.metrics().read_ahead_blocks, READ_AHEAD_BLOCKS as u64);
+
+        unsafe { disk.read_at(1, &mut output).unwrap() };
+        assert!(output.iter().all(|byte| *byte == 1));
+        assert_eq!(disk.inner().reads, 1);
+        assert_eq!(disk.metrics().clean_read_hits, 1);
+    }
+
+    #[test]
+    fn adjacent_cache_misses_use_one_backing_read_per_run() {
+        let mut disk = WriteBackDisk::new(FakeDisk::new(8), 4).unwrap();
+        unsafe { disk.write_at(2, &block(0xa5)).unwrap() };
+        let mut output = vec![0; 4 * WRITEBACK_BLOCK_SIZE];
+
+        unsafe { disk.read_at(0, &mut output).unwrap() };
+
+        assert_eq!(disk.inner().reads, 2);
+        assert_eq!(disk.metrics().underlying_reads, 2);
+        assert_eq!(disk.metrics().read_misses, 3);
+        assert_eq!(disk.metrics().dirty_read_hits, 1);
+        assert!(output[..WRITEBACK_BLOCK_SIZE].iter().all(|byte| *byte == 0));
+        assert!(output[WRITEBACK_BLOCK_SIZE..2 * WRITEBACK_BLOCK_SIZE]
+            .iter()
+            .all(|byte| *byte == 1));
+        assert!(output[2 * WRITEBACK_BLOCK_SIZE..3 * WRITEBACK_BLOCK_SIZE]
+            .iter()
+            .all(|byte| *byte == 0xa5));
+        assert!(output[3 * WRITEBACK_BLOCK_SIZE..]
+            .iter()
+            .all(|byte| *byte == 3));
     }
 
     #[test]
@@ -1017,10 +1236,7 @@ mod tests {
             }
         );
         disk.writeback_step().unwrap();
-        assert_eq!(
-            disk.inner().events,
-            vec![Event::Write(2, 0x34), Event::Write(3, 0x23)]
-        );
+        assert_eq!(disk.inner().events, vec![Event::Write(2, 0x34)]);
         assert_eq!(disk.metrics().coalesced_writes, 1);
     }
 
@@ -1034,7 +1250,7 @@ mod tests {
             disk.read_at(1, &mut output).unwrap();
             disk.read_at(2, &mut output).unwrap();
         }
-        assert_eq!(disk.metrics().clean_evictions, 1);
+        assert!(disk.metrics().clean_evictions >= 1);
         assert!(disk.status().lookup_tombstones <= disk.status().lookup_slot_count);
 
         unsafe {
@@ -1051,7 +1267,7 @@ mod tests {
         unsafe { disk.write_at(12, &block(12)).unwrap() };
         let error = unsafe { disk.write_at(13, &vec![1; 3 * WRITEBACK_BLOCK_SIZE]) }.unwrap_err();
         assert_eq!(error.errno, ENOSPC);
-        assert_eq!(disk.dirty_count(), 2);
+        assert_eq!(disk.dirty_count(), 1);
         assert_eq!(disk.metrics().pressure_stalls, 1);
     }
 
@@ -1225,17 +1441,19 @@ mod tests {
         unsafe { disk.read_at(2, &mut output).unwrap() };
         assert_eq!(output, input);
         assert_eq!(disk.inner().reads, 0);
-        for _ in 0..3 {
-            disk.writeback_step().unwrap();
-        }
+        disk.writeback_step().unwrap();
+        disk.writeback_step().unwrap();
         assert_eq!(
             disk.inner().events,
-            vec![
-                Event::Write(2, 0x51),
-                Event::Write(3, 0x52),
-                Event::Write(4, 0x53)
-            ]
+            vec![Event::Write(2, 0x51), Event::Write(4, 0x53)]
         );
+        assert_eq!(disk.dirty_count(), 0);
+        for (offset, expected) in [0x51, 0x52, 0x53].into_iter().enumerate() {
+            let start = (2 + offset) * WRITEBACK_BLOCK_SIZE;
+            assert!(disk.inner().data[start..start + WRITEBACK_BLOCK_SIZE]
+                .iter()
+                .all(|byte| *byte == expected));
+        }
     }
 
     #[test]
@@ -1246,7 +1464,7 @@ mod tests {
             disk.write_at(1, &block(2)).unwrap();
         }
         let first = disk.shutdown_drain(2).unwrap();
-        assert!(!first.complete);
+        assert!(first.complete);
         assert_eq!(first.steps, 2);
         assert_eq!(first.dirty_remaining, 0);
         assert!(disk.is_quiesced());
@@ -1257,7 +1475,7 @@ mod tests {
 
         let second = disk.shutdown_drain(1).unwrap();
         assert!(second.complete);
-        assert_eq!(second.steps, 1);
+        assert_eq!(second.steps, 0);
         assert_eq!(second.ticket, 2);
         assert_eq!(disk.inner().events.last(), Some(&Event::Flush));
     }
@@ -1281,9 +1499,11 @@ mod tests {
 
         assert_eq!(
             disk.inner().events,
-            (0..BLOCKS_WRITTEN - CACHE_ENTRIES)
-                .map(|target| Event::Write(target as u64, 0x40 + target as u8))
-                .collect::<Vec<_>>()
+            vec![
+                Event::Write(0, 0x40),
+                Event::Write(2, 0x42),
+                Event::Write(4, 0x44)
+            ]
         );
         for target in 0..BLOCKS_WRITTEN {
             let mut output = block(0);
@@ -1306,14 +1526,8 @@ mod tests {
             after_pressure.flush_ticket_allocation_capacity,
             before.flush_ticket_allocation_capacity
         );
-        assert_eq!(
-            disk.metrics().pressure_writeback_steps,
-            (BLOCKS_WRITTEN - CACHE_ENTRIES) as u64
-        );
-        assert_eq!(
-            disk.metrics().pressure_entries_freed,
-            (BLOCKS_WRITTEN - CACHE_ENTRIES) as u64
-        );
+        assert_eq!(disk.metrics().pressure_writeback_steps, 3);
+        assert_eq!(disk.metrics().pressure_entries_freed, 6);
 
         Disk::flush(&mut disk).unwrap();
         while disk.durable_sequence() < disk.requested_sequence() {
@@ -1321,11 +1535,20 @@ mod tests {
         }
         assert_eq!(
             disk.inner().events,
-            (0..BLOCKS_WRITTEN)
-                .map(|target| Event::Write(target as u64, 0x40 + target as u8))
-                .chain(core::iter::once(Event::Flush))
-                .collect::<Vec<_>>()
+            vec![
+                Event::Write(0, 0x40),
+                Event::Write(2, 0x42),
+                Event::Write(4, 0x44),
+                Event::Write(6, 0x46),
+                Event::Flush
+            ]
         );
+        for target in 0..BLOCKS_WRITTEN {
+            let start = target * WRITEBACK_BLOCK_SIZE;
+            assert!(disk.inner().data[start..start + WRITEBACK_BLOCK_SIZE]
+                .iter()
+                .all(|byte| *byte == 0x40 + target as u8));
+        }
     }
 
     #[test]

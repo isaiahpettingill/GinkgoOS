@@ -42,6 +42,8 @@ THREAD_SMOKE_ELF := $(USERSPACE_TARGET)/ginkgo-thread-smoke
 THREAD_SMOKE_ROOT := $(BUILD_DIR)/thread_smoke_root
 SCHEDULER_SMOKE_ROOT := $(BUILD_DIR)/scheduler_smoke_root
 SCHEDULER_SMOKE_DISK := $(BUILD_DIR)/scheduler-smoke.img
+SCHEDULER_AHCI_SMOKE_ROOT := $(BUILD_DIR)/scheduler_ahci_smoke_root
+SCHEDULER_AHCI_SMOKE_DISK := $(BUILD_DIR)/scheduler-ahci-smoke.img
 FS_IMAGE := $(BUILD_DIR)/ginkgo-redoxfs.img
 FS_IMAGE_SIZE_MB ?= 32
 ISO := $(BUILD_DIR)/$(IMAGE_NAME).iso
@@ -70,7 +72,7 @@ endif
 QEMU_FLAGS ?= -cpu max -m 512M -M pc,i8042=off -serial stdio -device qemu-xhci,id=xhci,msi=on,msix=off -device usb-hub,id=ginkgo-hub,bus=xhci.0,port=1 -device usb-kbd,bus=xhci.0,port=1.1 -device usb-tablet,bus=xhci.0,port=1.2 $(QEMU_AUDIO_FLAGS) -device ich9-intel-hda -device hda-output,audiodev=ginkgo-audio
 THREAD_SMOKE_KERNEL_BUILD = GINKGO_THREAD_SMOKE=1 GINKGO_THREAD_SMOKE_ELF="$(abspath $(THREAD_SMOKE_ELF))" GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" GINKGO_TEXT_EDITOR_ELF="$(abspath $(TEXT_EDITOR_ELF))" GINKGO_TERMINAL_ELF="$(abspath $(TERMINAL_ELF))" cargo build -p ginkgo-kernel --bin ginkgo-os
 
-.PHONY: all userspace kernel iso qemu no-iso run usb-smoke frame-reclaim-smoke thread-smoke scheduler-smoke request-smoke virtio-blk-smoke ahci-ncq-smoke filesystem-smoke text-editor-smoke process-capability-smoke memory-policy-smoke power-smoke check clean distclean reset-fs FORCE
+.PHONY: all userspace kernel iso qemu no-iso run usb-smoke frame-reclaim-smoke thread-smoke scheduler-smoke scheduler-ahci-smoke request-smoke virtio-blk-smoke ahci-ncq-smoke filesystem-smoke text-editor-smoke process-capability-smoke memory-policy-smoke power-smoke check clean distclean reset-fs FORCE
 
 all: iso
 
@@ -176,7 +178,18 @@ scheduler-smoke: userspace $(LIMINE_DIR)/BOOTX64.EFI $(OVMF_CODE)
 	cp $(LIMINE_DIR)/BOOTX64.EFI $(SCHEDULER_SMOKE_ROOT)/EFI/BOOT/
 	rm -f $(SCHEDULER_SMOKE_DISK)
 	$(PYTHON) tools/create_gpt_disk.py $(SCHEDULER_SMOKE_DISK) --size-mb 32
-	$(PYTHON) tools/qemu_scheduler_test.py --qemu "$(QEMU)" --ovmf $(OVMF_CODE) --disk $(SCHEDULER_SMOKE_DISK) --boot-root $(SCHEDULER_SMOKE_ROOT)
+	$(PYTHON) tools/qemu_scheduler_test.py --qemu "$(QEMU)" --ovmf $(OVMF_CODE) --disk $(SCHEDULER_SMOKE_DISK) --boot-root $(SCHEDULER_SMOKE_ROOT) --transport virtio
+
+scheduler-ahci-smoke: userspace $(LIMINE_DIR)/BOOTX64.EFI $(OVMF_CODE)
+	$(THREAD_SMOKE_KERNEL_BUILD)
+	rm -rf $(SCHEDULER_AHCI_SMOKE_ROOT)
+	mkdir -p $(SCHEDULER_AHCI_SMOKE_ROOT)/boot/limine $(SCHEDULER_AHCI_SMOKE_ROOT)/EFI/BOOT
+	cp $(KERNEL) $(SCHEDULER_AHCI_SMOKE_ROOT)/boot/kernel
+	cp limine.conf $(SCHEDULER_AHCI_SMOKE_ROOT)/boot/limine/limine.conf
+	cp $(LIMINE_DIR)/BOOTX64.EFI $(SCHEDULER_AHCI_SMOKE_ROOT)/EFI/BOOT/
+	rm -f $(SCHEDULER_AHCI_SMOKE_DISK)
+	$(PYTHON) tools/create_gpt_disk.py $(SCHEDULER_AHCI_SMOKE_DISK) --size-mb 32
+	$(PYTHON) tools/qemu_scheduler_test.py --qemu "$(QEMU)" --ovmf $(OVMF_CODE) --disk $(SCHEDULER_AHCI_SMOKE_DISK) --boot-root $(SCHEDULER_AHCI_SMOKE_ROOT) --transport ahci
 
 request-smoke: userspace $(LIMINE_DIR)/BOOTX64.EFI $(OVMF_CODE)
 	GINKGO_REQUEST_SMOKE=1 GINKGO_REQUEST_SMOKE_ELF="$(abspath $(REQUEST_SMOKE_ELF))" GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" GINKGO_TEXT_EDITOR_ELF="$(abspath $(TEXT_EDITOR_ELF))" GINKGO_TERMINAL_ELF="$(abspath $(TERMINAL_ELF))" cargo build -p ginkgo-kernel --bin ginkgo-os

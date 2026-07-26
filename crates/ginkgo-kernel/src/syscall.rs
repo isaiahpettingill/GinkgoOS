@@ -27,14 +27,15 @@ use ginkgo_sysapi::{
     Handle, MapFlags, MapProtection, MemoryInfo, ProcessInfo, ProcessMemoryPolicy, RequestBuffer,
     RequestBufferFlags, RequestBufferKind, RequestCompletionMode, RequestDiagnostics, RequestFlags,
     RequestInfo, RequestOperation, RequestResultFlags, RequestState, RequestSubmitArgs,
-    RequestSubmitBatchArgs, RequestSubmitOutput, SharedMemoryMapArgs, Status, SyscallNumber,
-    SystemPowerAction, SystemPowerFlags, SystemPowerInfo, ThreadInfo, ThreadSchedulingClass,
-    ThreadSchedulingInfo, ThreadState as PublicThreadState, VirtualAreaInfo, VirtualMapFileArgs,
-    CHANNEL_MAX_BYTES, CHANNEL_MAX_HANDLES, DEADLINE_INFINITE, FILESYSTEM_NAME_MAX,
-    FILESYSTEM_READ_MAX_BYTES, MEMORY_INFO_V1_SIZE, MEMORY_INFO_VERSION, MEMORY_INFO_VERSION_V1,
-    PROCESS_MAX_STARTUP_BYTES, PROCESS_MAX_STARTUP_HANDLES, PROCESS_MEMORY_POLICY_VERSION,
-    RANDOM_MAX_BYTES, REQUEST_DIAGNOSTICS_VERSION, REQUEST_INFO_VERSION, REQUEST_MAX_BATCH,
-    REQUEST_MAX_BUFFERS, REQUEST_SUBMIT_ARGS_VERSION, REQUEST_SUBMIT_BATCH_ARGS_VERSION,
+    RequestSubmitBatchArgs, RequestSubmitOutput, SharedMemoryMapArgs, Status,
+    StorageDiagnostics as PublicStorageDiagnostics, SyscallNumber, SystemPowerAction,
+    SystemPowerFlags, SystemPowerInfo, ThreadInfo, ThreadSchedulingClass, ThreadSchedulingInfo,
+    ThreadState as PublicThreadState, VirtualAreaInfo, VirtualMapFileArgs, CHANNEL_MAX_BYTES,
+    CHANNEL_MAX_HANDLES, DEADLINE_INFINITE, FILESYSTEM_NAME_MAX, FILESYSTEM_READ_MAX_BYTES,
+    MEMORY_INFO_V1_SIZE, MEMORY_INFO_VERSION, MEMORY_INFO_VERSION_V1, PROCESS_MAX_STARTUP_BYTES,
+    PROCESS_MAX_STARTUP_HANDLES, PROCESS_MEMORY_POLICY_VERSION, RANDOM_MAX_BYTES,
+    REQUEST_DIAGNOSTICS_VERSION, REQUEST_INFO_VERSION, REQUEST_MAX_BATCH, REQUEST_MAX_BUFFERS,
+    REQUEST_SUBMIT_ARGS_VERSION, REQUEST_SUBMIT_BATCH_ARGS_VERSION, STORAGE_DIAGNOSTICS_VERSION,
     THREAD_CREATE_ARGS_VERSION, THREAD_INFO_VERSION, THREAD_SCHEDULING_INFO_VERSION,
     VIRTUAL_AREA_INFO_VERSION,
 };
@@ -123,6 +124,7 @@ const REQUEST_SUBMIT_OUTPUT_SIZE: usize = size_of::<RequestSubmitOutput>();
 const REQUEST_INFO_SIZE: usize = size_of::<RequestInfo>();
 const REQUEST_SUBMIT_BATCH_ARGS_SIZE: usize = size_of::<RequestSubmitBatchArgs>();
 const REQUEST_DIAGNOSTICS_SIZE: usize = size_of::<RequestDiagnostics>();
+const STORAGE_DIAGNOSTICS_SIZE: usize = size_of::<PublicStorageDiagnostics>();
 const REQUEST_TARGET_FILESYSTEM_ROOT: u64 = u64::MAX;
 const REQUEST_TARGET_AUDIO: u64 = u64::MAX - 1;
 const REQUEST_TARGET_SYNTHETIC_TAG: u64 = 0x5359_4e54_0000_0000;
@@ -161,6 +163,9 @@ pub enum DirectFilesystemContinuation {
         rights: Rights,
     },
     FilesystemInfo {
+        output_address: u64,
+    },
+    StorageDiagnostics {
         output_address: u64,
     },
     Metadata {
@@ -677,6 +682,16 @@ fn dispatch_non_exit<D: DebugSink + ?Sized, Q: FilesystemJobQueue + ?Sized>(
         SyscallNumber::RequestGetDiagnostics => {
             request_get_diagnostics(process, requests, context.rdi, context.rsi, context.rdx)
         }
+        SyscallNumber::StorageGetDiagnostics => {
+            return prepare_storage_get_diagnostics(
+                process,
+                thread_id,
+                filesystem,
+                context.rdi,
+                context.rsi,
+                context.rdx,
+            );
+        }
         SyscallNumber::ProcessCreate2 => {
             return prepare_process_create(
                 process,
@@ -825,6 +840,7 @@ const fn decode_syscall_number(raw: u64) -> Option<SyscallNumber> {
         68 => SyscallNumber::RequestGetInfo,
         69 => SyscallNumber::RequestSubmitBatch,
         70 => SyscallNumber::RequestGetDiagnostics,
+        71 => SyscallNumber::StorageGetDiagnostics,
         _ => return None,
     })
 }
@@ -3653,6 +3669,63 @@ pub fn complete_direct_filesystem(
                 put_u32(&mut output, 32, MAX_TRAVERSAL_DEPTH as u32);
                 copy_to_user(process, output_address, &output)
             }
+            DirectFilesystemContinuation::StorageDiagnostics { output_address } => {
+                let (storage, writeback_status, writeback_metrics) = match result {
+                    Ok(FsResult::RuntimeDiagnostics {
+                        storage,
+                        writeback_status,
+                        writeback_metrics,
+                    }) => (storage, writeback_status, writeback_metrics),
+                    Ok(_) => return Status::Io,
+                    Err(status) => return status,
+                };
+                let counters = storage.queue.counters;
+                let output = PublicStorageDiagnostics {
+                    version: STORAGE_DIAGNOSTICS_VERSION,
+                    size: PublicStorageDiagnostics::SIZE,
+                    driver: match storage.driver {
+                        crate::storage::StorageDriverDiagnostics::Virtio(_) => 1,
+                        crate::storage::StorageDriverDiagnostics::Ahci(_) => 2,
+                    },
+                    mode: match storage.mode {
+                        crate::storage::StorageMode::Bootstrap => 0,
+                        crate::storage::StorageMode::Runtime => 1,
+                    },
+                    queue_depth: storage.queue.live_requests as u64,
+                    queue_high_water: counters.queue_high_water as u64,
+                    in_flight_commands: storage.queue.in_flight_commands as u64,
+                    in_flight_high_water: counters.in_flight_high_water as u64,
+                    submissions: counters.submissions,
+                    dispatches: counters.dispatches,
+                    successful_requests: counters.successful_requests,
+                    failed_requests: counters.failed_requests,
+                    bytes_transferred: counters.transferred_bytes,
+                    service_latency_samples: counters.service_latency_samples,
+                    total_service_latency_ns: counters.total_service_latency_ns,
+                    maximum_service_latency_ns: counters.max_service_latency_ns,
+                    maximum_queue_wait_ns: counters.max_queue_wait_ns,
+                    io_errors: counters.io_errors,
+                    unsupported_operations: counters.unsupported_operations,
+                    cancellations: counters.cancellations,
+                    timeouts: counters.timeouts,
+                    resets: counters.resets,
+                    removals: counters.removals,
+                    stale_completions: counters.stale_completions,
+                    duplicate_completions: counters.duplicate_completions,
+                    bounce_available: storage.bounce_available as u64,
+                    bounce_in_flight: storage.bounce_in_flight as u64,
+                    bounce_quarantined: storage.bounce_quarantined as u64,
+                    cache_resident_blocks: writeback_status.resident_count as u64,
+                    cache_dirty_blocks: writeback_status.dirty_count as u64,
+                    cache_read_hits: writeback_metrics.read_hits,
+                    cache_read_misses: writeback_metrics.read_misses,
+                    bytes_written_back: writeback_metrics.bytes_written_back,
+                    writeback_errors: writeback_metrics.writeback_errors,
+                    requested_write_sequence: writeback_status.requested_sequence,
+                    durable_write_sequence: writeback_status.durable_sequence,
+                };
+                copy_to_user(process, output_address, output.as_bytes())
+            }
             DirectFilesystemContinuation::Metadata { output_address } => {
                 let metadata = match result {
                     Ok(FsResult::Metadata(metadata)) => metadata,
@@ -4554,6 +4627,33 @@ fn filesystem_sync<B: Disk>(
         _ => return Err(Status::WrongObjectType),
     }
     filesystem.sync().map_err(map_fs_error)
+}
+
+fn prepare_storage_get_diagnostics<Q: FilesystemJobQueue + ?Sized>(
+    process: &mut Process,
+    thread_id: ThreadId,
+    filesystem: &mut Q,
+    output_address: u64,
+    size: u64,
+    version: u64,
+) -> DispatchResult {
+    if !storage_diagnostics_layout_is_valid(size, version) {
+        return DispatchResult::Complete(Status::InvalidArgument);
+    }
+    if let Err(status) = validate_user_output(process, output_address, STORAGE_DIAGNOSTICS_SIZE) {
+        return DispatchResult::Complete(status);
+    }
+    submit_direct_filesystem(
+        process,
+        thread_id,
+        filesystem,
+        FsJob::RuntimeDiagnostics,
+        DirectFilesystemContinuation::StorageDiagnostics { output_address },
+    )
+}
+
+const fn storage_diagnostics_layout_is_valid(size: u64, version: u64) -> bool {
+    size == PublicStorageDiagnostics::SIZE as u64 && version == STORAGE_DIAGNOSTICS_VERSION as u64
 }
 
 fn prepare_filesystem_get_info<Q: FilesystemJobQueue + ?Sized>(
@@ -6038,6 +6138,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn storage_diagnostics_uses_size_then_version_register_order() {
+        let size = u64::from(PublicStorageDiagnostics::SIZE);
+        let version = u64::from(STORAGE_DIAGNOSTICS_VERSION);
+        assert!(storage_diagnostics_layout_is_valid(size, version));
+        assert!(!storage_diagnostics_layout_is_valid(version, size));
+        assert!(!storage_diagnostics_layout_is_valid(size + 1, version));
+        assert!(!storage_diagnostics_layout_is_valid(size, version + 1));
+    }
+
+    #[test]
     fn syscall_number_decode_is_total_for_the_current_abi() {
         let expected = [
             SyscallNumber::ProcessYield,
@@ -6111,6 +6221,7 @@ mod tests {
             SyscallNumber::RequestGetInfo,
             SyscallNumber::RequestSubmitBatch,
             SyscallNumber::RequestGetDiagnostics,
+            SyscallNumber::StorageGetDiagnostics,
         ];
         for number in expected {
             assert_eq!(decode_syscall_number(number as u64), Some(number));
@@ -6190,7 +6301,11 @@ mod tests {
             decode_syscall_number(70),
             Some(SyscallNumber::RequestGetDiagnostics)
         );
-        assert_eq!(decode_syscall_number(71), None);
+        assert_eq!(
+            decode_syscall_number(71),
+            Some(SyscallNumber::StorageGetDiagnostics)
+        );
+        assert_eq!(decode_syscall_number(72), None);
         assert_eq!(decode_syscall_number(u64::MAX), None);
     }
 

@@ -56,7 +56,7 @@ use ginkgo_kernel::{
     fiber::FixedStack,
     fs_executor::{
         FsDirectory, FsExecutor, FsExecutorError, FsJob, FsJobId, FsResult, PollStep,
-        FS_JOB_CAPACITY,
+        FS_JOB_CAPACITY, FS_MAX_CHUNK_BYTES,
     },
     input::{DeviceInputEvent, InputManager},
     io::SerialPort,
@@ -1087,12 +1087,18 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
+    let writeback_batch_blocks = match storage.driver() {
+        StorageDriver::Virtio(_) => 1,
+        StorageDriver::Ahci(_) => 4,
+    };
     let Ok(mut volume) = Volume::discover(storage) else {
         ui.render_boot_log(&mut screen, "storage: invalid partition table");
         halt_forever();
     };
     let blank_disk = volume_is_blank(&mut volume);
-    let writeback = WriteBackDisk::try_new(volume, 3_072).unwrap_or_else(|_| halt_forever());
+    let writeback =
+        WriteBackDisk::try_new_with_writeback_batch(volume, 3_072, writeback_batch_blocks)
+            .unwrap_or_else(|_| halt_forever());
     let fs_result = if blank_disk {
         RedoxFs::format_disk(writeback)
     } else {
@@ -1166,11 +1172,37 @@ pub extern "C" fn _start() -> ! {
         ui.render_boot_log(&mut screen, "storage: async activation failed");
         halt_forever();
     }
-    let filesystem_executor = unsafe {
+    let mut filesystem_executor = unsafe {
         let slot = ptr::addr_of_mut!(FILESYSTEM_EXECUTOR);
         (*slot).write(filesystem_executor);
         Pin::new_unchecked(&mut *(*slot).as_mut_ptr())
     };
+    if thread_smoke_enabled() {
+        const PROBE_BYTES: usize = 32 * 1024;
+        let probe = filesystem_executor
+            .as_mut()
+            .enqueue(FsJob::StorageReadProbe {
+                lba: 64,
+                length: PROBE_BYTES,
+            })
+            .unwrap_or_else(|_| halt_forever());
+        loop {
+            match filesystem_executor.as_mut().poll_step() {
+                PollStep::Yielded(active) if active == probe => {}
+                PollStep::Completed(completed) if completed == probe => {
+                    let completion = filesystem_executor
+                        .as_mut()
+                        .take_completion(probe)
+                        .unwrap_or_else(|_| halt_forever());
+                    if !matches!(completion.result, Ok(FsResult::Count(PROBE_BYTES))) {
+                        halt_forever();
+                    }
+                    break;
+                }
+                _ => halt_forever(),
+            }
+        }
+    }
 
     let acpi_power = RSDP_REQUEST.response().and_then(|response| {
         match unsafe { AcpiPower::discover(response.address, hhdm.offset, tsc_frequency) } {
@@ -3881,8 +3913,8 @@ fn service_filesystem_request(
     if progress >= total {
         return RequestServiceResult::Complete(Status::Ok, total);
     }
-    let amount = usize::try_from((total - progress).min(redoxfs::BLOCK_SIZE))
-        .unwrap_or(redoxfs::BLOCK_SIZE as usize);
+    let amount = usize::try_from((total - progress).min(FS_MAX_CHUNK_BYTES as u64))
+        .unwrap_or(FS_MAX_CHUNK_BYTES);
     let (job, bridge_job) = match dispatch.operation {
         RequestOperation::FilesystemRead => (
             FsJob::ReadChunk {

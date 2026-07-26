@@ -13,8 +13,8 @@ use crate::{
         run_device_worker, AsyncBlockDevice, AsyncBlockQueue, BlockBuffer, BlockDeviceConfig,
         BlockDeviceId, BlockOperation, BlockPriority, BlockRequestId, BounceBufferLease,
         BufferError, DeviceLifecycleError, DeviceRegisterError, DeviceWorkerBudget,
-        DeviceWorkerOperation, DiagnosticSnapshot, QueueBuildError, QueueConfig, RequestCompletion,
-        RequestOutcome, RequestPoll, RequestSpec, ShutdownState, SubmitError,
+        DeviceWorkerOperation, DiagnosticSnapshot, DmaSegment, QueueBuildError, QueueConfig,
+        RequestCompletion, RequestOutcome, RequestPoll, RequestSpec, ShutdownState, SubmitError,
     },
     block::{BlockDevice, SECTOR_SIZE},
     fiber::{self, YieldError},
@@ -33,6 +33,9 @@ pub const STORAGE_REQUEST_CAPACITY: usize = STORAGE_BOUNCE_PAGES;
 pub const DEFAULT_STORAGE_IO_TIMEOUT_NS: u64 = 5_000_000_000;
 
 const BOUNCE_BYTES: usize = PAGE_SIZE as usize;
+const MAX_RUNTIME_TRANSFER_BYTES: usize = STORAGE_BOUNCE_PAGES * BOUNCE_BYTES;
+const VIRTIO_CHILD_BYTES: usize = 2 * BOUNCE_BYTES;
+const AHCI_CHILD_BYTES: usize = 4 * BOUNCE_BYTES;
 const WORKER_BUDGET: DeviceWorkerBudget = DeviceWorkerBudget {
     completions: STORAGE_REQUEST_CAPACITY,
     cancellations: STORAGE_REQUEST_CAPACITY,
@@ -330,7 +333,10 @@ enum BounceState {
         generation: u32,
         request: BlockRequestId,
     },
-    Quarantined,
+    Quarantined {
+        generation: u32,
+        request: BlockRequestId,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -346,7 +352,10 @@ impl BouncePage {
         physical_address: 0,
         pointer: ptr::null_mut(),
         next_generation: 1,
-        state: BounceState::Quarantined,
+        state: BounceState::Quarantined {
+            generation: 0,
+            request: BlockRequestId::INVALID,
+        },
     };
 }
 
@@ -465,6 +474,63 @@ impl BouncePool {
         Ok(())
     }
 
+    fn validate_submitted(
+        &self,
+        request: BlockRequestId,
+        index: usize,
+        generation: u32,
+    ) -> Result<(), StorageError> {
+        let page = self.pages.get(index).ok_or(StorageError::BounceOwnership)?;
+        if page.state
+            != (BounceState::Submitted {
+                generation,
+                request,
+            })
+        {
+            return Err(StorageError::BounceOwnership);
+        }
+        Ok(())
+    }
+
+    fn release_submitted(
+        &mut self,
+        request: BlockRequestId,
+        index: usize,
+        generation: u32,
+    ) -> Result<(), StorageError> {
+        self.validate_submitted(request, index, generation)?;
+        self.pages[index].state = BounceState::Available;
+        Ok(())
+    }
+
+    fn release_after_dma_stopped(
+        &mut self,
+        request: BlockRequestId,
+        index: usize,
+        generation: u32,
+    ) -> Result<(), StorageError> {
+        let page = self
+            .pages
+            .get_mut(index)
+            .ok_or(StorageError::BounceOwnership)?;
+        let owned = matches!(
+            page.state,
+            BounceState::Submitted {
+                generation: owner_generation,
+                request: owner_request,
+            } | BounceState::Quarantined {
+                generation: owner_generation,
+                request: owner_request,
+            } if owner_generation == generation && owner_request == request
+        );
+        if !owned {
+            return Err(StorageError::BounceOwnership);
+        }
+        page.state = BounceState::Available;
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn validate_return(
         &self,
         request: BlockRequestId,
@@ -487,6 +553,7 @@ impl BouncePool {
         Ok(index)
     }
 
+    #[cfg(test)]
     fn release_return(
         &mut self,
         request: BlockRequestId,
@@ -499,9 +566,17 @@ impl BouncePool {
 
     fn quarantine_request(&mut self, request: BlockRequestId) {
         for page in &mut self.pages {
-            if matches!(page.state, BounceState::Submitted { request: owner, .. } if owner == request)
+            if let BounceState::Submitted {
+                generation,
+                request: owner,
+            } = page.state
             {
-                page.state = BounceState::Quarantined;
+                if owner == request {
+                    page.state = BounceState::Quarantined {
+                        generation,
+                        request,
+                    };
+                }
             }
         }
     }
@@ -536,11 +611,34 @@ impl BouncePool {
             match page.state {
                 BounceState::Available => available += 1,
                 BounceState::Leased { .. } | BounceState::Submitted { .. } => in_flight += 1,
-                BounceState::Quarantined => quarantined += 1,
+                BounceState::Quarantined { .. } => quarantined += 1,
             }
         }
         (available, in_flight, quarantined)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingBouncePage {
+    index: usize,
+    generation: u32,
+    used: usize,
+}
+
+impl PendingBouncePage {
+    const EMPTY: Self = Self {
+        index: 0,
+        generation: 0,
+        used: 0,
+    };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingTransfer {
+    request: BlockRequestId,
+    pages: [PendingBouncePage; STORAGE_BOUNCE_PAGES],
+    page_count: usize,
+    byte_len: usize,
 }
 
 /// Production storage adapter used as a synchronous disk by partition and filesystem code.
@@ -553,7 +651,7 @@ pub struct StorageDisk {
     clock: StorageClock,
     io_timeout_ns: u64,
     request_priority: BlockPriority,
-    pending_request: Option<BlockRequestId>,
+    pending_transfer: Option<PendingTransfer>,
 }
 
 impl StorageDisk {
@@ -603,12 +701,16 @@ impl StorageDisk {
             },
         };
 
+        let child_bytes = match driver {
+            StorageDriver::Virtio(_) => VIRTIO_CHILD_BYTES,
+            StorageDriver::Ahci(_) => AHCI_CHILD_BYTES,
+        };
         let mut queue = AsyncBlockQueue::try_new(
             STORAGE_REQUEST_CAPACITY,
             1,
             QueueConfig {
-                max_request_bytes: BOUNCE_BYTES as u32,
-                child_bytes: BOUNCE_BYTES as u32,
+                max_request_bytes: MAX_RUNTIME_TRANSFER_BYTES as u32,
+                child_bytes: child_bytes as u32,
                 ..QueueConfig::default()
             },
         )?;
@@ -632,7 +734,7 @@ impl StorageDisk {
             clock,
             io_timeout_ns,
             request_priority: BlockPriority::Latency,
-            pending_request: None,
+            pending_transfer: None,
         })
     }
 
@@ -678,7 +780,7 @@ impl StorageDisk {
         if self.mode == StorageMode::Runtime {
             return Ok(());
         }
-        if self.pending_request.is_some() {
+        if self.pending_transfer.is_some() {
             return Err(StorageError::RecoveryRequired);
         }
         self.driver.enable_interrupts(destination_apic_id)?;
@@ -701,7 +803,7 @@ impl StorageDisk {
             StorageMode::Bootstrap => self.driver.bootstrap_flush().map_err(StorageError::from),
             StorageMode::Runtime => {
                 require_active_fiber()?;
-                if self.pending_request.is_some() {
+                if self.pending_transfer.is_some() {
                     return Err(StorageError::RecoveryRequired);
                 }
                 self.queue.begin_shutdown();
@@ -741,7 +843,7 @@ impl StorageDisk {
     /// The caller must prove that the selected device can no longer DMA before calling this hook.
     pub unsafe fn force_shutdown_after_dma_stopped(&mut self) -> Result<(), StorageError> {
         self.queue.force_shutdown();
-        self.reap_pending_after_reset()
+        self.reap_pending_after_dma_stopped()
     }
 
     fn run_worker(&mut self, now_ns: u64) -> Result<(), StorageError> {
@@ -767,9 +869,13 @@ impl StorageDisk {
                     self.queue.remove_device(self.device)?;
                     return Ok(());
                 }
-                Poll::Ready(Err(error)) => return Err(StorageError::Driver(error)),
+                Poll::Ready(Err(error)) => {
+                    self.quarantine_pending_transfer();
+                    return Err(StorageError::Driver(error));
+                }
                 Poll::Pending => {
                     if self.clock.now_ns() >= deadline {
+                        self.quarantine_pending_transfer();
                         return Err(StorageError::ResetTimedOut);
                     }
                     yield_runtime()?;
@@ -778,70 +884,110 @@ impl StorageDisk {
         }
     }
 
+    fn quarantine_pending_transfer(&mut self) {
+        if let Some(pending) = self.pending_transfer {
+            self.bounce.quarantine_request(pending.request);
+        }
+    }
+
+    fn release_pending_pages(&mut self, pending: PendingTransfer) -> Result<(), StorageError> {
+        for page in &pending.pages[..pending.page_count] {
+            self.bounce
+                .release_submitted(pending.request, page.index, page.generation)?;
+        }
+        Ok(())
+    }
+
     fn reap_pending_after_reset(&mut self) -> Result<(), StorageError> {
-        let Some(request) = self.pending_request else {
+        let Some(pending) = self.pending_transfer else {
             return Ok(());
         };
         let completion = self
             .queue
-            .take_completion(request)
+            .take_completion(pending.request)
             .ok_or(StorageError::UnexpectedCompletion)?;
-        self.pending_request = None;
-        if let Some(lease) = completion.bounce {
-            self.bounce.release_return(completion.id, lease)?;
+        if completion.id != pending.request || completion.bounce.is_some() {
+            self.quarantine_pending_transfer();
+            return Err(StorageError::UnexpectedCompletion);
         }
+        self.pending_transfer = None;
+        self.release_pending_pages(pending)
+    }
+
+    fn reap_pending_after_dma_stopped(&mut self) -> Result<(), StorageError> {
+        let Some(pending) = self.pending_transfer else {
+            return Ok(());
+        };
+        let completion = self
+            .queue
+            .take_completion(pending.request)
+            .ok_or(StorageError::UnexpectedCompletion)?;
+        if completion.id != pending.request || completion.bounce.is_some() {
+            return Err(StorageError::UnexpectedCompletion);
+        }
+        for page in &pending.pages[..pending.page_count] {
+            self.bounce
+                .release_after_dma_stopped(pending.request, page.index, page.generation)?;
+        }
+        self.pending_transfer = None;
         Ok(())
     }
 
     fn finish_completion(
         &mut self,
         completion: RequestCompletion,
-        expected_bytes: u32,
         read_destination: Option<&mut [u8]>,
     ) -> Result<(), StorageError> {
-        if self.pending_request != Some(completion.id) {
+        let Some(pending) = self.pending_transfer else {
+            return Err(StorageError::UnexpectedCompletion);
+        };
+        if pending.request != completion.id || completion.bounce.is_some() {
+            self.quarantine_pending_transfer();
             return Err(StorageError::UnexpectedCompletion);
         }
-        self.pending_request = None;
+
+        for page in &pending.pages[..pending.page_count] {
+            if let Err(error) =
+                self.bounce
+                    .validate_submitted(pending.request, page.index, page.generation)
+            {
+                self.quarantine_pending_transfer();
+                return Err(error);
+            }
+        }
 
         let result = if completion.outcome != RequestOutcome::Success {
             Err(StorageError::RequestFailed(completion.outcome))
-        } else if completion.bytes_completed != expected_bytes {
+        } else if completion.bytes_completed != pending.byte_len as u32 {
             Err(StorageError::UnexpectedCompletion)
         } else {
             Ok(())
         };
 
-        match completion.bounce {
-            Some(lease) => {
-                let index = match self.bounce.validate_return(completion.id, &lease) {
-                    Ok(index) => index,
-                    Err(error) => {
-                        self.bounce.quarantine_request(completion.id);
+        if result.is_ok() {
+            if let Some(destination) = read_destination {
+                if destination.len() != pending.byte_len {
+                    self.pending_transfer = None;
+                    self.release_pending_pages(pending)?;
+                    return Err(StorageError::UnexpectedCompletion);
+                }
+                let mut offset = 0;
+                for page in &pending.pages[..pending.page_count] {
+                    let end = offset + page.used;
+                    if let Err(error) = self
+                        .bounce
+                        .copy_out(page.index, &mut destination[offset..end])
+                    {
+                        self.quarantine_pending_transfer();
                         return Err(error);
                     }
-                };
-                if result.is_ok() {
-                    if let Some(destination) = read_destination {
-                        if destination.len() as u32 != expected_bytes {
-                            self.bounce.release_return(completion.id, lease)?;
-                            return Err(StorageError::UnexpectedCompletion);
-                        }
-                        if let Err(error) = self.bounce.copy_out(index, destination) {
-                            self.bounce.quarantine_request(completion.id);
-                            return Err(error);
-                        }
-                    }
+                    offset = end;
                 }
-                self.bounce.release_return(completion.id, lease)?;
-            }
-            None if expected_bytes == 0 => {}
-            None => {
-                self.bounce.quarantine_request(completion.id);
-                return Err(StorageError::BounceOwnership);
             }
         }
 
+        self.pending_transfer = None;
+        self.release_pending_pages(pending)?;
         result
     }
 
@@ -852,7 +998,7 @@ impl StorageDisk {
         write_source: Option<&[u8]>,
         read_destination: Option<&mut [u8]>,
     ) -> Result<(), StorageError> {
-        if self.pending_request.is_some() {
+        if self.pending_transfer.is_some() {
             return Err(StorageError::RecoveryRequired);
         }
 
@@ -864,22 +1010,56 @@ impl StorageDisk {
                     .map(|destination| destination.len())
             })
             .unwrap_or(0);
-        let mut bounce_owner = None;
-        let buffer = if byte_len == 0 {
-            None
-        } else {
-            let (index, generation, lease) = self.bounce.acquire(byte_len)?;
+        if byte_len > MAX_RUNTIME_TRANSFER_BYTES {
+            return Err(StorageError::BouncePoolExhausted);
+        }
+
+        let mut pages = [PendingBouncePage::EMPTY; STORAGE_BOUNCE_PAGES];
+        let mut segments = [DmaSegment::default(); STORAGE_BOUNCE_PAGES];
+        let page_count = byte_len.div_ceil(BOUNCE_BYTES);
+        for page_offset in 0..page_count {
+            let start = page_offset * BOUNCE_BYTES;
+            let used = (byte_len - start).min(BOUNCE_BYTES);
+            let (index, generation, lease) = match self.bounce.acquire(used) {
+                Ok(owner) => owner,
+                Err(error) => {
+                    for page in &pages[..page_offset] {
+                        let _ = self.bounce.release_unsubmitted(page.index, page.generation);
+                    }
+                    return Err(error);
+                }
+            };
             if let Some(source) = write_source {
-                if let Err(error) = self.bounce.copy_into(index, source) {
+                if let Err(error) = self.bounce.copy_into(index, &source[start..start + used]) {
                     let _ = self.bounce.release_unsubmitted(index, generation);
+                    for page in &pages[..page_offset] {
+                        let _ = self.bounce.release_unsubmitted(page.index, page.generation);
+                    }
                     return Err(error);
                 }
             }
-            bounce_owner = Some((index, generation));
-            match BlockBuffer::from_bounce(lease) {
+            pages[page_offset] = PendingBouncePage {
+                index,
+                generation,
+                used,
+            };
+            segments[page_offset] = DmaSegment {
+                physical_address: lease.physical_address,
+                length: used as u32,
+            };
+        }
+        let buffer = if byte_len == 0 {
+            None
+        } else {
+            match unsafe {
+                BlockBuffer::from_dma_segments(byte_len as u32, &segments[..page_count])
+            } {
                 Ok(buffer) => Some(buffer),
                 Err(error) => {
-                    self.bounce.release_unsubmitted(index, generation)?;
+                    for page in &pages[..page_count] {
+                        self.bounce
+                            .release_unsubmitted(page.index, page.generation)?;
+                    }
                     return Err(StorageError::Buffer(error));
                 }
             }
@@ -897,26 +1077,29 @@ impl StorageDisk {
         let id = match self.queue.submit(now, request) {
             Ok(id) => id,
             Err(failure) => {
-                if let Some((index, generation)) = bounce_owner {
-                    self.bounce.release_unsubmitted(index, generation)?;
+                for page in &pages[..page_count] {
+                    self.bounce
+                        .release_unsubmitted(page.index, page.generation)?;
                 }
                 return Err(StorageError::Submit(failure.error));
             }
         };
-        if let Some((index, generation)) = bounce_owner {
-            self.bounce.mark_submitted(index, generation, id)?;
+        for page in &pages[..page_count] {
+            self.bounce
+                .mark_submitted(page.index, page.generation, id)?;
         }
-        self.pending_request = Some(id);
+        self.pending_transfer = Some(PendingTransfer {
+            request: id,
+            pages,
+            page_count,
+            byte_len,
+        });
 
         let mut read_destination = read_destination;
         loop {
             let worker = self.run_worker(self.clock.now_ns());
             if let Some(completion) = self.queue.take_completion(id) {
-                return self.finish_completion(
-                    completion,
-                    byte_len as u32,
-                    read_destination.take(),
-                );
+                return self.finish_completion(completion, read_destination.take());
             }
             if let Err(error) = worker {
                 match self.reset_driver_and_offline_queue() {
@@ -925,7 +1108,7 @@ impl StorageDisk {
                             .queue
                             .take_completion(id)
                             .ok_or(StorageError::UnexpectedCompletion)?;
-                        self.finish_completion(completion, byte_len as u32, None)?;
+                        self.finish_completion(completion, None)?;
                         return Err(error);
                     }
                     Err(reset_error) => return Err(reset_error),
@@ -937,7 +1120,7 @@ impl StorageDisk {
                     .queue
                     .take_completion(id)
                     .ok_or(StorageError::UnexpectedCompletion)?;
-                return self.finish_completion(completion, byte_len as u32, None);
+                return self.finish_completion(completion, None);
             }
             yield_runtime()?;
         }
@@ -1040,7 +1223,7 @@ fn next_chunk(total: usize, offset: usize) -> Option<Chunk> {
     }
     Some(Chunk {
         offset,
-        len: (total - offset).min(BOUNCE_BYTES),
+        len: (total - offset).min(MAX_RUNTIME_TRANSFER_BYTES),
     })
 }
 
@@ -1125,26 +1308,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chunks_at_page_boundaries_without_overlap() {
+    fn chunks_at_runtime_transfer_boundaries_without_overlap() {
         assert_eq!(next_chunk(0, 0), None);
+        let total = MAX_RUNTIME_TRANSFER_BYTES + SECTOR_SIZE;
         assert_eq!(
-            next_chunk(BOUNCE_BYTES + SECTOR_SIZE, 0),
+            next_chunk(total, 0),
             Some(Chunk {
                 offset: 0,
-                len: BOUNCE_BYTES,
+                len: MAX_RUNTIME_TRANSFER_BYTES,
             })
         );
         assert_eq!(
-            next_chunk(BOUNCE_BYTES + SECTOR_SIZE, BOUNCE_BYTES),
+            next_chunk(total, MAX_RUNTIME_TRANSFER_BYTES),
             Some(Chunk {
-                offset: BOUNCE_BYTES,
+                offset: MAX_RUNTIME_TRANSFER_BYTES,
                 len: SECTOR_SIZE,
             })
         );
-        assert_eq!(
-            next_chunk(BOUNCE_BYTES + SECTOR_SIZE, BOUNCE_BYTES + SECTOR_SIZE),
-            None
-        );
+        assert_eq!(next_chunk(total, total), None);
     }
 
     #[test]
@@ -1176,6 +1357,48 @@ mod tests {
 
         assert_eq!(pool.release_return(request, lease), Ok(index));
         assert_eq!(pool.pages[index].state, BounceState::Available);
+    }
+
+    #[test]
+    fn submitted_batch_pages_release_only_for_the_matching_parent() {
+        let mut pool = BouncePool::model(0x20_0000);
+        let request = BlockRequestId::from_raw((1_u64 << 32) | 1);
+        let wrong = BlockRequestId::from_raw((1_u64 << 32) | 2);
+        let mut owners = [(0, 0); 3];
+        for owner in &mut owners {
+            let (index, generation, _) = pool.acquire(BOUNCE_BYTES).unwrap();
+            pool.mark_submitted(index, generation, request).unwrap();
+            *owner = (index, generation);
+        }
+
+        for (index, generation) in owners {
+            assert_eq!(
+                pool.release_submitted(wrong, index, generation),
+                Err(StorageError::BounceOwnership)
+            );
+            assert_eq!(pool.release_submitted(request, index, generation), Ok(()));
+        }
+        assert_eq!(pool.counts(), (STORAGE_BOUNCE_PAGES, 0, 0));
+    }
+
+    #[test]
+    fn quarantine_retains_ownership_until_external_dma_stop_proof() {
+        let mut pool = BouncePool::model(0x20_0000);
+        let request = BlockRequestId::from_raw((1_u64 << 32) | 1);
+        let mut owners = [(0, 0); 3];
+        for owner in &mut owners {
+            let (index, generation, _) = pool.acquire(BOUNCE_BYTES).unwrap();
+            pool.mark_submitted(index, generation, request).unwrap();
+            *owner = (index, generation);
+        }
+
+        pool.quarantine_request(request);
+        assert_eq!(pool.counts(), (STORAGE_BOUNCE_PAGES - 3, 0, 3));
+        for (index, generation) in owners {
+            pool.release_after_dma_stopped(request, index, generation)
+                .unwrap();
+        }
+        assert_eq!(pool.counts(), (STORAGE_BOUNCE_PAGES, 0, 0));
     }
 
     #[test]

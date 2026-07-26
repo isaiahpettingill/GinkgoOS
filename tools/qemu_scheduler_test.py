@@ -28,6 +28,29 @@ METRIC_NAMES = (
     "background_bytes",
     "hog_ticks",
 )
+STORAGE_METRIC_NAMES = (
+    "driver",
+    "queue_hwm",
+    "in_flight_hwm",
+    "bytes",
+    "failures",
+    "io_errors",
+    "bounce_in_flight",
+    "bounce_quarantined",
+    "cache_hits",
+    "cache_misses",
+    "writeback_bytes",
+    "requested",
+    "durable",
+)
+STORAGE_PATTERN = re.compile(
+    r"^ginkgo-scheduler-smoke: storage "
+    r"driver=([0-9]+) queue_hwm=([0-9]+) in_flight_hwm=([0-9]+) bytes=([0-9]+) "
+    r"failures=([0-9]+) io_errors=([0-9]+) bounce_in_flight=([0-9]+) "
+    r"bounce_quarantined=([0-9]+) cache_hits=([0-9]+) cache_misses=([0-9]+) "
+    r"writeback_bytes=([0-9]+) requested=([0-9]+) durable=([0-9]+)\r?$",
+    re.MULTILINE,
+)
 METRICS_PATTERN = re.compile(
     r"^ginkgo-scheduler-smoke: metrics "
     r"frames=([0-9]+) frame_misses=([0-9]+) frame_max_late_ns=([0-9]+) "
@@ -75,6 +98,38 @@ def parse_metrics(log: str) -> tuple[dict[str, int], int]:
     return values, match.start()
 
 
+def parse_storage_metrics(log: str) -> tuple[dict[str, int], int]:
+    matches = list(STORAGE_PATTERN.finditer(log))
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"expected exactly one storage metrics line, found {len(matches)}\n{log[-8000:]}"
+        )
+    match = matches[0]
+    values = {
+        name: int(value) for name, value in zip(STORAGE_METRIC_NAMES, match.groups())
+    }
+    return values, match.start()
+
+
+def require_storage_metric_limits(metrics: dict[str, int], log: str) -> None:
+    checks = (
+        (metrics["driver"] in (1, 2), "driver must identify virtio or AHCI"),
+        (metrics["queue_hwm"] > 0, "queue_hwm must be greater than 0"),
+        (metrics["in_flight_hwm"] > 1, "production in_flight_hwm must be greater than 1"),
+        (metrics["bytes"] > 0, "storage bytes must be greater than 0"),
+        (metrics["failures"] == 0, "storage failures must equal 0"),
+        (metrics["io_errors"] == 0, "storage io_errors must equal 0"),
+        (metrics["bounce_in_flight"] == 0, "bounce_in_flight must equal 0"),
+        (metrics["bounce_quarantined"] == 0, "bounce_quarantined must equal 0"),
+
+        (metrics["writeback_bytes"] > 0, "writeback_bytes must be greater than 0"),
+        (metrics["requested"] == metrics["durable"], "durability sequences must match"),
+    )
+    for passed, message in checks:
+        if not passed:
+            raise RuntimeError(f"storage metric check failed: {message}\n{log[-8000:]}")
+
+
 def require_metric_limits(metrics: dict[str, int], log: str) -> None:
     checks = (
         (metrics["frames"] == 180, "frames must equal 180"),
@@ -105,16 +160,35 @@ def validate_log(log: str) -> dict[str, int]:
             )
         positions.append(matches[0].start())
 
+    storage_metrics, storage_position = parse_storage_metrics(log)
     metrics, metrics_position = parse_metrics(log)
-    expected_order = (*positions[:2], metrics_position, positions[2], positions[3])
+    expected_order = (
+        *positions[:2],
+        storage_position,
+        metrics_position,
+        positions[2],
+        positions[3],
+    )
     if tuple(sorted(expected_order)) != expected_order:
         raise RuntimeError(f"scheduler smoke markers were out of order\n{log[-8000:]}")
 
+    require_storage_metric_limits(storage_metrics, log)
     require_metric_limits(metrics, log)
     return metrics
 
 
 def qemu_command(args: argparse.Namespace, serial_log: str) -> list[str]:
+    if args.transport == "virtio":
+        storage = [
+            "-drive", f"if=none,id=ginkgo-fs,format=raw,cache=writethrough,file={args.disk}",
+            "-device", "virtio-blk-pci,disable-modern=on,drive=ginkgo-fs",
+        ]
+    else:
+        storage = [
+            "-device", "ich9-ahci,id=ginkgo-ahci",
+            "-drive", f"if=none,id=ginkgo-fs,format=raw,cache=writethrough,file={args.disk}",
+            "-device", "ide-hd,drive=ginkgo-fs,bus=ginkgo-ahci.0",
+        ]
     return [
         args.qemu,
         "-accel", "tcg",
@@ -127,8 +201,7 @@ def qemu_command(args: argparse.Namespace, serial_log: str) -> list[str]:
         "-no-reboot",
         "-no-shutdown",
         "-drive", f"if=pflash,unit=0,format=raw,file={args.ovmf},readonly=on",
-        "-drive", f"if=none,id=ginkgo-fs,format=raw,cache=writethrough,file={args.disk}",
-        "-device", "virtio-blk-pci,disable-modern=on,drive=ginkgo-fs",
+        *storage,
         "-device", "qemu-xhci,id=xhci,msi=on,msix=off",
         "-device", "usb-kbd,bus=xhci.0,port=1",
         "-audiodev", "none,id=ginkgo-audio",
@@ -201,6 +274,7 @@ def main() -> None:
     parser.add_argument("--disk", required=True)
     parser.add_argument("--boot-root", required=True)
     parser.add_argument("--timeout", type=float, default=150)
+    parser.add_argument("--transport", choices=("virtio", "ahci"), default="virtio")
     args = parser.parse_args()
     if args.timeout <= 0:
         parser.error("--timeout must be greater than zero")

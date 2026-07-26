@@ -22,7 +22,7 @@ use ginkgo_filesystem::{
 
 use crate::{
     async_block::BlockPriority,
-    block::Volume,
+    block::{BlockDevice, Volume},
     fiber::{self, Fiber, FiberFault, FiberOutcome, FixedStack, ResumeError},
     storage::{StorageDiagnostics, StorageDisk, StorageError},
     writeback::{DrainReport, WriteBackDisk, WriteBackMetrics, WriteBackProgress, WriteBackStatus},
@@ -35,7 +35,7 @@ pub const FS_JOB_CAPACITY: usize = 32;
 pub const FS_RESERVED_KERNEL_JOBS: usize = 4;
 pub const FS_NORMAL_JOB_CAPACITY: usize = FS_JOB_CAPACITY - FS_RESERVED_KERNEL_JOBS;
 pub const FS_MAX_PATH_BYTES: usize = 4096;
-pub const FS_MAX_CHUNK_BYTES: usize = redoxfs::BLOCK_SIZE as usize;
+pub const FS_MAX_CHUNK_BYTES: usize = ginkgo_sysapi::FILESYSTEM_IO_MAX_BYTES;
 pub const FS_MAX_DIRECTORY_ENTRIES: usize = 256;
 pub const FS_MAX_DIRECTORY_RESULT_BYTES: usize = 64 * 1024;
 pub const FS_MAX_LOG_APPEND_BYTES: usize = redoxfs::BLOCK_SIZE as usize;
@@ -240,6 +240,11 @@ pub enum FsJob {
     },
     StorageDiagnostics,
     WritebackDiagnostics,
+    RuntimeDiagnostics,
+    StorageReadProbe {
+        lba: u64,
+        length: usize,
+    },
     #[cfg(test)]
     TestYield {
         yields: usize,
@@ -260,7 +265,8 @@ impl FsJob {
             | Self::Resume
             | Self::ActivateAsyncStorage { .. }
             | Self::StorageDiagnostics
-            | Self::WritebackDiagnostics => JobPriority::Kernel,
+            | Self::WritebackDiagnostics
+            | Self::StorageReadProbe { .. } => JobPriority::Kernel,
             #[cfg(test)]
             Self::TestYield {
                 shutdown_priority: true,
@@ -302,6 +308,14 @@ impl FsJob {
                 validate_path(destination_path)
             }
             Self::ReadChunk { length, .. } if *length > FS_MAX_CHUNK_BYTES => {
+                Err(FsExecutorError::PayloadTooLarge)
+            }
+            Self::StorageReadProbe { length, .. }
+                if *length == 0
+                    || *length
+                        > crate::storage::STORAGE_BOUNCE_PAGES * redoxfs::BLOCK_SIZE as usize
+                    || *length % crate::block::SECTOR_SIZE != 0 =>
+            {
                 Err(FsExecutorError::PayloadTooLarge)
             }
             Self::WriteChunk { data, .. } if data.len() > FS_MAX_CHUNK_BYTES => {
@@ -420,6 +434,11 @@ pub enum FsResult {
     WritebackDiagnostics {
         status: WriteBackStatus,
         metrics: WriteBackMetrics,
+    },
+    RuntimeDiagnostics {
+        storage: StorageDiagnostics,
+        writeback_status: WriteBackStatus,
+        writeback_metrics: WriteBackMetrics,
     },
     AsyncStorageActivated {
         writeback_newly_enabled: bool,
@@ -1379,6 +1398,20 @@ fn execute_job(
             status: filesystem.disk().status(),
             metrics: filesystem.disk().metrics(),
         }),
+        FsJob::RuntimeDiagnostics => Ok(FsResult::RuntimeDiagnostics {
+            storage: storage_disk(filesystem).diagnostics(),
+            writeback_status: filesystem.disk().status(),
+            writeback_metrics: filesystem.disk().metrics(),
+        }),
+        FsJob::StorageReadProbe { lba, length } => {
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(length)
+                .map_err(|_| FsExecutorError::PayloadTooLarge)?;
+            bytes.resize(length, 0);
+            storage_disk_mut(filesystem).read_sectors(lba, &mut bytes)?;
+            Ok(FsResult::Count(length))
+        }
         #[cfg(test)]
         FsJob::TestYield { .. } => unreachable!(),
     }
@@ -1575,6 +1608,48 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_chunk_limit_accepts_the_bound_and_rejects_larger_payloads() {
+        // SAFETY: `FileHandle` contains only integers and validation does not dereference it.
+        let file: FileHandle = unsafe { core::mem::zeroed() };
+        assert_eq!(
+            FsJob::ReadChunk {
+                file,
+                offset: 0,
+                length: FS_MAX_CHUNK_BYTES,
+            }
+            .validate(),
+            Ok(())
+        );
+        assert_eq!(
+            FsJob::WriteChunk {
+                file,
+                offset: 0,
+                data: alloc::vec![0; FS_MAX_CHUNK_BYTES],
+            }
+            .validate(),
+            Ok(())
+        );
+        assert_eq!(
+            FsJob::ReadChunk {
+                file,
+                offset: 0,
+                length: FS_MAX_CHUNK_BYTES + 1,
+            }
+            .validate(),
+            Err(FsExecutorError::PayloadTooLarge)
+        );
+        assert_eq!(
+            FsJob::WriteChunk {
+                file,
+                offset: 0,
+                data: alloc::vec![0; FS_MAX_CHUNK_BYTES + 1],
+            }
+            .validate(),
+            Err(FsExecutorError::PayloadTooLarge)
+        );
+    }
+
+    #[test]
     fn fs_executor_queue_bounds_and_generation_reuse() {
         let _guard = test_lock();
         let mut stack = core::pin::pin!(FixedStack::<TEST_STACK_SIZE>::new());
@@ -1616,6 +1691,31 @@ mod tests {
         assert_eq!(
             executor.as_mut().take_completion(first).unwrap_err(),
             FsExecutorError::UnknownJob
+        );
+    }
+
+    #[test]
+    fn runtime_diagnostics_cannot_consume_reserved_kernel_slots() {
+        let mut scheduler = SchedulerState::new();
+        for _ in 0..FS_NORMAL_JOB_CAPACITY {
+            scheduler.enqueue(FsJob::RuntimeDiagnostics).unwrap();
+        }
+        assert_eq!(
+            scheduler
+                .enqueue(FsJob::RuntimeDiagnostics)
+                .unwrap_err()
+                .error,
+            FsExecutorError::ReservedCapacity
+        );
+        for _ in 0..FS_RESERVED_KERNEL_JOBS {
+            scheduler.enqueue(FsJob::WritebackDiagnostics).unwrap();
+        }
+        assert_eq!(
+            scheduler
+                .enqueue(FsJob::WritebackDiagnostics)
+                .unwrap_err()
+                .error,
+            FsExecutorError::QueueFull
         );
     }
 

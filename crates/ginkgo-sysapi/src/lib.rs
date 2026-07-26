@@ -150,6 +150,8 @@ pub enum SyscallNumber {
     RequestSubmitBatch = 69,
     /// Returns aggregate request queue and completion diagnostics.
     RequestGetDiagnostics = 70,
+    /// Returns a coherent block-storage and writeback-cache diagnostics snapshot.
+    StorageGetDiagnostics = 71,
 }
 
 /// An opaque process-local reference to a kernel object.
@@ -1057,6 +1059,56 @@ impl RequestDiagnostics {
     pub const SIZE: u32 = core::mem::size_of::<Self>() as u32;
 }
 
+pub const STORAGE_DIAGNOSTICS_VERSION: u32 = 1;
+
+/// Versioned block-storage and writeback-cache diagnostics.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq,
+)]
+pub struct StorageDiagnostics {
+    pub version: u32,
+    pub size: u32,
+    pub driver: u32,
+    pub mode: u32,
+    pub queue_depth: u64,
+    pub queue_high_water: u64,
+    pub in_flight_commands: u64,
+    pub in_flight_high_water: u64,
+    pub submissions: u64,
+    pub dispatches: u64,
+    pub successful_requests: u64,
+    pub failed_requests: u64,
+    pub bytes_transferred: u64,
+    pub service_latency_samples: u64,
+    pub total_service_latency_ns: u64,
+    pub maximum_service_latency_ns: u64,
+    pub maximum_queue_wait_ns: u64,
+    pub io_errors: u64,
+    pub unsupported_operations: u64,
+    pub cancellations: u64,
+    pub timeouts: u64,
+    pub resets: u64,
+    pub removals: u64,
+    pub stale_completions: u64,
+    pub duplicate_completions: u64,
+    pub bounce_available: u64,
+    pub bounce_in_flight: u64,
+    pub bounce_quarantined: u64,
+    pub cache_resident_blocks: u64,
+    pub cache_dirty_blocks: u64,
+    pub cache_read_hits: u64,
+    pub cache_read_misses: u64,
+    pub bytes_written_back: u64,
+    pub writeback_errors: u64,
+    pub requested_write_sequence: u64,
+    pub durable_write_sequence: u64,
+}
+
+impl StorageDiagnostics {
+    pub const SIZE: u32 = core::mem::size_of::<Self>() as u32;
+}
+
 /// How a handle is transferred in a channel write.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1550,8 +1602,10 @@ pub struct VirtualMapFileArgs {
 
 /// Maximum UTF-8 bytes in one filesystem path component.
 pub const FILESYSTEM_NAME_MAX: usize = 252;
-/// Maximum bytes transferred by one filesystem read syscall.
-pub const FILESYSTEM_READ_MAX_BYTES: usize = 16 * 1024;
+/// Maximum bytes transferred by one filesystem read or write syscall.
+pub const FILESYSTEM_IO_MAX_BYTES: usize = 16 * 1024;
+/// Backward-compatible name for the filesystem read limit.
+pub const FILESYSTEM_READ_MAX_BYTES: usize = FILESYSTEM_IO_MAX_BYTES;
 
 /// Argument block for [`SyscallNumber::FilesystemOpen`].
 #[repr(C)]
@@ -1849,6 +1903,7 @@ const _: () = {
     assert!(core::mem::size_of::<RequestInfo>() == 80);
     assert!(core::mem::size_of::<RequestSubmitBatchArgs>() == 32);
     assert!(core::mem::size_of::<RequestDiagnostics>() == 128);
+    assert!(core::mem::size_of::<StorageDiagnostics>() == 272);
     assert!(core::mem::size_of::<ThreadId>() == 8);
     assert!(core::mem::size_of::<ThreadCreateArgs>() == 56);
     assert!(core::mem::size_of::<ThreadInfo>() == 64);
@@ -1971,6 +2026,7 @@ mod tests {
         assert_eq!(SyscallNumber::RequestGetInfo as u64, 68);
         assert_eq!(SyscallNumber::RequestSubmitBatch as u64, 69);
         assert_eq!(SyscallNumber::RequestGetDiagnostics as u64, 70);
+        assert_eq!(SyscallNumber::StorageGetDiagnostics as u64, 71);
     }
 
     #[test]
@@ -2250,6 +2306,15 @@ mod tests {
         assert_eq!(offset_of!(RequestDiagnostics, errors), 96);
         assert_eq!(offset_of!(RequestDiagnostics, rejected_requests), 104);
         assert_eq!(offset_of!(RequestDiagnostics, dropped_completions), 112);
+
+        assert_eq!(size_of::<StorageDiagnostics>(), 272);
+        assert_eq!(align_of::<StorageDiagnostics>(), 8);
+        assert_eq!(offset_of!(StorageDiagnostics, version), 0);
+        assert_eq!(offset_of!(StorageDiagnostics, queue_depth), 16);
+        assert_eq!(offset_of!(StorageDiagnostics, bytes_transferred), 80);
+        assert_eq!(offset_of!(StorageDiagnostics, bounce_available), 184);
+        assert_eq!(offset_of!(StorageDiagnostics, cache_resident_blocks), 208);
+        assert_eq!(offset_of!(StorageDiagnostics, durable_write_sequence), 264);
 
         assert_eq!(size_of::<ThreadCreateArgs>(), 56);
         assert_eq!(align_of::<ThreadCreateArgs>(), 8);

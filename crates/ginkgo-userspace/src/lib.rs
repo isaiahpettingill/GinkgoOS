@@ -676,6 +676,24 @@ pub fn request_get_diagnostics() -> SyscallResult<RequestDiagnostics> {
     Ok(diagnostics)
 }
 
+/// Returns one coherent block-storage and writeback-cache diagnostics snapshot.
+pub fn storage_get_diagnostics() -> SyscallResult<StorageDiagnostics> {
+    let mut diagnostics = StorageDiagnostics::default();
+    // SAFETY: diagnostics is writable and remains alive until the syscall returns.
+    status_result(unsafe {
+        raw_syscall6(
+            SyscallNumber::StorageGetDiagnostics,
+            mut_pointer_address(&mut diagnostics),
+            u64::from(StorageDiagnostics::SIZE),
+            u64::from(STORAGE_DIAGNOSTICS_VERSION),
+            0,
+            0,
+            0,
+        )
+    })?;
+    Ok(diagnostics)
+}
+
 /// Writes bytes to the kernel's initial bounded serial debug sink.
 ///
 /// The kernel defines and enforces the maximum accepted length. This wrapper

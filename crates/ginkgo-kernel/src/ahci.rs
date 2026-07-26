@@ -15,7 +15,10 @@ use core::{
 };
 
 use crate::{
-    arch::{take_ahci_interrupt_pending, AHCI_VECTOR},
+    arch::{
+        register_ahci_port_ie, take_ahci_interrupt_pending, unregister_ahci_port_ie,
+        AhciInterruptRegisterError, AHCI_VECTOR,
+    },
     async_block::{
         AsyncBlockDevice, BlockDeviceConfig, BlockOperation, DispatchCommand, DispatchToken,
         DmaAddressMode, DmaConstraints, DmaSegment, DriverCompletion, HardwareStatus,
@@ -120,6 +123,7 @@ const MAX_ATA_SECTORS: u32 = 65_536;
 pub enum AhciError {
     Pci(PciError),
     Io(IoError),
+    InterruptRegistration(AhciInterruptRegisterError),
     Mapping(MapError),
     FrameAllocator(FrameAllocatorError),
     ControllerNotFound,
@@ -156,6 +160,12 @@ pub enum AhciError {
 impl From<PciError> for AhciError {
     fn from(value: PciError) -> Self {
         Self::Pci(value)
+    }
+}
+
+impl From<AhciInterruptRegisterError> for AhciError {
+    fn from(value: AhciInterruptRegisterError) -> Self {
+        Self::InterruptRegistration(value)
     }
 }
 
@@ -414,6 +424,7 @@ pub struct AhciDisk {
     mmio: MmioRegion,
     pci_device: PciDevice,
     port: usize,
+    port_ie_address: u64,
     command_list: DmaPage,
     received_fis: DmaPage,
     command_tables: [Option<DmaPage>; MAX_SLOTS],
@@ -485,6 +496,7 @@ impl AhciDisk {
             return Err(AhciError::InvalidBar);
         }
 
+        let port_ie_address = mmio.u32_address(port_base + PORT_IE)?;
         stop_engine(&mut mmio, port_base)?;
         mmio.write_u32(port_base + PORT_IE, 0)?;
         mmio.write_u32(port_base + PORT_IS, u32::MAX)?;
@@ -506,6 +518,7 @@ impl AhciDisk {
             mmio,
             pci_device: device,
             port,
+            port_ie_address,
             command_list,
             received_fis,
             command_tables,
@@ -570,19 +583,31 @@ impl AhciDisk {
         if self.issued_mask != 0 {
             return Err(self.reject(AhciError::CommandSlotBusy));
         }
-        self.mmio.write_u32(base + PORT_IE, 0)?;
+        self.mask_interrupts(base)?;
         self.acknowledge_interrupts(base)?;
         let mut pci = unsafe { PciConfig::new()? };
-        pci.configure_msi(self.pci_device, destination_apic_id, AHCI_VECTOR)?;
-        if let Err(error) = self.mmio.write_u32(base + PORT_IE, PORT_INTERRUPT_MASK) {
-            let _ = pci.disable_msi(self.pci_device);
-            return Err(error.into());
-        }
-        let ghc = self.mmio.read_u32(REG_GHC)?;
-        if let Err(error) = self.mmio.write_u32(REG_GHC, ghc | GHC_AE | GHC_IE) {
-            let _ = self.mmio.write_u32(base + PORT_IE, 0);
-            let _ = pci.disable_msi(self.pci_device);
-            return Err(error.into());
+        unsafe { register_ahci_port_ie(self.port_ie_address)? };
+        fence(Ordering::SeqCst);
+        let mut msi_configured = false;
+        let enabled = (|| {
+            pci.configure_msi(self.pci_device, destination_apic_id, AHCI_VECTOR)?;
+            msi_configured = true;
+            self.mmio.write_u32(base + PORT_IE, PORT_INTERRUPT_MASK)?;
+            let ghc = self.mmio.read_u32(REG_GHC)?;
+            self.mmio.write_u32(REG_GHC, ghc | GHC_AE | GHC_IE)?;
+            let _ = self.mmio.read_u32(REG_GHC)?;
+            Ok::<(), AhciError>(())
+        })();
+        if let Err(error) = enabled {
+            let _ = self.mask_interrupts(base);
+            if let Ok(ghc) = self.mmio.read_u32(REG_GHC) {
+                let _ = self.mmio.write_u32(REG_GHC, ghc & !GHC_IE);
+            }
+            let delivery_disabled = !msi_configured || pci.disable_msi(self.pci_device).is_ok();
+            if delivery_disabled {
+                let _ = unsafe { unregister_ahci_port_ie(self.port_ie_address) };
+            }
+            return Err(error);
         }
         fence(Ordering::SeqCst);
         self.diagnostics.msi_enabled = true;
@@ -854,11 +879,18 @@ impl AhciDisk {
             .max(self.diagnostics.in_flight);
         self.diagnostics.prdt_high_water = self.diagnostics.prdt_high_water.max(plan.count);
         compiler_fence(Ordering::Release);
-        if self.ncq_enabled && !exclusive {
-            self.mmio.write_u32(base + PORT_SACT, mask)?;
-            compiler_fence(Ordering::Release);
+        let issue = (|| {
+            if self.ncq_enabled && !exclusive {
+                self.mmio.write_u32(base + PORT_SACT, mask)?;
+                compiler_fence(Ordering::Release);
+            }
+            self.mmio.write_u32(base + PORT_CI, mask)?;
+            Ok::<(), IoError>(())
+        })();
+        if let Err(error) = issue {
+            self.reject(error.into());
+            self.start_reset();
         }
-        self.mmio.write_u32(base + PORT_CI, mask)?;
         Ok(())
     }
 
@@ -875,11 +907,11 @@ impl AhciDisk {
         let interrupt = self.mmio.read_u32(base + PORT_IS)?;
         if interrupt != 0 {
             self.mmio.write_u32(base + PORT_IS, interrupt)?;
-            let global = self.mmio.read_u32(REG_IS)?;
-            let port_bit = 1_u32 << self.port;
-            if global & port_bit != 0 {
-                self.mmio.write_u32(REG_IS, port_bit)?;
-            }
+        }
+        let global = self.mmio.read_u32(REG_IS)?;
+        let port_bit = 1_u32 << self.port;
+        if global & port_bit != 0 {
+            self.mmio.write_u32(REG_IS, port_bit)?;
         }
         if interrupt & PORT_IS_ERROR_MASK != 0 {
             self.diagnostics.errors = self.diagnostics.errors.saturating_add(1);
@@ -894,7 +926,7 @@ impl AhciDisk {
         let ci = self.mmio.read_u32(base + PORT_CI)?;
         let completed = completed_slots(self.issued_mask, sact, ci);
         if completed == 0 {
-            return Ok(());
+            return self.rearm_interrupts(base);
         }
         fence(Ordering::Acquire);
         for slot in 0..usize::from(self.slot_count) {
@@ -931,7 +963,35 @@ impl AhciDisk {
         if self.issued_mask == 0 {
             self.exclusive_command = false;
         }
+        self.rearm_interrupts(base)
+    }
+
+    fn mask_interrupts(&mut self, base: usize) -> Result<(), AhciError> {
+        self.mmio.write_u32(base + PORT_IE, 0)?;
+        let _ = self.mmio.read_u32(base + PORT_IE)?;
         Ok(())
+    }
+
+    fn rearm_interrupts(&mut self, base: usize) -> Result<(), AhciError> {
+        if self.reset_state != ResetState::Running
+            || !self.diagnostics.async_enabled
+            || !self.diagnostics.msi_enabled
+        {
+            return Ok(());
+        }
+        fence(Ordering::Release);
+        let rearmed = (|| {
+            self.mmio.write_u32(base + PORT_IE, PORT_INTERRUPT_MASK)?;
+            let enabled = self.mmio.read_u32(base + PORT_IE)?;
+            if enabled & PORT_INTERRUPT_MASK != PORT_INTERRUPT_MASK {
+                return Err(AhciError::DeviceUnavailable);
+            }
+            Ok(())
+        })();
+        if rearmed.is_err() {
+            self.start_reset();
+        }
+        rearmed
     }
 
     fn acknowledge_interrupts(&mut self, base: usize) -> Result<(), AhciError> {
@@ -973,10 +1033,10 @@ impl AhciDisk {
     }
 
     fn poll_completion_inner(&mut self) -> Poll<Result<DriverCompletion, AhciError>> {
-        if let Some(completion) = self.pop_completion() {
-            return Poll::Ready(Ok(completion));
-        }
         if self.reset_state != ResetState::Running {
+            if let Some(completion) = self.pop_completion() {
+                return Poll::Ready(Ok(completion));
+            }
             return Poll::Ready(Err(if self.reset_state == ResetState::Quarantined {
                 AhciError::Quarantined
             } else {
@@ -1029,6 +1089,9 @@ impl AhciDisk {
             self.reset_state = ResetState::StopRequested;
             self.reset_watchdog = RESET_WATCHDOG_POLLS;
             self.diagnostics.resets = self.diagnostics.resets.saturating_add(1);
+            if let Ok(base) = port_offset(self.port) {
+                let _ = self.mask_interrupts(base);
+            }
         }
     }
 
@@ -1053,7 +1116,7 @@ impl AhciDisk {
 
         match self.reset_state {
             ResetState::StopRequested => {
-                if let Err(error) = self.mmio.write_u32(base + PORT_IE, 0) {
+                if let Err(error) = self.mask_interrupts(base) {
                     return Poll::Ready(Err(self.quarantine(error.into())));
                 }
                 if let Ok(mut pci) = unsafe { PciConfig::new() } {
@@ -1249,7 +1312,7 @@ impl AsyncBlockDevice for AhciDisk {
 impl Drop for AhciDisk {
     fn drop(&mut self) {
         if let Ok(base) = port_offset(self.port) {
-            let _ = self.mmio.write_u32(base + PORT_IE, 0);
+            let _ = self.mask_interrupts(base);
             if stop_engine(&mut self.mmio, base).is_err() {
                 if let Ok(mut pci) = unsafe { PciConfig::new() } {
                     let _ = pci.set_bus_mastering(self.pci_device, false);
@@ -1257,7 +1320,9 @@ impl Drop for AhciDisk {
             }
         }
         if let Ok(mut pci) = unsafe { PciConfig::new() } {
-            let _ = pci.disable_msi(self.pci_device);
+            if pci.disable_msi(self.pci_device).is_ok() {
+                let _ = unsafe { unregister_ahci_port_ie(self.port_ie_address) };
+            }
         }
         compiler_fence(Ordering::SeqCst);
         // The monotonic allocator does not reuse these frames. Active tokens are

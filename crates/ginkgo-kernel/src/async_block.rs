@@ -741,7 +741,7 @@ pub fn run_device_worker<D: AsyncBlockDevice + ?Sized>(
                 });
             }
         };
-        match queue.complete(completion.token, completion.status) {
+        match queue.complete_at(completion.token, completion.status, now_ns) {
             CompletionDisposition::Accepted => report.accepted_completions += 1,
             CompletionDisposition::DuplicateRejected => report.duplicate_completions += 1,
             CompletionDisposition::StaleRejected => report.stale_completions += 1,
@@ -784,7 +784,7 @@ pub fn run_device_worker<D: AsyncBlockDevice + ?Sized>(
             break;
         };
         if let Err(error) = driver.submit(&command) {
-            let disposition = queue.complete(command.token, HardwareStatus::IoError);
+            let disposition = queue.complete_at(command.token, HardwareStatus::IoError, now_ns);
             debug_assert_eq!(disposition, CompletionDisposition::Accepted);
             report.rejected_commands += 1;
             return Err(DeviceWorkerError {
@@ -810,6 +810,9 @@ pub struct BlockDiagnostics {
     pub terminal_requests: u64,
     pub successful_requests: u64,
     pub failed_requests: u64,
+    pub transferred_bytes: u64,
+    pub io_errors: u64,
+    pub unsupported_operations: u64,
     pub cancellations: u64,
     pub timeouts: u64,
     pub resets: u64,
@@ -821,6 +824,9 @@ pub struct BlockDiagnostics {
     pub queue_high_water: usize,
     pub in_flight_high_water: usize,
     pub max_queue_wait_ns: u64,
+    pub service_latency_samples: u64,
+    pub total_service_latency_ns: u64,
+    pub max_service_latency_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -869,6 +875,7 @@ struct RequestSlot {
     sequence: u64,
     ordering_epoch: u64,
     enqueued_at_ns: u64,
+    first_dispatched_at_ns: Option<u64>,
     child_count: u16,
     next_child: u16,
     children: [ChildState; MAX_CHILDREN],
@@ -893,6 +900,7 @@ impl RequestSlot {
             sequence: 0,
             ordering_epoch: 0,
             enqueued_at_ns: 0,
+            first_dispatched_at_ns: None,
             child_count: 0,
             next_child: 0,
             children: [ChildState::Pending; MAX_CHILDREN],
@@ -1156,6 +1164,7 @@ impl AsyncBlockQueue {
         slot.sequence = sequence;
         slot.ordering_epoch = ordering_epoch;
         slot.enqueued_at_ns = now_ns;
+        slot.first_dispatched_at_ns = None;
         slot.child_count = child_count;
         slot.next_child = 0;
         slot.children.fill(ChildState::Pending);
@@ -1504,6 +1513,9 @@ impl AsyncBlockQueue {
 
         let slot = &mut self.slots[slot_index];
         slot.state = SlotState::Active;
+        if slot.first_dispatched_at_ns.is_none() {
+            slot.first_dispatched_at_ns = Some(now_ns);
+        }
         slot.children[usize::from(child_index)] = ChildState::InFlight {
             serial,
             cancel_notified: false,
@@ -1592,6 +1604,25 @@ impl AsyncBlockQueue {
         token: DispatchToken,
         status: HardwareStatus,
     ) -> CompletionDisposition {
+        self.complete_observed(token, status, None)
+    }
+
+    /// Completes a command and records service latency against the worker's monotonic clock.
+    pub fn complete_at(
+        &mut self,
+        token: DispatchToken,
+        status: HardwareStatus,
+        now_ns: u64,
+    ) -> CompletionDisposition {
+        self.complete_observed(token, status, Some(now_ns))
+    }
+
+    fn complete_observed(
+        &mut self,
+        token: DispatchToken,
+        status: HardwareStatus,
+        now_ns: Option<u64>,
+    ) -> CompletionDisposition {
         let Some(device_index) = token
             .device_id
             .index()
@@ -1647,6 +1678,10 @@ impl AsyncBlockQueue {
             self.slots[slot_index].bytes_completed = self.slots[slot_index]
                 .bytes_completed
                 .saturating_add(child_len);
+            self.diagnostics.transferred_bytes = self
+                .diagnostics
+                .transferred_bytes
+                .saturating_add(u64::from(child_len));
         } else if self.slots[slot_index].pending_outcome.is_none() {
             self.slots[slot_index].pending_outcome = Some(match status {
                 HardwareStatus::Success => RequestOutcome::Success,
@@ -1663,7 +1698,7 @@ impl AsyncBlockQueue {
             let outcome = self.slots[slot_index]
                 .pending_outcome
                 .unwrap_or(RequestOutcome::Success);
-            self.mark_terminal(slot_index, outcome);
+            self.mark_terminal_at(slot_index, outcome, now_ns);
         }
         self.update_shutdown_state();
         CompletionDisposition::Accepted
@@ -1828,6 +1863,10 @@ impl AsyncBlockQueue {
     }
 
     fn mark_terminal(&mut self, index: usize, outcome: RequestOutcome) {
+        self.mark_terminal_at(index, outcome, None);
+    }
+
+    fn mark_terminal_at(&mut self, index: usize, outcome: RequestOutcome, now_ns: Option<u64>) {
         self.remove_queued_entry(index);
         if self.slots[index].state == SlotState::Terminal {
             return;
@@ -1840,6 +1879,23 @@ impl AsyncBlockQueue {
                 self.diagnostics.successful_requests.saturating_add(1);
         } else {
             self.diagnostics.failed_requests = self.diagnostics.failed_requests.saturating_add(1);
+            if outcome == RequestOutcome::IoError {
+                self.diagnostics.io_errors = self.diagnostics.io_errors.saturating_add(1);
+            } else if outcome == RequestOutcome::Unsupported {
+                self.diagnostics.unsupported_operations =
+                    self.diagnostics.unsupported_operations.saturating_add(1);
+            }
+        }
+        if let (Some(start), Some(end)) = (self.slots[index].first_dispatched_at_ns, now_ns) {
+            let latency = end.saturating_sub(start);
+            self.diagnostics.service_latency_samples =
+                self.diagnostics.service_latency_samples.saturating_add(1);
+            self.diagnostics.total_service_latency_ns = self
+                .diagnostics
+                .total_service_latency_ns
+                .saturating_add(latency);
+            self.diagnostics.max_service_latency_ns =
+                self.diagnostics.max_service_latency_ns.max(latency);
         }
         self.update_shutdown_state();
     }
@@ -2018,6 +2074,75 @@ mod tests {
             priority: BlockPriority::Latency,
             deadline_ns: None,
         }
+    }
+
+    #[test]
+    fn diagnostics_record_bytes_outcomes_and_service_latency() {
+        let (mut queue, device) = queue(1, 1);
+        let success = queue
+            .submit(
+                10,
+                transfer(
+                    device,
+                    BlockOperation::Read,
+                    0,
+                    512,
+                    0x1000,
+                    BlockPriority::Latency,
+                    None,
+                ),
+            )
+            .unwrap();
+        let command = queue.dispatch_one(device, 20).unwrap();
+        assert_eq!(
+            queue.complete_at(command.token, HardwareStatus::Success, 50),
+            CompletionDisposition::Accepted
+        );
+        queue.take_completion(success).unwrap();
+
+        let failed = queue
+            .submit(
+                55,
+                transfer(
+                    device,
+                    BlockOperation::Read,
+                    1,
+                    512,
+                    0x2000,
+                    BlockPriority::Latency,
+                    None,
+                ),
+            )
+            .unwrap();
+        let command = queue.dispatch_one(device, 60).unwrap();
+        queue.complete_at(command.token, HardwareStatus::IoError, 80);
+        queue.take_completion(failed).unwrap();
+
+        let unsupported = queue
+            .submit(
+                85,
+                transfer(
+                    device,
+                    BlockOperation::Write,
+                    2,
+                    512,
+                    0x3000,
+                    BlockPriority::Latency,
+                    None,
+                ),
+            )
+            .unwrap();
+        let command = queue.dispatch_one(device, 90).unwrap();
+        queue.complete_at(command.token, HardwareStatus::Unsupported, 100);
+        queue.take_completion(unsupported).unwrap();
+
+        let diagnostics = queue.diagnostics().counters;
+        assert_eq!(diagnostics.transferred_bytes, 512);
+        assert_eq!(diagnostics.io_errors, 1);
+        assert_eq!(diagnostics.unsupported_operations, 1);
+        assert_eq!(diagnostics.service_latency_samples, 3);
+        assert_eq!(diagnostics.total_service_latency_ns, 60);
+        assert_eq!(diagnostics.max_service_latency_ns, 30);
     }
 
     #[test]
