@@ -12,11 +12,12 @@ use ginkgo_desktop::{
     AttachmentIndex, ClientId, PresentationResult, RuntimeMessage, RuntimePacket, RuntimePlacement,
     RuntimeSender, RuntimeValidationError,
 };
-use ginkgo_graphics::{FramebufferWriter, SurfaceLayout};
+use ginkgo_graphics::FramebufferWriter;
 use ginkgo_ipc::ginkgo_sysapi::{CHANNEL_MAX_BYTES, CHANNEL_MAX_HANDLES};
 use ginkgo_ipc::{
     channel_create_between, handle_move_between, Handle, HandleDisposition,
-    HandleOperationDisposition, HandleTable, IpcError, ObjectType, Rights, WindowRelease,
+    HandleOperationDisposition, HandleTable, IpcError, ObjectType, Rights, WindowPresentation,
+    WindowRelease, CHANNEL_QUEUE_CAPACITY,
 };
 use ginkgo_window::{
     BufferId, ConfigurationError, Generation, KeyboardEvent, Point as InputPoint, PointerEventKind,
@@ -25,7 +26,8 @@ use ginkgo_window::{
 
 use crate::{
     compositor::{
-        Compositor, CompositorError, Rect, WindowConfig, WindowPlacement as CompositorPlacement,
+        Compositor, CompositorError, CompositorMetrics, Rect, SurfaceDamage, WindowConfig,
+        WindowPlacement as CompositorPlacement, DAMAGE_RECT_CAPACITY,
     },
     shared_memory::SharedMemoryFactory,
 };
@@ -163,6 +165,189 @@ pub enum DesktopRuntimeEvent {
     },
 }
 
+/// Default estimated display period used until a display backend supplies timing.
+pub const DEFAULT_REFRESH_INTERVAL_NS: u64 = 16_666_667;
+
+/// Confidence assigned to timing information for the active output.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DisplayTimingConfidence {
+    /// Timing is inferred from a configured or conventional refresh rate.
+    #[default]
+    Estimated,
+    /// Timing was measured from display completion events.
+    Measured,
+    /// Timing is synchronized to deadlines reported by the display hardware.
+    HardwareSynchronized,
+}
+
+/// Controls whether framebuffer publication follows the frame clock.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FramePacingMode {
+    /// Coalesce work and publish no more than once per refresh interval.
+    #[default]
+    Paced,
+    /// Publish pending work on every call. Intended for tests and debugging.
+    Immediate,
+}
+
+/// Display timing state used by the desktop broker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DisplayFrameClock {
+    refresh_interval_ns: u64,
+    next_deadline_ns: Option<u64>,
+    timing_confidence: DisplayTimingConfidence,
+    mode: FramePacingMode,
+}
+
+impl DisplayFrameClock {
+    /// Creates an estimated 60 Hz paced clock. The first deadline is selected
+    /// from the first call to [`DesktopBroker::compose_due`].
+    pub const fn estimated_60_hz() -> Self {
+        Self {
+            refresh_interval_ns: DEFAULT_REFRESH_INTERVAL_NS,
+            next_deadline_ns: None,
+            timing_confidence: DisplayTimingConfidence::Estimated,
+            mode: FramePacingMode::Paced,
+        }
+    }
+
+    /// Creates a paced clock, returning `None` for a zero refresh interval.
+    pub const fn new(
+        refresh_interval_ns: u64,
+        timing_confidence: DisplayTimingConfidence,
+    ) -> Option<Self> {
+        if refresh_interval_ns == 0 {
+            return None;
+        }
+        Some(Self {
+            refresh_interval_ns,
+            next_deadline_ns: None,
+            timing_confidence,
+            mode: FramePacingMode::Paced,
+        })
+    }
+
+    pub const fn refresh_interval_ns(&self) -> u64 {
+        self.refresh_interval_ns
+    }
+
+    pub const fn next_deadline_ns(&self) -> Option<u64> {
+        self.next_deadline_ns
+    }
+
+    pub const fn timing_confidence(&self) -> DisplayTimingConfidence {
+        self.timing_confidence
+    }
+
+    pub const fn mode(&self) -> FramePacingMode {
+        self.mode
+    }
+
+    /// Changes the refresh period and reselects the deadline on the next paced call.
+    /// Returns `false` and leaves the clock unchanged for a zero interval.
+    pub fn set_refresh_interval_ns(&mut self, refresh_interval_ns: u64) -> bool {
+        if refresh_interval_ns == 0 {
+            return false;
+        }
+        self.refresh_interval_ns = refresh_interval_ns;
+        self.next_deadline_ns = None;
+        true
+    }
+
+    pub fn set_timing_confidence(&mut self, confidence: DisplayTimingConfidence) {
+        self.timing_confidence = confidence;
+    }
+
+    /// Changes pacing mode. Returning to paced mode selects a fresh deadline.
+    pub fn set_mode(&mut self, mode: FramePacingMode) {
+        if self.mode != mode {
+            self.mode = mode;
+            self.next_deadline_ns = None;
+        }
+    }
+
+    /// Selects `now_ns` as the next paced deadline.
+    pub fn reset(&mut self, now_ns: u64) {
+        self.next_deadline_ns = Some(now_ns);
+    }
+
+    fn select(&mut self, now_ns: u64) -> FrameDeadlineSelection {
+        if self.mode == FramePacingMode::Immediate {
+            return FrameDeadlineSelection {
+                due: true,
+                deadline_ns: None,
+                late: false,
+                missed_deadlines: 0,
+            };
+        }
+
+        let deadline_ns = self.next_deadline_ns.unwrap_or(now_ns);
+        if now_ns < deadline_ns {
+            return FrameDeadlineSelection {
+                due: false,
+                deadline_ns: Some(deadline_ns),
+                late: false,
+                missed_deadlines: 0,
+            };
+        }
+
+        let elapsed = now_ns.saturating_sub(deadline_ns);
+        let missed_deadlines = elapsed / self.refresh_interval_ns;
+        let steps = u128::from(missed_deadlines) + 1;
+        let next = u128::from(deadline_ns)
+            .saturating_add(steps.saturating_mul(u128::from(self.refresh_interval_ns)))
+            .min(u128::from(u64::MAX)) as u64;
+        self.next_deadline_ns = Some(next);
+        FrameDeadlineSelection {
+            due: true,
+            deadline_ns: Some(deadline_ns),
+            late: now_ns > deadline_ns,
+            missed_deadlines,
+        }
+    }
+}
+
+impl Default for DisplayFrameClock {
+    fn default() -> Self {
+        Self::estimated_60_hz()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FrameDeadlineSelection {
+    due: bool,
+    deadline_ns: Option<u64>,
+    late: bool,
+    missed_deadlines: u64,
+}
+
+/// Broker counters. Duration fields are cumulative nanoseconds reported through
+/// [`DesktopBroker::record_frame_durations`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DesktopBrokerMetrics {
+    pub submitted_frames: u64,
+    pub composed_frames: u64,
+    pub coalesced_frames: u64,
+    pub dropped_frames: u64,
+    pub late_frames: u64,
+    pub displayed_frames: u64,
+    pub missed_deadlines: u64,
+    pub composition_duration_ns: u64,
+    pub publication_duration_ns: u64,
+    pub compositor: CompositorMetrics,
+}
+
+/// Result of one frame-clock composition attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameCompositionOutcome {
+    pub due: bool,
+    pub deadline_ns: Option<u64>,
+    pub next_deadline_ns: Option<u64>,
+    pub composed_windows: usize,
+    pub late: bool,
+    pub missed_deadlines: u64,
+}
+
 /// Result of successfully composing one pending frame.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CompositionOutcome {
@@ -176,10 +361,46 @@ pub struct CompositionOutcome {
 }
 
 #[derive(Clone, Copy)]
+struct SubmissionDamage {
+    rects: [Rect; DAMAGE_RECT_CAPACITY],
+    len: usize,
+}
+
+impl SubmissionDamage {
+    const FULL: Self = Self {
+        rects: [Rect::new(0, 0, 0, 0); DAMAGE_RECT_CAPACITY],
+        len: 0,
+    };
+
+    fn as_slice(&self) -> &[Rect] {
+        &self.rects[..self.len]
+    }
+
+    fn union(self, other: Self) -> Self {
+        if self.len == 0 || other.len == 0 || self.len + other.len > DAMAGE_RECT_CAPACITY {
+            return Self::FULL;
+        }
+        let mut combined = self;
+        for rect in &other.rects[..other.len] {
+            combined.rects[combined.len] = *rect;
+            combined.len += 1;
+        }
+        combined
+    }
+}
+
+#[derive(Clone, Copy)]
 struct Submission {
     serial: u64,
     request_id: RequestId,
     buffer_id: BufferId,
+    damage: SubmissionDamage,
+}
+
+struct QueuedPresentation {
+    presentation: WindowPresentation,
+    damage: SubmissionDamage,
+    coalesced_release: Option<ReleaseNotice>,
 }
 
 struct BrokerWindow {
@@ -213,6 +434,22 @@ struct ReleaseNotice {
     request_id: RequestId,
 }
 
+#[derive(Clone, Copy)]
+struct PresentResultNotice {
+    client_id: ClientId,
+    request_id: RequestId,
+    window_id: WindowId,
+    generation: Generation,
+    buffer_id: BufferId,
+    result: PresentationResult,
+}
+
+#[derive(Clone, Copy)]
+enum DeferredNotice {
+    Release(ReleaseNotice),
+    PresentResult(PresentResultNotice),
+}
+
 /// Privileged kernel endpoint for one userspace desktop service.
 ///
 /// All surface shared memory, protected client endpoints, and manager endpoints
@@ -229,6 +466,12 @@ pub struct DesktopBroker {
     service_ready: bool,
     launcher_visible: bool,
     focused_window: Option<WindowId>,
+    frame_clock: DisplayFrameClock,
+    metrics: DesktopBrokerMetrics,
+    frame_now_ns: u64,
+    deferred_notices: Vec<DeferredNotice>,
+    deferred_notice_bound: usize,
+    outbound_bytes: [u8; CHANNEL_MAX_BYTES],
 }
 
 impl DesktopBroker {
@@ -243,6 +486,10 @@ impl DesktopBroker {
         if !actual.contains(required) {
             return Err(DesktopBrokerError::RuntimeChannelRights { required, actual });
         }
+        let mut deferred_notices = Vec::new();
+        deferred_notices
+            .try_reserve_exact(CHANNEL_QUEUE_CAPACITY.saturating_mul(2))
+            .map_err(|_| DesktopBrokerError::OutOfMemory)?;
         Ok(Self {
             handles,
             channel,
@@ -252,6 +499,12 @@ impl DesktopBroker {
             service_ready: false,
             launcher_visible: false,
             focused_window: None,
+            frame_clock: DisplayFrameClock::estimated_60_hz(),
+            metrics: DesktopBrokerMetrics::default(),
+            frame_now_ns: 0,
+            deferred_notices,
+            deferred_notice_bound: CHANNEL_QUEUE_CAPACITY.saturating_mul(2),
+            outbound_bytes: [0; CHANNEL_MAX_BYTES],
         })
     }
 
@@ -284,6 +537,72 @@ impl DesktopBroker {
         &self.compositor
     }
 
+    pub const fn frame_clock(&self) -> &DisplayFrameClock {
+        &self.frame_clock
+    }
+
+    pub fn frame_clock_mut(&mut self) -> &mut DisplayFrameClock {
+        &mut self.frame_clock
+    }
+
+    pub fn set_frame_pacing_mode(&mut self, mode: FramePacingMode) {
+        self.frame_clock.set_mode(mode);
+    }
+
+    /// Supplies the monotonic time used when a new pending epoch begins.
+    pub fn set_frame_time(&mut self, now_ns: u64) {
+        self.frame_now_ns = now_ns;
+    }
+
+    pub fn next_presentation_deadline_ns(&self) -> Option<u64> {
+        self.windows
+            .iter()
+            .any(|window| self.handles.window_manager_pending(window.manager).is_ok())
+            .then(|| self.frame_clock.next_deadline_ns())
+            .flatten()
+    }
+
+    /// Returns whether pending work should be published at `now_ns`.
+    pub fn presentation_due(&mut self, now_ns: u64) -> bool {
+        let pending = self
+            .windows
+            .iter()
+            .any(|window| self.handles.window_manager_pending(window.manager).is_ok());
+        if !pending {
+            return false;
+        }
+        self.frame_clock.mode() == FramePacingMode::Immediate
+            || self
+                .frame_clock
+                .next_deadline_ns()
+                .is_none_or(|deadline| now_ns >= deadline)
+    }
+
+    /// Returns broker counters with a current snapshot of compositor counters.
+    pub fn metrics(&self) -> DesktopBrokerMetrics {
+        DesktopBrokerMetrics {
+            compositor: self.compositor.metrics(),
+            ..self.metrics
+        }
+    }
+
+    /// Adds externally measured composition and framebuffer publication time.
+    /// The broker takes timestamps for pacing but does not own a monotonic clock.
+    pub fn record_frame_durations(
+        &mut self,
+        composition_duration_ns: u64,
+        publication_duration_ns: u64,
+    ) {
+        self.metrics.composition_duration_ns = self
+            .metrics
+            .composition_duration_ns
+            .saturating_add(composition_duration_ns);
+        self.metrics.publication_duration_ns = self
+            .metrics
+            .publication_duration_ns
+            .saturating_add(publication_duration_ns);
+    }
+
     pub const fn service_ready(&self) -> bool {
         self.service_ready
     }
@@ -314,6 +633,7 @@ impl DesktopBroker {
         &mut self,
         shared_memory: &mut SharedMemoryFactory<'_, '_>,
     ) -> Result<Option<DesktopRuntimeEvent>, DesktopBrokerError> {
+        self.flush_deferred_notices()?;
         let mut bytes = [0_u8; CHANNEL_MAX_BYTES];
         let mut attachments = [Handle::INVALID; CHANNEL_MAX_HANDLES];
         let info = match self
@@ -434,8 +754,12 @@ impl DesktopBroker {
         packet
             .validate(RuntimeSender::KernelBroker, 0)
             .map_err(DesktopBrokerError::Validation)?;
-        let bytes = packet.encode_validated(RuntimeSender::KernelBroker, 0)?;
-        self.handles.channel_write(self.channel, &bytes, &[])?;
+        let bytes = packet.encode_validated_into(
+            RuntimeSender::KernelBroker,
+            0,
+            &mut self.outbound_bytes,
+        )?;
+        self.handles.channel_write(self.channel, bytes, &[])?;
         Ok(())
     }
 
@@ -558,8 +882,104 @@ impl DesktopBroker {
         Ok(removed)
     }
 
-    /// Composes one pending presentation and emits the release for the formerly
-    /// displayed buffer, if any.
+    /// Composes every pending window when the display frame clock is due.
+    /// Early paced calls leave pending ownership untouched. Late calls advance
+    /// directly to the first deadline after `now_ns` without an unbounded loop.
+    pub fn compose_due(
+        &mut self,
+        framebuffer: &mut FramebufferWriter<'_>,
+        now_ns: u64,
+    ) -> Result<FrameCompositionOutcome, DesktopBrokerError> {
+        let selection = self.frame_clock.select(now_ns);
+        if !selection.due {
+            return Ok(FrameCompositionOutcome {
+                due: false,
+                deadline_ns: selection.deadline_ns,
+                next_deadline_ns: self.frame_clock.next_deadline_ns(),
+                composed_windows: 0,
+                late: false,
+                missed_deadlines: 0,
+            });
+        }
+
+        self.metrics.missed_deadlines = self
+            .metrics
+            .missed_deadlines
+            .saturating_add(selection.missed_deadlines);
+        let composed_windows = if self
+            .windows
+            .iter()
+            .any(|window| window.transition.is_some())
+        {
+            let mut composed = 0;
+            let mut index = 0;
+            while index < self.windows.len() {
+                match self
+                    .handles
+                    .window_manager_pending(self.windows[index].manager)
+                {
+                    Ok(_) => {
+                        let window_id = self.windows[index].window_id;
+                        self.compose_pending(framebuffer, window_id)?;
+                        composed += 1;
+                    }
+                    Err(IpcError::ShouldWait | IpcError::PeerClosed) => {}
+                    Err(error) => return Err(error.into()),
+                }
+                index += 1;
+            }
+            composed
+        } else {
+            let windows = &self.windows;
+            let composed = self.compositor.compose_pending_batch(
+                &self.handles,
+                framebuffer,
+                |id, presentation| {
+                    windows
+                        .iter()
+                        .find(|window| window.window_id.get() == id)
+                        .and_then(|window| {
+                            window.submissions.iter().find(|submission| {
+                                submission.serial == presentation.presentation_serial
+                            })
+                        })
+                        .map(|submission| SurfaceDamage::from_slice(submission.damage.as_slice()))
+                        .unwrap_or(SurfaceDamage::FULL)
+                },
+            )?;
+            self.metrics.composed_frames =
+                self.metrics.composed_frames.saturating_add(composed as u64);
+            self.metrics.displayed_frames = self
+                .metrics
+                .displayed_frames
+                .saturating_add(composed as u64);
+            for index in 0..self.windows.len() {
+                if let Some(release) = self.take_release(index)? {
+                    self.send_release_or_defer(release)?;
+                }
+            }
+            composed
+        };
+        if selection.late {
+            self.metrics.late_frames = self
+                .metrics
+                .late_frames
+                .saturating_add(composed_windows as u64);
+        }
+
+        Ok(FrameCompositionOutcome {
+            due: true,
+            deadline_ns: selection.deadline_ns,
+            next_deadline_ns: self.frame_clock.next_deadline_ns(),
+            composed_windows,
+            late: selection.late,
+            missed_deadlines: selection.missed_deadlines,
+        })
+    }
+
+    /// Composes one pending presentation immediately and emits the release for
+    /// the formerly displayed buffer, if any. This explicit path remains
+    /// independent of frame pacing for tests and kernel-controlled publication.
     pub fn compose_pending(
         &mut self,
         framebuffer: &mut FramebufferWriter<'_>,
@@ -575,21 +995,29 @@ impl DesktopBroker {
             return Err(DesktopBrokerError::WindowNotPlaced(window_id));
         }
 
-        let presentation =
-            self.compositor
-                .compose_pending(&self.handles, framebuffer, window_id.get())?;
+        let pending = self
+            .handles
+            .window_manager_pending(self.windows[index].manager)?;
         let submission = self.windows[index]
             .submissions
             .iter()
-            .find(|submission| submission.serial == presentation.presentation_serial)
+            .find(|submission| submission.serial == pending.presentation_serial)
             .copied()
             .ok_or(DesktopBrokerError::UnknownPresentationSerial {
                 window_id,
-                serial: presentation.presentation_serial,
+                serial: pending.presentation_serial,
             })?;
+        let presentation = self.compositor.compose_pending_damage(
+            &self.handles,
+            framebuffer,
+            window_id.get(),
+            submission.damage.as_slice(),
+        )?;
+        debug_assert_eq!(presentation, pending);
+        self.record_composed_frame();
         let released = self.take_release(index)?;
         if let Some(release) = released {
-            self.send_release(release)?;
+            self.send_release_or_defer(release)?;
         }
 
         Ok(CompositionOutcome {
@@ -627,7 +1055,7 @@ impl DesktopBroker {
         let new_config = make_window_config(
             window_id,
             self.windows[index].manager,
-            self.windows[index].configuration.graphics_layout()?,
+            self.windows[index].configuration,
             placement,
         )?;
         let transition = self.windows[index]
@@ -647,27 +1075,29 @@ impl DesktopBroker {
             self.compositor.register_window(new_config)?;
         }
 
-        let presentation =
-            match self
-                .compositor
-                .compose_pending(&self.handles, framebuffer, window_id.get())
-            {
-                Ok(presentation) => presentation,
-                Err(error) => {
-                    let restore = if let Some(old_config) = old_config {
-                        self.compositor.update_window(old_config).map(|_| ())
-                    } else {
-                        self.compositor.remove_window(window_id.get());
-                        Ok(())
-                    };
-                    if let Err(restore_error) = restore {
-                        return Err(restore_error.into());
-                    }
-                    return Err(error.into());
+        let presentation = match self.compositor.compose_pending_damage(
+            &self.handles,
+            framebuffer,
+            window_id.get(),
+            submission.damage.as_slice(),
+        ) {
+            Ok(presentation) => presentation,
+            Err(error) => {
+                let restore = if let Some(old_config) = old_config {
+                    self.compositor.update_window(old_config).map(|_| ())
+                } else {
+                    self.compositor.remove_window(window_id.get());
+                    Ok(())
+                };
+                if let Err(restore_error) = restore {
+                    return Err(restore_error.into());
                 }
-            };
+                return Err(error.into());
+            }
+        };
 
         debug_assert_eq!(presentation, pending);
+        self.record_composed_frame();
 
         let old_manager = self.windows[index]
             .transition
@@ -682,7 +1112,7 @@ impl DesktopBroker {
             .expect("transition disappeared during retirement");
         self.close_transition_handles(transition);
         if let Some(release) = released {
-            self.send_release(release)?;
+            self.send_release_or_defer(release)?;
         }
 
         Ok(CompositionOutcome {
@@ -696,6 +1126,11 @@ impl DesktopBroker {
         })
     }
 
+    fn record_composed_frame(&mut self) {
+        self.metrics.composed_frames = self.metrics.composed_frames.saturating_add(1);
+        self.metrics.displayed_frames = self.metrics.displayed_frames.saturating_add(1);
+    }
+
     /// Alias emphasizing that composition is scoped to one window submission.
     pub fn compose_window(
         &mut self,
@@ -707,7 +1142,7 @@ impl DesktopBroker {
 
     /// Redraws retained displayed buffers without changing ownership.
     pub fn redraw(
-        &self,
+        &mut self,
         framebuffer: &mut FramebufferWriter<'_>,
     ) -> Result<(), DesktopBrokerError> {
         self.compositor.redraw(&self.handles, framebuffer)?;
@@ -761,7 +1196,7 @@ impl DesktopBroker {
             }
 
             if let Some(release) = self.take_release(index)? {
-                self.send_release(release)?;
+                self.send_release_or_defer(release)?;
             }
         } else {
             self.windows
@@ -769,6 +1204,20 @@ impl DesktopBroker {
                 .map_err(|_| DesktopBrokerError::OutOfMemory)?;
         }
 
+        let submissions = reserved_submission_queue(configuration.buffer_count)?;
+        let notice_slots = usize::from(configuration.buffer_count).saturating_mul(2);
+        self.deferred_notice_bound = self
+            .deferred_notice_bound
+            .checked_add(notice_slots)
+            .ok_or(DesktopBrokerError::ArithmeticOverflow)?;
+        if self.deferred_notices.capacity() < self.deferred_notice_bound {
+            self.deferred_notices
+                .try_reserve_exact(
+                    self.deferred_notice_bound
+                        .saturating_sub(self.deferred_notices.len()),
+                )
+                .map_err(|_| DesktopBrokerError::OutOfMemory)?;
+        }
         let memory = shared_memory.create_handle(&mut self.handles, surface_bytes)?;
         let (client, manager) = match self.handles.window_create_with_generation_and_buffer_count(
             memory,
@@ -816,7 +1265,10 @@ impl DesktopBroker {
                     client: self.windows[index].client,
                     manager: self.windows[index].manager,
                     placement: self.windows[index].placement.take(),
-                    submissions: core::mem::take(&mut self.windows[index].submissions),
+                    submissions: core::mem::replace(
+                        &mut self.windows[index].submissions,
+                        submissions,
+                    ),
                     compositor: old_compositor,
                 };
                 self.windows[index].configuration = configuration;
@@ -824,6 +1276,7 @@ impl DesktopBroker {
                 self.windows[index].client = client;
                 self.windows[index].manager = manager;
                 self.windows[index].transition = Some(transition);
+                self.compositor.invalidate_output();
             } else {
                 let old_memory = self.windows[index].memory;
                 let old_client = self.windows[index].client;
@@ -840,7 +1293,7 @@ impl DesktopBroker {
                 self.windows[index].client = client;
                 self.windows[index].manager = manager;
                 self.windows[index].placement = None;
-                self.windows[index].submissions.clear();
+                self.windows[index].submissions = submissions;
                 self.close_pool(old_memory, old_client, old_manager);
             }
         } else {
@@ -852,7 +1305,7 @@ impl DesktopBroker {
                 client,
                 manager,
                 placement: None,
-                submissions: Vec::new(),
+                submissions,
                 transition: None,
             });
         }
@@ -894,7 +1347,7 @@ impl DesktopBroker {
             self.focused_window = None;
         }
         if let Some(release) = release {
-            self.send_release(release)?;
+            self.send_release_or_defer(release)?;
         }
         Ok(DesktopRuntimeEvent::WindowDestroyed {
             client_id,
@@ -931,7 +1384,7 @@ impl DesktopBroker {
                 configs.push(make_window_config(
                     window.window_id,
                     window.manager,
-                    window.configuration.graphics_layout()?,
+                    window.configuration,
                     *placement,
                 )?);
             }
@@ -958,8 +1411,13 @@ impl DesktopBroker {
         }
 
         for config in configs {
-            if self.compositor.window(config.id).is_some() {
-                self.compositor.update_window(config)?;
+            if let Some(existing) = self.compositor.window(config.id).copied() {
+                if focus_only_window_change(existing, config) {
+                    self.compositor
+                        .set_focused(config.id, config.placement.focused)?;
+                } else {
+                    self.compositor.update_window(config)?;
+                }
             } else {
                 self.compositor.register_window(config)?;
             }
@@ -1062,17 +1520,18 @@ impl DesktopBroker {
                 ServerErrorCode::InvalidRequest,
             );
         }
-        self.windows[index]
-            .submissions
-            .try_reserve(1)
-            .map_err(|_| DesktopBrokerError::OutOfMemory)?;
-
-        let presentation = match self.handles.window_present(
-            self.windows[index].client,
+        let had_pending = self
+            .windows
+            .iter()
+            .any(|window| self.handles.window_manager_pending(window.manager).is_ok());
+        let stored_damage = submission_damage(damage)?;
+        let queued = match self.window_present_coalescing(
+            index,
             u32::from(buffer_id.get()),
             u64::from(generation.get()),
-        ) {
-            Ok(presentation) => presentation,
+            stored_damage,
+        )? {
+            Ok(queued) => queued,
             Err(IpcError::InvalidMessage | IpcError::ShouldWait) => {
                 return self.reject_present(
                     client_id,
@@ -1095,11 +1554,29 @@ impl DesktopBroker {
             }
             Err(error) => return Err(error.into()),
         };
+        debug_assert!(
+            self.windows[index].submissions.len() < self.windows[index].submissions.capacity(),
+            "configured submission storage must cover every protected buffer"
+        );
+        if !had_pending
+            && self.frame_now_ns != 0
+            && self
+                .frame_clock
+                .next_deadline_ns()
+                .is_some_and(|deadline| deadline <= self.frame_now_ns)
+        {
+            self.frame_clock.reset(self.frame_now_ns);
+        }
         self.windows[index].submissions.push(Submission {
-            serial: presentation.presentation_serial,
+            serial: queued.presentation.presentation_serial,
             request_id,
             buffer_id,
+            damage: queued.damage,
         });
+        self.metrics.submitted_frames = self.metrics.submitted_frames.saturating_add(1);
+        if let Some(release) = queued.coalesced_release {
+            self.send_release_or_defer(release)?;
+        }
         self.send_present_result(
             client_id,
             request_id,
@@ -1114,8 +1591,69 @@ impl DesktopBroker {
             window_id,
             generation,
             buffer_id,
-            presentation_serial: presentation.presentation_serial,
+            presentation_serial: queued.presentation.presentation_serial,
         })
+    }
+
+    fn window_present_coalescing(
+        &mut self,
+        index: usize,
+        buffer_index: u32,
+        generation: u64,
+        damage: SubmissionDamage,
+    ) -> Result<Result<QueuedPresentation, IpcError>, DesktopBrokerError> {
+        let client = self.windows[index].client;
+        let first = self
+            .handles
+            .window_present(client, buffer_index, generation);
+        if !matches!(first, Err(IpcError::ShouldWait)) {
+            return Ok(first.map(|presentation| QueuedPresentation {
+                presentation,
+                damage,
+                coalesced_release: None,
+            }));
+        }
+
+        let manager = self.windows[index].manager;
+        let pending = match self.handles.window_manager_pending(manager) {
+            Ok(pending) => pending,
+            Err(IpcError::ShouldWait) => return Ok(Err(IpcError::ShouldWait)),
+            Err(error) => return Err(error.into()),
+        };
+        let pending_damage = self.windows[index]
+            .submissions
+            .iter()
+            .find(|submission| submission.serial == pending.presentation_serial)
+            .map(|submission| submission.damage)
+            .ok_or(DesktopBrokerError::UnknownPresentationSerial {
+                window_id: self.windows[index].window_id,
+                serial: pending.presentation_serial,
+            })?;
+        let replacement = match self.handles.window_manager_coalesce_pending(
+            manager,
+            pending,
+            buffer_index,
+            generation,
+        ) {
+            Ok(replacement) => replacement,
+            Err(IpcError::ShouldWait) => return Ok(Err(IpcError::ShouldWait)),
+            Err(IpcError::InvalidMessage) => return Ok(Err(IpcError::InvalidMessage)),
+            Err(error) => return Err(error.into()),
+        };
+
+        let release =
+            self.take_release(index)?
+                .ok_or(DesktopBrokerError::UnknownPresentationSerial {
+                    window_id: self.windows[index].window_id,
+                    serial: pending.presentation_serial,
+                })?;
+        self.metrics.coalesced_frames = self.metrics.coalesced_frames.saturating_add(1);
+        self.metrics.dropped_frames = self.metrics.dropped_frames.saturating_add(1);
+        Ok(Ok(QueuedPresentation {
+            presentation: replacement,
+            damage: pending_damage.union(damage),
+            coalesced_release: Some(release),
+        }))
     }
 
     fn reject_present(
@@ -1154,13 +1692,27 @@ impl DesktopBroker {
         buffer_id: BufferId,
         result: PresentationResult,
     ) -> Result<(), DesktopBrokerError> {
-        self.send_kernel_packet(RuntimePacket::new(RuntimeMessage::PresentResult {
+        self.send_notice_or_defer(DeferredNotice::PresentResult(PresentResultNotice {
             client_id,
             request_id,
             window_id,
             generation,
             buffer_id,
             result,
+        }))
+    }
+
+    fn send_present_result_now(
+        &mut self,
+        notice: PresentResultNotice,
+    ) -> Result<(), DesktopBrokerError> {
+        self.send_kernel_packet(RuntimePacket::new(RuntimeMessage::PresentResult {
+            client_id: notice.client_id,
+            request_id: notice.request_id,
+            window_id: notice.window_id,
+            generation: notice.generation,
+            buffer_id: notice.buffer_id,
+            result: notice.result,
         }))
     }
 
@@ -1177,10 +1729,14 @@ impl DesktopBroker {
             generation,
             surface_attachment: AttachmentIndex::new(0),
         });
-        let bytes = packet.encode_validated(RuntimeSender::KernelBroker, 1)?;
+        let bytes = packet.encode_validated_into(
+            RuntimeSender::KernelBroker,
+            1,
+            &mut self.outbound_bytes,
+        )?;
         self.handles.channel_write_with_handle_operations(
             self.channel,
-            &bytes,
+            bytes,
             &[HandleOperationDisposition::duplicate(
                 memory,
                 DESKTOP_SURFACE_RIGHTS,
@@ -1197,6 +1753,52 @@ impl DesktopBroker {
             buffer_id: release.buffer_id,
             present_request_id: release.request_id,
         }))
+    }
+
+    fn send_release_or_defer(&mut self, release: ReleaseNotice) -> Result<(), DesktopBrokerError> {
+        self.send_notice_or_defer(DeferredNotice::Release(release))
+    }
+
+    fn send_notice_now(&mut self, notice: DeferredNotice) -> Result<(), DesktopBrokerError> {
+        match notice {
+            DeferredNotice::Release(release) => self.send_release(release),
+            DeferredNotice::PresentResult(result) => self.send_present_result_now(result),
+        }
+    }
+
+    fn send_notice_or_defer(&mut self, notice: DeferredNotice) -> Result<(), DesktopBrokerError> {
+        if !self.deferred_notices.is_empty() {
+            if self.deferred_notices.len() == self.deferred_notices.capacity() {
+                return Err(IpcError::ShouldWait.into());
+            }
+            self.deferred_notices.push(notice);
+            return Ok(());
+        }
+        match self.send_notice_now(notice) {
+            Ok(()) => Ok(()),
+            Err(DesktopBrokerError::Ipc(IpcError::ShouldWait)) => {
+                if self.deferred_notices.len() == self.deferred_notices.capacity() {
+                    return Err(IpcError::ShouldWait.into());
+                }
+                self.deferred_notices.push(notice);
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Retries ordered broker notifications retained after channel backpressure.
+    pub fn flush_deferred_notices(&mut self) -> Result<(), DesktopBrokerError> {
+        while let Some(notice) = self.deferred_notices.first().copied() {
+            match self.send_notice_now(notice) {
+                Ok(()) => {
+                    self.deferred_notices.remove(0);
+                }
+                Err(DesktopBrokerError::Ipc(IpcError::ShouldWait)) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     fn take_release(&mut self, index: usize) -> Result<Option<ReleaseNotice>, DesktopBrokerError> {
@@ -1260,6 +1862,35 @@ impl DesktopBroker {
     }
 }
 
+fn reserved_submission_queue(buffer_count: u8) -> Result<Vec<Submission>, DesktopBrokerError> {
+    let mut submissions = Vec::new();
+    submissions
+        .try_reserve_exact(usize::from(buffer_count))
+        .map_err(|_| DesktopBrokerError::OutOfMemory)?;
+    Ok(submissions)
+}
+
+fn submission_damage(
+    damage: &[ginkgo_window::Rect],
+) -> Result<SubmissionDamage, DesktopBrokerError> {
+    if damage.is_empty() || damage.len() > DAMAGE_RECT_CAPACITY {
+        return Ok(SubmissionDamage::FULL);
+    }
+
+    let mut stored = SubmissionDamage::FULL;
+    for (index, rect) in damage.iter().enumerate() {
+        stored.rects[index] = Rect::new(
+            i64::from(rect.origin.x),
+            i64::from(rect.origin.y),
+            usize::try_from(rect.size.width).map_err(|_| DesktopBrokerError::ArithmeticOverflow)?,
+            usize::try_from(rect.size.height)
+                .map_err(|_| DesktopBrokerError::ArithmeticOverflow)?,
+        );
+    }
+    stored.len = damage.len();
+    Ok(stored)
+}
+
 fn take_pool_release(
     handles: &HandleTable,
     client_id: ClientId,
@@ -1306,19 +1937,36 @@ fn release_notice(
     })
 }
 
+fn focus_only_window_change(old: WindowConfig, new: WindowConfig) -> bool {
+    old.id == new.id
+        && old.manager == new.manager
+        && old.source_layout == new.source_layout
+        && old.source_logical_width == new.source_logical_width
+        && old.source_logical_height == new.source_logical_height
+        && old.placement.outer == new.placement.outer
+        && old.placement.client == new.placement.client
+        && old.placement.visible == new.placement.visible
+        && old.placement.decorated == new.placement.decorated
+        && old.placement.focused != new.placement.focused
+}
+
 fn make_window_config(
     window_id: WindowId,
     manager: Handle,
-    layout: SurfaceLayout,
+    configuration: SurfaceConfiguration,
     placement: RuntimePlacement,
 ) -> Result<WindowConfig, DesktopBrokerError> {
     let outer = compositor_rect(placement.outer)?;
     let client = compositor_rect(placement.client)?;
     let visible = placement.visible.map(compositor_rect).transpose()?;
+    let logical_width = usize::try_from(configuration.logical_size.width)
+        .map_err(|_| DesktopBrokerError::ArithmeticOverflow)?;
+    let logical_height = usize::try_from(configuration.logical_size.height)
+        .map_err(|_| DesktopBrokerError::ArithmeticOverflow)?;
     Ok(WindowConfig::new(
         window_id.get(),
         manager,
-        layout,
+        configuration.graphics_layout()?,
         CompositorPlacement::new(
             outer,
             client,
@@ -1326,7 +1974,8 @@ fn make_window_config(
             placement.focused,
             placement.decorated,
         ),
-    ))
+    )
+    .with_source_logical_size(logical_width, logical_height))
 }
 
 fn compositor_rect(rect: ginkgo_desktop::PlacementRect) -> Result<Rect, DesktopBrokerError> {
@@ -1554,7 +2203,8 @@ mod tests {
                 damage: vec![DamageRect::new(
                     InputPoint::new(0, 0),
                     Size::new(width, height),
-                )],
+                )]
+                .into(),
             })
         }
     }
@@ -2095,7 +2745,7 @@ mod tests {
             window_id: id,
             generation: config.generation,
             buffer_id: BufferId::new(0),
-            damage: vec![DamageRect::new(InputPoint::new(1, 0), Size::new(1, 1))],
+            damage: vec![DamageRect::new(InputPoint::new(1, 0), Size::new(1, 1))].into(),
         });
         assert!(matches!(
             bad_damage,
@@ -2145,6 +2795,409 @@ mod tests {
             RuntimeMessage::KeyboardInput { .. }
         ));
         assert!(!fixture.client_handles.is_empty());
+    }
+
+    #[test]
+    fn damage_storage_converts_source_rects_and_falls_back_to_full() {
+        let damage = [
+            DamageRect::new(InputPoint::new(1, 2), Size::new(3, 4)),
+            DamageRect::new(InputPoint::new(5, 6), Size::new(7, 8)),
+        ];
+        let stored = submission_damage(&damage).unwrap();
+        assert_eq!(
+            stored.as_slice(),
+            &[Rect::new(1, 2, 3, 4), Rect::new(5, 6, 7, 8)]
+        );
+        assert!(submission_damage(&[]).unwrap().as_slice().is_empty());
+
+        let fragmented =
+            vec![DamageRect::new(InputPoint::new(0, 0), Size::new(1, 1)); DAMAGE_RECT_CAPACITY + 1];
+        assert!(submission_damage(&fragmented)
+            .unwrap()
+            .as_slice()
+            .is_empty());
+    }
+
+    #[test]
+    fn present_forwards_stored_partial_damage_to_compositor() {
+        let mut fixture = Fixture::new();
+        let id = window(55);
+        let config = configuration(1, 3, 1, 2);
+        let surface = fixture.configure(id, config);
+        fixture.place(vec![placement(id, 0, 0, 3, 1, true)]);
+        for offset in [0, 4, 8] {
+            fixture
+                .desktop
+                .shared_memory_write(surface, offset, &0x00ff_0000_u32.to_le_bytes())
+                .unwrap();
+        }
+        fixture.present(id, config.generation, 0, request(50), 3, 1);
+        let _ = receive(&mut fixture.desktop, fixture.desktop_channel);
+        let mut framebuffer_bytes = [0_u8; 12];
+        let mut screen = framebuffer(&mut framebuffer_bytes, 3, 1);
+        fixture.broker.compose_pending(&mut screen, id).unwrap();
+
+        for offset in [12, 16, 20] {
+            fixture
+                .desktop
+                .shared_memory_write(surface, offset, &0x0000_ff00_u32.to_le_bytes())
+                .unwrap();
+        }
+        let partial = DamageRect::new(InputPoint::new(1, 0), Size::new(1, 1));
+        fixture.send(RuntimeMessage::Present {
+            client_id: fixture.client_id,
+            request_id: request(51),
+            window_id: id,
+            generation: config.generation,
+            buffer_id: BufferId::new(1),
+            damage: vec![partial].into(),
+        });
+        let _ = receive(&mut fixture.desktop, fixture.desktop_channel);
+        assert_eq!(
+            fixture.broker.windows[0]
+                .submissions
+                .last()
+                .unwrap()
+                .damage
+                .as_slice(),
+            &[Rect::new(1, 0, 1, 1)]
+        );
+
+        fixture.broker.compose_pending(&mut screen, id).unwrap();
+        let _ = receive(&mut fixture.desktop, fixture.desktop_channel);
+        assert_eq!(screen.read_raw_pixel(0, 0), Some(0x00ff_0000));
+        assert_eq!(screen.read_raw_pixel(1, 0), Some(0x0000_ff00));
+        assert_eq!(screen.read_raw_pixel(2, 0), Some(0x00ff_0000));
+    }
+
+    #[test]
+    fn frame_clock_selects_early_on_time_and_late_deadlines() {
+        let mut clock = DisplayFrameClock::new(10, DisplayTimingConfidence::Measured).unwrap();
+        clock.reset(100);
+
+        let early = clock.select(99);
+        assert!(!early.due);
+        assert_eq!(early.deadline_ns, Some(100));
+        assert_eq!(clock.next_deadline_ns(), Some(100));
+
+        let on_time = clock.select(100);
+        assert!(on_time.due);
+        assert!(!on_time.late);
+        assert_eq!(on_time.missed_deadlines, 0);
+        assert_eq!(clock.next_deadline_ns(), Some(110));
+
+        let late = clock.select(135);
+        assert!(late.due);
+        assert!(late.late);
+        assert_eq!(late.deadline_ns, Some(110));
+        assert_eq!(late.missed_deadlines, 2);
+        assert_eq!(clock.next_deadline_ns(), Some(140));
+
+        clock.reset(u64::MAX - 1);
+        let saturated = clock.select(u64::MAX);
+        assert!(saturated.due);
+        assert_eq!(clock.next_deadline_ns(), Some(u64::MAX));
+    }
+
+    #[test]
+    fn production_due_check_preserves_real_missed_deadlines() {
+        let mut fixture = Fixture::new();
+        let id = window(62);
+        let config = configuration(1, 1, 1, 2);
+        fixture.configure(id, config);
+        fixture.place(vec![placement(id, 0, 0, 1, 1, true)]);
+        fixture.broker.frame_clock =
+            DisplayFrameClock::new(10, DisplayTimingConfidence::Measured).unwrap();
+        fixture.broker.frame_clock.reset(100);
+        fixture.present(id, config.generation, 0, request(96), 1, 1);
+        let _ = receive(&mut fixture.desktop, fixture.desktop_channel);
+
+        assert!(fixture.broker.presentation_due(135));
+        let mut framebuffer_bytes = [0_u8; 4];
+        let mut screen = framebuffer(&mut framebuffer_bytes, 1, 1);
+        let outcome = fixture.broker.compose_due(&mut screen, 135).unwrap();
+        assert!(outcome.late);
+        assert_eq!(outcome.missed_deadlines, 3);
+        assert_eq!(outcome.next_deadline_ns, Some(140));
+    }
+
+    #[test]
+    fn compose_due_paces_early_and_late_frames_and_reports_metrics() {
+        let mut fixture = Fixture::new();
+        let id = window(56);
+        let config = configuration(1, 1, 1, 2);
+        let surface = fixture.configure(id, config);
+        fixture.place(vec![placement(id, 0, 0, 1, 1, true)]);
+        fixture
+            .desktop
+            .shared_memory_write(surface, 0, &0x00aa_0000_u32.to_le_bytes())
+            .unwrap();
+        fixture.present(id, config.generation, 0, request(60), 1, 1);
+        let _ = receive(&mut fixture.desktop, fixture.desktop_channel);
+
+        assert!(fixture.broker.frame_clock_mut().set_refresh_interval_ns(10));
+        fixture.broker.frame_clock_mut().reset(100);
+        let mut framebuffer_bytes = [0_u8; 4];
+        let mut screen = framebuffer(&mut framebuffer_bytes, 1, 1);
+        let early = fixture.broker.compose_due(&mut screen, 99).unwrap();
+        assert!(!early.due);
+        assert_eq!(early.composed_windows, 0);
+        assert!(fixture
+            .broker
+            .handles
+            .window_manager_pending(fixture.broker.windows[0].manager)
+            .is_ok());
+
+        let first = fixture.broker.compose_due(&mut screen, 100).unwrap();
+        assert!(first.due);
+        assert_eq!(first.composed_windows, 1);
+        assert_eq!(first.next_deadline_ns, Some(110));
+
+        fixture
+            .desktop
+            .shared_memory_write(surface, 4, &0x0000_aa00_u32.to_le_bytes())
+            .unwrap();
+        fixture.present(id, config.generation, 1, request(61), 1, 1);
+        let _ = receive(&mut fixture.desktop, fixture.desktop_channel);
+        let still_early = fixture.broker.compose_due(&mut screen, 105).unwrap();
+        assert!(!still_early.due);
+        assert_eq!(screen.read_raw_pixel(0, 0), Some(0x00aa_0000));
+
+        let late = fixture.broker.compose_due(&mut screen, 135).unwrap();
+        assert!(late.due);
+        assert!(late.late);
+        assert_eq!(late.missed_deadlines, 2);
+        assert_eq!(late.next_deadline_ns, Some(140));
+        assert_eq!(screen.read_raw_pixel(0, 0), Some(0x0000_aa00));
+        let _ = receive(&mut fixture.desktop, fixture.desktop_channel);
+
+        fixture.broker.record_frame_durations(7, 11);
+        let metrics = fixture.broker.metrics();
+        assert_eq!(metrics.submitted_frames, 2);
+        assert_eq!(metrics.composed_frames, 2);
+        assert_eq!(metrics.displayed_frames, 2);
+        assert_eq!(metrics.late_frames, 1);
+        assert_eq!(metrics.missed_deadlines, 2);
+        assert_eq!(metrics.composition_duration_ns, 7);
+        assert_eq!(metrics.publication_duration_ns, 11);
+        assert_eq!(metrics.compositor.composed_frames, 2);
+    }
+
+    #[test]
+    fn immediate_mode_composes_without_waiting_for_the_paced_deadline() {
+        let mut fixture = Fixture::new();
+        let id = window(57);
+        let config = configuration(1, 1, 1, 2);
+        fixture.configure(id, config);
+        fixture.place(vec![placement(id, 0, 0, 1, 1, true)]);
+        fixture.present(id, config.generation, 0, request(70), 1, 1);
+        let _ = receive(&mut fixture.desktop, fixture.desktop_channel);
+        fixture.broker.frame_clock_mut().reset(1_000);
+        fixture
+            .broker
+            .set_frame_pacing_mode(FramePacingMode::Immediate);
+
+        let mut framebuffer_bytes = [0_u8; 4];
+        let mut screen = framebuffer(&mut framebuffer_bytes, 1, 1);
+        let outcome = fixture.broker.compose_due(&mut screen, 1).unwrap();
+        assert!(outcome.due);
+        assert_eq!(outcome.deadline_ns, None);
+        assert_eq!(outcome.next_deadline_ns, None);
+        assert_eq!(outcome.composed_windows, 1);
+    }
+
+    #[test]
+    fn configure_reserves_submission_capacity_for_each_new_pool() {
+        let mut fixture = Fixture::new();
+        let id = window(58);
+        fixture.configure(id, configuration(1, 1, 1, 3));
+        assert!(fixture.broker.windows[0].submissions.capacity() >= 3);
+
+        fixture.configure(id, configuration(2, 1, 1, 4));
+        assert!(fixture.broker.windows[0].transition.is_none());
+        assert!(fixture.broker.windows[0].submissions.capacity() >= 4);
+    }
+
+    #[test]
+    fn accepted_present_result_is_retried_after_channel_backpressure() {
+        let mut fixture = Fixture::new();
+        let id = window(61);
+        let config = configuration(1, 1, 1, 2);
+        fixture.configure(id, config);
+        fixture.place(vec![placement(id, 0, 0, 1, 1, true)]);
+        for _ in 0..CHANNEL_QUEUE_CAPACITY {
+            fixture.broker.send_toggle_launcher().unwrap();
+        }
+
+        let event = fixture.send(RuntimeMessage::Present {
+            client_id: fixture.client_id,
+            request_id: request(95),
+            window_id: id,
+            generation: config.generation,
+            buffer_id: BufferId::new(0),
+            damage: Vec::new().into(),
+        });
+        assert!(matches!(
+            event,
+            DesktopRuntimeEvent::PresentationQueued { .. }
+        ));
+        assert_eq!(fixture.broker.deferred_notices.len(), 1);
+
+        let _ = receive(&mut fixture.desktop, fixture.desktop_channel);
+        fixture.broker.flush_deferred_notices().unwrap();
+        assert!(fixture.broker.deferred_notices.is_empty());
+        for _ in 1..CHANNEL_QUEUE_CAPACITY {
+            let _ = receive(&mut fixture.desktop, fixture.desktop_channel);
+        }
+        let (accepted, _) = receive(&mut fixture.desktop, fixture.desktop_channel);
+        assert!(matches!(
+            accepted.message,
+            RuntimeMessage::PresentResult {
+                request_id,
+                result: PresentationResult::Accepted,
+                ..
+            } if request_id == request(95)
+        ));
+    }
+
+    #[test]
+    fn coalescing_unions_damage_from_every_replaced_frame() {
+        let mut fixture = Fixture::new();
+        let id = window(60);
+        let config = configuration(1, 3, 1, 3);
+        let surface = fixture.configure(id, config);
+        fixture.place(vec![placement(id, 0, 0, 3, 1, true)]);
+        let red = 0x00ff_0000_u32.to_le_bytes();
+        for offset in [0, 4, 8, 12, 20, 24, 28] {
+            fixture
+                .desktop
+                .shared_memory_write(surface, offset, &red)
+                .unwrap();
+        }
+        fixture
+            .desktop
+            .shared_memory_write(surface, 12, &0x0000_ff00_u32.to_le_bytes())
+            .unwrap();
+        fixture
+            .desktop
+            .shared_memory_write(surface, 24, &0x0000_ff00_u32.to_le_bytes())
+            .unwrap();
+        fixture
+            .desktop
+            .shared_memory_write(surface, 32, &0x0000_00ff_u32.to_le_bytes())
+            .unwrap();
+
+        fixture.present(id, config.generation, 0, request(90), 3, 1);
+        let _ = receive(&mut fixture.desktop, fixture.desktop_channel);
+        let mut framebuffer_bytes = [0_u8; 12];
+        let mut screen = framebuffer(&mut framebuffer_bytes, 3, 1);
+        fixture.broker.compose_pending(&mut screen, id).unwrap();
+
+        fixture.send(RuntimeMessage::Present {
+            client_id: fixture.client_id,
+            request_id: request(91),
+            window_id: id,
+            generation: config.generation,
+            buffer_id: BufferId::new(1),
+            damage: vec![DamageRect::new(InputPoint::new(0, 0), Size::new(1, 1))].into(),
+        });
+        let _ = receive(&mut fixture.desktop, fixture.desktop_channel);
+        fixture.send(RuntimeMessage::Present {
+            client_id: fixture.client_id,
+            request_id: request(92),
+            window_id: id,
+            generation: config.generation,
+            buffer_id: BufferId::new(2),
+            damage: vec![DamageRect::new(InputPoint::new(2, 0), Size::new(1, 1))].into(),
+        });
+        let _ = receive(&mut fixture.desktop, fixture.desktop_channel);
+        let _ = receive(&mut fixture.desktop, fixture.desktop_channel);
+
+        fixture.broker.compose_pending(&mut screen, id).unwrap();
+        assert_eq!(screen.read_raw_pixel(0, 0), Some(0x0000_ff00));
+        assert_eq!(screen.read_raw_pixel(1, 0), Some(0x00ff_0000));
+        assert_eq!(screen.read_raw_pixel(2, 0), Some(0x0000_00ff));
+    }
+
+    #[test]
+    fn coalescing_releases_exact_pending_request_without_releasing_displayed_buffer() {
+        let mut fixture = Fixture::new();
+        let id = window(59);
+        let config = configuration(1, 1, 1, 3);
+        fixture.configure(id, config);
+        fixture.place(vec![placement(id, 0, 0, 1, 1, true)]);
+        let initial = fixture.present(id, config.generation, 0, request(80), 1, 1);
+        let first_serial = match initial {
+            DesktopRuntimeEvent::PresentationQueued {
+                presentation_serial,
+                ..
+            } => presentation_serial,
+            other => panic!("unexpected event: {other:?}"),
+        };
+        let _ = receive(&mut fixture.desktop, fixture.desktop_channel);
+        let mut framebuffer_bytes = [0_u8; 4];
+        let mut screen = framebuffer(&mut framebuffer_bytes, 1, 1);
+        fixture.broker.compose_pending(&mut screen, id).unwrap();
+
+        fixture.present(id, config.generation, 1, request(81), 1, 1);
+        let _ = receive(&mut fixture.desktop, fixture.desktop_channel);
+        let capacity = fixture.broker.windows[0].submissions.capacity();
+        fixture.present(id, config.generation, 2, request(82), 1, 1);
+
+        let (coalesced_release, attachments) =
+            receive(&mut fixture.desktop, fixture.desktop_channel);
+        assert!(attachments.is_empty());
+        assert!(matches!(
+            coalesced_release.message,
+            RuntimeMessage::BufferReleased {
+                buffer_id,
+                present_request_id,
+                ..
+            } if buffer_id == BufferId::new(1) && present_request_id == request(81)
+        ));
+        let (accepted, _) = receive(&mut fixture.desktop, fixture.desktop_channel);
+        assert!(matches!(
+            accepted.message,
+            RuntimeMessage::PresentResult {
+                request_id,
+                result: PresentationResult::Accepted,
+                ..
+            } if request_id == request(82)
+        ));
+        assert_eq!(fixture.broker.windows[0].submissions.capacity(), capacity);
+        assert!(fixture.broker.windows[0]
+            .submissions
+            .iter()
+            .all(|submission| submission.request_id != request(81)));
+        assert_eq!(
+            fixture
+                .broker
+                .handles
+                .window_manager_displayed(fixture.broker.windows[0].manager)
+                .unwrap()
+                .unwrap()
+                .presentation_serial,
+            first_serial
+        );
+
+        let metrics = fixture.broker.metrics();
+        assert_eq!(metrics.submitted_frames, 3);
+        assert_eq!(metrics.coalesced_frames, 1);
+        assert_eq!(metrics.dropped_frames, 1);
+        assert_eq!(metrics.displayed_frames, 1);
+
+        let outcome = fixture.broker.compose_pending(&mut screen, id).unwrap();
+        assert_eq!(outcome.request_id, request(82));
+        assert_eq!(outcome.released_request_id, Some(request(80)));
+        let (displayed_release, _) = receive(&mut fixture.desktop, fixture.desktop_channel);
+        assert!(matches!(
+            displayed_release.message,
+            RuntimeMessage::BufferReleased {
+                buffer_id,
+                present_request_id,
+                ..
+            } if buffer_id == BufferId::new(0) && present_request_id == request(80)
+        ));
     }
 
     #[test]

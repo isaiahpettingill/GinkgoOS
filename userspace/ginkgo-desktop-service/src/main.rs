@@ -19,7 +19,7 @@ use ginkgo_userspace::{
 };
 use ginkgo_window::{
     decode_request, encode_event, Configured, ScaleFactor, ServerErrorCode, WireEvent, WireRequest,
-    PROTOCOL_VERSION,
+    MIN_BUFFER_SLOTS, PROTOCOL_VERSION,
 };
 
 const MAX_CLIENTS: usize = 64;
@@ -232,6 +232,7 @@ impl Service {
         }
         let mut policy = DesktopPolicy::default();
         policy.scale = ScaleFactor::new(1, 1).map_err(|_| ServiceError::Desktop)?;
+        policy.buffer_count = MIN_BUFFER_SLOTS + 1;
         policy.window_margins = Insets::new(12, 12, 12, 12);
         Ok(Self {
             desktop: Desktop::with_policy(output, policy).map_err(|_| ServiceError::Desktop)?,
@@ -671,7 +672,7 @@ impl Service {
                     window_id,
                     generation,
                     buffer_id,
-                    damage,
+                    damage: damage.into(),
                 })?,
                 DesktopAction::ForwardPointer {
                     client_id,

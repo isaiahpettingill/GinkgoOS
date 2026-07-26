@@ -20,13 +20,70 @@ pub const RUNTIME_PROTOCOL_ID: u32 = u32::from_le_bytes(*b"GKDR");
 /// Current version of the desktop runtime protocol.
 ///
 /// Existing variants and fields are append-only within a version.
-pub const RUNTIME_PROTOCOL_VERSION: u16 = 2;
+pub const RUNTIME_PROTOCOL_VERSION: u16 = 3;
 /// Maximum encoded packet size, matching the channel transport limit.
 pub const MAX_RUNTIME_PACKET_BYTES: usize = 16 * 1024;
 /// Maximum number of placements accepted in one replacement set.
 pub const MAX_RUNTIME_PLACEMENTS: usize = 128;
 /// Maximum number of damage rectangles accepted for one presentation.
-pub const MAX_RUNTIME_DAMAGE_RECTS: usize = 256;
+pub const MAX_RUNTIME_DAMAGE_RECTS: usize = 8;
+
+/// Fixed-capacity surface-local damage carried by one runtime present packet.
+/// Empty or over-capacity input means full-surface damage.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RuntimeDamage {
+    rects: [Rect; MAX_RUNTIME_DAMAGE_RECTS],
+    len: u8,
+}
+
+impl RuntimeDamage {
+    pub const FULL: Self = Self {
+        rects: [Rect::new(Point::new(0, 0), ginkgo_window::Size::new(0, 0));
+            MAX_RUNTIME_DAMAGE_RECTS],
+        len: 0,
+    };
+
+    pub fn from_slice(rects: &[Rect]) -> Self {
+        if rects.is_empty() || rects.len() > MAX_RUNTIME_DAMAGE_RECTS {
+            return Self::FULL;
+        }
+        let mut damage = Self::FULL;
+        for (index, rect) in rects.iter().copied().enumerate() {
+            damage.rects[index] = rect;
+        }
+        damage.len = rects.len() as u8;
+        damage
+    }
+
+    pub fn as_slice(&self) -> &[Rect] {
+        let len = usize::from(self.len).min(MAX_RUNTIME_DAMAGE_RECTS);
+        &self.rects[..len]
+    }
+
+    fn validate(&self) -> Result<(), RuntimeValidationError> {
+        if usize::from(self.len) > MAX_RUNTIME_DAMAGE_RECTS {
+            return Err(RuntimeValidationError::TooManyDamageRects {
+                maximum: MAX_RUNTIME_DAMAGE_RECTS,
+                actual: usize::from(self.len),
+            });
+        }
+        validate_damage(self.as_slice())
+    }
+}
+
+impl From<Vec<Rect>> for RuntimeDamage {
+    fn from(rects: Vec<Rect>) -> Self {
+        Self::from_slice(&rects)
+    }
+}
+
+impl core::ops::Deref for RuntimeDamage {
+    type Target = [Rect];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
 
 /// Endpoint that originated a runtime packet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -164,7 +221,7 @@ pub enum RuntimeMessage {
         window_id: WindowId,
         generation: Generation,
         buffer_id: BufferId,
-        damage: Vec<Rect>,
+        damage: RuntimeDamage,
     },
     /// Requests a registry-governed launch and transfers the child's console endpoint.
     LaunchProgram {
@@ -284,7 +341,7 @@ impl RuntimeMessage {
                 .validate()
                 .map_err(RuntimeValidationError::InvalidConfiguration),
             Self::SetPlacements { placements } => validate_placements(placements),
-            Self::Present { damage, .. } => validate_damage(damage),
+            Self::Present { damage, .. } => damage.validate(),
             Self::LaunchProgram { app_id, .. }
                 if app_id.is_empty() || app_id.len() > 255 || !app_id.is_ascii() =>
             {
@@ -360,6 +417,25 @@ impl RuntimePacket {
             });
         }
         Ok(bytes)
+    }
+
+    /// Validates and serializes into caller-owned transport storage.
+    pub fn encode_validated_into<'a>(
+        &self,
+        sender: RuntimeSender,
+        attachment_count: usize,
+        output: &'a mut [u8],
+    ) -> Result<&'a [u8], RuntimeEncodeError> {
+        self.validate(sender, attachment_count)
+            .map_err(RuntimeEncodeError::Validation)?;
+        if output.len() > MAX_RUNTIME_PACKET_BYTES {
+            return Err(RuntimeEncodeError::PacketTooLarge {
+                maximum: MAX_RUNTIME_PACKET_BYTES,
+                actual: output.len(),
+            });
+        }
+        let encoded = postcard::to_slice(self, output).map_err(RuntimeEncodeError::Postcard)?;
+        Ok(encoded)
     }
 
     /// Decodes and strictly validates a packet before returning it.
@@ -633,7 +709,7 @@ mod tests {
                 window_id: window_id(2),
                 generation: generation(1),
                 buffer_id: BufferId::new(0),
-                damage: vec![Rect::new(Point::new(0, 0), Size::new(4, 2))],
+                damage: vec![Rect::new(Point::new(0, 0), Size::new(4, 2))].into(),
             },
             RuntimeMessage::LaunchProgram {
                 requester: client_id(1),
@@ -841,7 +917,7 @@ mod tests {
             window_id: window_id(3),
             generation: generation(1),
             buffer_id: BufferId::new(0),
-            damage: vec![Rect::new(Point::new(-1, 0), Size::new(1, 1))],
+            damage: vec![Rect::new(Point::new(-1, 0), Size::new(1, 1))].into(),
         };
         assert_eq!(
             present.validate(RuntimeSender::DesktopService, 0),

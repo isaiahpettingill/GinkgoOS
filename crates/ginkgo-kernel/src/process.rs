@@ -1318,6 +1318,13 @@ impl ThreadTable {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct ChannelSyscallScratch {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) handles: Vec<Handle>,
+    pub(crate) metadata: Vec<u8>,
+}
+
 /// Process-wide protection, authority, resource, and thread ownership state.
 pub struct Process {
     address_space: Option<AddressSpace>,
@@ -1327,6 +1334,7 @@ pub struct Process {
     retirement_context: UserContext,
     terminal_state: Option<ProcessState>,
     handles: Option<HandleTable>,
+    channel_syscall_scratch: ChannelSyscallScratch,
     application_data: Option<Handle>,
     control: Option<ProcessControl>,
     shared_mappings: Option<Vec<SharedMemoryMapping>>,
@@ -1629,6 +1637,7 @@ impl Process {
             retirement_context: context,
             terminal_state: None,
             handles: Some(HandleTable::new()),
+            channel_syscall_scratch: ChannelSyscallScratch::default(),
             application_data: None,
             control: None,
             shared_mappings: Some(Vec::new()),
@@ -3384,6 +3393,14 @@ impl Process {
         self.handles
             .as_mut()
             .expect("live process lost its handle table")
+    }
+
+    pub(crate) fn take_channel_syscall_scratch(&mut self) -> ChannelSyscallScratch {
+        mem::take(&mut self.channel_syscall_scratch)
+    }
+
+    pub(crate) fn restore_channel_syscall_scratch(&mut self, scratch: ChannelSyscallScratch) {
+        self.channel_syscall_scratch = scratch;
     }
 
     pub fn shared_mappings(&self) -> &[SharedMemoryMapping] {
@@ -6150,6 +6167,7 @@ mod tests {
             retirement_context: UserContext::new(0x1000, USER_STACK_TOP),
             terminal_state,
             handles: None,
+            channel_syscall_scratch: ChannelSyscallScratch::default(),
             application_data: None,
             control: None,
             shared_mappings: None,

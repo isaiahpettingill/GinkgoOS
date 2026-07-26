@@ -379,7 +379,7 @@ impl DrawTarget for PixelSurface<'_> {
 }
 
 /// Raw RGB framebuffer geometry and pixel-channel layout.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FramebufferConfig {
     pub address: *mut u8,
     pub width: u64,
@@ -459,6 +459,11 @@ impl<'a> FramebufferWriter<'a> {
 
     pub fn height(&self) -> usize {
         self.framebuffer.height as usize
+    }
+
+    /// Returns the claimed output identity, geometry, and channel layout.
+    pub const fn configuration(&self) -> FramebufferConfig {
+        self.framebuffer
     }
 
     pub fn clear(&mut self, color: Rgb) {
@@ -603,66 +608,135 @@ impl<'a> FramebufferWriter<'a> {
 
     /// Publishes a complete tightly packed XRGB8888 scene to the framebuffer.
     ///
-    /// Standard 32-bit RGB framebuffers use paired volatile stores. Other RGB
+    /// Standard 32-bit RGB framebuffers use packed volatile stores. Other RGB
     /// layouts fall back to mask-aware pixel conversion. The framebuffer is not
     /// accessed when `pixels` does not contain the complete scene.
     pub fn write_xrgb8888_scene(&mut self, pixels: &[SurfacePixel]) -> bool {
-        let Some(required) = self.width().checked_mul(self.height()) else {
+        let width = self.width();
+        let height = self.height();
+        let Some(required) = width.checked_mul(height) else {
             return false;
         };
         if pixels.len() < required {
             return false;
         }
 
-        let native_xrgb = self.framebuffer.bits_per_pixel == 32
-            && self.framebuffer.red_mask_size == 8
-            && self.framebuffer.red_mask_shift == 16
-            && self.framebuffer.green_mask_size == 8
-            && self.framebuffer.green_mask_shift == 8
-            && self.framebuffer.blue_mask_size == 8
-            && self.framebuffer.blue_mask_shift == 0;
-        if !native_xrgb {
-            for (index, pixel) in pixels[..required].iter().copied().enumerate() {
-                let x = index % self.width();
-                let y = index / self.width();
-                if !self.write_rgb_pixel(x, y, Rgb::new(pixel.red, pixel.green, pixel.blue)) {
-                    return false;
+        self.write_xrgb8888_scene_region(pixels, width, 0, 0, width, height)
+    }
+
+    /// Publishes one rectangular region of a tightly packed XRGB8888 scene.
+    ///
+    /// `scene_width` is the number of pixels in each source row. The region uses
+    /// the same `x` and `y` coordinates in the scene and framebuffer. Standard
+    /// 32-bit XRGB framebuffers use packed volatile row stores; other RGB layouts
+    /// use mask-aware conversion. Returns `false` without accessing framebuffer
+    /// memory when the source rows are incomplete, an extent overflows, or the
+    /// region exceeds either the scene or framebuffer bounds.
+    pub fn write_xrgb8888_scene_region(
+        &mut self,
+        pixels: &[SurfacePixel],
+        scene_width: usize,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        let (Some(right), Some(bottom)) = (x.checked_add(width), y.checked_add(height)) else {
+            return false;
+        };
+        if scene_width == 0
+            || right > scene_width
+            || bottom > pixels.len() / scene_width
+            || right > self.width()
+            || bottom > self.height()
+        {
+            return false;
+        }
+        if width == 0 || height == 0 {
+            return true;
+        }
+
+        if !self.is_native_xrgb8888() {
+            for destination_y in y..bottom {
+                let source_start = destination_y * scene_width + x;
+                for (column, pixel) in pixels[source_start..source_start + width]
+                    .iter()
+                    .copied()
+                    .enumerate()
+                {
+                    if !self.write_rgb_pixel(
+                        x + column,
+                        destination_y,
+                        Rgb::new(pixel.red, pixel.green, pixel.blue),
+                    ) {
+                        return false;
+                    }
                 }
             }
             return true;
         }
 
         let pitch = self.framebuffer.pitch as usize;
-        let width = self.width();
-        for y in 0..self.height() {
-            let source = &pixels[y * width..(y + 1) * width];
-            let destination = unsafe { self.framebuffer.address.add(y * pitch) };
-            let mut x = 0;
-            while x < width
-                && (unsafe { destination.add(x * 4) } as usize) % core::mem::align_of::<u128>() != 0
-            {
-                let output = unsafe { destination.add(x * 4) }.cast::<u32>();
-                unsafe { ptr::write_volatile(output, source[x].raw()) };
-                x += 1;
-            }
-            while x + 3 < width {
-                let pixels = unsafe { ptr::read_unaligned(source.as_ptr().add(x).cast::<u128>()) };
-                let output = unsafe { destination.add(x * 4) }.cast::<u128>();
-                unsafe { ptr::write_volatile(output, pixels) };
-                x += 4;
-            }
-            while x + 1 < width {
-                let pair = unsafe { ptr::read_unaligned(source.as_ptr().add(x).cast::<u64>()) };
-                let output = unsafe { destination.add(x * 4) }.cast::<u64>();
-                unsafe { ptr::write_volatile(output, pair) };
-                x += 2;
-            }
-            if x < width {
-                let output = unsafe { destination.add(x * 4) }.cast::<u32>();
-                unsafe { ptr::write_volatile(output, source[x].raw()) };
-            }
+        for destination_y in y..bottom {
+            let source_start = destination_y * scene_width + x;
+            let source = &pixels[source_start..source_start + width];
+            let destination = unsafe {
+                self.framebuffer
+                    .address
+                    .add(destination_y * pitch + x * core::mem::size_of::<u32>())
+            };
+            Self::write_native_xrgb8888_row(destination, source);
         }
         true
+    }
+
+    fn is_native_xrgb8888(&self) -> bool {
+        self.framebuffer.bits_per_pixel == 32
+            && self.framebuffer.red_mask_size == 8
+            && self.framebuffer.red_mask_shift == 16
+            && self.framebuffer.green_mask_size == 8
+            && self.framebuffer.green_mask_shift == 8
+            && self.framebuffer.blue_mask_size == 8
+            && self.framebuffer.blue_mask_shift == 0
+    }
+
+    fn write_native_xrgb8888_row(destination: *mut u8, source: &[SurfacePixel]) {
+        if !(destination as usize).is_multiple_of(core::mem::align_of::<u32>()) {
+            for (index, pixel) in source.iter().copied().enumerate() {
+                let bytes = pixel.raw().to_le_bytes();
+                let output = unsafe { destination.add(index * 4) };
+                for (byte_index, byte) in bytes.into_iter().enumerate() {
+                    unsafe { ptr::write_volatile(output.add(byte_index), byte) };
+                }
+            }
+            return;
+        }
+
+        let mut x = 0;
+        while x < source.len()
+            && !(unsafe { destination.add(x * 4) } as usize)
+                .is_multiple_of(core::mem::align_of::<u128>())
+        {
+            let output = unsafe { destination.add(x * 4) }.cast::<u32>();
+            unsafe { ptr::write_volatile(output, source[x].raw()) };
+            x += 1;
+        }
+        while x + 3 < source.len() {
+            let pixels = unsafe { ptr::read_unaligned(source.as_ptr().add(x).cast::<u128>()) };
+            let output = unsafe { destination.add(x * 4) }.cast::<u128>();
+            unsafe { ptr::write_volatile(output, pixels) };
+            x += 4;
+        }
+        while x + 1 < source.len() {
+            let pair = unsafe { ptr::read_unaligned(source.as_ptr().add(x).cast::<u64>()) };
+            let output = unsafe { destination.add(x * 4) }.cast::<u64>();
+            unsafe { ptr::write_volatile(output, pair) };
+            x += 2;
+        }
+        if x < source.len() {
+            let output = unsafe { destination.add(x * 4) }.cast::<u32>();
+            unsafe { ptr::write_volatile(output, source[x].raw()) };
+        }
     }
 
     fn put_pixel(&mut self, x: usize, y: usize, color: Rgb) {
@@ -828,11 +902,20 @@ mod tests {
     use super::*;
 
     fn rgb_config(address: *mut u8) -> FramebufferConfig {
+        rgb_config_with_size(address, 2, 1, 8)
+    }
+
+    fn rgb_config_with_size(
+        address: *mut u8,
+        width: u64,
+        height: u64,
+        pitch: u64,
+    ) -> FramebufferConfig {
         FramebufferConfig {
             address,
-            width: 2,
-            height: 1,
-            pitch: 8,
+            width,
+            height,
+            pitch,
             bits_per_pixel: 32,
             memory_model: 1,
             red_mask_size: 8,
@@ -1051,6 +1134,79 @@ mod tests {
         assert_eq!(bytes, [0xAA; 8]);
         assert!(writer.write_xrgb8888_scene(&scene));
         assert_eq!(bytes, [0x56, 0x34, 0x12, 0, 0xBC, 0x9A, 0x78, 0]);
+    }
+
+    #[test]
+    fn publishes_native_xrgb_scene_region_and_preserves_other_pixels() {
+        let mut bytes = [0xAA_u8; 32];
+        {
+            let config = rgb_config_with_size(bytes.as_mut_ptr(), 3, 2, 16);
+            let mut writer =
+                unsafe { FramebufferWriter::from_raw(config) }.expect("valid framebuffer");
+            let scene = [
+                SurfacePixel::xrgb(1, 2, 3),
+                SurfacePixel::xrgb(4, 5, 6),
+                SurfacePixel::xrgb(7, 8, 9),
+                SurfacePixel::xrgb(10, 11, 12),
+                SurfacePixel::xrgb(13, 14, 15),
+                SurfacePixel::xrgb(16, 17, 18),
+                SurfacePixel::xrgb(19, 20, 21),
+                SurfacePixel::xrgb(22, 23, 24),
+            ];
+
+            assert!(writer.write_xrgb8888_scene_region(&scene, 4, 1, 0, 2, 2));
+            assert_eq!(writer.read_raw_pixel(0, 0), Some(0xAAAA_AAAA));
+            assert_eq!(writer.read_raw_pixel(1, 0), Some(scene[1].raw()));
+            assert_eq!(writer.read_raw_pixel(2, 0), Some(scene[2].raw()));
+            assert_eq!(writer.read_raw_pixel(0, 1), Some(0xAAAA_AAAA));
+            assert_eq!(writer.read_raw_pixel(1, 1), Some(scene[5].raw()));
+            assert_eq!(writer.read_raw_pixel(2, 1), Some(scene[6].raw()));
+        }
+
+        assert_eq!(&bytes[12..16], &[0xAA; 4]);
+        assert_eq!(&bytes[28..32], &[0xAA; 4]);
+    }
+
+    #[test]
+    fn rejects_out_of_bounds_xrgb_scene_regions_without_writing() {
+        let mut bytes = [0xAA_u8; 64];
+        {
+            let config = rgb_config_with_size(bytes.as_mut_ptr(), 4, 4, 16);
+            let mut writer =
+                unsafe { FramebufferWriter::from_raw(config) }.expect("valid framebuffer");
+            let scene = [SurfacePixel::xrgb(1, 2, 3); 25];
+
+            assert!(!writer.write_xrgb8888_scene_region(&scene, 0, 0, 0, 1, 1));
+            assert!(!writer.write_xrgb8888_scene_region(&scene, 3, 2, 0, 2, 1));
+            assert!(!writer.write_xrgb8888_scene_region(&scene[..10], 5, 0, 1, 1, 2));
+            assert!(!writer.write_xrgb8888_scene_region(&scene, 5, 3, 0, 2, 1));
+            assert!(!writer.write_xrgb8888_scene_region(&scene, 5, 0, 3, 1, 2));
+            assert!(!writer.write_xrgb8888_scene_region(&scene, 5, usize::MAX, 0, 2, 1));
+            assert!(!writer.write_xrgb8888_scene_region(&scene, 5, 0, usize::MAX, 1, 2));
+        }
+
+        assert_eq!(bytes, [0xAA; 64]);
+    }
+
+    #[test]
+    fn converts_xrgb_scene_region_for_bgr_channel_masks() {
+        let mut bytes = [0xAA_u8; 16];
+        let mut config = rgb_config_with_size(bytes.as_mut_ptr(), 2, 2, 8);
+        config.red_mask_shift = 0;
+        config.blue_mask_shift = 16;
+        let mut writer = unsafe { FramebufferWriter::from_raw(config) }.expect("valid framebuffer");
+        let scene = [
+            SurfacePixel::xrgb(1, 2, 3),
+            SurfacePixel::new(0x12, 0x34, 0x56, 0xFF),
+            SurfacePixel::xrgb(4, 5, 6),
+            SurfacePixel::new(0x78, 0x9A, 0xBC, 0xFF),
+        ];
+
+        assert!(writer.write_xrgb8888_scene_region(&scene, 2, 1, 0, 1, 2));
+        assert_eq!(writer.read_raw_pixel(0, 0), Some(0xAAAA_AAAA));
+        assert_eq!(writer.read_raw_pixel(1, 0), Some(0x0056_3412));
+        assert_eq!(writer.read_raw_pixel(0, 1), Some(0xAAAA_AAAA));
+        assert_eq!(writer.read_raw_pixel(1, 1), Some(0x00BC_9A78));
     }
 
     #[test]

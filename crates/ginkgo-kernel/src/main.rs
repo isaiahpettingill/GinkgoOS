@@ -2254,14 +2254,17 @@ fn run_scheduler(context: &mut KernelContext) -> ! {
         scheduler.run_round(context);
         reclaim_idle_shared_frames(context);
         let now_ns = context.timer.clock().now_ns();
-        let next_deadline_ns = match (
+        let next_deadline_ns = [
             context.waits.next_deadline_ns(),
             context.requests.next_deadline_ns(),
-        ) {
-            (Some(wait), Some(request)) => Some(wait.min(request)),
-            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
-            (None, None) => None,
-        };
+            context
+                .desktop
+                .as_ref()
+                .and_then(DesktopBroker::next_presentation_deadline_ns),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         let idle_slice_ns = next_deadline_ns
             .map(|deadline| deadline.saturating_sub(now_ns).max(1))
             .unwrap_or(KERNEL_IDLE_POLL_NS)
@@ -6428,7 +6431,7 @@ fn finish_frame_reclaim_stress(
 
 fn redraw_desktop(context: &mut KernelContext) {
     context.ui.hide_cursor(&mut context.screen);
-    if let Some(desktop) = context.desktop.as_ref() {
+    if let Some(desktop) = context.desktop.as_mut() {
         let _ = desktop.redraw(&mut context.screen);
     }
     if context.ui.launcher_visible {
@@ -6518,6 +6521,11 @@ fn desktop_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
             Err(DesktopBrokerError::Ipc(IpcError::ShouldWait)) => {}
             Err(_) => context.launcher_toggle_pending = false,
         }
+    }
+
+    let desktop_now_ns = context.timer.clock().now_ns();
+    if let Some(desktop) = context.desktop.as_mut() {
+        desktop.set_frame_time(desktop_now_ns);
     }
 
     let mut shared_memory = SharedMemoryFactory::new(
@@ -6615,19 +6623,35 @@ fn desktop_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                 redraw_desktop(context);
             }
             DesktopRuntimeEvent::WindowDestroyed { .. } => redraw_desktop(context),
-            DesktopRuntimeEvent::PresentationQueued { window_id, .. } => {
-                context.ui.hide_cursor(&mut context.screen);
-                if let Some(desktop) = context.desktop.as_mut() {
-                    let _ = desktop.compose_window(&mut context.screen, window_id);
-                }
-                if context.ui.launcher_visible {
-                    context.ui.render_content(&mut context.screen);
-                } else {
-                    context.ui.show_cursor(&mut context.screen);
-                }
-            }
+            DesktopRuntimeEvent::PresentationQueued { .. } => {}
             DesktopRuntimeEvent::SurfaceConfigured { .. }
             | DesktopRuntimeEvent::PresentationRejected { .. } => {}
+        }
+    }
+
+    let now_ns = context.timer.clock().now_ns();
+    let presentation_due = context
+        .desktop
+        .as_mut()
+        .is_some_and(|desktop| desktop.presentation_due(now_ns));
+    if presentation_due {
+        context.ui.hide_cursor(&mut context.screen);
+        let started_ns = context.timer.clock().now_ns();
+        let composed = context
+            .desktop
+            .as_mut()
+            .and_then(|desktop| desktop.compose_due(&mut context.screen, started_ns).ok())
+            .is_some_and(|outcome| outcome.composed_windows != 0);
+        let finished_ns = context.timer.clock().now_ns();
+        if let Some(desktop) = context.desktop.as_mut() {
+            desktop.record_frame_durations(finished_ns.saturating_sub(started_ns), 0);
+        }
+        if context.ui.launcher_visible {
+            if composed {
+                context.ui.render_content(&mut context.screen);
+            }
+        } else {
+            context.ui.show_cursor(&mut context.screen);
         }
     }
 

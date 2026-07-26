@@ -829,6 +829,7 @@ struct WindowState {
     generation: u64,
     buffers: Vec<WindowBufferState>,
     pending: Option<WindowPresentation>,
+    pending_read: bool,
     displayed: Option<WindowPresentation>,
     release: Option<WindowRelease>,
     next_serial: u64,
@@ -890,6 +891,7 @@ impl Drop for ChannelEndpoint {
 struct ChannelState {
     open: [bool; 2],
     queues: [VecDeque<KernelMessage>; 2],
+    free_messages: [Vec<KernelMessage>; 2],
     waiters: [Vec<SignalWaiter>; 2],
 }
 
@@ -1886,6 +1888,7 @@ impl HandleTable {
             generation,
             buffers,
             pending: None,
+            pending_read: false,
             displayed: None,
             release: None,
             next_serial: 1,
@@ -1974,6 +1977,7 @@ impl HandleTable {
         state.next_serial = next_serial;
         state.buffers[index] = WindowBufferState::Pending;
         state.pending = Some(presentation);
+        state.pending_read = false;
         drop(state);
         notify_window_waiters(&endpoint.state, WindowRole::Client);
         notify_window_waiters(&endpoint.state, WindowRole::Manager);
@@ -2042,11 +2046,122 @@ impl HandleTable {
     ) -> Result<(), IpcError> {
         let object = self.object_with_rights(manager, Rights::READ | Rights::MANAGE)?;
         let endpoint = window_endpoint_for_role(&object, WindowRole::Manager)?;
-        let state = endpoint.state.lock();
+        let mut state = endpoint.state.lock();
         if state.pending != Some(presentation) {
             return Err(IpcError::InvalidMessage);
         }
-        copy_window_buffer(&state, presentation, offset, output)
+        copy_window_buffer(&state, presentation, offset, output)?;
+        state.pending_read = true;
+        Ok(())
+    }
+
+    /// Discards the exact current pending presentation without changing display state.
+    ///
+    /// The pending buffer moves to the single unread-release slot and remains unavailable
+    /// to the client until [`Self::window_read_release`] consumes that exact request/serial.
+    /// A displayed buffer is never released by this operation. The first successful pending
+    /// copy marks that presentation compositor-read and prevents discard, including between
+    /// row copies. Later copies and completion of a discarded presentation fail exact-match
+    /// validation.
+    ///
+    /// This is a bounded manager-side drop primitive, not client-side pending replacement.
+    /// With two buffers, one displayed plus one pending leaves no client-owned replacement
+    /// buffer. A broker can discard unread work it no longer plans to compose, deliver the
+    /// resulting release, and accept a newer presentation only after the client reacquires
+    /// that buffer.
+    pub fn window_manager_discard_pending(
+        &self,
+        manager: Handle,
+        presentation: WindowPresentation,
+    ) -> Result<(), IpcError> {
+        let object = self.object_with_rights(manager, Rights::MANAGE)?;
+        let endpoint = window_endpoint_for_role(&object, WindowRole::Manager)?;
+        let mut state = endpoint.state.lock();
+        if state.pending != Some(presentation) {
+            return Err(IpcError::InvalidMessage);
+        }
+        if state.pending_read || state.release.is_some() {
+            return Err(IpcError::ShouldWait);
+        }
+
+        let index =
+            usize::try_from(presentation.buffer_index).map_err(|_| IpcError::InvalidMessage)?;
+        if state.buffers.get(index) != Some(&WindowBufferState::Pending) {
+            return Err(IpcError::InvalidMessage);
+        }
+
+        state.buffers[index] = WindowBufferState::Released;
+        state.pending = None;
+        state.release = Some(WindowRelease {
+            buffer_index: presentation.buffer_index,
+            generation: presentation.generation,
+            presentation_serial: presentation.presentation_serial,
+        });
+        drop(state);
+        notify_window_waiters(&endpoint.state, WindowRole::Client);
+        notify_window_waiters(&endpoint.state, WindowRole::Manager);
+        Ok(())
+    }
+
+    /// Atomically replaces an unread pending presentation with a client-owned buffer.
+    ///
+    /// The old pending buffer enters the unread-release slot and the replacement
+    /// becomes pending with a new serial. Validation happens before either state
+    /// change, so an invalid replacement never drops accepted work. Displayed and
+    /// compositor-read buffers cannot be replaced.
+    pub fn window_manager_coalesce_pending(
+        &self,
+        manager: Handle,
+        pending: WindowPresentation,
+        replacement_buffer_index: u32,
+        generation: u64,
+    ) -> Result<WindowPresentation, IpcError> {
+        let object = self.object_with_rights(manager, Rights::MANAGE)?;
+        let endpoint = window_endpoint_for_role(&object, WindowRole::Manager)?;
+        let mut state = endpoint.state.lock();
+        if state.pending != Some(pending)
+            || state.pending_read
+            || state.release.is_some()
+            || state.retired
+            || !state.client_open
+            || generation != state.generation
+        {
+            return Err(IpcError::ShouldWait);
+        }
+
+        let old_index =
+            usize::try_from(pending.buffer_index).map_err(|_| IpcError::InvalidMessage)?;
+        let replacement_index =
+            usize::try_from(replacement_buffer_index).map_err(|_| IpcError::InvalidMessage)?;
+        if state.buffers.get(old_index) != Some(&WindowBufferState::Pending)
+            || state.buffers.get(replacement_index) != Some(&WindowBufferState::ClientOwned)
+        {
+            return Err(IpcError::InvalidMessage);
+        }
+        let next_serial = state
+            .next_serial
+            .checked_add(1)
+            .ok_or(IpcError::InvalidMessage)?;
+        let replacement = WindowPresentation {
+            buffer_index: replacement_buffer_index,
+            generation,
+            presentation_serial: state.next_serial,
+        };
+
+        state.buffers[old_index] = WindowBufferState::Released;
+        state.buffers[replacement_index] = WindowBufferState::Pending;
+        state.pending = Some(replacement);
+        state.pending_read = false;
+        state.release = Some(WindowRelease {
+            buffer_index: pending.buffer_index,
+            generation: pending.generation,
+            presentation_serial: pending.presentation_serial,
+        });
+        state.next_serial = next_serial;
+        drop(state);
+        notify_window_waiters(&endpoint.state, WindowRole::Client);
+        notify_window_waiters(&endpoint.state, WindowRole::Manager);
+        Ok(replacement)
     }
 
     /// Copies a checked range from the retained displayed buffer.
@@ -2123,6 +2238,7 @@ impl HandleTable {
         }
         state.buffers[displayed_index] = WindowBufferState::Displayed;
         state.pending = None;
+        state.pending_read = false;
         state.displayed = Some(presentation);
         drop(state);
         notify_window_waiters(&endpoint.state, WindowRole::Client);
@@ -2200,12 +2316,49 @@ impl HandleTable {
         if bytes.len() > CHANNEL_MAX_BYTES || handles.len() > CHANNEL_MAX_HANDLES {
             return Err(IpcError::MessageTooLarge);
         }
+        if handles.is_empty() {
+            return self.channel_write_bytes(channel, bytes);
+        }
 
         let mut dispositions = try_vec_with_capacity(handles.len())?;
         for handle in handles.iter().copied() {
             dispositions.push(HandleDisposition::new(handle, self.handle_rights(handle)?));
         }
         self.channel_write_with_dispositions(channel, bytes, &dispositions)
+    }
+
+    fn channel_write_bytes(&self, channel: Handle, bytes: &[u8]) -> Result<(), IpcError> {
+        if bytes.len() > CHANNEL_MAX_BYTES {
+            return Err(IpcError::MessageTooLarge);
+        }
+        let channel_object = self.object_with_rights(channel, Rights::WRITE)?;
+        let endpoint = channel_endpoint(&channel_object)?;
+        let mut state = endpoint.state.lock();
+        let peer = 1 - endpoint.side;
+        if !state.open[peer] {
+            return Err(IpcError::PeerClosed);
+        }
+        if state.queues[peer].len() == CHANNEL_QUEUE_CAPACITY {
+            return Err(IpcError::ShouldWait);
+        }
+
+        let mut message = state.free_messages[peer].pop().unwrap_or(KernelMessage {
+            bytes: Vec::new(),
+            handles: Vec::new(),
+        });
+        if message.bytes.capacity() < bytes.len() {
+            message
+                .bytes
+                .try_reserve_exact(bytes.len() - message.bytes.len())
+                .map_err(|_| IpcError::OutOfMemory)?;
+        }
+        message.bytes.clear();
+        message.bytes.extend_from_slice(bytes);
+        debug_assert!(message.handles.is_empty());
+        state.queues[peer].push_back(message);
+        drop(state);
+        notify_channel_waiters(&endpoint.state, peer);
+        Ok(())
     }
 
     /// Writes one complete message and atomically moves handles with attenuated rights.
@@ -2222,6 +2375,9 @@ impl HandleTable {
     ) -> Result<(), IpcError> {
         if bytes.len() > CHANNEL_MAX_BYTES || dispositions.len() > CHANNEL_MAX_HANDLES {
             return Err(IpcError::MessageTooLarge);
+        }
+        if dispositions.is_empty() {
+            return self.channel_write_bytes(channel, bytes);
         }
         let mut operations = try_vec_with_capacity(dispositions.len())?;
         for disposition in dispositions {
@@ -2245,6 +2401,9 @@ impl HandleTable {
         bytes: &[u8],
         dispositions: &[HandleOperationDisposition],
     ) -> Result<(), IpcError> {
+        if dispositions.is_empty() {
+            return self.channel_write_bytes(channel, bytes);
+        }
         self.channel_write_with_handle_operations_impl(channel, bytes, dispositions, &mut || Ok(()))
     }
 
@@ -2396,17 +2555,21 @@ impl HandleTable {
         }
 
         let destination_slots = self.reserve_slots(handle_count)?;
-        let message = state.queues[endpoint.side]
+        let mut message = state.queues[endpoint.side]
             .pop_front()
             .expect("front message disappeared while channel was locked");
         bytes_out[..byte_count].copy_from_slice(&message.bytes);
         for ((entry, slot), output) in message
             .handles
-            .into_iter()
+            .drain(..)
             .zip(destination_slots)
             .zip(handles_out.iter_mut())
         {
             *output = self.insert_reserved(slot, entry.object, entry.rights);
+        }
+        if handle_count == 0 {
+            message.bytes.clear();
+            state.free_messages[endpoint.side].push(message);
         }
         let peer = 1 - endpoint.side;
         drop(state);
@@ -2771,9 +2934,18 @@ fn new_channel_objects() -> Result<[Arc<KernelObject>; 2], IpcError> {
     right_queue
         .try_reserve_exact(CHANNEL_QUEUE_CAPACITY)
         .map_err(|_| IpcError::OutOfMemory)?;
+    let mut left_free = Vec::new();
+    left_free
+        .try_reserve_exact(CHANNEL_QUEUE_CAPACITY)
+        .map_err(|_| IpcError::OutOfMemory)?;
+    let mut right_free = Vec::new();
+    right_free
+        .try_reserve_exact(CHANNEL_QUEUE_CAPACITY)
+        .map_err(|_| IpcError::OutOfMemory)?;
     let state = Arc::try_new(Spinlock::new(ChannelState {
         open: [true, true],
         queues: [left_queue, right_queue],
+        free_messages: [left_free, right_free],
         waiters: [Vec::new(), Vec::new()],
     }))
     .map_err(|_| IpcError::OutOfMemory)?;
@@ -4605,6 +4777,17 @@ mod tests {
             Err(IpcError::AccessDenied)
         );
         assert_eq!(
+            table.window_manager_discard_pending(
+                client,
+                WindowPresentation {
+                    buffer_index: 0,
+                    generation: 1,
+                    presentation_serial: 1,
+                },
+            ),
+            Err(IpcError::AccessDenied)
+        );
+        assert_eq!(
             table.window_present(manager, 0, 1),
             Err(IpcError::AccessDenied)
         );
@@ -4723,6 +4906,165 @@ mod tests {
         assert_eq!(third.presentation_serial, 3);
         assert_eq!(fourth.presentation_serial, 4);
         assert_eq!(fourth.generation, 7);
+    }
+
+    #[test]
+    fn window_pending_discard_is_exact_bounded_and_preserves_protected_ownership() {
+        let _shared_memory_test = SHARED_MEMORY_TEST_LOCK.lock();
+        let mut table = HandleTable::new();
+        let memory = table.shared_memory_create(8).unwrap();
+        table.shared_memory_write(memory, 0, &[1, 2, 3, 4]).unwrap();
+        table.shared_memory_write(memory, 4, &[5, 6, 7, 8]).unwrap();
+        let (client, manager) = table.window_create(memory).unwrap();
+
+        let first = table.window_present(client, 0, 1).unwrap();
+        table.window_manager_complete(manager, first, true).unwrap();
+        let second = table.window_present(client, 1, 1).unwrap();
+        let stale = WindowPresentation {
+            presentation_serial: second.presentation_serial + 1,
+            ..second
+        };
+
+        assert_eq!(
+            table.window_manager_discard_pending(manager, stale),
+            Err(IpcError::InvalidMessage)
+        );
+        assert_eq!(table.window_manager_pending(manager), Ok(second));
+        assert_eq!(table.window_manager_displayed(manager), Ok(Some(first)));
+        assert_eq!(table.window_read_release(client), Err(IpcError::ShouldWait));
+
+        let mut copied = [0; 4];
+        table
+            .window_manager_copy_pending(manager, second, 0, &mut copied)
+            .unwrap();
+        assert_eq!(copied, [5, 6, 7, 8]);
+        assert_eq!(
+            table.window_manager_discard_pending(manager, second),
+            Err(IpcError::ShouldWait)
+        );
+        assert_eq!(table.window_manager_pending(manager), Ok(second));
+        assert_eq!(table.window_manager_displayed(manager), Ok(Some(first)));
+        assert_eq!(table.window_read_release(client), Err(IpcError::ShouldWait));
+
+        table
+            .window_manager_complete(manager, second, true)
+            .unwrap();
+        assert_eq!(
+            table.window_read_release(client).unwrap(),
+            WindowRelease {
+                buffer_index: first.buffer_index,
+                generation: first.generation,
+                presentation_serial: first.presentation_serial,
+            }
+        );
+        let third = table.window_present(client, 0, 1).unwrap();
+        table
+            .window_manager_discard_pending(manager, third)
+            .unwrap();
+
+        assert_eq!(
+            table.window_manager_pending(manager),
+            Err(IpcError::ShouldWait)
+        );
+        assert_eq!(table.window_manager_displayed(manager), Ok(Some(second)));
+        assert_eq!(
+            table.window_manager_copy_pending(manager, third, 0, &mut copied),
+            Err(IpcError::InvalidMessage)
+        );
+        assert_eq!(
+            table.window_manager_complete(manager, third, true),
+            Err(IpcError::InvalidMessage)
+        );
+        copied.fill(0);
+        table
+            .window_manager_copy_displayed(manager, second, 0, &mut copied)
+            .unwrap();
+        assert_eq!(copied, [5, 6, 7, 8]);
+
+        let signals = table.object_signals(client).unwrap();
+        assert!(signals.contains(Signals::READABLE));
+        assert!(!signals.contains(Signals::WRITABLE));
+        assert_eq!(
+            table.window_present(client, third.buffer_index, third.generation),
+            Err(IpcError::ShouldWait)
+        );
+        assert_eq!(
+            table.window_read_release(client).unwrap(),
+            WindowRelease {
+                buffer_index: third.buffer_index,
+                generation: third.generation,
+                presentation_serial: third.presentation_serial,
+            }
+        );
+
+        assert_eq!(
+            table.window_present(client, second.buffer_index, second.generation),
+            Err(IpcError::InvalidMessage)
+        );
+        let replacement = table
+            .window_present(client, third.buffer_index, third.generation)
+            .unwrap();
+        assert_eq!(replacement.buffer_index, third.buffer_index);
+        assert_eq!(replacement.generation, third.generation);
+        assert_eq!(replacement.presentation_serial, 4);
+        assert_eq!(table.window_manager_pending(manager), Ok(replacement));
+        assert_eq!(table.window_manager_displayed(manager), Ok(Some(second)));
+    }
+
+    #[test]
+    fn window_pending_coalescing_validates_replacement_before_atomic_swap() {
+        let _shared_memory_test = SHARED_MEMORY_TEST_LOCK.lock();
+        let mut table = HandleTable::new();
+        let memory = table.shared_memory_create(12).unwrap();
+        table.shared_memory_write(memory, 0, &[1, 2, 3, 4]).unwrap();
+        table.shared_memory_write(memory, 4, &[5, 6, 7, 8]).unwrap();
+        table
+            .shared_memory_write(memory, 8, &[9, 10, 11, 12])
+            .unwrap();
+        let (client, manager) = table
+            .window_create_with_generation_and_buffer_count(memory, 3, 3)
+            .unwrap();
+        let displayed = table.window_present(client, 0, 3).unwrap();
+        table
+            .window_manager_complete(manager, displayed, true)
+            .unwrap();
+        let pending = table.window_present(client, 1, 3).unwrap();
+
+        assert_eq!(
+            table.window_manager_coalesce_pending(manager, pending, 0, 3),
+            Err(IpcError::InvalidMessage)
+        );
+        assert_eq!(table.window_manager_pending(manager), Ok(pending));
+        assert_eq!(table.window_manager_displayed(manager), Ok(Some(displayed)));
+        assert_eq!(table.window_read_release(client), Err(IpcError::ShouldWait));
+
+        let replacement = table
+            .window_manager_coalesce_pending(manager, pending, 2, 3)
+            .unwrap();
+        assert_eq!(replacement.buffer_index, 2);
+        assert_eq!(
+            replacement.presentation_serial,
+            pending.presentation_serial + 1
+        );
+        assert_eq!(table.window_manager_pending(manager), Ok(replacement));
+        assert_eq!(table.window_manager_displayed(manager), Ok(Some(displayed)));
+        assert_eq!(
+            table.window_read_release(client).unwrap(),
+            WindowRelease {
+                buffer_index: pending.buffer_index,
+                generation: pending.generation,
+                presentation_serial: pending.presentation_serial,
+            }
+        );
+        let mut copied = [0; 4];
+        table
+            .window_manager_copy_pending(manager, replacement, 0, &mut copied)
+            .unwrap();
+        assert_eq!(copied, [9, 10, 11, 12]);
+        assert_eq!(
+            table.window_manager_coalesce_pending(manager, replacement, 1, 3),
+            Err(IpcError::ShouldWait)
+        );
     }
 
     #[test]
@@ -5131,6 +5473,67 @@ mod tests {
             table.channel_read(right, &mut bytes, &mut []),
             Err(IpcError::ShouldWait)
         );
+    }
+
+    #[test]
+    fn handle_free_channel_messages_reuse_warmed_byte_storage() {
+        let mut table = HandleTable::new();
+        let (left, right) = table.channel_create().unwrap();
+        table.channel_write(left, b"present-result", &[]).unwrap();
+        let mut bytes = [0; 32];
+        table.channel_read(right, &mut bytes, &mut []).unwrap();
+
+        let right_object = table.object_with_rights(right, Rights::READ).unwrap();
+        let endpoint = channel_endpoint(&right_object).unwrap();
+        let state = endpoint.state.lock();
+        let warmed_pointer = state.free_messages[endpoint.side][0].bytes.as_ptr();
+        let warmed_capacity = state.free_messages[endpoint.side][0].bytes.capacity();
+        drop(state);
+
+        table.channel_write(left, b"buffer-release", &[]).unwrap();
+        let state = endpoint.state.lock();
+        let queued = state.queues[endpoint.side].front().unwrap();
+        assert_eq!(queued.bytes.as_ptr(), warmed_pointer);
+        assert_eq!(queued.bytes.capacity(), warmed_capacity);
+    }
+
+    #[test]
+    fn zero_operation_channel_writes_reuse_one_cached_message() {
+        let mut table = HandleTable::new();
+        let (left, right) = table.channel_create().unwrap();
+        let mut bytes = [0; 32];
+
+        table
+            .channel_write_with_handle_operations(left, b"present-one", &[])
+            .unwrap();
+        table.channel_read(right, &mut bytes, &mut []).unwrap();
+        for payload in [b"present-two".as_slice(), b"present-three".as_slice()] {
+            table
+                .channel_write_with_handle_operations(left, payload, &[])
+                .unwrap();
+            table.channel_read(right, &mut bytes, &mut []).unwrap();
+        }
+
+        let right_object = table.object_with_rights(right, Rights::READ).unwrap();
+        let endpoint = channel_endpoint(&right_object).unwrap();
+        assert_eq!(endpoint.state.lock().free_messages[endpoint.side].len(), 1);
+    }
+
+    #[test]
+    fn handle_bearing_channel_messages_do_not_grow_the_byte_cache() {
+        let mut table = HandleTable::new();
+        let (left, right) = table.channel_create().unwrap();
+        let (transferred, _retained_peer) = table.channel_create().unwrap();
+        table
+            .channel_write(left, b"endpoint", &[transferred])
+            .unwrap();
+        let mut bytes = [0; 8];
+        let mut handles = [Handle::INVALID; 1];
+        table.channel_read(right, &mut bytes, &mut handles).unwrap();
+
+        let right_object = table.object_with_rights(right, Rights::READ).unwrap();
+        let endpoint = channel_endpoint(&right_object).unwrap();
+        assert!(endpoint.state.lock().free_messages[endpoint.side].is_empty());
     }
 
     #[test]

@@ -2558,7 +2558,6 @@ fn channel_write(process: &mut Process, raw_channel: u64, args_address: u64) -> 
         CHANNEL_MAX_HANDLES as u64,
         Status::MessageTooLarge,
     )?;
-    let bytes = copy_vec_from_user(process, bytes_address, byte_count)?;
     let raw_dispositions =
         copy_vec_from_user(process, dispositions_address, disposition_bytes_len)?;
 
@@ -2575,10 +2574,35 @@ fn channel_write(process: &mut Process, raw_channel: u64, args_address: u64) -> 
     if !process.can_send_channel_bytes(byte_count) {
         return Err(Status::ResourceLimit);
     }
-    process
+    let mut scratch = process.take_channel_syscall_scratch();
+    scratch.bytes.clear();
+    if scratch.bytes.capacity() < byte_count
+        && scratch
+            .bytes
+            .try_reserve_exact(byte_count)
+            .map_err(|_| Status::OutOfMemory)
+            .is_err()
+    {
+        process.restore_channel_syscall_scratch(scratch);
+        return Err(Status::OutOfMemory);
+    }
+    scratch.bytes.resize(byte_count, 0);
+    if let Err(error) = process
+        .address_space()
+        .copy_from_user(&mut scratch.bytes, bytes_address)
+        .map_err(map_address_space_error)
+    {
+        scratch.bytes.clear();
+        process.restore_channel_syscall_scratch(scratch);
+        return Err(error);
+    }
+    let result = process
         .handles_mut()
-        .channel_write_with_handle_operations(channel, &bytes, &dispositions)
-        .map_err(map_ipc_error)?;
+        .channel_write_with_handle_operations(channel, &scratch.bytes, &dispositions)
+        .map_err(map_ipc_error);
+    scratch.bytes.clear();
+    process.restore_channel_syscall_scratch(scratch);
+    result?;
     process.record_channel_bytes(byte_count);
     Ok(())
 }
@@ -2615,50 +2639,92 @@ fn channel_read(process: &mut Process, raw_channel: u64, args_address: u64) -> R
     validate_user_output(process, handles_address, handle_bytes_len)?;
     validate_user_output(process, output_address, CHANNEL_READ_OUTPUT_SIZE)?;
 
-    let mut bytes = zeroed_vec(byte_capacity)?;
-    let mut handles = Vec::new();
-    handles
-        .try_reserve_exact(handle_capacity)
-        .map_err(|_| Status::OutOfMemory)?;
-    handles.resize(handle_capacity, Handle::INVALID);
-    // Allocate the complete ABI metadata capacity before channel_read's dequeue
-    // commit point. Everything after a successful read is allocation-free.
-    let mut metadata = zeroed_vec(handle_bytes_len)?;
+    let mut scratch = process.take_channel_syscall_scratch();
+    scratch.bytes.clear();
+    scratch.handles.clear();
+    scratch.metadata.clear();
+    let reserve_result = scratch
+        .bytes
+        .try_reserve_exact(byte_capacity)
+        .and_then(|()| scratch.handles.try_reserve_exact(handle_capacity))
+        .and_then(|()| scratch.metadata.try_reserve_exact(handle_bytes_len));
+    if reserve_result.is_err() {
+        process.restore_channel_syscall_scratch(scratch);
+        return Err(Status::OutOfMemory);
+    }
+    scratch.bytes.resize(byte_capacity, 0);
+    scratch.handles.resize(handle_capacity, Handle::INVALID);
+    scratch.metadata.resize(handle_bytes_len, 0);
 
-    let info = match process
-        .handles_mut()
-        .channel_read(channel, &mut bytes, &mut handles)
-    {
-        Ok(info) => info,
-        Err(IpcError::BufferTooSmall(info)) => {
-            let output = encode_channel_read_output(info);
-            copy_to_user(process, output_address, &output)?;
-            return Err(Status::BufferTooSmall);
-        }
-        Err(error) => return Err(map_ipc_error(error)),
-    };
+    let info =
+        match process
+            .handles_mut()
+            .channel_read(channel, &mut scratch.bytes, &mut scratch.handles)
+        {
+            Ok(info) => info,
+            Err(IpcError::BufferTooSmall(info)) => {
+                scratch.bytes.clear();
+                scratch.handles.clear();
+                scratch.metadata.clear();
+                process.restore_channel_syscall_scratch(scratch);
+                let output = encode_channel_read_output(info);
+                copy_to_user(process, output_address, &output)?;
+                return Err(Status::BufferTooSmall);
+            }
+            Err(error) => {
+                scratch.bytes.clear();
+                scratch.handles.clear();
+                scratch.metadata.clear();
+                process.restore_channel_syscall_scratch(scratch);
+                return Err(map_ipc_error(error));
+            }
+        };
 
     let byte_count = info.byte_count as usize;
     let handle_count = usize::from(info.handle_count);
-    if byte_count > bytes.len() || handle_count > handles.len() || info.reserved != 0 {
-        close_handles(process, &handles[..handle_count.min(handles.len())]);
+    if byte_count > scratch.bytes.len()
+        || handle_count > scratch.handles.len()
+        || info.reserved != 0
+    {
+        close_handles(
+            process,
+            &scratch.handles[..handle_count.min(scratch.handles.len())],
+        );
+        scratch.bytes.clear();
+        scratch.handles.clear();
+        scratch.metadata.clear();
+        process.restore_channel_syscall_scratch(scratch);
         return Err(Status::InvalidMessage);
     }
-    let received = &handles[..handle_count];
+    let received = &scratch.handles[..handle_count];
     let metadata_len = handle_count * RECEIVED_HANDLE_SIZE;
-    if fill_received_handle_metadata(process, received, &mut metadata[..metadata_len]).is_err() {
+    if fill_received_handle_metadata(process, received, &mut scratch.metadata[..metadata_len])
+        .is_err()
+    {
         close_handles(process, received);
+        scratch.bytes.clear();
+        scratch.handles.clear();
+        scratch.metadata.clear();
+        process.restore_channel_syscall_scratch(scratch);
         return Err(Status::InvalidMessage);
     }
     let output = encode_channel_read_output(info);
 
-    let copied = copy_to_user(process, bytes_address, &bytes[..byte_count])
-        .and_then(|()| copy_to_user(process, handles_address, &metadata[..metadata_len]))
+    let copied = copy_to_user(process, bytes_address, &scratch.bytes[..byte_count])
+        .and_then(|()| copy_to_user(process, handles_address, &scratch.metadata[..metadata_len]))
         .and_then(|()| copy_to_user(process, output_address, &output));
     if let Err(status) = copied {
         close_handles(process, received);
+        scratch.bytes.clear();
+        scratch.handles.clear();
+        scratch.metadata.clear();
+        process.restore_channel_syscall_scratch(scratch);
         return Err(status);
     }
+    scratch.bytes.clear();
+    scratch.handles.clear();
+    scratch.metadata.clear();
+    process.restore_channel_syscall_scratch(scratch);
     Ok(())
 }
 
