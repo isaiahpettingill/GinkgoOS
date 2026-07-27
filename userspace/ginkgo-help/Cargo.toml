@@ -1,0 +1,17 @@
+[package]
+name = "ginkgo-help"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "ginkgo-help"
+path = "src/main.rs"
+
+[dependencies]
+ginkgo-graphics.workspace = true
+ginkgo-runtime.workspace = true
+ginkgo-userspace.workspace = true
+ginkgo-window.workspace = true

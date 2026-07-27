@@ -33,6 +33,7 @@ USERSPACE_MANIFEST := userspace/Cargo.toml
 USERSPACE_TARGET := userspace/target/x86_64-unknown-none/release
 DESKTOP_ELF := $(USERSPACE_TARGET)/ginkgo-desktop-service
 MINIMAL_CLIENT_ELF := $(USERSPACE_TARGET)/ginkgo-minimal-client
+HELP_ELF := $(USERSPACE_TARGET)/ginkgo-help
 FILE_NAVIGATOR_ELF := $(USERSPACE_TARGET)/ginkgo-file-navigator
 TEXT_EDITOR_ELF := $(USERSPACE_TARGET)/ginkgo-text-editor
 TERMINAL_ELF := $(USERSPACE_TARGET)/ginkgo-terminal
@@ -77,11 +78,11 @@ THREAD_SMOKE_KERNEL_BUILD = GINKGO_THREAD_SMOKE=1 GINKGO_THREAD_SMOKE_ELF="$(abs
 all: iso
 
 userspace:
-	cargo build --manifest-path $(USERSPACE_MANIFEST) --release --target x86_64-unknown-none -p ginkgo-desktop-service -p ginkgo-minimal-client -p ginkgo-file-navigator -p ginkgo-text-editor -p ginkgo-terminal -p ginkgo-process-capability-smoke -p ginkgo-request-smoke
+	cargo build --manifest-path $(USERSPACE_MANIFEST) --release --target x86_64-unknown-none -p ginkgo-desktop-service -p ginkgo-minimal-client -p ginkgo-help -p ginkgo-file-navigator -p ginkgo-text-editor -p ginkgo-terminal -p ginkgo-process-capability-smoke -p ginkgo-request-smoke
 	CARGO_PROFILE_RELEASE_LTO=false cargo build --manifest-path $(USERSPACE_MANIFEST) --release --target x86_64-unknown-none -p ginkgo-thread-smoke
 
 kernel: userspace
-	GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" GINKGO_TEXT_EDITOR_ELF="$(abspath $(TEXT_EDITOR_ELF))" GINKGO_TERMINAL_ELF="$(abspath $(TERMINAL_ELF))" GINKGO_THREAD_SMOKE_ELF="$(abspath $(THREAD_SMOKE_ELF))" cargo build -p ginkgo-kernel --bin ginkgo-os
+	GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_HELP_ELF="$(abspath $(HELP_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" GINKGO_TEXT_EDITOR_ELF="$(abspath $(TEXT_EDITOR_ELF))" GINKGO_TERMINAL_ELF="$(abspath $(TERMINAL_ELF))" GINKGO_THREAD_SMOKE_ELF="$(abspath $(THREAD_SMOKE_ELF))" cargo build -p ginkgo-kernel --bin ginkgo-os
 
 $(LIMINE_DIR)/BOOTX64.EFI:
 	mkdir -p $(BUILD_DIR)

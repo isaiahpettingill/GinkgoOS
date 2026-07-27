@@ -5088,6 +5088,7 @@ fn is_protected_system_file(name: &str) -> bool {
     name == "system"
         || name == "desktop.elf"
         || name == "minimal-client.elf"
+        || name == "help.elf"
         || name == "file-navigator.elf"
         || name == "text-editor.elf"
         || name == "terminal.elf"
@@ -7436,6 +7437,7 @@ mod tests {
             "system/desktop.elf",
             "system/nested/artifact",
             "desktop.elf",
+            "help.elf",
             "programs.gkr/metadata",
             "system.log/archive",
             "console/child",

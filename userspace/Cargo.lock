@@ -247,6 +247,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ginkgo-help"
+version = "0.1.0"
+dependencies = [
+ "ginkgo-graphics",
+ "ginkgo-runtime",
+ "ginkgo-userspace",
+ "ginkgo-window",
+]
+
+[[package]]
 name = "ginkgo-ipc"
 version = "0.1.0"
 dependencies = [

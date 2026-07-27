@@ -57,6 +57,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=GINKGO_DESKTOP_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_MINIMAL_CLIENT_ELF");
+    println!("cargo:rerun-if-env-changed=GINKGO_HELP_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_FILE_NAVIGATOR_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_TEXT_EDITOR_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_TERMINAL_ELF");
@@ -188,6 +189,7 @@ fn main() {
     let desktop = read_userspace_artifact("GINKGO_DESKTOP_ELF").unwrap_or_else(build_desktop_elf);
     let minimal_client = read_userspace_artifact("GINKGO_MINIMAL_CLIENT_ELF")
         .unwrap_or_else(build_userspace_smoke_elf);
+    let help = read_userspace_artifact("GINKGO_HELP_ELF").unwrap_or_else(build_userspace_smoke_elf);
     let file_navigator = read_userspace_artifact("GINKGO_FILE_NAVIGATOR_ELF")
         .unwrap_or_else(build_userspace_smoke_elf);
     let text_editor =
@@ -198,6 +200,7 @@ fn main() {
     let artifacts = [
         ("/system/desktop.elf", desktop.as_slice()),
         ("/system/minimal-client.elf", minimal_client.as_slice()),
+        ("/system/help.elf", help.as_slice()),
         ("/system/file-navigator.elf", file_navigator.as_slice()),
         ("/system/text-editor.elf", text_editor.as_slice()),
         ("/system/terminal.elf", terminal.as_slice()),
@@ -207,6 +210,7 @@ fn main() {
     fs::write(out_dir.join("ginkgo-desktop.elf"), desktop).expect("write ginkgo desktop ELF");
     fs::write(out_dir.join("ginkgo-minimal-client.elf"), minimal_client)
         .expect("write Ginkgo minimal client ELF");
+    fs::write(out_dir.join("ginkgo-help.elf"), help).expect("write Ginkgo help ELF");
     fs::write(out_dir.join("ginkgo-file-navigator.elf"), file_navigator)
         .expect("write Ginkgo file navigator ELF");
     fs::write(out_dir.join("ginkgo-text-editor.elf"), text_editor)
@@ -1056,6 +1060,12 @@ fn build_program_registry() -> Vec<u8> {
             flags: EntryFlags::HIDDEN,
         },
         EncodeEntry {
+            app_id: "help",
+            display_name: "Help",
+            executable_path: "/system/help.elf",
+            flags: EntryFlags::EMPTY,
+        },
+        EncodeEntry {
             app_id: "file-navigator",
             display_name: "Files",
             executable_path: "/system/file-navigator.elf",
@@ -1089,6 +1099,13 @@ fn build_program_registry() -> Vec<u8> {
     assert_eq!(desktop.app_id, "desktop");
     assert_eq!(desktop.executable_path, "/system/desktop.elf");
     assert!(!desktop.is_visible());
+
+    let help = parsed
+        .entries()
+        .find(|entry| entry.app_id == "help")
+        .expect("help registry entry exists");
+    assert_eq!(help.executable_path, "/system/help.elf");
+    assert_eq!(help.flags, EntryFlags::EMPTY);
 
     let file_navigator = parsed
         .entries()

@@ -23,9 +23,9 @@ use ginkgo_scroll_layout::{
 };
 pub use ginkgo_scroll_layout::{HorizontalAlignment, Insets};
 use ginkgo_window::{
-    BufferId, Generation, KeyboardEvent, PixelFormat, Point, PointerEvent, PointerEventKind, Rect,
-    RequestId, ScaleFactor, ServerErrorCode, Size, SurfaceConfiguration, WindowId, WindowOptions,
-    WireRequest, MIN_BUFFER_SLOTS, PROTOCOL_VERSION,
+    BufferId, ButtonState, Generation, KeyboardEvent, PixelFormat, Point, PointerButton,
+    PointerEvent, PointerEventKind, Rect, RequestId, ScaleFactor, ServerErrorCode, Size,
+    SurfaceConfiguration, WindowId, WindowOptions, WireRequest, MIN_BUFFER_SLOTS, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -64,6 +64,18 @@ impl<'de> Deserialize<'de> for ClientId {
         let value = u64::deserialize(deserializer)?;
         Self::new(value).ok_or_else(|| serde::de::Error::custom("client ID must be non-zero"))
     }
+}
+
+/// Height reserved for the persistent system tray at the top of the output.
+pub const SYSTEM_TRAY_HEIGHT: u32 = 32;
+/// Preferred square size of a server-side decoration close control.
+pub const DECORATION_CLOSE_BUTTON_SIZE: u32 = 18;
+/// Space between a decoration control and the outer window edge.
+pub const DECORATION_CONTROL_MARGIN: u32 = 3;
+
+/// Returns whether an output-space point belongs to the desktop-owned tray.
+pub const fn system_tray_contains(position: Point) -> bool {
+    position.y >= 0 && (position.y as u32) < SYSTEM_TRAY_HEIGHT
 }
 
 /// Desktop-controlled surface and scrolling policy.
@@ -548,29 +560,64 @@ impl Desktop {
             })
     }
 
-    /// Hit-tests pointer input, focuses its target, and returns a client-local
-    /// forwarding action. Input on server decorations is not forwarded.
+    /// Hit-tests pointer input, focuses its target, handles server decoration
+    /// controls, and forwards client-area input in client-local coordinates.
     pub fn pointer_input(
         &mut self,
         position: Point,
         kind: PointerEventKind,
     ) -> Result<Vec<DesktopAction>, DesktopError> {
-        let Some(hit) = self.hit_test(position) else {
+        let x = i64::from(position.x);
+        let y = i64::from(position.y);
+        let Some(placement) = self
+            .effective_placements()
+            .into_iter()
+            .rev()
+            .find(|placement| contains(placement.outer, x, y))
+        else {
             return Ok(Vec::new());
         };
-        let mut actions = if self.focused_window() == Some(hit.window_id) {
+        let Some(window) = self.window(placement.window_id) else {
+            return Ok(Vec::new());
+        };
+        let client_id = window.owner;
+        let window_id = window.id;
+        let mut actions = if self.focused_window() == Some(window_id) {
             Vec::new()
         } else {
-            self.focus_window(hit.window_id)?
+            self.focus_window(window_id)?
         };
-        actions.push(DesktopAction::ForwardPointer {
-            client_id: hit.client_id,
-            window_id: hit.window_id,
-            event: PointerEvent {
-                position: hit.local_position,
-                kind,
-            },
-        });
+
+        if matches!(
+            kind,
+            PointerEventKind::Button {
+                button: PointerButton::Primary,
+                state: ButtonState::Pressed,
+            }
+        ) && decoration_close_rect(placement).is_some_and(|rect| contains(rect, x, y))
+        {
+            actions.push(DesktopAction::CloseRequested {
+                client_id,
+                window_id,
+            });
+            return Ok(actions);
+        }
+
+        if contains(placement.client, x, y) {
+            actions.push(DesktopAction::ForwardPointer {
+                client_id,
+                window_id,
+                event: PointerEvent {
+                    position: Point::new(
+                        i32::try_from(x.saturating_sub(placement.client.x))
+                            .map_err(|_| DesktopError::OutOfResources)?,
+                        i32::try_from(y.saturating_sub(placement.client.y))
+                            .map_err(|_| DesktopError::OutOfResources)?,
+                    ),
+                    kind,
+                },
+            });
+        }
         Ok(actions)
     }
 
@@ -956,6 +1003,33 @@ impl Desktop {
             .iter()
             .position(|window| window.id == window_id && window.owner == client_id)
     }
+}
+
+fn decoration_close_rect(placement: WindowPlacement) -> Option<LayoutRect> {
+    if !placement.decorated {
+        return None;
+    }
+    let title_height = u32::try_from(placement.client.y.checked_sub(placement.outer.y)?).ok()?;
+    let available = title_height.checked_sub(DECORATION_CONTROL_MARGIN.saturating_mul(2))?;
+    let size = DECORATION_CLOSE_BUTTON_SIZE.min(available);
+    if size < 8
+        || placement.outer.width < size.saturating_add(DECORATION_CONTROL_MARGIN.saturating_mul(2))
+    {
+        return None;
+    }
+    Some(LayoutRect::new(
+        placement.outer.x
+            + i64::from(
+                placement
+                    .outer
+                    .width
+                    .saturating_sub(DECORATION_CONTROL_MARGIN)
+                    .saturating_sub(size),
+            ),
+        placement.outer.y + i64::from(title_height.saturating_sub(size) / 2),
+        size,
+        size,
+    ))
 }
 
 fn validate_output(output: Size, policy: DesktopPolicy) -> Result<(), DesktopError> {
@@ -1724,6 +1798,47 @@ mod tests {
             }]
         );
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn system_tray_owns_only_the_reserved_top_strip() {
+        assert!(system_tray_contains(Point::new(0, 0)));
+        assert!(system_tray_contains(Point::new(999, 31)));
+        assert!(!system_tray_contains(Point::new(0, -1)));
+        assert!(!system_tray_contains(Point::new(0, 32)));
+    }
+
+    #[test]
+    fn primary_click_on_close_decoration_requests_close_without_forwarding() {
+        let mut desktop = Desktop::new(Size::new(1000, 600)).unwrap();
+        let (window_id, _) = create(&mut desktop, client(1), 1, options("closable"));
+        let placement = desktop
+            .placements()
+            .into_iter()
+            .find(|placement| placement.window_id == window_id)
+            .unwrap();
+        let close = decoration_close_rect(placement).expect("decorated window has close control");
+
+        let actions = desktop
+            .pointer_input(
+                Point::new(
+                    i32::try_from(close.x + i64::from(close.width / 2)).unwrap(),
+                    i32::try_from(close.y + i64::from(close.height / 2)).unwrap(),
+                ),
+                PointerEventKind::Button {
+                    button: PointerButton::Primary,
+                    state: ButtonState::Pressed,
+                },
+            )
+            .unwrap();
+
+        assert!(actions.contains(&DesktopAction::CloseRequested {
+            client_id: client(1),
+            window_id,
+        }));
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, DesktopAction::ForwardPointer { .. })));
     }
 
     trait RectSize {

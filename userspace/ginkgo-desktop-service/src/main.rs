@@ -9,7 +9,7 @@ use core::mem::MaybeUninit;
 use ginkgo_desktop::{
     AttachmentIndex, ClientId, Desktop, DesktopAction, DesktopPolicy, HorizontalAlignment, Insets,
     PresentationResult, RuntimeMessage, RuntimePacket, RuntimePlacement, RuntimeSender,
-    TrustedCommand, MAX_RUNTIME_PLACEMENTS,
+    TrustedCommand, MAX_RUNTIME_PLACEMENTS, SYSTEM_TRAY_HEIGHT,
 };
 use ginkgo_terminal_protocol::{decode_launch_request, is_launch_message};
 use ginkgo_userspace::{
@@ -233,7 +233,7 @@ impl Service {
         let mut policy = DesktopPolicy::default();
         policy.scale = ScaleFactor::new(1, 1).map_err(|_| ServiceError::Desktop)?;
         policy.buffer_count = MIN_BUFFER_SLOTS + 1;
-        policy.window_margins = Insets::new(12, 12, 12, 12);
+        policy.window_margins = Insets::new(12, SYSTEM_TRAY_HEIGHT + 12, 12, 12);
         Ok(Self {
             desktop: Desktop::with_policy(output, policy).map_err(|_| ServiceError::Desktop)?,
             broker: OwnedHandle::new(bootstrap)?,
@@ -363,13 +363,11 @@ impl Service {
                 self.execute_actions(actions)?;
             }
             RuntimeMessage::PointerInput { position, kind } => {
-                if !self.launcher_visible {
-                    let actions = self
-                        .desktop
-                        .handle_trusted_command(TrustedCommand::PointerInput { position, kind })
-                        .map_err(|_| ServiceError::Desktop)?;
-                    self.execute_actions(actions)?;
-                }
+                let actions = self
+                    .desktop
+                    .handle_trusted_command(TrustedCommand::PointerInput { position, kind })
+                    .map_err(|_| ServiceError::Desktop)?;
+                self.execute_actions(actions)?;
             }
             RuntimeMessage::KeyboardInput { event } => {
                 if !self.launcher_visible {

@@ -53,6 +53,7 @@ const INSTALLED_REGISTRY_PATH: &str = "applications/installed.gki";
 const STAGED_REGISTRY_PATH: &str = "applications/installed.gki.new";
 const PROTECTED_SYSTEM_IDS: &[&str] = &[
     "desktop",
+    "help",
     "file-navigator",
     "text-editor",
     "terminal",

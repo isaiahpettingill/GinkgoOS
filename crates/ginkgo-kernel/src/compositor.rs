@@ -2,6 +2,7 @@
 
 use alloc::vec::Vec;
 
+use ginkgo_desktop::{DECORATION_CLOSE_BUTTON_SIZE, DECORATION_CONTROL_MARGIN};
 use ginkgo_graphics::{
     FramebufferConfig, FramebufferWriter, PixelFormat, SurfaceError, SurfaceLayout, SurfacePixel,
 };
@@ -18,6 +19,9 @@ const UNFOCUSED_BORDER_COLOR: SurfacePixel = SurfacePixel::xrgb(58, 61, 68);
 /// Maximum number of output damage rectangles retained before full-output fallback.
 pub const DAMAGE_RECT_CAPACITY: usize = 8;
 const LETTERBOX_COLOR: SurfacePixel = SurfacePixel::xrgb(0, 0, 0);
+const CLOSE_BUTTON_COLOR: SurfacePixel = SurfacePixel::xrgb(190, 52, 64);
+const CLOSE_BUTTON_BORDER_COLOR: SurfacePixel = SurfacePixel::xrgb(112, 24, 34);
+const CLOSE_BUTTON_ICON_COLOR: SurfacePixel = SurfacePixel::xrgb(255, 244, 246);
 
 /// A signed screen or surface coordinate.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -658,7 +662,13 @@ impl Compositor {
         let mut queued_visible_damage = false;
         let first_presentation = self.render_state.selected_buffers[target]
             .is_some_and(|selection| !selection.had_displayed);
-        if first_presentation || damage.is_empty() {
+        if first_presentation {
+            queued_visible_damage = Self::queue_first_presentation_damage(
+                &self.windows,
+                target,
+                &mut self.render_state,
+            )?;
+        } else if damage.is_empty() {
             let full = Rect::new(
                 0,
                 0,
@@ -941,7 +951,9 @@ impl Compositor {
             };
             let damage = damage_for(windows[index].id, selection.presentation);
             let mut queued = false;
-            if !selection.had_displayed || damage.as_slice().is_empty() {
+            if !selection.had_displayed {
+                queued = Self::queue_first_presentation_damage(windows, index, state)?;
+            } else if damage.as_slice().is_empty() {
                 queued = Self::queue_source_damage(
                     windows,
                     index,
@@ -964,6 +976,27 @@ impl Compositor {
             }
         }
         Ok(pending_count)
+    }
+
+    fn queue_first_presentation_damage(
+        windows: &[WindowConfig],
+        target: usize,
+        state: &mut RenderState,
+    ) -> Result<bool, CompositorError> {
+        let Some(visible) = windows[target].placement.visible else {
+            return Ok(false);
+        };
+        let Some(visible) = clip_rect_to_output(visible, state.output_width, state.output_height)
+        else {
+            return Ok(false);
+        };
+        if rect_fully_occluded(windows, &state.selected_buffers, target, visible)? {
+            return Ok(false);
+        }
+        state
+            .damage
+            .add(visible, state.output_width, state.output_height);
+        Ok(true)
     }
 
     fn queue_source_damage(
@@ -1675,11 +1708,68 @@ fn draw_frame_row(
 
     let left = left.max(damage_left);
     let right = right.min(damage_right);
+    let close = decoration_close_rect(placement);
     for (x, pixel) in destination.iter_mut().enumerate().take(right).skip(left) {
-        if !placement.client.contains(x as i128, y) {
-            *pixel = frame_color;
+        if placement.client.contains(x as i128, y) {
+            continue;
         }
+        *pixel = frame_color;
+        let Some(close) = close.filter(|close| close.contains(x as i128, y)) else {
+            continue;
+        };
+        let local_x = (x as i128 - i128::from(close.x)) as usize;
+        let local_y = (y - i128::from(close.y)) as usize;
+        let edge = local_x == 0
+            || local_y == 0
+            || local_x + 1 == close.width
+            || local_y + 1 == close.height;
+        let inset = 4.min(close.width / 3).min(close.height / 3);
+        let inside = local_x >= inset
+            && local_y >= inset
+            && local_x + inset < close.width
+            && local_y + inset < close.height;
+        let descending = local_x.abs_diff(local_y) <= 1;
+        let ascending = local_x
+            .saturating_add(local_y)
+            .abs_diff(close.width.saturating_sub(1))
+            <= 1;
+        *pixel = if inside && (descending || ascending) {
+            CLOSE_BUTTON_ICON_COLOR
+        } else if edge {
+            CLOSE_BUTTON_BORDER_COLOR
+        } else {
+            CLOSE_BUTTON_COLOR
+        };
     }
+}
+
+fn decoration_close_rect(placement: WindowPlacement) -> Option<Rect> {
+    if !placement.decorated {
+        return None;
+    }
+    let title_height = usize::try_from(placement.client.y.checked_sub(placement.outer.y)?).ok()?;
+    let margin = usize::try_from(DECORATION_CONTROL_MARGIN).ok()?;
+    let available = title_height.checked_sub(margin.saturating_mul(2))?;
+    let size = usize::try_from(DECORATION_CLOSE_BUTTON_SIZE)
+        .ok()?
+        .min(available);
+    if size < 8 || placement.outer.width < size.saturating_add(margin.saturating_mul(2)) {
+        return None;
+    }
+    Some(Rect::new(
+        placement.outer.x
+            + i64::try_from(
+                placement
+                    .outer
+                    .width
+                    .saturating_sub(margin)
+                    .saturating_sub(size),
+            )
+            .ok()?,
+        placement.outer.y + i64::try_from(title_height.saturating_sub(size) / 2).ok()?,
+        size,
+        size,
+    ))
 }
 
 /// Clips one output-space axis against a visible range and the framebuffer.
@@ -2705,6 +2795,50 @@ mod tests {
         assert_eq!(framebuffer.read_raw_pixel(0, 0), Some(0x00FF_0000));
         assert_eq!(framebuffer.read_raw_pixel(1, 0), Some(0x0000_FF00));
         assert_eq!(framebuffer.read_raw_pixel(2, 0), Some(0x007F_0080));
+    }
+
+    #[test]
+    fn first_partial_present_repaints_decorations_and_close_control() {
+        let mut shared_memory = TestSharedMemoryContext::new(64);
+        let mut handles = HandleTable::new();
+        let source = pixels(&[0x00ff_0000, 0x0000_ff00]);
+        let (_, client, manager) =
+            create_window(&mut shared_memory, &mut handles, &source, &source);
+        let outer = Rect::new(0, 0, 24, 26);
+        let placement =
+            WindowPlacement::new(outer, Rect::new(1, 24, 2, 1), Some(outer), true, true);
+        let mut compositor = Compositor::new();
+        compositor
+            .register_window(WindowConfig::new(
+                1,
+                manager,
+                layout(2, 1, PixelFormat::Xrgb8888),
+                placement,
+            ))
+            .unwrap();
+        let mut bytes = [0_u8; 24 * 26 * 4];
+        let mut framebuffer = standard_framebuffer(&mut bytes, 24, 26);
+        compositor.redraw(&handles, &mut framebuffer).unwrap();
+
+        handles.window_present(client, 0, 1).unwrap();
+        compositor
+            .compose_pending_damage(&handles, &mut framebuffer, 1, &[Rect::new(0, 0, 1, 1)])
+            .unwrap();
+
+        assert_eq!(
+            framebuffer.read_raw_pixel(0, 0),
+            Some(raw_color(FOCUSED_TITLE_COLOR))
+        );
+        assert_eq!(
+            framebuffer.read_raw_pixel(3, 3),
+            Some(raw_color(CLOSE_BUTTON_BORDER_COLOR))
+        );
+        assert_eq!(
+            framebuffer.read_raw_pixel(12, 12),
+            Some(raw_color(CLOSE_BUTTON_ICON_COLOR))
+        );
+        assert_eq!(framebuffer.read_raw_pixel(1, 24), Some(0x00ff_0000));
+        assert_eq!(framebuffer.read_raw_pixel(2, 24), Some(0x0000_ff00));
     }
 
     #[test]

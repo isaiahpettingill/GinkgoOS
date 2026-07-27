@@ -25,7 +25,7 @@ use embedded_icon::{
     NewIcon,
 };
 use framebuffer::{FramebufferWriter, Rgb};
-use ginkgo_desktop::ClientId;
+use ginkgo_desktop::{system_tray_contains, ClientId, SYSTEM_TRAY_HEIGHT};
 use ginkgo_filesystem::{FsError, NodeKind, NodeMetadata, RedoxFs, RenameMode};
 use ginkgo_hid::{ApplicationKind, Axis, InputEvent, AXIS_MAX, AXIS_MIN};
 use ginkgo_ipc::{
@@ -135,6 +135,7 @@ static REQUESTS_END: [u64; 2] = limine::REQUESTS_END_MARKER;
 static DESKTOP_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-desktop.elf"));
 static MINIMAL_CLIENT_ELF: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-minimal-client.elf"));
+static HELP_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-help.elf"));
 static FILE_NAVIGATOR_ELF: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-file-navigator.elf"));
 static TEXT_EDITOR_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-text-editor.elf"));
@@ -232,6 +233,7 @@ const SYSTEM_DIRECTORY: &str = "system";
 const USER_DIRECTORY: &str = "user";
 const DESKTOP_PATH: &str = "/system/desktop.elf";
 const MINIMAL_CLIENT_PATH: &str = "/system/minimal-client.elf";
+const HELP_PATH: &str = "/system/help.elf";
 const FILE_NAVIGATOR_PATH: &str = "/system/file-navigator.elf";
 const TEXT_EDITOR_PATH: &str = "/system/text-editor.elf";
 const TERMINAL_PATH: &str = "/system/terminal.elf";
@@ -401,6 +403,12 @@ impl ProgramCatalog {
             .copied()
             .find(|program| program.app_id() == app_id)
     }
+
+    fn index_of(&self, app_id: &str) -> Option<usize> {
+        self.programs[..self.len]
+            .iter()
+            .position(|program| program.app_id() == app_id)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -441,6 +449,7 @@ fn install_and_load_system_programs<D: Disk>(
     install_system_file(fs, DESKTOP_PATH, DESKTOP_ELF).map_err(|_| "install desktop")?;
     install_system_file(fs, MINIMAL_CLIENT_PATH, MINIMAL_CLIENT_ELF)
         .map_err(|_| "install minimal client")?;
+    install_system_file(fs, HELP_PATH, HELP_ELF).map_err(|_| "install help")?;
     install_system_file(fs, FILE_NAVIGATOR_PATH, FILE_NAVIGATOR_ELF)
         .map_err(|_| "install file navigator")?;
     install_system_file(fs, TEXT_EDITOR_PATH, TEXT_EDITOR_ELF)
@@ -557,6 +566,7 @@ fn migrate_legacy_system_files<D: Disk>(
     for name in [
         "desktop.elf",
         "minimal-client.elf",
+        "help.elf",
         "file-navigator.elf",
         "text-editor.elf",
         "terminal.elf",
@@ -585,6 +595,7 @@ fn recover_system_installation_space<D: Disk>(fs: &mut RedoxFs<D>) -> Result<(),
     let artifacts = [
         (DESKTOP_PATH, DESKTOP_ELF),
         (MINIMAL_CLIENT_PATH, MINIMAL_CLIENT_ELF),
+        (HELP_PATH, HELP_ELF),
         (FILE_NAVIGATOR_PATH, FILE_NAVIGATOR_ELF),
         (TEXT_EDITOR_PATH, TEXT_EDITOR_ELF),
         (TERMINAL_PATH, TERMINAL_ELF),
@@ -1283,6 +1294,8 @@ pub extern "C" fn _start() -> ! {
         pending_input_len: 0,
         pressed_keys: Vec::new(),
         pressed_pointer_buttons: Vec::new(),
+        desktop_captured_pointer_buttons: Vec::new(),
+        overlay_captured_pointer_buttons: Vec::new(),
         log_flush_deadline: 0,
         writeback_job: None,
         writeback_retry: false,
@@ -2327,6 +2340,7 @@ struct FilesystemBridge {
 struct ProcessClient {
     process_id: ProcessId,
     client_id: ClientId,
+    program: ProgramSummary,
     launch_authority: RegistryLaunchAuthority,
     interactive_authority: SchedulingAuthorityControl,
 }
@@ -2378,6 +2392,8 @@ struct KernelContext {
     pending_input_len: usize,
     pressed_keys: Vec<(ginkgo_kernel::usb::HidInterfaceId, u16)>,
     pressed_pointer_buttons: Vec<(ginkgo_kernel::usb::HidInterfaceId, u16)>,
+    desktop_captured_pointer_buttons: Vec<(ginkgo_kernel::usb::HidInterfaceId, u16)>,
+    overlay_captured_pointer_buttons: Vec<(ginkgo_kernel::usb::HidInterfaceId, u16)>,
     log_flush_deadline: u64,
     writeback_job: Option<FsJobId>,
     writeback_retry: bool,
@@ -2511,12 +2527,44 @@ const LAUNCHER_SEARCH_HEIGHT: usize = 58;
 const LAUNCHER_ROW_HEIGHT: usize = 66;
 const LAUNCHER_GAP: usize = 10;
 const LAUNCHER_POWER_ROWS: usize = 2;
+const TRAY_REFRESH_NS: u64 = 1_000_000_000;
+const TRAY_HELP_WIDTH: usize = 64;
+const TRAY_HELP_MARGIN: usize = 4;
+const MAX_TRAY_PROGRAMS: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LauncherSelection {
     Program(usize),
     PowerOff,
     Reboot,
+}
+
+struct FixedText<const N: usize> {
+    bytes: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> FixedText<N> {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; N],
+            len: 0,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        unsafe { core::str::from_utf8_unchecked(&self.bytes[..self.len]) }
+    }
+}
+
+impl<const N: usize> fmt::Write for FixedText<N> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        let end = self.len.checked_add(text.len()).ok_or(fmt::Error)?;
+        let destination = self.bytes.get_mut(self.len..end).ok_or(fmt::Error)?;
+        destination.copy_from_slice(text.as_bytes());
+        self.len = end;
+        Ok(())
+    }
 }
 
 const fn blend_channel(source: u8, background: u8, alpha: u8) -> u8 {
@@ -2542,6 +2590,10 @@ struct ValidationUi {
     catalog: ProgramCatalog,
     launcher_backing: Vec<u32>,
     launcher_backing_geometry: Option<(usize, usize, usize, usize)>,
+    tray_next_refresh_ns: u64,
+    tray_last_sample_ns: u64,
+    tray_last_cpu_ns: u64,
+    tray_cpu_percent: u64,
     cursor_backing: [u32; CURSOR_SIZE * CURSOR_SIZE],
     cursor_origin_x: usize,
     cursor_origin_y: usize,
@@ -2571,6 +2623,10 @@ impl ValidationUi {
             catalog: ProgramCatalog::EMPTY,
             launcher_backing: Vec::new(),
             launcher_backing_geometry: None,
+            tray_next_refresh_ns: 0,
+            tray_last_sample_ns: 0,
+            tray_last_cpu_ns: 0,
+            tray_cpu_percent: 0,
             cursor_backing: [0; CURSOR_SIZE * CURSOR_SIZE],
             cursor_origin_x: 0,
             cursor_origin_y: 0,
@@ -2751,6 +2807,113 @@ impl ValidationUi {
 
     fn render_status(&mut self, _screen: &mut FramebufferWriter<'_>) {}
 
+    fn tray_refresh_due(&self, now_ns: u64) -> bool {
+        self.desktop_ready && !self.desktop_failed && now_ns >= self.tray_next_refresh_ns
+    }
+
+    fn tray_help_geometry(&self) -> (usize, usize, usize, usize) {
+        let height = usize::try_from(SYSTEM_TRAY_HEIGHT).unwrap_or(32);
+        let width = TRAY_HELP_WIDTH.min(self.width);
+        (
+            self.width.saturating_sub(width + TRAY_HELP_MARGIN),
+            TRAY_HELP_MARGIN,
+            width,
+            height.saturating_sub(TRAY_HELP_MARGIN * 2),
+        )
+    }
+
+    fn tray_help_at(&self, x: usize, y: usize) -> bool {
+        let (left, top, width, height) = self.tray_help_geometry();
+        x >= left && x < left.saturating_add(width) && y >= top && y < top.saturating_add(height)
+    }
+
+    fn render_system_tray(
+        &mut self,
+        screen: &mut FramebufferWriter<'_>,
+        now_ns: u64,
+        total_cpu_ns: u64,
+        memory_used_bytes: u64,
+        memory_total_bytes: u64,
+        programs: &[ProgramSummary],
+        sample_metrics: bool,
+    ) {
+        if sample_metrics || self.tray_last_sample_ns == 0 {
+            let elapsed_ns = now_ns.saturating_sub(self.tray_last_sample_ns);
+            if self.tray_last_sample_ns != 0 && elapsed_ns != 0 {
+                let cpu_delta = total_cpu_ns.saturating_sub(self.tray_last_cpu_ns);
+                self.tray_cpu_percent = cpu_delta
+                    .saturating_mul(100)
+                    .checked_div(elapsed_ns)
+                    .unwrap_or(0)
+                    .min(100);
+            }
+            self.tray_last_sample_ns = now_ns;
+            self.tray_last_cpu_ns = total_cpu_ns;
+            self.tray_next_refresh_ns = now_ns.saturating_add(TRAY_REFRESH_NS);
+        }
+
+        let tray_height = usize::try_from(SYSTEM_TRAY_HEIGHT).unwrap_or(32);
+        let background = Rgb::new(24, 32, 48);
+        let border = Rgb::new(52, 65, 82);
+        let text = Rgb::new(222, 229, 239);
+        let muted = Rgb::new(148, 163, 184);
+        let accent = Rgb::new(52, 211, 153);
+        screen.fill_rect(0, 0, self.width, tray_height, background);
+        screen.fill_rect(0, tray_height.saturating_sub(2), self.width, 2, border);
+        screen.draw_text(10, 8, 1, "GinkgoOS", accent);
+
+        let (help_x, help_y, help_width, help_height) = self.tray_help_geometry();
+        screen.fill_rect(help_x, help_y, help_width, help_height, accent);
+        screen.fill_rect(
+            help_x + 2,
+            help_y + 2,
+            help_width.saturating_sub(4),
+            help_height.saturating_sub(4),
+            background,
+        );
+        screen.draw_text(help_x + 13, help_y + 6, 1, "Help", text);
+
+        let uptime_seconds = now_ns / 1_000_000_000;
+        let hours = uptime_seconds / 3600;
+        let minutes = uptime_seconds / 60 % 60;
+        let seconds = uptime_seconds % 60;
+        let used_mib = memory_used_bytes / (1024 * 1024);
+        let total_mib = memory_total_bytes / (1024 * 1024);
+        let mut metrics = FixedText::<96>::new();
+        let _ = write!(
+            metrics,
+            "UP {hours:02}:{minutes:02}:{seconds:02}  CPU {:>3}%  MEM {used_mib}/{total_mib}M  NET offline",
+            self.tray_cpu_percent
+        );
+        let metrics_x = help_x.saturating_sub(410);
+        screen.draw_text(metrics_x, 8, 1, metrics.as_str(), muted);
+
+        let mut open = FixedText::<64>::new();
+        let _ = open.write_str("OPEN ");
+        for (index, program) in programs.iter().take(MAX_TRAY_PROGRAMS).enumerate() {
+            let separator_len = usize::from(index != 0) * 3;
+            if open
+                .len
+                .saturating_add(separator_len)
+                .saturating_add(program.name().len())
+                > 38
+            {
+                let _ = open.write_str("...");
+                break;
+            }
+            if index != 0 {
+                let _ = open.write_str(" | ");
+            }
+            let _ = open.write_str(program.name());
+        }
+        if programs.is_empty() {
+            let _ = open.write_str("none");
+        }
+        if metrics_x > 110 {
+            screen.draw_text(92, 8, 1, open.as_str(), text);
+        }
+    }
+
     fn render_text_range(
         &mut self,
         screen: &mut FramebufferWriter<'_>,
@@ -2779,7 +2942,10 @@ impl ValidationUi {
             LAUNCHER_GAP + result_height
         });
         let x = self.width.saturating_sub(width) / 2;
-        let y = self.height.saturating_sub(height) / 3;
+        let tray_bottom = usize::try_from(SYSTEM_TRAY_HEIGHT)
+            .unwrap_or(32)
+            .saturating_add(6);
+        let y = (self.height.saturating_sub(height) / 3).max(tray_bottom);
         (x, y, width, height)
     }
 
@@ -5726,6 +5892,7 @@ fn finish_program_launch(
     context.process_clients.push(ProcessClient {
         process_id,
         client_id,
+        program,
         launch_authority: RegistryLaunchAuthority::for_program(program),
         interactive_authority: interactive_control,
     });
@@ -6434,9 +6601,47 @@ fn redraw_desktop(context: &mut KernelContext) {
     if let Some(desktop) = context.desktop.as_mut() {
         let _ = desktop.redraw(&mut context.screen);
     }
+    render_system_tray(context, false);
     if context.ui.launcher_visible {
         context.ui.render_content(&mut context.screen);
     } else {
+        context.ui.show_cursor(&mut context.screen);
+    }
+}
+
+fn render_system_tray(context: &mut KernelContext, sample_metrics: bool) {
+    if !context.ui.desktop_ready || context.ui.desktop_failed {
+        return;
+    }
+    let now_ns = context.timer.clock().now_ns();
+    let mut total_cpu_ns = 0_u64;
+    let mut programs = [ProgramSummary::EMPTY; MAX_TRAY_PROGRAMS];
+    let mut program_count = 0_usize;
+    for client in &context.process_clients {
+        if let Some(process) = context.processes.get(client.process_id) {
+            total_cpu_ns = total_cpu_ns.saturating_add(process.usage().cpu_time_ns);
+            if program_count < programs.len() {
+                programs[program_count] = client.program;
+                program_count += 1;
+            }
+        }
+    }
+    let memory = context.frames.stats();
+    let used_bytes = memory
+        .total_eligible_bytes
+        .saturating_sub(memory.available_bytes);
+    let cursor_was_visible = context.ui.cursor_visible;
+    context.ui.hide_cursor(&mut context.screen);
+    context.ui.render_system_tray(
+        &mut context.screen,
+        now_ns,
+        total_cpu_ns,
+        used_bytes,
+        memory.total_eligible_bytes,
+        &programs[..program_count],
+        sample_metrics,
+    );
+    if cursor_was_visible {
         context.ui.show_cursor(&mut context.screen);
     }
 }
@@ -6556,6 +6761,7 @@ fn desktop_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
                     context.ui.desktop_ready = true;
                     context.ui.desktop_failed = false;
                     context.ui.render(&mut context.screen);
+                    render_system_tray(context, true);
                     let mut sink = SerialDebugSink::new(&mut context.serial);
                     let _ = writeln!(sink, "desktop: protected Rust userland ready\r");
                     if text_editor_smoke_enabled() {
@@ -6646,6 +6852,9 @@ fn desktop_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
         if let Some(desktop) = context.desktop.as_mut() {
             desktop.record_frame_durations(finished_ns.saturating_sub(started_ns), 0);
         }
+        if composed {
+            render_system_tray(context, false);
+        }
         if context.ui.launcher_visible {
             if composed {
                 context.ui.render_content(&mut context.screen);
@@ -6653,6 +6862,11 @@ fn desktop_task(context: &mut KernelContext, _state: &mut TaskState) -> TaskPoll
         } else {
             context.ui.show_cursor(&mut context.screen);
         }
+    }
+
+    let tray_now_ns = context.timer.clock().now_ns();
+    if context.ui.tray_refresh_due(tray_now_ns) {
+        render_system_tray(context, true);
     }
 
     if let Some(program_index) = context.launch_requested.take() {
@@ -6686,6 +6900,12 @@ fn request_desktop_power(context: &mut KernelContext, action: ginkgo_sysapi::Sys
         let mut sink = SerialDebugSink::new(&mut context.serial);
         let _ = writeln!(sink, "power: desktop request rejected\r");
         redraw_desktop(context);
+    }
+}
+
+fn request_help_launch(context: &mut KernelContext) {
+    if context.launch_requested.is_none() {
+        context.launch_requested = context.ui.catalog.index_of("help");
     }
 }
 
@@ -6912,8 +7132,19 @@ fn release_disconnected_input(
         .iter()
         .filter_map(|(owner, button)| (*owner == interface).then_some(*button))
         .collect();
+    let desktop_captured_buttons: Vec<u16> = context
+        .desktop_captured_pointer_buttons
+        .iter()
+        .filter_map(|(owner, button)| (*owner == interface).then_some(*button))
+        .collect();
     context
         .pressed_pointer_buttons
+        .retain(|(owner, _)| *owner != interface);
+    context
+        .desktop_captured_pointer_buttons
+        .retain(|(owner, _)| *owner != interface);
+    context
+        .overlay_captured_pointer_buttons
         .retain(|(owner, _)| *owner != interface);
     if released_buttons.contains(&1) {
         let primary_still_pressed = context
@@ -6923,7 +7154,11 @@ fn release_disconnected_input(
         context.ui.set_mouse_button(primary_still_pressed);
     }
     if let Some(desktop) = context.desktop.as_mut() {
-        for button in released_buttons.into_iter().filter_map(pointer_button) {
+        for button in released_buttons
+            .into_iter()
+            .filter(|button| desktop_captured_buttons.contains(button))
+            .filter_map(pointer_button)
+        {
             let _ = desktop.send_pointer_input(
                 WindowPoint::new(context.ui.mouse_x as i32, context.ui.mouse_y as i32),
                 PointerEventKind::Button {
@@ -7093,22 +7328,33 @@ fn handle_input_event(
             ..
         } if application == Some(ApplicationKind::Mouse) => {
             if axis == Axis::Wheel {
-                if !context.ui.launcher_visible {
+                let position =
+                    WindowPoint::new(context.ui.mouse_x as i32, context.ui.mouse_y as i32);
+                if !context.ui.launcher_visible
+                    && context.overlay_captured_pointer_buttons.is_empty()
+                    && !system_tray_contains(position)
+                {
                     if let Some(desktop) = context.desktop.as_mut() {
                         let _ = desktop.send_pointer_input(
-                            WindowPoint::new(context.ui.mouse_x as i32, context.ui.mouse_y as i32),
+                            position,
                             PointerEventKind::Scrolled {
                                 delta: WindowPoint::new(0, value),
                             },
                         );
                     }
                 }
-            } else if context.ui.move_mouse(axis, value, relative) && !context.ui.launcher_visible {
-                if let Some(desktop) = context.desktop.as_mut() {
-                    let _ = desktop.send_pointer_input(
-                        WindowPoint::new(context.ui.mouse_x as i32, context.ui.mouse_y as i32),
-                        PointerEventKind::Moved,
-                    );
+            } else if context.ui.move_mouse(axis, value, relative) {
+                let position =
+                    WindowPoint::new(context.ui.mouse_x as i32, context.ui.mouse_y as i32);
+                let desktop_capture = !context.desktop_captured_pointer_buttons.is_empty();
+                if desktop_capture
+                    || (context.overlay_captured_pointer_buttons.is_empty()
+                        && !context.ui.launcher_visible
+                        && !system_tray_contains(position))
+                {
+                    if let Some(desktop) = context.desktop.as_mut() {
+                        let _ = desktop.send_pointer_input(position, PointerEventKind::Moved);
+                    }
                 }
             }
         }
@@ -7123,33 +7369,83 @@ fn handle_input_event(
             if button == 1 {
                 let _ = context.ui.set_mouse_button(pressed);
             }
-            if context.ui.launcher_visible {
-                if button == 1 && pressed {
-                    match context
-                        .ui
-                        .launcher_selection_at(context.ui.mouse_x, context.ui.mouse_y)
-                    {
-                        Some(LauncherSelection::Program(index)) => {
-                            context.ui.power_confirmation = None;
-                            context.launch_requested = Some(index);
+            let position = WindowPoint::new(context.ui.mouse_x as i32, context.ui.mouse_y as i32);
+            let over_tray = system_tray_contains(position);
+            let capture = (device_event.interface, button);
+            let overlay_index = context
+                .overlay_captured_pointer_buttons
+                .iter()
+                .position(|known| *known == capture);
+            let desktop_index = context
+                .desktop_captured_pointer_buttons
+                .iter()
+                .position(|known| *known == capture);
+            let overlay_target = over_tray || context.ui.launcher_visible;
+            let mut forward_to_desktop = false;
+            let mut refresh_cursor = false;
+
+            if pressed {
+                if overlay_index.is_some() {
+                    refresh_cursor = true;
+                } else if desktop_index.is_none() {
+                    if overlay_target {
+                        context.overlay_captured_pointer_buttons.push(capture);
+                        refresh_cursor = true;
+                        if over_tray {
+                            if button == 1
+                                && context
+                                    .ui
+                                    .tray_help_at(context.ui.mouse_x, context.ui.mouse_y)
+                            {
+                                request_help_launch(context);
+                            }
+                        } else if button == 1 {
+                            match context
+                                .ui
+                                .launcher_selection_at(context.ui.mouse_x, context.ui.mouse_y)
+                            {
+                                Some(LauncherSelection::Program(index)) => {
+                                    context.ui.power_confirmation = None;
+                                    context.launch_requested = Some(index);
+                                }
+                                Some(LauncherSelection::PowerOff) => request_desktop_power(
+                                    context,
+                                    ginkgo_sysapi::SystemPowerAction::PowerOff,
+                                ),
+                                Some(LauncherSelection::Reboot) => request_desktop_power(
+                                    context,
+                                    ginkgo_sysapi::SystemPowerAction::Reboot,
+                                ),
+                                None => {
+                                    context.ui.power_confirmation = None;
+                                    redraw_desktop(context);
+                                }
+                            }
                         }
-                        Some(LauncherSelection::PowerOff) => request_desktop_power(
-                            context,
-                            ginkgo_sysapi::SystemPowerAction::PowerOff,
-                        ),
-                        Some(LauncherSelection::Reboot) => {
-                            request_desktop_power(context, ginkgo_sysapi::SystemPowerAction::Reboot)
-                        }
-                        None => {
-                            context.ui.power_confirmation = None;
-                            redraw_desktop(context);
-                        }
+                    } else {
+                        context.desktop_captured_pointer_buttons.push(capture);
+                        forward_to_desktop = true;
                     }
                 }
-            } else if let Some(pointer_button) = pointer_button(button) {
-                if let Some(desktop) = context.desktop.as_mut() {
+            } else if let Some(index) = overlay_index {
+                context.overlay_captured_pointer_buttons.swap_remove(index);
+                refresh_cursor = true;
+            } else if let Some(index) = desktop_index {
+                context.desktop_captured_pointer_buttons.swap_remove(index);
+                forward_to_desktop = true;
+            } else if overlay_target {
+                refresh_cursor = true;
+            }
+
+            if refresh_cursor {
+                context.ui.refresh_cursor(&mut context.screen);
+            }
+            if forward_to_desktop {
+                if let (Some(desktop), Some(pointer_button)) =
+                    (context.desktop.as_mut(), pointer_button(button))
+                {
                     let _ = desktop.send_pointer_input(
-                        WindowPoint::new(context.ui.mouse_x as i32, context.ui.mouse_y as i32),
+                        position,
                         PointerEventKind::Button {
                             button: pointer_button,
                             state: if pressed {
