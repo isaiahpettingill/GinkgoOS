@@ -68,6 +68,8 @@ impl<'de> Deserialize<'de> for ClientId {
 
 /// Height reserved for the persistent system tray at the top of the output.
 pub const SYSTEM_TRAY_HEIGHT: u32 = 32;
+/// Width of the tray's GinkgoOS launcher target.
+pub const SYSTEM_TRAY_LAUNCHER_WIDTH: u32 = 100;
 /// Preferred square size of a server-side decoration close control.
 pub const DECORATION_CLOSE_BUTTON_SIZE: u32 = 18;
 /// Space between a decoration control and the outer window edge.
@@ -76,6 +78,13 @@ pub const DECORATION_CONTROL_MARGIN: u32 = 3;
 /// Returns whether an output-space point belongs to the desktop-owned tray.
 pub const fn system_tray_contains(position: Point) -> bool {
     position.y >= 0 && (position.y as u32) < SYSTEM_TRAY_HEIGHT
+}
+
+/// Returns whether an output-space point belongs to the tray's launcher target.
+pub const fn system_tray_launcher_contains(position: Point) -> bool {
+    system_tray_contains(position)
+        && position.x >= 0
+        && (position.x as u32) < SYSTEM_TRAY_LAUNCHER_WIDTH
 }
 
 /// Desktop-controlled surface and scrolling policy.
@@ -1806,6 +1815,15 @@ mod tests {
         assert!(system_tray_contains(Point::new(999, 31)));
         assert!(!system_tray_contains(Point::new(0, -1)));
         assert!(!system_tray_contains(Point::new(0, 32)));
+    }
+
+    #[test]
+    fn system_tray_launcher_target_covers_only_the_brand_area() {
+        assert!(system_tray_launcher_contains(Point::new(0, 0)));
+        assert!(system_tray_launcher_contains(Point::new(99, 31)));
+        assert!(!system_tray_launcher_contains(Point::new(100, 10)));
+        assert!(!system_tray_launcher_contains(Point::new(-1, 10)));
+        assert!(!system_tray_launcher_contains(Point::new(10, 32)));
     }
 
     #[test]

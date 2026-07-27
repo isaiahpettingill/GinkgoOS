@@ -25,7 +25,9 @@ use embedded_icon::{
     NewIcon,
 };
 use framebuffer::{FramebufferWriter, Rgb};
-use ginkgo_desktop::{system_tray_contains, ClientId, SYSTEM_TRAY_HEIGHT};
+use ginkgo_desktop::{
+    system_tray_contains, system_tray_launcher_contains, ClientId, SYSTEM_TRAY_HEIGHT,
+};
 use ginkgo_filesystem::{FsError, NodeKind, NodeMetadata, RedoxFs, RenameMode};
 use ginkgo_hid::{ApplicationKind, Axis, InputEvent, AXIS_MAX, AXIS_MIN};
 use ginkgo_ipc::{
@@ -2530,6 +2532,12 @@ const LAUNCHER_POWER_ROWS: usize = 2;
 const TRAY_REFRESH_NS: u64 = 1_000_000_000;
 const TRAY_HELP_WIDTH: usize = 64;
 const TRAY_HELP_MARGIN: usize = 4;
+const TRAY_BRAND_X: usize = 10;
+const TRAY_OPEN_X: usize = 112;
+const TRAY_TEXT_Y: usize = 8;
+const TRAY_TEXT_ADVANCE: usize = 9;
+const TRAY_SECTION_GAP: usize = 16;
+const MAX_TRAY_OPEN_CHARACTERS: usize = 38;
 const MAX_TRAY_PROGRAMS: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2860,7 +2868,7 @@ impl ValidationUi {
         let accent = Rgb::new(52, 211, 153);
         screen.fill_rect(0, 0, self.width, tray_height, background);
         screen.fill_rect(0, tray_height.saturating_sub(2), self.width, 2, border);
-        screen.draw_text(10, 8, 1, "GinkgoOS", accent);
+        screen.draw_text(TRAY_BRAND_X, TRAY_TEXT_Y, 1, "GinkgoOS", accent);
 
         let (help_x, help_y, help_width, help_height) = self.tray_help_geometry();
         screen.fill_rect(help_x, help_y, help_width, help_height, accent);
@@ -2885,32 +2893,46 @@ impl ValidationUi {
             "UP {hours:02}:{minutes:02}:{seconds:02}  CPU {:>3}%  MEM {used_mib}/{total_mib}M  NET offline",
             self.tray_cpu_percent
         );
-        let metrics_x = help_x.saturating_sub(410);
-        screen.draw_text(metrics_x, 8, 1, metrics.as_str(), muted);
+        let metrics_width = metrics.as_str().len().saturating_mul(TRAY_TEXT_ADVANCE);
+        let metrics_right = help_x.saturating_sub(TRAY_SECTION_GAP);
+        let metrics_x = metrics_right.saturating_sub(metrics_width);
+        if metrics_width <= metrics_right {
+            screen.draw_text(metrics_x, TRAY_TEXT_Y, 1, metrics.as_str(), muted);
+        }
 
+        let open_right = metrics_x.saturating_sub(TRAY_SECTION_GAP);
+        let open_character_limit = open_right
+            .saturating_sub(TRAY_OPEN_X)
+            .checked_div(TRAY_TEXT_ADVANCE)
+            .unwrap_or(0)
+            .min(MAX_TRAY_OPEN_CHARACTERS);
         let mut open = FixedText::<64>::new();
-        let _ = open.write_str("OPEN ");
-        for (index, program) in programs.iter().take(MAX_TRAY_PROGRAMS).enumerate() {
-            let separator_len = usize::from(index != 0) * 3;
-            if open
-                .len
-                .saturating_add(separator_len)
-                .saturating_add(program.name().len())
-                > 38
-            {
-                let _ = open.write_str("...");
-                break;
+        if open_character_limit >= "OPEN ...".len() {
+            let _ = open.write_str("OPEN ");
+            for (index, program) in programs.iter().take(MAX_TRAY_PROGRAMS).enumerate() {
+                let separator_len = usize::from(index != 0) * 3;
+                if open
+                    .len
+                    .saturating_add(separator_len)
+                    .saturating_add(program.name().len())
+                    > open_character_limit
+                {
+                    if open.len.saturating_add(3) <= open_character_limit {
+                        let _ = open.write_str("...");
+                    }
+                    break;
+                }
+                if index != 0 {
+                    let _ = open.write_str(" | ");
+                }
+                let _ = open.write_str(program.name());
             }
-            if index != 0 {
-                let _ = open.write_str(" | ");
+            if programs.is_empty() && open.len.saturating_add(4) <= open_character_limit {
+                let _ = open.write_str("none");
             }
-            let _ = open.write_str(program.name());
         }
-        if programs.is_empty() {
-            let _ = open.write_str("none");
-        }
-        if metrics_x > 110 {
-            screen.draw_text(92, 8, 1, open.as_str(), text);
+        if !open.as_str().is_empty() {
+            screen.draw_text(TRAY_OPEN_X, TRAY_TEXT_Y, 1, open.as_str(), text);
         }
     }
 
@@ -6909,6 +6931,12 @@ fn request_help_launch(context: &mut KernelContext) {
     }
 }
 
+fn request_launcher_open(context: &mut KernelContext) {
+    if !context.ui.launcher_visible && !context.launcher_toggle_pending {
+        request_launcher_toggle(context);
+    }
+}
+
 fn request_launcher_toggle(context: &mut KernelContext) {
     if context.launcher_toggle_pending {
         context.launcher_toggle_pending = false;
@@ -7398,6 +7426,8 @@ fn handle_input_event(
                                     .tray_help_at(context.ui.mouse_x, context.ui.mouse_y)
                             {
                                 request_help_launch(context);
+                            } else if button == 1 && system_tray_launcher_contains(position) {
+                                request_launcher_open(context);
                             }
                         } else if button == 1 {
                             match context
