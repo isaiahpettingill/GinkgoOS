@@ -1,0 +1,13 @@
+[workspace]
+
+[package]
+name = "yaff2gkf"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Compile YAFF bitmap fonts into validated Ginkgo .gkf files"
+
+[dependencies]
+ginkgo-fonts = { path = "../../crates/ginkgo-fonts" }
+libyaff = { git = "https://github.com/isaiahpettingill/libyaff.git", rev = "4194ee0", default-features = false, features = ["std", "parsing"] }

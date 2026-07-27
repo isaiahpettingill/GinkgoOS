@@ -9,6 +9,7 @@
 //! other embedded-graphics targets.
 
 mod gkf;
+mod yaff;
 
 use core::cmp::Ordering;
 
@@ -21,6 +22,7 @@ pub use gkf::{
     GkfError, GkfFont, GKF_GLYPH_RECORD_SIZE, GKF_HEADER_SIZE, GKF_KERNING_RECORD_SIZE, GKF_MAGIC,
     GKF_NO_FALLBACK, GKF_VERSION,
 };
+pub use yaff::{normalize_yaff, NormalizedFont, YaffError};
 
 /// Global vertical measurements in pixels.
 ///

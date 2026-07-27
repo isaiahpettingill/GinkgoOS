@@ -11,3 +11,4 @@ path = "src/lib.rs"
 
 [dependencies]
 embedded-graphics.workspace = true
+libyaff = { git = "https://github.com/isaiahpettingill/libyaff.git", rev = "4194ee0", default-features = false, features = ["parsing"] }
