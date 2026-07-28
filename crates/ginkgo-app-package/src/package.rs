@@ -29,6 +29,30 @@ impl AppKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u16)]
+pub enum ExecutableFormat {
+    Elf = 0,
+    Wasm = 1,
+}
+
+impl ExecutableFormat {
+    pub(crate) fn from_wire(value: u16) -> Option<Self> {
+        match value {
+            0 => Some(Self::Elf),
+            1 => Some(Self::Wasm),
+            _ => None,
+        }
+    }
+
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::Elf => "elf",
+            Self::Wasm => "wasm",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Field {
     AppId,
     DisplayName,
@@ -48,6 +72,11 @@ pub enum PackageError {
     UnknownHeaderFlags(u16),
     UnknownKind(u16),
     UnknownReservedBits(u16),
+    UnknownExecutableFormat(u16),
+    IncompatibleExecutableFormat {
+        kind: AppKind,
+        format: ExecutableFormat,
+    },
     TooManyAssets {
         count: usize,
         maximum: usize,
@@ -113,6 +142,7 @@ pub struct Package<'a> {
     pub display_name: &'a str,
     pub version: &'a str,
     pub kind: AppKind,
+    pub format: ExecutableFormat,
     pub executable: &'a [u8],
     bytes: &'a [u8],
     assets_offset: usize,
@@ -153,10 +183,10 @@ impl<'a> Package<'a> {
         let app_id_len = read_u16(bytes, 12) as usize;
         let display_name_len = read_u16(bytes, 14) as usize;
         let version_len = read_u16(bytes, 16) as usize;
-        let reserved = read_u16(bytes, 18);
-        if reserved != 0 {
-            return Err(PackageError::UnknownReservedBits(reserved));
-        }
+        let format_value = read_u16(bytes, 18);
+        let format = ExecutableFormat::from_wire(format_value)
+            .ok_or(PackageError::UnknownExecutableFormat(format_value))?;
+        validate_kind_format(kind, format)?;
         let executable_len = read_u32(bytes, 20) as usize;
 
         check_field_len(Field::AppId, app_id_len, MAX_APP_ID_LEN)?;
@@ -236,6 +266,7 @@ impl<'a> Package<'a> {
             display_name,
             version,
             kind,
+            format,
             executable: &bytes[metadata_end..executable_end],
             bytes,
             assets_offset: executable_end,
@@ -360,6 +391,14 @@ fn parse_asset<'a>(
     ))
 }
 
+fn validate_kind_format(kind: AppKind, format: ExecutableFormat) -> Result<(), PackageError> {
+    if kind == AppKind::Graphical && format == ExecutableFormat::Wasm {
+        Err(PackageError::IncompatibleExecutableFormat { kind, format })
+    } else {
+        Ok(())
+    }
+}
+
 fn check_field_len(field: Field, length: usize, maximum: usize) -> Result<(), PackageError> {
     if length > maximum {
         Err(PackageError::FieldTooLong {
@@ -380,31 +419,29 @@ fn parse_text(
     str::from_utf8(bytes).map_err(|_| PackageError::InvalidUtf8 { field, asset_index })
 }
 
-#[cfg(feature = "host")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AssetInput<'a> {
     pub path: &'a str,
     pub data: &'a [u8],
 }
 
-#[cfg(feature = "host")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PackageInput<'a> {
     pub app_id: &'a str,
     pub display_name: &'a str,
     pub version: &'a str,
     pub kind: AppKind,
+    pub format: ExecutableFormat,
     pub executable: &'a [u8],
     pub assets: &'a [AssetInput<'a>],
 }
 
-#[cfg(feature = "host")]
 pub type EncodeError = PackageError;
 
-#[cfg(feature = "host")]
 pub fn encode_package(input: &PackageInput<'_>) -> Result<alloc::vec::Vec<u8>, EncodeError> {
     use alloc::vec::Vec;
 
+    validate_kind_format(input.kind, input.format)?;
     if input.assets.len() > MAX_ASSET_COUNT {
         return Err(PackageError::TooManyAssets {
             count: input.assets.len(),
@@ -477,7 +514,7 @@ pub fn encode_package(input: &PackageInput<'_>) -> Result<alloc::vec::Vec<u8>, E
     bytes.extend_from_slice(&(input.app_id.len() as u16).to_le_bytes());
     bytes.extend_from_slice(&(input.display_name.len() as u16).to_le_bytes());
     bytes.extend_from_slice(&(input.version.len() as u16).to_le_bytes());
-    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&(input.format as u16).to_le_bytes());
     bytes.extend_from_slice(&(input.executable.len() as u32).to_le_bytes());
     bytes.extend_from_slice(input.app_id.as_bytes());
     bytes.extend_from_slice(input.display_name.as_bytes());

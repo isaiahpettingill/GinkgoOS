@@ -1,0 +1,76 @@
+WHITESPACE = _{ " " | "\t" | "\r" }
+COMMENT = _{ "#" ~ (!NEWLINE ~ ANY)* }
+
+program = { SOI ~ separator* ~ statement_list? ~ EOI }
+statement_list = { statement ~ (separator+ ~ statement)* ~ separator* }
+separator = _{ ";" | NEWLINE }
+
+statement = { definition | for_loop | while_loop | repeat_loop | until_loop | do_while_loop | assignment | include_stmt | run_stmt | alias_stmt | return_stmt | command_stmt | expression_stmt }
+
+definition = { KW_DEF ~ identifier ~ "(" ~ parameters? ~ ")" ~ separator+ ~ statement_list? ~ KW_END }
+parameters = { variable ~ ("," ~ variable)* }
+for_loop = { KW_FOR ~ variable ~ KW_IN ~ expression ~ KW_DO ~ separator+ ~ statement_list? ~ KW_END }
+while_loop = { KW_WHILE ~ expression ~ KW_DO ~ separator+ ~ statement_list? ~ KW_END }
+repeat_loop = { KW_REPEAT ~ expression ~ KW_TIMES ~ separator+ ~ statement_list? ~ KW_END }
+until_loop = { KW_UNTIL ~ expression ~ KW_DO ~ separator+ ~ statement_list? ~ KW_END }
+do_while_loop = { KW_DO ~ separator+ ~ statement_list? ~ KW_WHILE ~ expression }
+assignment = { variable ~ "=" ~ expression }
+include_stmt = { KW_INCLUDE ~ string }
+run_stmt = { KW_RUN ~ string }
+alias_stmt = { KW_ALIAS ~ identifier ~ "=" ~ command_name }
+return_stmt = { KW_RETURN ~ expression? }
+expression_stmt = { &expression_leader ~ expression }
+command_stmt = { !(expression_leader | reserved_word) ~ command_name ~ command_arguments? }
+expression_leader = _{ KW_TRUE | KW_FALSE | KW_NOT | "$" | "@[" | "(" | "\"" | ASCII_DIGIT | ("-" ~ ASCII_DIGIT) | "*" }
+reserved_word = _{ KW_DEF | KW_END | KW_FOR | KW_IN | KW_DO | KW_WHILE | KW_REPEAT | KW_TIMES | KW_UNTIL | KW_INCLUDE | KW_ALIAS | KW_RETURN }
+command_arguments = { expression ~ ("," ~ expression)* }
+
+expression = { or_expression }
+expression_non_bare = { (KW_NOT ~ unary_expression) | list | variable | string | integer | boolean | glob | parenthesized }
+or_expression = { and_expression ~ (OP_OR ~ and_expression)* }
+and_expression = { equality_expression ~ (OP_AND ~ equality_expression)* }
+equality_expression = { comparison_expression ~ ((OP_EQ | OP_NE) ~ comparison_expression)* }
+comparison_expression = { unary_expression ~ ((OP_LE | OP_GE | OP_LT | OP_GT) ~ unary_expression)* }
+unary_expression = { (KW_NOT)* ~ primary }
+primary = { list | variable | string | integer | boolean | glob | parenthesized | bare }
+parenthesized = { "(" ~ expression ~ ")" }
+list = { "@[" ~ (expression ~ ("," ~ expression)*)? ~ "]" }
+
+variable = @{ "$" ~ identifier }
+identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_" | "-")* }
+integer = @{ "-"? ~ ASCII_DIGIT+ }
+boolean = { KW_TRUE | KW_FALSE }
+string = @{ "\"" ~ ("\\" ~ ANY | !"\"" ~ ANY)* ~ "\"" }
+glob = @{ glob_prefix_char* ~ "*" ~ glob_char* }
+glob_prefix_char = { !("*" | "," | ";" | "(" | ")" | "[" | "]" | "\"" | " " | "\t" | "\r" | NEWLINE) ~ ANY }
+glob_char = { !("," | ";" | "(" | ")" | "[" | "]" | "\"" | " " | "\t" | "\r" | NEWLINE) ~ ANY }
+bare = @{ bare_char+ }
+bare_char = { !("," | ";" | "(" | ")" | "[" | "]" | "=" | "<" | ">" | "\"" | " " | "\t" | "\r" | NEWLINE) ~ ANY }
+command_name = @{ ("!" | "%")? ~ command_char+ }
+command_char = { !("," | ";" | "(" | ")" | "[" | "]" | "=" | "\"" | " " | "\t" | "\r" | NEWLINE) ~ ANY }
+
+KW_DEF = @{ "def" ~ !ident_continue }
+KW_END = @{ "end" ~ !ident_continue }
+KW_FOR = @{ "for" ~ !ident_continue }
+KW_IN = @{ "in" ~ !ident_continue }
+KW_DO = @{ "do" ~ !ident_continue }
+KW_WHILE = @{ "while" ~ !ident_continue }
+KW_REPEAT = @{ "repeat" ~ !ident_continue }
+KW_TIMES = @{ "times" ~ !ident_continue }
+KW_UNTIL = @{ "until" ~ !ident_continue }
+KW_INCLUDE = @{ "include" ~ !ident_continue }
+KW_RUN = @{ "run" ~ !ident_continue }
+KW_ALIAS = @{ "alias" ~ !ident_continue }
+KW_RETURN = @{ "return" ~ !ident_continue }
+KW_NOT = @{ "not" ~ !ident_continue }
+OP_AND = @{ "and" ~ !ident_continue }
+OP_OR = @{ "or" ~ !ident_continue }
+KW_TRUE = @{ "true" ~ !ident_continue }
+KW_FALSE = @{ "false" ~ !ident_continue }
+OP_EQ = { "==" }
+OP_NE = { "<>" }
+OP_LE = { "<=" }
+OP_GE = { ">=" }
+OP_LT = { "<" }
+OP_GT = { ">" }
+ident_continue = _{ ASCII_ALPHANUMERIC | "_" | "-" }

@@ -37,6 +37,7 @@ HELP_ELF := $(USERSPACE_TARGET)/ginkgo-help
 FILE_NAVIGATOR_ELF := $(USERSPACE_TARGET)/ginkgo-file-navigator
 TEXT_EDITOR_ELF := $(USERSPACE_TARGET)/ginkgo-text-editor
 TERMINAL_ELF := $(USERSPACE_TARGET)/ginkgo-terminal
+WASM_RUNTIME_ELF := $(USERSPACE_TARGET)/ginkgo-wasm-runtime
 PROCESS_CAPABILITY_SMOKE_ELF := $(USERSPACE_TARGET)/ginkgo-process-capability-smoke
 REQUEST_SMOKE_ELF := $(USERSPACE_TARGET)/ginkgo-request-smoke
 THREAD_SMOKE_ELF := $(USERSPACE_TARGET)/ginkgo-thread-smoke
@@ -70,8 +71,8 @@ else
 QEMU ?= qemu-system-x86_64
 QEMU_AUDIO_FLAGS ?= -audiodev sdl,id=ginkgo-audio
 endif
-QEMU_FLAGS ?= -cpu max -m 512M -M pc,i8042=off -serial stdio -device qemu-xhci,id=xhci,msi=on,msix=off -device usb-hub,id=ginkgo-hub,bus=xhci.0,port=1 -device usb-kbd,bus=xhci.0,port=1.1 -device usb-tablet,bus=xhci.0,port=1.2 $(QEMU_AUDIO_FLAGS) -device ich9-intel-hda -device hda-output,audiodev=ginkgo-audio
-THREAD_SMOKE_KERNEL_BUILD = GINKGO_THREAD_SMOKE=1 GINKGO_THREAD_SMOKE_ELF="$(abspath $(THREAD_SMOKE_ELF))" GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" GINKGO_TEXT_EDITOR_ELF="$(abspath $(TEXT_EDITOR_ELF))" GINKGO_TERMINAL_ELF="$(abspath $(TERMINAL_ELF))" cargo build -p ginkgo-kernel --bin ginkgo-os
+QEMU_FLAGS ?= -cpu max -m 1024M -M pc,i8042=off -serial stdio -device qemu-xhci,id=xhci,msi=on,msix=off -device usb-hub,id=ginkgo-hub,bus=xhci.0,port=1 -device usb-kbd,bus=xhci.0,port=1.1 -device usb-tablet,bus=xhci.0,port=1.2 $(QEMU_AUDIO_FLAGS) -device ich9-intel-hda -device hda-output,audiodev=ginkgo-audio
+THREAD_SMOKE_KERNEL_BUILD = GINKGO_THREAD_SMOKE=1 GINKGO_THREAD_SMOKE_ELF="$(abspath $(THREAD_SMOKE_ELF))" GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" GINKGO_TEXT_EDITOR_ELF="$(abspath $(TEXT_EDITOR_ELF))" GINKGO_TERMINAL_ELF="$(abspath $(TERMINAL_ELF))" GINKGO_WASM_RUNTIME_ELF="$(abspath $(WASM_RUNTIME_ELF))" cargo build -p ginkgo-kernel --bin ginkgo-os
 
 .PHONY: all userspace kernel iso qemu no-iso run usb-smoke frame-reclaim-smoke thread-smoke scheduler-smoke scheduler-ahci-smoke request-smoke virtio-blk-smoke ahci-ncq-smoke filesystem-smoke text-editor-smoke process-capability-smoke memory-policy-smoke power-smoke check clean distclean reset-fs FORCE
 
@@ -79,10 +80,10 @@ all: iso
 
 userspace:
 	cargo build --manifest-path $(USERSPACE_MANIFEST) --release --target x86_64-unknown-none -p ginkgo-desktop-service -p ginkgo-minimal-client -p ginkgo-help -p ginkgo-file-navigator -p ginkgo-text-editor -p ginkgo-terminal -p ginkgo-process-capability-smoke -p ginkgo-request-smoke
-	CARGO_PROFILE_RELEASE_LTO=false cargo build --manifest-path $(USERSPACE_MANIFEST) --release --target x86_64-unknown-none -p ginkgo-thread-smoke
+	CARGO_PROFILE_RELEASE_LTO=false cargo build --manifest-path $(USERSPACE_MANIFEST) --release --target x86_64-unknown-none -p ginkgo-thread-smoke -p ginkgo-wasm-runtime
 
 kernel: userspace
-	GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_HELP_ELF="$(abspath $(HELP_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" GINKGO_TEXT_EDITOR_ELF="$(abspath $(TEXT_EDITOR_ELF))" GINKGO_TERMINAL_ELF="$(abspath $(TERMINAL_ELF))" GINKGO_THREAD_SMOKE_ELF="$(abspath $(THREAD_SMOKE_ELF))" cargo build -p ginkgo-kernel --bin ginkgo-os
+	GINKGO_DESKTOP_ELF="$(abspath $(DESKTOP_ELF))" GINKGO_MINIMAL_CLIENT_ELF="$(abspath $(MINIMAL_CLIENT_ELF))" GINKGO_HELP_ELF="$(abspath $(HELP_ELF))" GINKGO_FILE_NAVIGATOR_ELF="$(abspath $(FILE_NAVIGATOR_ELF))" GINKGO_TEXT_EDITOR_ELF="$(abspath $(TEXT_EDITOR_ELF))" GINKGO_TERMINAL_ELF="$(abspath $(TERMINAL_ELF))" GINKGO_WASM_RUNTIME_ELF="$(abspath $(WASM_RUNTIME_ELF))" GINKGO_THREAD_SMOKE_ELF="$(abspath $(THREAD_SMOKE_ELF))" cargo build -p ginkgo-kernel --bin ginkgo-os
 
 $(LIMINE_DIR)/BOOTX64.EFI:
 	mkdir -p $(BUILD_DIR)

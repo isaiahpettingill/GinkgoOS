@@ -6,6 +6,8 @@ pub const CLEAR: u8 = 0x0c;
 pub const CANCEL: u8 = 0x03;
 pub const HISTORY_PREVIOUS: u8 = 0x10;
 pub const HISTORY_NEXT: u8 = 0x0e;
+pub const CURSOR_LEFT: u8 = 0x1c;
+pub const CURSOR_RIGHT: u8 = 0x1d;
 
 pub fn translate(event: KeyboardEvent) -> Option<u8> {
     let control = event.modifiers.control;
@@ -14,6 +16,8 @@ pub fn translate(event: KeyboardEvent) -> Option<u8> {
         0x2a => return Some(BACKSPACE),
         0x52 => return Some(HISTORY_PREVIOUS),
         0x51 => return Some(HISTORY_NEXT),
+        0x50 => return Some(CURSOR_LEFT),
+        0x4f => return Some(CURSOR_RIGHT),
         0x0f if control => return Some(CLEAR),
         0x06 if control => return Some(CANCEL),
         _ => {}

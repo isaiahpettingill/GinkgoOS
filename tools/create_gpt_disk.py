@@ -18,7 +18,7 @@ DISK_GUID = uuid.UUID("67db1850-3e9d-4d70-9528-58acdf755133")
 PARTITION_GUID = uuid.UUID("afea2d75-6340-48f2-b128-428c5b0601f7")
 
 
-def crc32(data: bytes) -> int:
+def crc32(data: bytes | bytearray) -> int:
     return binascii.crc32(data) & 0xFFFFFFFF
 
 
@@ -64,7 +64,7 @@ def validate_primary_gpt(image) -> tuple[bytearray, bytearray, tuple]:
 def grow(path: str, size_mb: int) -> bool:
     requested_bytes = size_mb * 1024 * 1024
     old_bytes = os.path.getsize(path)
-    if old_bytes >= requested_bytes:
+    if old_bytes > requested_bytes:
         return False
     if old_bytes % SECTOR_SIZE != 0 or requested_bytes % SECTOR_SIZE != 0:
         raise ValueError("disk image size is not sector aligned")
@@ -78,6 +78,8 @@ def grow(path: str, size_mb: int) -> bool:
         with open(temporary, "r+b") as image:
             signature = image.read(8)
             if signature == b"RedoxFS\0":
+                if old_bytes == requested_bytes:
+                    return False
                 raw_image = True
                 image.truncate(requested_bytes)
             else:
@@ -91,9 +93,11 @@ def grow(path: str, size_mb: int) -> bool:
                 old_last_usable = fields[8]
                 disk_guid = uuid.UUID(bytes_le=fields[9])
                 partition_first, partition_last = struct.unpack_from("<QQ", entries, 32)
-                if (old_backup_lba != old_last_lba or partition_first != first_usable
+                if (old_backup_lba > old_last_lba or partition_first != first_usable
                         or partition_last != old_last_usable):
                     raise ValueError("existing partition does not fill the supported GPT disk")
+                if old_backup_lba == new_last_lba:
+                    return False
 
                 backup_entries_lba = new_last_lba - ENTRY_SECTORS
                 last_usable = backup_entries_lba - 1
@@ -131,8 +135,12 @@ def grow(path: str, size_mb: int) -> bool:
     finally:
         if os.path.exists(temporary):
             os.remove(temporary)
-    print(f"expanded {path} from {old_bytes // (1024 * 1024)} MiB "
-          f"to {size_mb} MiB; RedoxFS will grow on next boot")
+    if old_bytes == requested_bytes:
+        print(f"repaired GPT metadata in externally expanded image {path}; "
+              "RedoxFS will grow on next boot if needed")
+    else:
+        print(f"expanded {path} from {old_bytes // (1024 * 1024)} MiB "
+              f"to {size_mb} MiB; RedoxFS will grow on next boot")
     return True
 
 

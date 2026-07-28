@@ -12,14 +12,14 @@ use alloc::{collections::VecDeque, format, string::String, vec, vec::Vec};
 use ginkgo_graphics::Rgb;
 use ginkgo_terminal_protocol::ConsoleMessage;
 use ginkgo_userspace::{
-    channel_create, debug_write, handle_close, process_yield,
+    channel_create, debug_write, handle_close, process_get_info, process_yield,
     window::{ButtonState, ClientError, Event, WindowClient, WindowOptions},
-    Handle, Status, WindowTransport, WindowTransportError,
+    Handle, ProcessState, Status, WindowTransport, WindowTransportError,
 };
 
 use crate::{
     shell::Shell,
-    transport::{read_console, DrainResult, PendingSend},
+    transport::{read_console, read_terminal_startup, DrainResult, PendingSend},
 };
 
 const MAX_EVENTS_PER_TURN: usize = 32;
@@ -30,15 +30,24 @@ const TEXT_TOP: usize = 12;
 const LINE_HEIGHT: usize = 16;
 const CHARACTER_WIDTH: usize = 8;
 
-ginkgo_runtime::entry!(process_main);
+ginkgo_runtime::entry6!(process_main);
 
-extern "C" fn process_main(window_raw: u64, filesystem_raw: u64, _arg2: u64, power_raw: u64) -> ! {
+extern "C" fn process_main(
+    window_raw: u64,
+    filesystem_raw: u64,
+    startup_raw: u64,
+    power_raw: u64,
+    _interactive_raw: u64,
+    random_raw: u64,
+) -> ! {
     let desktop =
         parse_handle(window_raw).unwrap_or_else(|| fail(b"terminal: invalid desktop channel\n", 1));
     let filesystem = parse_handle(filesystem_raw)
         .unwrap_or_else(|| fail(b"terminal: missing filesystem capability\n", 1));
     let power = parse_handle(power_raw)
         .unwrap_or_else(|| fail(b"terminal: missing system-power capability\n", 1));
+    let random = parse_handle(random_raw)
+        .unwrap_or_else(|| fail(b"terminal: missing random-source capability\n", 1));
     let transport = WindowTransport::new(desktop)
         .unwrap_or_else(|_| fail(b"terminal: transport initialization failed\n", 1));
     let mut client = WindowClient::new(transport);
@@ -46,13 +55,23 @@ extern "C" fn process_main(window_raw: u64, filesystem_raw: u64, _arg2: u64, pow
 
     let (terminal_endpoint, shell_endpoint) =
         channel_create().unwrap_or_else(|_| fail(b"terminal: channel creation failed\n", 1));
-    let mut shell = Shell::new(filesystem, desktop, power, shell_endpoint);
+    let mut shell = Shell::new(filesystem, desktop, power, random, shell_endpoint);
+    if let Some(startup) = parse_handle(startup_raw) {
+        match read_terminal_startup(startup) {
+            Ok(Some(command)) => shell.run_startup_application(command.app_id, command.arguments),
+            Ok(None) | Err(()) => {
+                let _ = handle_close(startup);
+                fail(b"terminal: invalid command startup message\n", 1);
+            }
+        }
+        let _ = handle_close(startup);
+    }
     let host = shell.host();
     let mut input_pending = VecDeque::new();
     let mut scrollback = VecDeque::new();
     push_line(
         &mut scrollback,
-        String::from("Ginkgo Terminal — Rhai shell"),
+        String::from("Ginkgo Terminal — Ginkgo shell"),
     );
     push_line(
         &mut scrollback,
@@ -72,7 +91,11 @@ extern "C" fn process_main(window_raw: u64, filesystem_raw: u64, _arg2: u64, pow
                 Event::Keyboard { event, .. } if event.state == ButtonState::Pressed => {
                     if let Some(byte) = keyboard::translate(event) {
                         let message = ConsoleMessage::Input(vec![byte]);
-                        if let Ok(send) = PendingSend::console(terminal_endpoint, &message) {
+                        let destination = host
+                            .borrow()
+                            .foreground_endpoint()
+                            .unwrap_or(terminal_endpoint);
+                        if let Ok(send) = PendingSend::console(destination, &message) {
                             input_pending.push_back(send);
                         }
                     }
@@ -135,13 +158,18 @@ extern "C" fn process_main(window_raw: u64, filesystem_raw: u64, _arg2: u64, pow
             while index < state.children.len() {
                 let endpoint = state.children[index].endpoint;
                 let app_id = state.children[index].app_id.clone();
+                let process_terminated = state.children[index].process.is_some_and(|process| {
+                    process_get_info(process)
+                        .ok()
+                        .is_some_and(|info| info.process_state() == Some(ProcessState::Terminated))
+                });
                 let mut closed = false;
                 let mut exit_announced = false;
                 for _ in 0..MAX_CHANNEL_MESSAGES_PER_TURN {
                     match read_console(endpoint) {
                         DrainResult::Message(message) => {
                             exit_announced |= matches!(&message, ConsoleMessage::Exit(_));
-                            closed |= consume_console(&mut scrollback, message, Some(&app_id));
+                            closed = consume_console(&mut scrollback, message, Some(&app_id));
                             redraw = true;
                             if closed {
                                 break;
@@ -154,7 +182,10 @@ extern "C" fn process_main(window_raw: u64, filesystem_raw: u64, _arg2: u64, pow
                             );
                             redraw = true;
                         }
-                        DrainResult::Empty => break,
+                        DrainResult::Empty => {
+                            closed = process_terminated;
+                            break;
+                        }
                         DrainResult::Closed => {
                             closed = true;
                             break;
@@ -164,7 +195,10 @@ extern "C" fn process_main(window_raw: u64, filesystem_raw: u64, _arg2: u64, pow
                 if closed {
                     let child = state.children.remove(index);
                     let _ = handle_close(child.endpoint);
-                    if !exit_announced {
+                    if let Some(process) = child.process {
+                        let _ = handle_close(process);
+                    }
+                    if child.announce_close && !exit_announced {
                         push_line(&mut scrollback, format!("[{} exited]", child.app_id));
                     }
                     redraw = true;
@@ -174,8 +208,27 @@ extern "C" fn process_main(window_raw: u64, filesystem_raw: u64, _arg2: u64, pow
             }
         }
 
+        if host.borrow().exit_requested {
+            destroy_window(&mut client);
+            let state = host.borrow();
+            close_runtime_handles(
+                terminal_endpoint,
+                shell_endpoint,
+                &state.children,
+                &state.jobs,
+            );
+            drop(state);
+            ginkgo_runtime::exit(0);
+        }
+
         if redraw {
-            match submit_frame(&mut client, &scrollback, shell.current_line()) {
+            match submit_frame(
+                &mut client,
+                &scrollback,
+                shell.current_line(),
+                shell.current_cursor(),
+                shell.is_waiting(),
+            ) {
                 SubmitResult::Submitted => redraw = false,
                 SubmitResult::RetryLater => {}
                 SubmitResult::Fatal => fail(b"terminal: frame submission failed\n", 4),
@@ -207,10 +260,8 @@ fn consume_console(
     }
     let text = String::from_utf8_lossy(&bytes);
     let prefix = match (source, error) {
-        (Some(source), true) => format!("[{} error] ", source),
-        (Some(source), false) => format!("[{}] ", source),
         (None, true) => String::from("error: "),
-        (None, false) => String::new(),
+        _ => String::new(),
     };
     let mut first = true;
     for line in text.split('\n') {
@@ -275,6 +326,8 @@ fn submit_frame(
     client: &mut WindowClient<WindowTransport>,
     scrollback: &VecDeque<String>,
     input: &str,
+    cursor: usize,
+    waiting: bool,
 ) -> SubmitResult {
     let mut frame = match client.acquire_frame() {
         Ok(Some(frame)) => frame,
@@ -310,9 +363,12 @@ fn submit_frame(
         );
     }
 
-    let available = columns.saturating_sub(3);
-    let visible_input = ascii_tail(input, available);
-    let prompt = format!("> {}_", visible_input);
+    let available = columns.saturating_sub(2);
+    let prompt = if waiting {
+        String::from("> [waiting for app]")
+    } else {
+        format!("> {}", input_with_cursor(input, cursor, available))
+    };
     surface.draw_text(
         TEXT_X,
         surface.height().saturating_sub(TEXT_TOP + LINE_HEIGHT),
@@ -362,12 +418,22 @@ fn visible_scrollback(
     lines.into_iter().collect()
 }
 
-fn ascii_tail(text: &str, maximum: usize) -> &str {
-    if text.len() <= maximum {
-        text
-    } else {
-        &text[text.len() - maximum..]
+fn input_with_cursor(text: &str, cursor: usize, maximum: usize) -> String {
+    let cursor = cursor.min(text.len());
+    let text_width = maximum.saturating_sub(1);
+    if text_width == 0 {
+        return String::from("_");
     }
+    let mut start = cursor.saturating_sub(text_width);
+    if text.len().saturating_sub(start) < text_width {
+        start = text.len().saturating_sub(text_width);
+    }
+    let end = start.saturating_add(text_width).min(text.len());
+    let mut visible = String::with_capacity(end.saturating_sub(start) + 1);
+    visible.push_str(&text[start..cursor]);
+    visible.push('_');
+    visible.push_str(&text[cursor..end]);
+    visible
 }
 
 fn close_runtime_handles(
@@ -378,6 +444,9 @@ fn close_runtime_handles(
 ) {
     for child in children {
         let _ = handle_close(child.endpoint);
+        if let Some(process) = child.process {
+            let _ = handle_close(process);
+        }
     }
     for job in jobs {
         let _ = handle_close(job.process);

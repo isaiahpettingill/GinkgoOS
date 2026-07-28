@@ -387,7 +387,8 @@ extern "C" fn process_main(
         .unwrap_or_else(|| fail(b"text-editor: missing random capability\n", 1));
     let transport = WindowTransport::new(window)
         .unwrap_or_else(|_| fail(b"text-editor: transport initialization failed\n", 1));
-    let startup = read_startup(startup_raw);
+    let startup_handle = parse_handle(startup_raw);
+    let startup = read_startup(startup_handle);
     let mut client = WindowClient::new(transport);
     let mut editor = Editor::new(filesystem, random);
     if let Some(mode) = option_env!("GINKGO_TEXT_EDITOR_SMOKE") {
@@ -706,15 +707,14 @@ enum StartupOutcome {
     Error(String),
 }
 
-fn read_startup(startup_raw: u64) -> StartupOutcome {
-    let Some(startup) = parse_handle(startup_raw) else {
+fn read_startup(startup: Option<Handle>) -> StartupOutcome {
+    let Some(startup) = startup else {
         return StartupOutcome::Untitled;
     };
 
     let mut bytes = vec![0; CHANNEL_MAX_BYTES];
     let mut handles = [MaybeUninit::uninit(); CHANNEL_MAX_HANDLES];
     let result = channel_read(startup, &mut bytes, &mut handles);
-    let _ = handle_close(startup);
 
     let info = match result {
         Ok(info) => info,

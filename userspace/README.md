@@ -7,17 +7,18 @@ This is the production, nested `x86_64-unknown-none` workspace. It is intentiona
 - `ginkgo-runtime`: shared `no_std` syscall-backed growable Talc heap, panic/exit handling, `_start` entry macro, linker script, and build-script helper.
 - `ginkgo-desktop-service`: production window-policy service using `ginkgo_desktop::Desktop`, the broker runtime protocol, per-app channels, and protected two-buffer surface pools.
 - `ginkgo-minimal-client`: production syscall-backed `WindowTransport`/`WindowClient` demo with a centered “Hello World” surface and `F11` fullscreen toggling.
+- `ginkgo-help`: unprivileged desktop-controls guide launched from the registry or the system tray Help button.
 - `ginkgo-file-navigator`: keyboard-controlled `/user` workspace browser; Up/Down selects, Enter enters a directory or securely launches the text editor for a file, Backspace returns, and Delete removes entries.
 - `ginkgo-text-editor`: persistent UTF-8 editor scoped to `/user`, with open/save/save-as, selection, clipboard, undo/redo, and startup document requests from the file navigator.
-- `ginkgo-terminal`: terminal emulator and bounded Rhai shell. Keyboard input and graphical child output use framed Ginkgo channel messages rather than file descriptors. Scripts can perform root file I/O, launch and inspect headless ELF jobs through process capabilities, manage bounded GKP installations, source another script, and request registry-governed graphical launches.
+- `ginkgo-terminal`: terminal emulator and bounded Ginkgo shell. Pest parses the language before a register-machine bytecode VM runs it. Scripts can perform root file I/O, launch and inspect headless ELF jobs, manage bounded GKP installations, include another script once, and request registry-governed graphical launches.
 - `validator`: host-only copy of the existing validation harness pattern which imports the kernel ELF parser directly.
 
 ## Build and validate
 
-Normal root Makefile builds compile the production ELFs before the kernel and pass their paths into the kernel build for embedding as `/system/desktop.elf`, `/system/file-navigator.elf`, `/system/text-editor.elf`, `/system/minimal-client.elf`, and `/system/terminal.elf` alongside `/system/programs.gkr`.
+Normal root Makefile builds compile the production ELFs before the kernel and pass their paths into the kernel build for embedding as `/system/desktop.elf`, `/system/help.elf`, `/system/file-navigator.elf`, `/system/text-editor.elf`, `/system/minimal-client.elf`, and `/system/terminal.elf` alongside `/system/programs.gkr`.
 
 ```sh
-cargo build --release --target x86_64-unknown-none -p ginkgo-desktop-service -p ginkgo-file-navigator -p ginkgo-text-editor -p ginkgo-minimal-client -p ginkgo-terminal
+cargo build --release --target x86_64-unknown-none -p ginkgo-desktop-service -p ginkgo-help -p ginkgo-file-navigator -p ginkgo-text-editor -p ginkgo-minimal-client -p ginkgo-terminal
 cargo run --manifest-path validator/Cargo.toml --target x86_64-pc-windows-msvc -- \
   target/x86_64-unknown-none/release/ginkgo-desktop-service \
   target/x86_64-unknown-none/release/ginkgo-file-navigator \
@@ -36,6 +37,7 @@ Artifacts:
 
 - `target/x86_64-unknown-none/release/ginkgo-desktop-service`
 - `target/x86_64-unknown-none/release/ginkgo-minimal-client`
+- `target/x86_64-unknown-none/release/ginkgo-help`
 - `target/x86_64-unknown-none/release/ginkgo-file-navigator`
 - `target/x86_64-unknown-none/release/ginkgo-text-editor`
 - `target/x86_64-unknown-none/release/ginkgo-terminal`
@@ -46,40 +48,73 @@ The kernel boots `ginkgo-desktop-service` with only one bootstrap channel and th
 
 ## Terminal shell
 
-The prompt preprocesses Ginkgo command syntax and then evaluates ordinary Rhai. Interactive input and `source` scripts use the same token-aware preprocessor. Registered commands support shell-style arguments, aliases, `$(...)` Rhai interpolation, and structured F#-style pipelines; registered names followed by normal Rhai call/member/index/assignment syntax remain unchanged.
+The terminal uses the Ginkgo shell language. Pest parses each input or loaded file into an AST, which is compiled to register-machine bytecode before execution. Variables, aliases, functions, and included-file state persist for the life of the terminal. Execution is bounded to 100,000 bytecode instructions, 32 nested calls, 4,096 list values, and 64 KiB of source or string data. Left and Right move the input cursor so text can be inserted or removed inside the pending command; Up and Down browse command history.
 
-```text
+Bare commands take comma-separated values:
+
+```gsh
 ls
 ls /system
 cd documents
-pwd
-cat "notes with spaces.txt"
-cp notes.txt backup.txt
-mv backup.txt archive.txt
-rm archive.txt
-mkdir drafts
-rmdir drafts
-clear
-ps
-kill 1
-print "hello from Rhai"
-help
-help ls
-
-@edit
-@files
-@minimal-client
-@tools/example.elf --verbose $(option)
-
-let extension = ".rhai";
-ls /system |> filter(extension) |> sort |> print
+cat "notes, with commas.txt"
+cp notes.txt, backup.txt
+rm archive.txt, old.txt
+print "hello from Ginkgo"
 ```
+
+Values include strings, signed integers, booleans, variables, and lists. Unquoted glob expressions expand through the terminal's logical current directory. A glob used as a command argument is spliced into the command's argument list; a glob assigned to a variable or used by `for` is a list.
+
+```gsh
+$name = "Ginkgo"
+$files = **/*.ts
+print @["hello", $name, 10, true]
+for $file in *.txt do
+  print $file
+end
+```
+
+The language supports `not`, `and`, `or`, `==`, `<>`, `>`, `<`, `<=`, and `>=`, with short-circuit boolean evaluation. It also supports Ruby-like functions and loops:
+
+```gsh
+def greet($name)
+  print $name
+end
+
+greet "world"
+
+while $ready do
+  print "ready"
+end
+
+until $ready do
+  print "waiting"
+end
+
+repeat 5 times
+  print "again"
+end
+
+do
+  print "once"
+while false
+```
+
+`include "path/to/file.gsh"` reads a script relative to the logical current directory and evaluates it in the same interpreter. Each include path is evaluated once. `run "path/to/file.gsh"` evaluates the file every time. Include and run cycles are rejected. `#pragma once` is accepted as a comment because include-once behavior is always enabled.
+
+Aliases use `alias short = target`. Dispatch follows this order:
+
+1. An absolute path such as `/system/tool.elf`.
+2. A user alias or user function.
+3. An installed package or trusted program-registry entry.
+4. A builtin.
+
+`!app-name` always launches a registered application. `%builtin` always invokes a builtin, even when a function or alias has the same name. App IDs and executable basenames such as `text-editor` and `text-editor.elf` resolve through the program registry. A normal graphical app command opens a new window and holds the prompt until the app exits. `launch app-name` starts it without holding the prompt. Installed command apps and absolute ELF paths follow the same foreground/background rule.
 
 Built-in canonical names and aliases are:
 
 | Canonical name | Aliases | Result |
 | --- | --- | --- |
-| `list_files` | `ls`, `dir` | Structured directory-entry array |
+| `list_files` | `ls`, `dir` | Structured directory-entry list |
 | `change_directory` | `cd`, `chdir` | Changes the terminal's capability-rooted logical directory |
 | `current_directory` | `pwd`, `cwd` | Logical directory beginning at `/` |
 | `copy` | `cp` | Copies one file without escaping the filesystem capability |
@@ -88,72 +123,54 @@ Built-in canonical names and aliases are:
 | `make_directory` | `mkdir`, `md` | Creates one or more directories |
 | `remove_directory` | `rmdir`, `rd` | Removes one or more empty directories |
 | `show_file` | `cat`, `type` | Returns file text |
+| `edit` | — | Opens a `/user` file in a new text editor window and waits |
+| `launch` | — | Starts a registered app or ELF without waiting |
+| `exit` | `quit` | Closes the terminal |
 | `clear_terminal` | `clear`, `cls` | Clears terminal scrollback |
-| `show_processes` | `ps`, `tasks` | Structured terminal-owned job array |
+| `show_processes` | `ps`, `tasks` | Structured terminal-owned job list |
 | `terminate_process` | `kill`, `stop` | Terminates a terminal-owned job ID |
-| `print` | `output` | Evaluates and prints one Rhai expression |
-| `help` | — | Shows the command/syntax summary or detailed command help |
+| `print` | `output` | Prints one value |
+| `help` | — | Shows command and syntax help |
 
-Shell arguments are literal strings unless wrapped in `$(...)`. Pipelines pass Rhai `Dynamic` values rather than formatted terminal text. For example, `ls /system` returns entry maps that `filter`, `sort`, and later stages consume directly. Directory-entry arrays and terminal-job arrays are rendered as compact tables when printed; other arrays render one item per line. Unknown identifiers are left to Rhai and are never guessed to be commands.
+Low-level host operations use the same bare-command syntax. For example:
 
-A statement-boundary `@` sigil launches executables without adding every application to the command registry. `@edit` and `@editor` launch `text-editor`; `@files` launches `file-navigator`; `@demo` launches `minimal-client`; and any other bare target is passed to the trusted graphical program registry as its application ID. Targets ending in `.elf` or containing `/` are opened beneath the terminal's filesystem capability and started as headless terminal jobs; following shell arguments become process arguments. Graphical launch arguments are rejected because the desktop launch protocol does not currently carry an argument vector. Executable launches cannot be pipeline inputs.
+```gsh
+write_file "documents/notes.txt", "persistent text"
+append_file "documents/notes.txt", "\nmore"
+$contents = read_file "documents/notes.txt"
+$metadata = metadata "documents/notes.txt"
+rename_path "documents/notes.txt", "documents/archive.txt", false
+sync_filesystem
 
-Ordinary Rhai remains available and unchanged:
+$job = spawn_elf "hello.elf", @["--verbose"]
+process_status $job
+wait_process $job
+close_process $job
 
-```rhai
-print("hello from Rhai");
-list_files() // compatibility: root entry names
-mkdir("documents")
-write_file("documents/notes.txt", "persistent text")
-append_file("documents/notes.txt", "\nmore")
-read_file("documents/notes.txt")
-file_size("documents/notes.txt")
-metadata("documents/notes.txt")
-list_directory("documents")
-rename_path("documents/notes.txt", "documents/archive.txt", false)
-remove_file("documents/archive.txt")
-rmdir("documents")
-filesystem_info()
-sync_filesystem()
-syscall("yield")
-
-// Direct ELF execution is headless and receives no transferred startup handles.
-let job = spawn_elf("hello.elf", ["--verbose"]);
-process_status(job)
-wait_process(job)
-terminate_process(job)
-close_process(job)
-exec_elf("one-shot.elf", ["input.txt"])
-
-install_package("paint.gkp")
-list_installed()
-let installed_job = spawn_installed("tools.paint", ["document.gkg"]);
-wait_process(installed_job)
-close_process(installed_job)
-exec_installed("tools.paint", ["document.gkg"])
-uninstall_app("tools.paint")       // preserves appdata/tools.paint/
-purge_app_data("tools.paint")      // explicit recursive data removal
-
-// Graphical applications continue through registry and desktop policy.
-run("minimal-client")
+install_package "paint.gkp"
+$installed = list_installed
+$job = spawn_installed "tools.paint", @["document.gkg"]
+run "/user/scripts/setup.gsh"
+edit "documents/notes.txt"
+text-editor
+launch minimal-client
 ```
 
-Enter `source "script.rhai"` to preprocess and evaluate another script relative to the terminal's logical directory, initially `/user`. A leading `/` explicitly addresses the trusted terminal's filesystem root.
+Directory-entry lists and terminal-job lists are rendered as compact tables. Other lists render one value per line.
 
 ### Filesystem functions
 
-All terminal filesystem access remains beneath its explicit trusted filesystem-root capability. The shell starts in `/user`; shell commands, sourced scripts, and `@` executable paths resolve relative to that logical directory. A leading `/` addresses the capability root, and normalization rejects attempts to ascend above it. Low-level Rhai filesystem functions remain explicit capability-root-relative APIs. The kernel has no ambient current-working-directory state: ordinary graphical processes instead receive `/user` itself as their scoped filesystem capability, so their relative paths naturally remain in the user workspace.
+All terminal filesystem access remains beneath its explicit trusted filesystem-root capability. The shell starts in `/user`; shell commands, includes, globs, and executable paths resolve from that logical directory. A leading `/` addresses the capability root, and normalization rejects attempts to ascend above it. Low-level filesystem builtins remain explicit capability-root-relative APIs. The kernel has no ambient current-working-directory state: ordinary graphical processes instead receive `/user` itself as their scoped filesystem capability.
 
-- `mkdir(path)` creates one directory at `path`; parent directories must already exist.
-- `rmdir(path)` removes an empty directory.
-- `rename_path(source, destination, replace)` atomically renames or moves a file or directory beneath the same root. If `replace` is `false`, an existing destination causes failure; if it is `true`, a compatible destination may be replaced.
-- `sync_filesystem()` flushes pending filesystem data and metadata.
-- `filesystem_info()` returns capacity and limit fields (`total_bytes`, `free_bytes`, `available_bytes`, `block_size`, `max_name_length`, `max_path_depth`, and `read_only`) or an error string.
-- `metadata(path)` returns `kind`, stable `identity`, numeric `mode`, `size`, and a `time` map containing `created_ns` and `modified_ns`, or an error string.
-- `list_directory(path)` returns up to 256 rich entry maps with `name` plus the same kind, identity, mode, size, and time fields. It reports an error and returns an empty array on failure.
-- `list_files()` remains the compatibility form and returns up to 256 root entry names.
+- `mkdir path` creates one directory; parent directories must already exist.
+- `rmdir path` removes an empty directory.
+- `rename_path source, destination, replace` atomically renames or moves a file or directory beneath the same root.
+- `sync_filesystem` flushes pending filesystem data and metadata.
+- `filesystem_info` returns capacity and limit fields.
+- `metadata path` returns kind, stable identity, numeric mode, size, and timestamps.
+- `list_directory path` returns up to 256 rich entry maps.
 
-Filesystem counters, identities, sizes, and nanosecond timestamps are Rhai integers when they fit; values beyond the signed integer range are returned as decimal strings instead of being truncated.
+Filesystem counters, identities, sizes, and nanosecond timestamps are integers when they fit; values beyond the signed integer range are returned as decimal strings instead of being truncated.
 
 ### Process jobs
 
@@ -175,9 +192,9 @@ Once the cancellation interval expires, the kernel rejects new launches, gives e
 
 ### Package installation
 
-`install_package(path)` accepts a bounded GKP file, validates it with `ginkgo-app-package`, and installs or updates its registry entry. `desktop`, `file-navigator`, `terminal`, and `minimal-client` are protected system IDs and cannot be installed, updated, removed, or data-purged. `list_installed()` returns maps containing `app_id`, `display_name`, `version`, `kind`, the full immutable executable path, executable `sha256`, and package `package_sha256`.
+`install_package(path)` accepts a bounded GKP file, validates it with `ginkgo-app-package`, and installs or updates its registry entry. `desktop`, `help`, `file-navigator`, `text-editor`, `terminal`, and `minimal-client` are protected system IDs and cannot be installed, updated, removed, or data-purged. `list_installed()` returns maps containing `app_id`, `display_name`, `version`, `kind`, the full immutable executable path, executable `sha256`, and package `package_sha256`.
 
-Trusted built-in artifacts are separate from installed packages: the desktop, file navigator, terminal, minimal client, and trusted program registry live at `/system/desktop.elf`, `/system/file-navigator.elf`, `/system/terminal.elf`, `/system/minimal-client.elf`, and `/system/programs.gkr`. Userspace may read this top-level `/system` subtree but cannot open it for writing or use it as a create, truncate, unlink, directory-mutation, or rename source/target. Legacy trusted filenames at the root remain protected. During upgrade, boot moves an existing legacy artifact into `/system` when no destination exists, or removes the obsolete root duplicate after the `/system` copy is present; this space-safe migration runs before signed artifacts are refreshed and verified.
+Trusted built-in artifacts are separate from installed packages: the desktop, help app, file navigator, text editor, terminal, minimal client, and trusted program registry live at `/system/desktop.elf`, `/system/help.elf`, `/system/file-navigator.elf`, `/system/text-editor.elf`, `/system/terminal.elf`, `/system/minimal-client.elf`, and `/system/programs.gkr`. Userspace may read this top-level `/system` subtree but cannot open it for writing or use it as a create, truncate, unlink, directory-mutation, or rename source/target. Legacy trusted filenames at the root remain protected. During upgrade, boot moves an existing legacy artifact into `/system` when no destination exists, or removes the obsolete root duplicate after the `/system` copy is present; this space-safe migration runs before signed artifacts are refreshed and verified.
 
 Package persistence uses the #4 hierarchy. The installed registry is `applications/installed.gki`, and its stage is `applications/installed.gki.new` in the same directory. Executable generations are stored at `applications/<app-id>/versions/<generation-filename>`, where the immutable filename is derived from the app ID and actual ELF SHA-256. Every installation creates `appdata/<app-id>/`, including executable-only packages. Package assets retain their exact validated relative paths beneath that directory; required parent directories are created idempotently, and an existing asset is preserved rather than overwritten. Authorized root-capability holders retain mutation access to both `applications` and `appdata`.
 
@@ -187,8 +204,8 @@ Registry publication writes and syncs the stage, reads it back through the bound
 
 Installed-package launch uses the hierarchy registry and explicit process-startup authority described above. It does not alter the explicit-path behavior of `spawn_elf(path, args)` or `exec_elf(path, args)`, and it does not route user-installed graphical metadata through the trusted graphical launcher.
 
-The service implements channel handling, protected two-buffer pools, server decorations, focus, fullscreen, pointer/keyboard routing, and compositor placements. Resize is generation-staged: the old frame remains displayed until the first new-generation present succeeds. Presented slots return to the client only through matching `BufferReleased` events. The compositor assembles a complete scene in RAM and publishes it with packed framebuffer writes before completing a presentation.
+The service implements channel handling, protected three-buffer pools, server decorations with clickable close controls, focus, fullscreen, pointer/keyboard routing, and compositor placements. The top system tray reserves desktop space and shows uptime, graphical-process CPU use, physical-memory use, network availability, open graphical programs, and a Help launcher. Resize is generation-staged: the old frame remains displayed until the first new-generation present succeeds. Presented slots return to the client only through matching `BufferReleased` events. The compositor publishes bounded damaged regions from its persistent scene before completing a presentation.
 
 All userspace and kernel channel queues are bounded. The service retains queued payloads and transferred surface handles after `ShouldWait`, retries after yielding, and limits work per scheduler turn. The minimal client treats empty reads and full writes as transient, submits one steady “Hello World” frame for each configuration, and does not repaint continuously after `BufferReleased`. The kernel does not auto-launch it; apps start only through an explicit launcher action.
 
-`META+N` toggles the registry launcher. Integrated pane bindings are `META+Left/Right` (focus), `META+Q` (close the focused application), `META+A/S` (move left/right), `META+=/-` (width by 5%), and `META+L/C/R` (left/center/right alignment). Columns scroll horizontally, so additional live applications may be off-screen and remain reachable with the focus bindings. Remaining hotkey work is tracked in #5.
+`META+N` toggles the registry launcher, and Escape closes it. Integrated pane bindings are `META+Left/Right` (focus), `META+Q` (close the focused application), `META+A/S` (move left/right), `META+=/-` (width by 5%), and `META+L/C/R` (left/center/right alignment). Windows also expose a clickable X in the title bar. Columns scroll horizontally, so additional live applications may be off-screen and remain reachable with the focus bindings. The Help app repeats these controls inside the desktop. Remaining hotkey work is tracked in #5.

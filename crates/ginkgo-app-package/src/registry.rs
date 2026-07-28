@@ -2,7 +2,7 @@ use alloc::{string::String, vec::Vec};
 use core::str;
 
 use crate::{
-    package::{AppKind, Package},
+    package::{AppKind, ExecutableFormat, Package},
     validation::{
         read_u16, read_u32, read_u64, valid_app_id, valid_display_name, valid_version, DIGEST_LEN,
         MAX_APP_ID_LEN, MAX_DISPLAY_NAME_LEN, MAX_EXECUTABLE_LEN, MAX_GENERATION_FILENAME_LEN,
@@ -19,14 +19,25 @@ const PROVENANCE_PACKAGE: u16 = 1;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutableGeneration {
     pub filename: String,
+    pub format: ExecutableFormat,
     pub digest: [u8; DIGEST_LEN],
     pub length: u64,
 }
 
 impl ExecutableGeneration {
     pub fn new(app_id: &str, digest: [u8; DIGEST_LEN], length: u64) -> Result<Self, MutationError> {
+        Self::new_with_format(app_id, ExecutableFormat::Elf, digest, length)
+    }
+
+    pub fn new_with_format(
+        app_id: &str,
+        format: ExecutableFormat,
+        digest: [u8; DIGEST_LEN],
+        length: u64,
+    ) -> Result<Self, MutationError> {
         Ok(Self {
-            filename: generation_filename(app_id, &digest)?,
+            filename: generation_filename_for_format(app_id, &digest, format)?,
+            format,
             digest,
             length,
         })
@@ -77,6 +88,15 @@ pub enum RegistryError {
     UnknownKind {
         index: usize,
         value: u16,
+    },
+    UnknownExecutableFormat {
+        index: usize,
+        value: u16,
+    },
+    IncompatibleExecutableFormat {
+        index: usize,
+        kind: AppKind,
+        format: ExecutableFormat,
     },
     UnknownProvenance {
         index: usize,
@@ -130,7 +150,14 @@ pub enum MutationError {
     AlreadyInstalled,
     NotInstalled,
     RegistryFull,
-    ExecutableLengthMismatch { package: usize, generation: u64 },
+    ExecutableLengthMismatch {
+        package: usize,
+        generation: u64,
+    },
+    ExecutableFormatMismatch {
+        package: ExecutableFormat,
+        generation: ExecutableFormat,
+    },
     InvalidGenerationFilename,
     GenerationFilenameCollision,
 }
@@ -212,7 +239,7 @@ impl InstalledRegistry {
             bytes.extend_from_slice(&(entry.kind as u16).to_le_bytes());
             bytes.extend_from_slice(&0u16.to_le_bytes());
             bytes.extend_from_slice(&PROVENANCE_PACKAGE.to_le_bytes());
-            bytes.extend_from_slice(&0u16.to_le_bytes());
+            bytes.extend_from_slice(&(entry.executable.format as u16).to_le_bytes());
             bytes.extend_from_slice(&entry.executable.length.to_le_bytes());
             bytes.extend_from_slice(&entry.executable.digest);
             bytes.extend_from_slice(&entry.provenance.package_digest);
@@ -296,7 +323,14 @@ impl InstalledRegistry {
                 generation: executable.length,
             });
         }
-        let expected = generation_filename(package.app_id, &executable.digest)?;
+        if executable.format != package.format {
+            return Err(MutationError::ExecutableFormatMismatch {
+                package: package.format,
+                generation: executable.format,
+            });
+        }
+        let expected =
+            generation_filename_for_format(package.app_id, &executable.digest, package.format)?;
         if executable.filename != expected {
             return Err(MutationError::InvalidGenerationFilename);
         }
@@ -313,22 +347,35 @@ pub fn generation_filename(
     app_id: &str,
     digest: &[u8; DIGEST_LEN],
 ) -> Result<String, MutationError> {
+    generation_filename_for_format(app_id, digest, ExecutableFormat::Elf)
+}
+
+pub fn generation_filename_for_format(
+    app_id: &str,
+    digest: &[u8; DIGEST_LEN],
+    format: ExecutableFormat,
+) -> Result<String, MutationError> {
     if !valid_app_id(app_id) {
         return Err(MutationError::InvalidAppId);
     }
-    Ok(generation_filename_validated(app_id, digest))
+    Ok(generation_filename_validated(app_id, digest, format))
 }
 
-fn generation_filename_validated(app_id: &str, digest: &[u8; DIGEST_LEN]) -> String {
+fn generation_filename_validated(
+    app_id: &str,
+    digest: &[u8; DIGEST_LEN],
+    format: ExecutableFormat,
+) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut filename = String::with_capacity(app_id.len() + 69);
+    let mut filename = String::with_capacity(app_id.len() + 70);
     filename.push_str(app_id);
     filename.push('-');
     for byte in digest {
         filename.push(HEX[(byte >> 4) as usize] as char);
         filename.push(HEX[(byte & 0x0f) as usize] as char);
     }
-    filename.push_str(".elf");
+    filename.push('.');
+    filename.push_str(format.extension());
     filename
 }
 
@@ -395,11 +442,18 @@ fn parse_entry(
             value: provenance_kind,
         });
     }
-    let reserved = read_u16(bytes, cursor + 14);
-    if reserved != 0 {
-        return Err(RegistryError::UnknownReservedBits {
+    let format_value = read_u16(bytes, cursor + 14);
+    let format = ExecutableFormat::from_wire(format_value).ok_or(
+        RegistryError::UnknownExecutableFormat {
             index,
-            bits: reserved,
+            value: format_value,
+        },
+    )?;
+    if kind == AppKind::Graphical && format == ExecutableFormat::Wasm {
+        return Err(RegistryError::IncompatibleExecutableFormat {
+            index,
+            kind,
+            format,
         });
     }
     let executable_length = read_u64(bytes, cursor + 16);
@@ -446,7 +500,7 @@ fn parse_entry(
     if !valid_version(version) {
         return Err(RegistryError::InvalidVersion { index });
     }
-    if filename != generation_filename_validated(app_id, &executable_digest) {
+    if filename != generation_filename_validated(app_id, &executable_digest, format) {
         return Err(RegistryError::InvalidGenerationFilename { index });
     }
 
@@ -458,6 +512,7 @@ fn parse_entry(
             kind,
             executable: ExecutableGeneration {
                 filename: String::from(filename),
+                format,
                 digest: executable_digest,
                 length: executable_length,
             },

@@ -1,16 +1,16 @@
 pub const MAX_APP_ID_LEN: usize = 127;
 pub const MAX_DISPLAY_NAME_LEN: usize = 255;
 pub const MAX_VERSION_LEN: usize = 63;
-pub const MAX_EXECUTABLE_LEN: usize = 16 * 1024 * 1024;
+pub const MAX_EXECUTABLE_LEN: usize = 64 * 1024 * 1024;
 pub const MAX_ASSET_COUNT: usize = 64;
 pub const MAX_ASSET_PATH_LEN: usize = 255;
 pub const MAX_ASSET_DATA_LEN: usize = 1024 * 1024;
 pub const MAX_TOTAL_ASSET_DATA_LEN: usize = 8 * 1024 * 1024;
-pub const MAX_PACKAGE_LEN: usize = 24 * 1024 * 1024;
+pub const MAX_PACKAGE_LEN: usize = 80 * 1024 * 1024;
 pub const MAX_INSTALLED_APPS: usize = 1024;
 pub const MAX_REGISTRY_LEN: usize = 1024 * 1024;
 pub const DIGEST_LEN: usize = 32;
-pub const GENERATION_SUFFIX_LEN: usize = 1 + DIGEST_LEN * 2 + 4;
+pub const GENERATION_SUFFIX_LEN: usize = 1 + DIGEST_LEN * 2 + 5;
 pub const MAX_GENERATION_FILENAME_LEN: usize = MAX_APP_ID_LEN + GENERATION_SUFFIX_LEN;
 
 pub fn valid_app_id(value: &str) -> bool {

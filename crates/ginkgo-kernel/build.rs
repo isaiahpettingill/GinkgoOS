@@ -61,6 +61,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GINKGO_FILE_NAVIGATOR_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_TEXT_EDITOR_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_TERMINAL_ELF");
+    println!("cargo:rerun-if-env-changed=GINKGO_WASM_RUNTIME_ELF");
     println!("cargo:rerun-if-env-changed=GINKGO_PREEMPTION_SMOKE");
     println!("cargo:rerun-if-env-changed=GINKGO_FRAME_RECLAIM_STRESS");
     println!("cargo:rerun-if-env-changed=GINKGO_FILESYSTEM_HIERARCHY_SMOKE");
@@ -196,7 +197,22 @@ fn main() {
         read_userspace_artifact("GINKGO_TEXT_EDITOR_ELF").unwrap_or_else(build_userspace_smoke_elf);
     let terminal =
         read_userspace_artifact("GINKGO_TERMINAL_ELF").unwrap_or_else(build_userspace_smoke_elf);
+    let wasm_runtime = read_userspace_artifact("GINKGO_WASM_RUNTIME_ELF")
+        .unwrap_or_else(build_userspace_smoke_elf);
     let registry = build_program_registry();
+    let wabt_spectest_interp = read_repository_file("vendor/wabt-1.0.41/bin/spectest-interp");
+    let wabt_wasm_decompile = read_repository_file("vendor/wabt-1.0.41/bin/wasm-decompile");
+    let wabt_wasm_interp = read_repository_file("vendor/wabt-1.0.41/bin/wasm-interp");
+    let wabt_wasm_objdump = read_repository_file("vendor/wabt-1.0.41/bin/wasm-objdump");
+    let wabt_wasm_stats = read_repository_file("vendor/wabt-1.0.41/bin/wasm-stats");
+    let wabt_wasm_strip = read_repository_file("vendor/wabt-1.0.41/bin/wasm-strip");
+    let wabt_wasm_validate = read_repository_file("vendor/wabt-1.0.41/bin/wasm-validate");
+    let wabt_wasm2c = read_repository_file("vendor/wabt-1.0.41/bin/wasm2c");
+    let wabt_wasm2wat = read_repository_file("vendor/wabt-1.0.41/bin/wasm2wat");
+    let wabt_wast2json = read_repository_file("vendor/wabt-1.0.41/bin/wast2json");
+    let wabt_wat_desugar = read_repository_file("vendor/wabt-1.0.41/bin/wat-desugar");
+    let wabt_wat2wasm = read_repository_file("vendor/wabt-1.0.41/bin/wat2wasm");
+    let webassembly_manual = read_repository_file("docs/webassembly-development.md");
     let artifacts = [
         ("/system/desktop.elf", desktop.as_slice()),
         ("/system/minimal-client.elf", minimal_client.as_slice()),
@@ -204,6 +220,23 @@ fn main() {
         ("/system/file-navigator.elf", file_navigator.as_slice()),
         ("/system/text-editor.elf", text_editor.as_slice()),
         ("/system/terminal.elf", terminal.as_slice()),
+        ("/system/wasm-runtime.elf", wasm_runtime.as_slice()),
+        (
+            "/system/bin/spectest-interp",
+            wabt_spectest_interp.as_slice(),
+        ),
+        ("/system/bin/wasm-decompile", wabt_wasm_decompile.as_slice()),
+        ("/system/bin/wasm-interp", wabt_wasm_interp.as_slice()),
+        ("/system/bin/wasm-objdump", wabt_wasm_objdump.as_slice()),
+        ("/system/bin/wasm-stats", wabt_wasm_stats.as_slice()),
+        ("/system/bin/wasm-strip", wabt_wasm_strip.as_slice()),
+        ("/system/bin/wasm-validate", wabt_wasm_validate.as_slice()),
+        ("/system/bin/wasm2c", wabt_wasm2c.as_slice()),
+        ("/system/bin/wasm2wat", wabt_wasm2wat.as_slice()),
+        ("/system/bin/wast2json", wabt_wast2json.as_slice()),
+        ("/system/bin/wat-desugar", wabt_wat_desugar.as_slice()),
+        ("/system/bin/wat2wasm", wabt_wat2wasm.as_slice()),
+        ("/system/docs/webassembly.md", webassembly_manual.as_slice()),
         ("/system/programs.gkr", registry.as_slice()),
     ];
     let (manifest, signature, public_key) = build_trust_manifest(&artifacts);
@@ -216,6 +249,8 @@ fn main() {
     fs::write(out_dir.join("ginkgo-text-editor.elf"), text_editor)
         .expect("write Ginkgo text editor ELF");
     fs::write(out_dir.join("ginkgo-terminal.elf"), terminal).expect("write Ginkgo terminal ELF");
+    fs::write(out_dir.join("ginkgo-wasm-runtime.elf"), wasm_runtime)
+        .expect("write Ginkgo WASM runtime ELF");
     fs::write(out_dir.join("programs.gkr"), registry).expect("write Ginkgo program registry");
     fs::write(out_dir.join("system-trust.manifest"), manifest).expect("write trust manifest");
     fs::write(out_dir.join("system-trust.signature"), signature).expect("write trust signature");
@@ -283,6 +318,15 @@ fn write_splash_rgba(source: &PathBuf, output: &PathBuf) {
     pixels.truncate(info.buffer_size());
     assert_eq!(pixels.len(), 256 * 256 * 4);
     fs::write(output, pixels).expect("write Ginkgo splash RGBA artifact");
+}
+
+fn read_repository_file(relative: &str) -> Vec<u8> {
+    let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
+    let path = manifest.join("../..").join(relative);
+    println!("cargo:rerun-if-changed={}", path.display());
+    fs::read(&path).unwrap_or_else(|error| {
+        panic!("failed to read repository file {}: {error}", path.display())
+    })
 }
 
 fn read_userspace_artifact(variable: &str) -> Option<Vec<u8>> {

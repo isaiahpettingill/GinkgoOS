@@ -142,6 +142,23 @@ static FILE_NAVIGATOR_ELF: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-file-navigator.elf"));
 static TEXT_EDITOR_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-text-editor.elf"));
 static TERMINAL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-terminal.elf"));
+static WASM_RUNTIME_ELF: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/ginkgo-wasm-runtime.elf"));
+static WABT_SPECTEST_INTERP: &[u8] =
+    include_bytes!("../../../vendor/wabt-1.0.41/bin/spectest-interp");
+static WABT_WASM_DECOMPILE: &[u8] =
+    include_bytes!("../../../vendor/wabt-1.0.41/bin/wasm-decompile");
+static WABT_WASM_INTERP: &[u8] = include_bytes!("../../../vendor/wabt-1.0.41/bin/wasm-interp");
+static WABT_WASM_OBJDUMP: &[u8] = include_bytes!("../../../vendor/wabt-1.0.41/bin/wasm-objdump");
+static WABT_WASM_STATS: &[u8] = include_bytes!("../../../vendor/wabt-1.0.41/bin/wasm-stats");
+static WABT_WASM_STRIP: &[u8] = include_bytes!("../../../vendor/wabt-1.0.41/bin/wasm-strip");
+static WABT_WASM_VALIDATE: &[u8] = include_bytes!("../../../vendor/wabt-1.0.41/bin/wasm-validate");
+static WABT_WASM2C: &[u8] = include_bytes!("../../../vendor/wabt-1.0.41/bin/wasm2c");
+static WABT_WASM2WAT: &[u8] = include_bytes!("../../../vendor/wabt-1.0.41/bin/wasm2wat");
+static WABT_WAST2JSON: &[u8] = include_bytes!("../../../vendor/wabt-1.0.41/bin/wast2json");
+static WABT_WAT_DESUGAR: &[u8] = include_bytes!("../../../vendor/wabt-1.0.41/bin/wat-desugar");
+static WABT_WAT2WASM: &[u8] = include_bytes!("../../../vendor/wabt-1.0.41/bin/wat2wasm");
+static WEBASSEMBLY_MANUAL: &[u8] = include_bytes!("../../../docs/webassembly-development.md");
 static PROGRAM_REGISTRY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/programs.gkr"));
 static TRUST_MANIFEST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/system-trust.manifest"));
 static TRUST_SIGNATURE: &[u8; 64] =
@@ -239,6 +256,20 @@ const HELP_PATH: &str = "/system/help.elf";
 const FILE_NAVIGATOR_PATH: &str = "/system/file-navigator.elf";
 const TEXT_EDITOR_PATH: &str = "/system/text-editor.elf";
 const TERMINAL_PATH: &str = "/system/terminal.elf";
+const WASM_RUNTIME_PATH: &str = "/system/wasm-runtime.elf";
+const WABT_SPECTEST_INTERP_PATH: &str = "/system/bin/spectest-interp";
+const WABT_WASM_DECOMPILE_PATH: &str = "/system/bin/wasm-decompile";
+const WABT_WASM_INTERP_PATH: &str = "/system/bin/wasm-interp";
+const WABT_WASM_OBJDUMP_PATH: &str = "/system/bin/wasm-objdump";
+const WABT_WASM_STATS_PATH: &str = "/system/bin/wasm-stats";
+const WABT_WASM_STRIP_PATH: &str = "/system/bin/wasm-strip";
+const WABT_WASM_VALIDATE_PATH: &str = "/system/bin/wasm-validate";
+const WABT_WASM2C_PATH: &str = "/system/bin/wasm2c";
+const WABT_WASM2WAT_PATH: &str = "/system/bin/wasm2wat";
+const WABT_WAST2JSON_PATH: &str = "/system/bin/wast2json";
+const WABT_WAT_DESUGAR_PATH: &str = "/system/bin/wat-desugar";
+const WABT_WAT2WASM_PATH: &str = "/system/bin/wat2wasm";
+const WEBASSEMBLY_MANUAL_PATH: &str = "/system/docs/webassembly.md";
 const PROGRAM_REGISTRY_PATH: &str = "/system/programs.gkr";
 const PROCESS_CAPABILITY_SMOKE_PATH: &str = "/system/process-capability-smoke.elf";
 const PROCESS_CAPABILITY_MALFORMED_PATH: &str = "/system/process-capability-malformed.elf";
@@ -445,6 +476,8 @@ fn install_and_load_system_programs<D: Disk>(
     executable_source_limit: usize,
 ) -> Result<(Vec<u8>, ProgramCatalog), &'static str> {
     let system = ensure_system_directory(fs).ok_or("create system directory")?;
+    ensure_system_subdirectory(fs, system, "bin").ok_or("create system bin directory")?;
+    ensure_system_subdirectory(fs, system, "docs").ok_or("create system docs directory")?;
     migrate_legacy_system_files(fs, system).ok_or("migrate legacy system files")?;
     recover_system_installation_space(fs).map_err(|_| "recover system installation space")?;
     ensure_user_directory(fs).ok_or("create user directory")?;
@@ -457,6 +490,26 @@ fn install_and_load_system_programs<D: Disk>(
     install_system_file(fs, TEXT_EDITOR_PATH, TEXT_EDITOR_ELF)
         .map_err(|_| "install text editor")?;
     install_system_file(fs, TERMINAL_PATH, TERMINAL_ELF).map_err(|_| "install terminal")?;
+    install_system_file(fs, WASM_RUNTIME_PATH, WASM_RUNTIME_ELF)
+        .map_err(|_| "install WASM runtime")?;
+    for (path, bytes) in [
+        (WABT_SPECTEST_INTERP_PATH, WABT_SPECTEST_INTERP),
+        (WABT_WASM_DECOMPILE_PATH, WABT_WASM_DECOMPILE),
+        (WABT_WASM_INTERP_PATH, WABT_WASM_INTERP),
+        (WABT_WASM_OBJDUMP_PATH, WABT_WASM_OBJDUMP),
+        (WABT_WASM_STATS_PATH, WABT_WASM_STATS),
+        (WABT_WASM_STRIP_PATH, WABT_WASM_STRIP),
+        (WABT_WASM_VALIDATE_PATH, WABT_WASM_VALIDATE),
+        (WABT_WASM2C_PATH, WABT_WASM2C),
+        (WABT_WASM2WAT_PATH, WABT_WASM2WAT),
+        (WABT_WAST2JSON_PATH, WABT_WAST2JSON),
+        (WABT_WAT_DESUGAR_PATH, WABT_WAT_DESUGAR),
+        (WABT_WAT2WASM_PATH, WABT_WAT2WASM),
+    ] {
+        install_system_file(fs, path, bytes).map_err(|_| "install WABT tool")?;
+    }
+    install_system_file(fs, WEBASSEMBLY_MANUAL_PATH, WEBASSEMBLY_MANUAL)
+        .map_err(|_| "install WebAssembly manual")?;
     install_system_file(fs, PROGRAM_REGISTRY_PATH, PROGRAM_REGISTRY)
         .map_err(|_| "install program registry")?;
     if process_capability_smoke_enabled() {
@@ -542,6 +595,18 @@ fn ensure_system_directory<D: Disk>(
     ensure_top_level_directory(fs, SYSTEM_DIRECTORY)
 }
 
+fn ensure_system_subdirectory<D: Disk>(
+    fs: &mut RedoxFs<D>,
+    system: ginkgo_filesystem::DirectoryHandle,
+    name: &str,
+) -> Option<ginkgo_filesystem::DirectoryHandle> {
+    match fs.open_directory_at(system, name) {
+        Ok(directory) => Some(directory),
+        Err(FsError::NotFound) => fs.create_directory_at(system, name).ok(),
+        Err(_) => None,
+    }
+}
+
 fn ensure_user_directory<D: Disk>(
     fs: &mut RedoxFs<D>,
 ) -> Option<ginkgo_filesystem::DirectoryHandle> {
@@ -572,6 +637,7 @@ fn migrate_legacy_system_files<D: Disk>(
         "file-navigator.elf",
         "text-editor.elf",
         "terminal.elf",
+        "wasm-runtime.elf",
         "programs.gkr",
     ] {
         let Ok(legacy) = fs.open_file_at(root, name) else {
@@ -587,7 +653,7 @@ fn migrate_legacy_system_files<D: Disk>(
     Some(())
 }
 
-const MIN_SYSTEM_INSTALLATION_WORKSPACE: u64 = 512 * 1024;
+const MIN_SYSTEM_INSTALLATION_WORKSPACE: u64 = 18 * 1024 * 1024;
 
 fn recover_system_installation_space<D: Disk>(fs: &mut RedoxFs<D>) -> Result<(), FsError> {
     if fs.filesystem_info()?.free_bytes.unwrap_or(u64::MAX) >= MIN_SYSTEM_INSTALLATION_WORKSPACE {
@@ -601,6 +667,20 @@ fn recover_system_installation_space<D: Disk>(fs: &mut RedoxFs<D>) -> Result<(),
         (FILE_NAVIGATOR_PATH, FILE_NAVIGATOR_ELF),
         (TEXT_EDITOR_PATH, TEXT_EDITOR_ELF),
         (TERMINAL_PATH, TERMINAL_ELF),
+        (WASM_RUNTIME_PATH, WASM_RUNTIME_ELF),
+        (WABT_SPECTEST_INTERP_PATH, WABT_SPECTEST_INTERP),
+        (WABT_WASM_DECOMPILE_PATH, WABT_WASM_DECOMPILE),
+        (WABT_WASM_INTERP_PATH, WABT_WASM_INTERP),
+        (WABT_WASM_OBJDUMP_PATH, WABT_WASM_OBJDUMP),
+        (WABT_WASM_STATS_PATH, WABT_WASM_STATS),
+        (WABT_WASM_STRIP_PATH, WABT_WASM_STRIP),
+        (WABT_WASM_VALIDATE_PATH, WABT_WASM_VALIDATE),
+        (WABT_WASM2C_PATH, WABT_WASM2C),
+        (WABT_WASM2WAT_PATH, WABT_WASM2WAT),
+        (WABT_WAST2JSON_PATH, WABT_WAST2JSON),
+        (WABT_WAT_DESUGAR_PATH, WABT_WAT_DESUGAR),
+        (WABT_WAT2WASM_PATH, WABT_WAT2WASM),
+        (WEBASSEMBLY_MANUAL_PATH, WEBASSEMBLY_MANUAL),
         (PROGRAM_REGISTRY_PATH, PROGRAM_REGISTRY),
     ];
     let mut replacement_needed = false;
@@ -5880,7 +5960,8 @@ fn finish_program_launch(
         },
         None => ginkgo_sysapi::Handle::INVALID,
     };
-    let auxiliary = if program.app_id() == "terminal" {
+    let is_terminal = program.app_id() == "terminal";
+    let auxiliary = if is_terminal {
         process
             .handles_mut()
             .system_power_install(&context.power_control)
@@ -5898,13 +5979,21 @@ fn finish_program_launch(
         Ok(authority) => authority,
         Err(_) => return reject_unstarted_client(context, client_id, process),
     };
+    let terminal_random = if is_terminal {
+        match process.handles_mut().random_source_create() {
+            Ok(handle) => handle,
+            Err(_) => return reject_unstarted_client(context, client_id, process),
+        }
+    } else {
+        ginkgo_sysapi::Handle::INVALID
+    };
     process.set_start_arguments6([
         u64::from(channel.raw()),
         u64::from(filesystem.raw()),
         u64::from(startup.raw()),
         u64::from(auxiliary.raw()),
         u64::from(interactive_authority.raw()),
-        0,
+        u64::from(terminal_random.raw()),
     ]);
     let process_id = context
         .processes
@@ -7289,8 +7378,9 @@ fn dispatch_keyboard_event(
     if pressed && !repeat && usage == 0x11 && logo {
         request_launcher_toggle(context);
     } else if context.ui.launcher_visible {
-        if pressed && !repeat && usage == 0x29 && context.ui.power_confirmation.take().is_some() {
-            redraw_desktop(context);
+        if pressed && !repeat && usage == 0x29 {
+            context.ui.power_confirmation = None;
+            request_launcher_toggle(context);
         } else if pressed && !repeat && usage == 0x28 && context.ui.catalog.len != 0 {
             context.launch_requested = Some(0);
         } else if pressed {

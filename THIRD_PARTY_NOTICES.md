@@ -36,9 +36,40 @@ The filesystem core under `vendor/redoxfs` is adapted from RedoxFS commit `99bc1
 
 The complete upstream license is retained at `vendor/redoxfs/LICENSE`.
 
+## wasmi
+
+- Project: wasmi
+- Source: https://github.com/wasmi-labs/wasmi
+- Version: 0.46.0
+- Copyright: wasmi contributors
+- License: MIT OR Apache-2.0
+- Use: `no_std` WebAssembly interpreter for the ring-3 WASIp1 command runtime
+
+## WebAssembly Binary Toolkit (WABT)
+
+- Project: WABT
+- Source: https://github.com/WebAssembly/wabt
+- Release: https://github.com/WebAssembly/wabt/releases/tag/1.0.41
+- Version: 1.0.41
+- Copyright: WABT contributors
+- License: Apache-2.0
+- Use: official, unmodified WASI command modules bundled under `/system/bin`
+
+The upstream license is retained at `vendor/wabt-1.0.41/LICENSE`.
+
 ## ProFont
 
 - Project: ProFont for embedded-graphics
 - Source: https://github.com/wezm/profont
 - Copyright: 2018 Wes M
 - License: MIT
+
+## libyaff
+
+- Project: libyaff, GinkgoOS fork
+- Source: https://github.com/isaiahpettingill/libyaff
+- Pinned revision: `4194ee0`
+- Upstream source: https://github.com/mist64/libyaff
+- License: MIT OR Apache-2.0
+- Use: host-side YAFF parsing and conversion to the Ginkgo `.gkf` font format
+- Local changes: `no_std + alloc` core support, handwritten label parsing, and `std`-gated filesystem helpers

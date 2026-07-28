@@ -1569,11 +1569,13 @@ impl HandleTable {
         }
     }
 
-    /// Creates a non-transferable capability authorizing kernel random bytes.
+    /// Creates a duplicable capability authorizing kernel random bytes.
+    ///
+    /// Delegation keeps the source in the parent and may only grant read authority.
     pub fn random_source_create(&mut self) -> Result<Handle, IpcError> {
         let object = Arc::try_new(KernelObject::RandomSource).map_err(|_| IpcError::OutOfMemory)?;
         let slot = self.reserve_slots(1)?[0];
-        Ok(self.insert_reserved(slot, object, Rights::READ))
+        Ok(self.insert_reserved(slot, object, Rights::READ | Rights::DUPLICATE))
     }
 
     pub fn random_source(&self, handle: Handle) -> Result<(), IpcError> {
@@ -4612,16 +4614,18 @@ mod tests {
     }
 
     #[test]
-    fn random_source_is_read_only_nontransferable_authority() {
+    fn random_source_is_read_only_delegatable_authority() {
         let mut table = HandleTable::new();
         let source = table.random_source_create().unwrap();
         assert_eq!(table.object_type(source), Ok(ObjectType::RandomSource));
-        assert_eq!(table.handle_rights(source), Ok(Rights::READ));
-        assert_eq!(table.random_source(source), Ok(()));
         assert_eq!(
-            table.handle_duplicate(source, Rights::READ),
-            Err(IpcError::AccessDenied)
+            table.handle_rights(source),
+            Ok(Rights::READ | Rights::DUPLICATE)
         );
+        assert_eq!(table.random_source(source), Ok(()));
+        let duplicate = table.handle_duplicate(source, Rights::READ).unwrap();
+        assert_eq!(table.random_source(duplicate), Ok(()));
+        assert_eq!(table.handle_rights(duplicate), Ok(Rights::READ));
     }
 
     #[test]

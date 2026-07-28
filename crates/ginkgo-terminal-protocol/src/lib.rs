@@ -16,21 +16,32 @@ pub const CONSOLE_PROTOCOL_ID: u32 = u32::from_le_bytes(*b"GCON");
 pub const LAUNCH_PROTOCOL_ID: u32 = u32::from_le_bytes(*b"GLCH");
 /// Stable RPC protocol identifier for document startup messages (`GDOC`).
 pub const DOCUMENT_PROTOCOL_ID: u32 = u32::from_le_bytes(*b"GDOC");
+/// Stable RPC protocol identifier for terminal startup commands (`GTSC`).
+pub const TERMINAL_STARTUP_PROTOCOL_ID: u32 = u32::from_le_bytes(*b"GTSC");
+/// Current wire version for [`TerminalStartupCommand`].
+pub const TERMINAL_STARTUP_VERSION: u16 = 1;
 /// RPC method carrying a postcard-encoded [`ConsoleMessage`].
 pub const CONSOLE_MESSAGE_METHOD_ID: u32 = 1;
 /// RPC method carrying a postcard-encoded [`LaunchRequest`].
 pub const LAUNCH_REQUEST_METHOD_ID: u32 = 1;
 /// RPC method carrying a postcard-encoded [`OpenDocument`].
 pub const OPEN_DOCUMENT_METHOD_ID: u32 = 1;
+/// RPC method carrying a postcard-encoded [`TerminalStartupCommand`].
+pub const TERMINAL_STARTUP_COMMAND_METHOD_ID: u32 = 1;
 /// Maximum application identifier length accepted by the program registry.
 pub const MAX_APP_ID_LEN: usize = 255;
 /// Maximum UTF-8 byte length accepted for an [`OpenDocument`] path.
 pub const MAX_DOCUMENT_PATH_BYTES: usize = 512;
+/// Maximum number of arguments accepted in a [`TerminalStartupCommand`].
+pub const MAX_TERMINAL_STARTUP_ARGUMENTS: usize = 32;
+/// Maximum combined UTF-8 byte length of terminal startup arguments.
+pub const MAX_TERMINAL_STARTUP_ARGUMENT_BYTES: usize = 16 * 1024;
 
 const TRANSACTION_ID: u64 = 0;
 const CONSOLE_ATTACHMENT_COUNT: usize = 0;
 const LAUNCH_ATTACHMENT_COUNT: usize = 1;
 const DOCUMENT_ATTACHMENT_COUNT: usize = 0;
+const TERMINAL_STARTUP_ATTACHMENT_COUNT: usize = 0;
 const STARTUP_ATTACHMENT_INDEX: u16 = 0;
 
 /// One message on a terminal console channel.
@@ -55,6 +66,14 @@ pub struct OpenDocument {
     pub path: String,
 }
 
+/// Versioned command asking a terminal to start an installed application.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct TerminalStartupCommand {
+    pub version: u16,
+    pub app_id: String,
+    pub arguments: Vec<String>,
+}
+
 /// Strict terminal protocol framing, attachment, or payload validation failure.
 #[derive(Debug)]
 pub enum ProtocolCodecError {
@@ -67,6 +86,10 @@ pub enum ProtocolCodecError {
     InvalidAppId,
     InvalidDocumentPath,
     InvalidStartupAttachment { received: u16 },
+    UnsupportedTerminalStartupVersion { expected: u16, received: u16 },
+    TooManyTerminalStartupArguments { maximum: usize, received: usize },
+    TerminalStartupArgumentsTooLarge { maximum: usize, received: usize },
+    TerminalStartupArgumentContainsNul { index: usize },
 }
 
 impl From<StructuredMessageError> for ProtocolCodecError {
@@ -161,6 +184,39 @@ pub fn decode_open_document(
     Ok(document)
 }
 
+/// Encodes one validated terminal startup command as an `RpcHeader` and postcard payload.
+pub fn encode_terminal_startup_command(
+    command: &TerminalStartupCommand,
+) -> Result<Vec<u8>, ProtocolCodecError> {
+    validate_terminal_startup_command(command)?;
+    encode_structured(
+        RpcHeader::new(
+            TRANSACTION_ID,
+            TERMINAL_STARTUP_PROTOCOL_ID,
+            TERMINAL_STARTUP_COMMAND_METHOD_ID,
+            RpcFlags::ONE_WAY,
+        ),
+        command,
+    )
+    .map_err(Into::into)
+}
+
+/// Decodes and strictly validates one terminal startup command with no attachments.
+pub fn decode_terminal_startup_command(
+    bytes: &[u8],
+    attachment_count: usize,
+) -> Result<TerminalStartupCommand, ProtocolCodecError> {
+    let (header, command) = decode_structured::<TerminalStartupCommand>(bytes)?;
+    validate_header(
+        &header,
+        TERMINAL_STARTUP_PROTOCOL_ID,
+        TERMINAL_STARTUP_COMMAND_METHOD_ID,
+    )?;
+    validate_attachment_count(TERMINAL_STARTUP_ATTACHMENT_COUNT, attachment_count)?;
+    validate_terminal_startup_command(&command)?;
+    Ok(command)
+}
+
 fn validate_header(
     header: &RpcHeader,
     expected_protocol: u32,
@@ -219,6 +275,47 @@ fn validate_open_document(document: &OpenDocument) -> Result<(), ProtocolCodecEr
     Ok(())
 }
 
+fn validate_terminal_startup_command(
+    command: &TerminalStartupCommand,
+) -> Result<(), ProtocolCodecError> {
+    if command.version != TERMINAL_STARTUP_VERSION {
+        return Err(ProtocolCodecError::UnsupportedTerminalStartupVersion {
+            expected: TERMINAL_STARTUP_VERSION,
+            received: command.version,
+        });
+    }
+    if !valid_app_id(&command.app_id) {
+        return Err(ProtocolCodecError::InvalidAppId);
+    }
+    if command.arguments.len() > MAX_TERMINAL_STARTUP_ARGUMENTS {
+        return Err(ProtocolCodecError::TooManyTerminalStartupArguments {
+            maximum: MAX_TERMINAL_STARTUP_ARGUMENTS,
+            received: command.arguments.len(),
+        });
+    }
+
+    let mut total_bytes = 0usize;
+    for (index, argument) in command.arguments.iter().enumerate() {
+        if argument.contains('\0') {
+            return Err(ProtocolCodecError::TerminalStartupArgumentContainsNul { index });
+        }
+        total_bytes = total_bytes.checked_add(argument.len()).ok_or(
+            ProtocolCodecError::TerminalStartupArgumentsTooLarge {
+                maximum: MAX_TERMINAL_STARTUP_ARGUMENT_BYTES,
+                received: usize::MAX,
+            },
+        )?;
+    }
+    if total_bytes > MAX_TERMINAL_STARTUP_ARGUMENT_BYTES {
+        return Err(ProtocolCodecError::TerminalStartupArgumentsTooLarge {
+            maximum: MAX_TERMINAL_STARTUP_ARGUMENT_BYTES,
+            received: total_bytes,
+        });
+    }
+
+    Ok(())
+}
+
 fn valid_document_path(path: &str) -> bool {
     if path.is_empty()
         || path.len() > MAX_DOCUMENT_PATH_BYTES
@@ -267,6 +364,27 @@ mod tests {
         OpenDocument {
             path: path.to_string(),
         }
+    }
+
+    fn terminal_startup_command(arguments: Vec<String>) -> TerminalStartupCommand {
+        TerminalStartupCommand {
+            version: TERMINAL_STARTUP_VERSION,
+            app_id: "org.ginkgo.shell-2".to_string(),
+            arguments,
+        }
+    }
+
+    fn encode_unvalidated_terminal_startup_command(command: &TerminalStartupCommand) -> Vec<u8> {
+        encode_structured(
+            RpcHeader::new(
+                0,
+                TERMINAL_STARTUP_PROTOCOL_ID,
+                TERMINAL_STARTUP_COMMAND_METHOD_ID,
+                RpcFlags::ONE_WAY,
+            ),
+            command,
+        )
+        .unwrap()
     }
 
     fn encode_unvalidated_open_document(document: &OpenDocument) -> Vec<u8> {
@@ -592,6 +710,159 @@ mod tests {
         replace_u64(&mut bytes, 0, 1);
         assert!(matches!(
             decode_open_document(&bytes, 0),
+            Err(ProtocolCodecError::TransactionMismatch {
+                expected: 0,
+                received: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn terminal_startup_command_round_trips_unicode_arguments() {
+        let command = terminal_startup_command(vec![
+            "--title".to_string(),
+            "Ginkgo notes".to_string(),
+            "資料/設計書.md".to_string(),
+        ]);
+        let bytes = encode_terminal_startup_command(&command).unwrap();
+
+        assert_eq!(decode_terminal_startup_command(&bytes, 0).unwrap(), command);
+    }
+
+    #[test]
+    fn terminal_startup_codec_accepts_argument_limits() {
+        let command =
+            terminal_startup_command(vec!["x".to_string(); MAX_TERMINAL_STARTUP_ARGUMENTS]);
+        let bytes = encode_terminal_startup_command(&command).unwrap();
+        assert_eq!(decode_terminal_startup_command(&bytes, 0).unwrap(), command);
+
+        let command =
+            terminal_startup_command(vec!["a".repeat(MAX_TERMINAL_STARTUP_ARGUMENT_BYTES)]);
+        assert!(validate_terminal_startup_command(&command).is_ok());
+    }
+
+    #[test]
+    fn terminal_startup_encoder_rejects_arguments_over_total_byte_limit() {
+        let command =
+            terminal_startup_command(vec!["a".repeat(MAX_TERMINAL_STARTUP_ARGUMENT_BYTES + 1)]);
+
+        assert!(matches!(
+            encode_terminal_startup_command(&command),
+            Err(ProtocolCodecError::TerminalStartupArgumentsTooLarge {
+                maximum: MAX_TERMINAL_STARTUP_ARGUMENT_BYTES,
+                received
+            }) if received == MAX_TERMINAL_STARTUP_ARGUMENT_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn terminal_startup_codec_rejects_invalid_payloads_on_encode_and_decode() {
+        let cases = [
+            (
+                TerminalStartupCommand {
+                    version: TERMINAL_STARTUP_VERSION + 1,
+                    ..terminal_startup_command(vec![])
+                },
+                "version",
+            ),
+            (
+                TerminalStartupCommand {
+                    app_id: "invalid_id".to_string(),
+                    ..terminal_startup_command(vec![])
+                },
+                "app_id",
+            ),
+            (
+                terminal_startup_command(vec![String::new(); MAX_TERMINAL_STARTUP_ARGUMENTS + 1]),
+                "count",
+            ),
+            (
+                terminal_startup_command(vec!["bad\0argument".to_string()]),
+                "nul",
+            ),
+        ];
+
+        for (command, kind) in cases {
+            let encode_error = encode_terminal_startup_command(&command).unwrap_err();
+            assert!(
+                matches!(
+                    (kind, &encode_error),
+                    (
+                        "version",
+                        ProtocolCodecError::UnsupportedTerminalStartupVersion { .. }
+                    ) | ("app_id", ProtocolCodecError::InvalidAppId)
+                        | (
+                            "count",
+                            ProtocolCodecError::TooManyTerminalStartupArguments { .. }
+                        )
+                        | (
+                            "nul",
+                            ProtocolCodecError::TerminalStartupArgumentContainsNul { index: 0 }
+                        )
+                ),
+                "wrong encode error for {kind}: {encode_error:?}"
+            );
+
+            let bytes = encode_unvalidated_terminal_startup_command(&command);
+            let decode_error = decode_terminal_startup_command(&bytes, 0).unwrap_err();
+            assert!(
+                matches!(
+                    (kind, &decode_error),
+                    (
+                        "version",
+                        ProtocolCodecError::UnsupportedTerminalStartupVersion { .. }
+                    ) | ("app_id", ProtocolCodecError::InvalidAppId)
+                        | (
+                            "count",
+                            ProtocolCodecError::TooManyTerminalStartupArguments { .. }
+                        )
+                        | (
+                            "nul",
+                            ProtocolCodecError::TerminalStartupArgumentContainsNul { index: 0 }
+                        )
+                ),
+                "wrong decode error for {kind}: {decode_error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_startup_decoder_requires_zero_attachments() {
+        let bytes = encode_terminal_startup_command(&terminal_startup_command(vec![])).unwrap();
+
+        assert!(matches!(
+            decode_terminal_startup_command(&bytes, 1),
+            Err(ProtocolCodecError::AttachmentCountMismatch {
+                expected: 0,
+                received: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn terminal_startup_decoder_rejects_header_changes() {
+        let original = encode_terminal_startup_command(&terminal_startup_command(vec![])).unwrap();
+        let u32_cases = [
+            (8, LAUNCH_PROTOCOL_ID, "protocol"),
+            (12, 99, "method"),
+            (16, RpcFlags::RESPONSE.bits(), "flags"),
+        ];
+        for (offset, value, kind) in u32_cases {
+            let mut bytes = original.clone();
+            replace_u32(&mut bytes, offset, value);
+            let error = decode_terminal_startup_command(&bytes, 0).unwrap_err();
+            assert!(matches!(
+                (kind, error),
+                ("protocol", ProtocolCodecError::WrongProtocol { .. })
+                    | ("method", ProtocolCodecError::WrongMethod { .. })
+                    | ("flags", ProtocolCodecError::WrongFlags { .. })
+            ));
+        }
+
+        let mut bytes = original;
+        replace_u64(&mut bytes, 0, 1);
+        assert!(matches!(
+            decode_terminal_startup_command(&bytes, 0),
             Err(ProtocolCodecError::TransactionMismatch {
                 expected: 0,
                 received: 1

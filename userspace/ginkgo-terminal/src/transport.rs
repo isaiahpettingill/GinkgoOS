@@ -4,8 +4,9 @@ use alloc::{collections::VecDeque, string::String, vec, vec::Vec};
 use core::mem::MaybeUninit;
 
 use ginkgo_terminal_protocol::{
-    decode_console_message, encode_console_message, encode_launch_request, ConsoleMessage,
-    LaunchRequest,
+    decode_console_message, decode_terminal_startup_command, encode_console_message,
+    encode_launch_request, encode_open_document, encode_terminal_startup_command, ConsoleMessage,
+    LaunchRequest, OpenDocument, TerminalStartupCommand, TERMINAL_STARTUP_VERSION,
 };
 use ginkgo_userspace::{
     channel_read, channel_write, handle_close, DispositionOperation, Handle, HandleDisposition,
@@ -27,6 +28,31 @@ impl PendingSend {
         Ok(Self {
             channel,
             bytes: encode_console_message(message).map_err(|_| ())?,
+            moved_handle: None,
+        })
+    }
+
+    pub fn terminal_command(
+        channel: Handle,
+        app_id: String,
+        arguments: Vec<String>,
+    ) -> Result<Self, ()> {
+        let command = TerminalStartupCommand {
+            version: TERMINAL_STARTUP_VERSION,
+            app_id,
+            arguments,
+        };
+        Ok(Self {
+            channel,
+            bytes: encode_terminal_startup_command(&command).map_err(|_| ())?,
+            moved_handle: None,
+        })
+    }
+
+    pub fn document(channel: Handle, path: String) -> Result<Self, ()> {
+        Ok(Self {
+            channel,
+            bytes: encode_open_document(&OpenDocument { path }).map_err(|_| ())?,
             moved_handle: None,
         })
     }
@@ -70,6 +96,28 @@ pub fn flush(queue: &mut VecDeque<PendingSend>) -> bool {
         }
     }
     changed
+}
+
+pub fn read_terminal_startup(channel: Handle) -> Result<Option<TerminalStartupCommand>, ()> {
+    let mut bytes = vec![0; CHANNEL_MAX_BYTES];
+    let mut handles = [MaybeUninit::uninit(); CHANNEL_MAX_HANDLES];
+    let info = match channel_read(channel, &mut bytes, &mut handles) {
+        Ok(info) => info,
+        Err(Status::ShouldWait) => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    bytes.truncate(info.byte_count as usize);
+    if info.handle_count != 0 {
+        for handle in handles.iter().take(info.handle_count as usize) {
+            // SAFETY: channel_read initialized the reported prefix.
+            let received = unsafe { handle.assume_init() };
+            let _ = handle_close(received.handle);
+        }
+        return Err(());
+    }
+    decode_terminal_startup_command(&bytes, 0)
+        .map(Some)
+        .map_err(|_| ())
 }
 
 pub enum DrainResult {
