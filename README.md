@@ -142,7 +142,7 @@ Install Rust through rustup, then ensure `cargo` is in `PATH`.
 make run
 ```
 
-The first run downloads Limine and OVMF, builds the kernel, creates `build/ginkgo-os.iso`, creates a persistent 16 MiB GPT `build/ginkgo-redoxfs.img` if needed, and starts QEMU. The default `pc` machine attaches that image through transitional `virtio-blk` plus an xHCI USB hub containing a keyboard and tablet. Subsequent runs reuse the same filesystem image.
+The first run downloads Limine and OVMF, builds the kernel, creates `build/ginkgo-os.iso`, creates a persistent 512 MiB sparse GPT `build/ginkgo-redoxfs.img` if needed, and starts QEMU. The default `pc` machine attaches that image through transitional `virtio-blk` plus an xHCI USB hub containing a keyboard and tablet. Subsequent runs reuse the same filesystem image.
 
 Run `make usb-smoke` for automated headless QEMU/QMP coverage. The test verifies hub enumeration, MSI delivery, disconnect with an outstanding HID transfer, repeated keyboard reconnects, and restoration of the live-interface baseline while an unrelated tablet remains active. Run `make frame-reclaim-smoke` to stress normal exits, faults, shared-memory final-owner release, and frame reuse across 512 sequential processes. Run `make process-capability-smoke` for deterministic issue #8 coverage; its bounded headless harness accepts exactly one `ginkgo-process-capability-smoke: PASS` marker, emitted only after the parent exits and normal process reclamation succeeds.
 

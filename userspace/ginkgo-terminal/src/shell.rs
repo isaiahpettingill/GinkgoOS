@@ -388,6 +388,21 @@ impl HostState {
             .map(|child| child.endpoint)
     }
 
+    pub fn terminate_foreground(&mut self) -> bool {
+        let Some(process) = self
+            .children
+            .iter()
+            .find(|child| child.foreground)
+            .and_then(|child| child.process)
+        else {
+            return false;
+        };
+        if let Err(error) = process_terminate(process) {
+            self.error(format!("cannot terminate foreground command: {:?}", error));
+        }
+        true
+    }
+
     fn job_process(&self, id: INT) -> Option<Handle> {
         self.jobs
             .iter()
@@ -2100,8 +2115,13 @@ fn package_executable(root: Handle, current: &str, arguments: &[String]) -> Resu
         .map_err(|error| format!("invalid executable path: {}", error))?;
     let output_path = resolve_shell_path(current, &arguments[1])
         .map_err(|error| format!("invalid output path: {}", error))?;
-    let executable = read_bounded(root, &executable_path, MAX_EXECUTABLE_LEN)
-        .map_err(|error| format!("cannot read executable: {:?}", error))?;
+    let executable =
+        read_bounded_detailed(root, &executable_path, MAX_EXECUTABLE_LEN).map_err(|error| {
+            format!(
+                "cannot read executable at offset {}: {:?}",
+                error.offset, error.status
+            )
+        })?;
     let format = detect_executable_format(&executable_path, &executable)?;
     let kind = parse_app_kind(arguments.get(5).map(String::as_str).unwrap_or("command"))?;
     let input = PackageInput {
@@ -2134,8 +2154,13 @@ fn package_editable_directory(
         .map_err(|error| format!("cannot read {}: {:?}", manifest_path, error))?;
     let manifest = parse_editable_manifest(&manifest_text)?;
     let executable_path = join_path(&source, &manifest.executable);
-    let executable = read_bounded(root, &executable_path, MAX_EXECUTABLE_LEN)
-        .map_err(|error| format!("cannot read executable: {:?}", error))?;
+    let executable =
+        read_bounded_detailed(root, &executable_path, MAX_EXECUTABLE_LEN).map_err(|error| {
+            format!(
+                "cannot read executable at offset {}: {:?}",
+                error.offset, error.status
+            )
+        })?;
     let detected = detect_executable_format(&executable_path, &executable)?;
     if detected != manifest.format {
         return Err(String::from(
@@ -2854,13 +2879,36 @@ fn collect_removals(
     result
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BoundedReadError {
+    offset: usize,
+    status: Status,
+}
+
 fn read_bounded(root: Handle, path: &str, maximum: usize) -> Result<Vec<u8>, Status> {
-    let file = filesystem_open(root, path, FilesystemOpenFlags::READ)?;
+    read_bounded_detailed(root, path, maximum).map_err(|error| error.status)
+}
+
+fn read_bounded_detailed(
+    root: Handle,
+    path: &str,
+    maximum: usize,
+) -> Result<Vec<u8>, BoundedReadError> {
+    let file = filesystem_open(root, path, FilesystemOpenFlags::READ)
+        .map_err(|status| BoundedReadError { offset: 0, status })?;
     let result = (|| {
-        let length =
-            usize::try_from(filesystem_stat(file)?.length).map_err(|_| Status::OutOfRange)?;
+        let length = filesystem_stat(file)
+            .map_err(|status| BoundedReadError { offset: 0, status })?
+            .length;
+        let length = usize::try_from(length).map_err(|_| BoundedReadError {
+            offset: 0,
+            status: Status::OutOfRange,
+        })?;
         if length > maximum {
-            return Err(Status::OutOfRange);
+            return Err(BoundedReadError {
+                offset: 0,
+                status: Status::OutOfRange,
+            });
         }
         let mut bytes = vec![0; length];
         let mut offset = 0;
@@ -2868,13 +2916,16 @@ fn read_bounded(root: Handle, path: &str, maximum: usize) -> Result<Vec<u8>, Sta
             let chunk_end = offset
                 .saturating_add(FILESYSTEM_IO_MAX_BYTES)
                 .min(bytes.len());
-            let count = filesystem_read(file, offset as u64, &mut bytes[offset..chunk_end])?;
+            let count = filesystem_read(file, offset as u64, &mut bytes[offset..chunk_end])
+                .map_err(|status| BoundedReadError { offset, status })?;
             if count == 0 {
-                break;
+                return Err(BoundedReadError {
+                    offset,
+                    status: Status::Io,
+                });
             }
             offset += count;
         }
-        bytes.truncate(offset);
         Ok(bytes)
     })();
     let _ = handle_close(file);

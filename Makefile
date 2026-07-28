@@ -47,7 +47,7 @@ SCHEDULER_SMOKE_DISK := $(BUILD_DIR)/scheduler-smoke.img
 SCHEDULER_AHCI_SMOKE_ROOT := $(BUILD_DIR)/scheduler_ahci_smoke_root
 SCHEDULER_AHCI_SMOKE_DISK := $(BUILD_DIR)/scheduler-ahci-smoke.img
 FS_IMAGE := $(BUILD_DIR)/ginkgo-redoxfs.img
-FS_IMAGE_SIZE_MB ?= 32
+FS_IMAGE_SIZE_MB ?= 512
 ISO := $(BUILD_DIR)/$(IMAGE_NAME).iso
 
 LIMINE_VERSION ?= v12.5.1

@@ -90,13 +90,17 @@ extern "C" fn process_main(
                 Event::Configured { .. } | Event::Redraw { .. } => redraw = true,
                 Event::Keyboard { event, .. } if event.state == ButtonState::Pressed => {
                     if let Some(byte) = keyboard::translate(event) {
-                        let message = ConsoleMessage::Input(vec![byte]);
-                        let destination = host
-                            .borrow()
-                            .foreground_endpoint()
-                            .unwrap_or(terminal_endpoint);
-                        if let Ok(send) = PendingSend::console(destination, &message) {
-                            input_pending.push_back(send);
+                        let terminated =
+                            byte == keyboard::CANCEL && host.borrow_mut().terminate_foreground();
+                        if !terminated {
+                            let message = ConsoleMessage::Input(vec![byte]);
+                            let destination = host
+                                .borrow()
+                                .foreground_endpoint()
+                                .unwrap_or(terminal_endpoint);
+                            if let Ok(send) = PendingSend::console(destination, &message) {
+                                input_pending.push_back(send);
+                            }
                         }
                     }
                 }
