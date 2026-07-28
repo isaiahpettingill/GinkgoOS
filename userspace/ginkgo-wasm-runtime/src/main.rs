@@ -350,7 +350,7 @@ fn run_module(
     };
     config
         .set_stack_limits(stack_limits)
-        .enforced_limits(EnforcedLimits::strict())
+        .enforced_limits(EnforcedLimits::default())
         .consume_fuel(true)
         .wasm_memory64(false)
         .wasm_multi_memory(false)
@@ -1342,52 +1342,50 @@ fn wasi_path_open(
         Some(slot) => slot,
         None => return ERRNO_MFILE,
     };
-    let rights_base = rights_base as u64;
-    let rights_inheriting = rights_inheriting as u64;
+    let requested_rights = rights_base as u64;
+    let requested_inheriting = rights_inheriting as u64;
     let parent_inheriting = match directory_inheriting_rights(&caller, fd) {
         Ok(rights) => rights,
         Err(errno) => return errno,
     };
-    if rights_base & !parent_inheriting != 0 || rights_inheriting & !parent_inheriting != 0 {
-        return ERRNO_NOTCAPABLE;
-    }
 
     let (handle, filetype, granted_rights, granted_inheriting) = if oflags & OFLAG_DIRECTORY != 0 {
         if oflags & (OFLAG_CREAT | OFLAG_TRUNC) != 0 || fdflags & FDFLAG_APPEND != 0 {
             return ERRNO_INVAL;
         }
-        if rights_base & !DIRECTORY_RIGHTS != 0
-            || rights_inheriting & !(FILE_RIGHTS | DIRECTORY_RIGHTS) != 0
-        {
-            return ERRNO_NOTCAPABLE;
-        }
+        let granted_rights = requested_rights & parent_inheriting & DIRECTORY_RIGHTS;
+        let granted_inheriting =
+            requested_inheriting & parent_inheriting & (FILE_RIGHTS | DIRECTORY_RIGHTS);
         let handle = match filesystem_open_directory(anchor, &path) {
             Ok(handle) => handle,
             Err(status) => return status_to_errno(status),
         };
-        (handle, FILETYPE_DIRECTORY, rights_base, rights_inheriting)
+        (
+            handle,
+            FILETYPE_DIRECTORY,
+            granted_rights,
+            granted_inheriting,
+        )
     } else {
-        if rights_base & !FILE_RIGHTS != 0 || rights_inheriting != 0 {
-            return ERRNO_NOTCAPABLE;
-        }
+        let granted_rights = requested_rights & parent_inheriting & FILE_RIGHTS;
         let mut flags = FilesystemOpenFlags::empty();
-        if rights_base & RIGHT_FD_READ != 0 {
+        if granted_rights & RIGHT_FD_READ != 0 {
             flags |= FilesystemOpenFlags::READ;
         }
-        if rights_base & (RIGHT_FD_WRITE | RIGHT_FD_FILESTAT_SET_SIZE) != 0 {
+        if granted_rights & (RIGHT_FD_WRITE | RIGHT_FD_FILESTAT_SET_SIZE) != 0 {
             flags |= FilesystemOpenFlags::WRITE;
         }
         if flags.is_empty() {
             flags |= FilesystemOpenFlags::READ;
         }
         if oflags & OFLAG_CREAT != 0 {
-            if rights_base & RIGHT_FD_WRITE == 0 {
+            if granted_rights & RIGHT_FD_WRITE == 0 {
                 return ERRNO_NOTCAPABLE;
             }
             flags |= FilesystemOpenFlags::CREATE;
         }
         if oflags & OFLAG_TRUNC != 0 {
-            if rights_base & RIGHT_FD_WRITE == 0 {
+            if granted_rights & RIGHT_FD_WRITE == 0 {
                 return ERRNO_NOTCAPABLE;
             }
             flags |= FilesystemOpenFlags::TRUNCATE;
@@ -1396,7 +1394,7 @@ fn wasi_path_open(
             Ok(handle) => handle,
             Err(status) => return status_to_errno(status),
         };
-        (handle, FILETYPE_REGULAR_FILE, rights_base, 0)
+        (handle, FILETYPE_REGULAR_FILE, granted_rights, 0)
     };
 
     caller.data_mut().files[slot] = Some(OpenFile {

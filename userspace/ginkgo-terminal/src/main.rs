@@ -264,7 +264,7 @@ fn consume_console(
         _ => String::new(),
     };
     let mut first = true;
-    for line in text.split('\n') {
+    for line in text.split_terminator('\n') {
         let line_prefix = if first { prefix.as_str() } else { "" };
         push_line(scrollback, format!("{}{}", line_prefix, line));
         first = false;
