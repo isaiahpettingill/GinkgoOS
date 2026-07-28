@@ -80,6 +80,22 @@ uninstall "tools.hello"
 
 Uninstall removes the installed registry entry and immutable executable generation. It preserves application data. Use the existing `purge_app_data("tools.hello")` system function when the data must also be removed. System app IDs are protected and cannot be installed over or uninstalled.
 
+## Trusting a large WASM application
+
+Installed WASM applications use interpreter fuel and memory/table limits by default. After reviewing an installed executable, allow that exact generation to use the normal kernel process limits instead:
+
+```text
+trust "tools.python"
+```
+
+Restore interpreter limits for future launches with:
+
+```text
+untrust "tools.python"
+```
+
+Trust does not add filesystem, window, IPC, or other capabilities. It only removes the interpreter fuel and store memory/table ceilings; kernel scheduling and per-process memory limits still apply. Every install or update clears trust, so changed executable bytes must be reviewed and trusted again. Direct-path WASM files cannot be trusted because they have no installed identity or immutable registry generation.
+
 ## Running command and graphical apps
 
 Run a command app in the current terminal and wait for its exit status:

@@ -14,6 +14,8 @@ pub const REGISTRY_MAGIC: [u8; 4] = *b"GKI\0";
 pub const REGISTRY_VERSION: u16 = 1;
 const REGISTRY_HEADER_SIZE: usize = 12;
 const ENTRY_HEADER_SIZE: usize = 88;
+const ENTRY_FLAG_WASM_TRUSTED: u16 = 1 << 0;
+const ENTRY_FLAGS_KNOWN: u16 = ENTRY_FLAG_WASM_TRUSTED;
 const PROVENANCE_PACKAGE: u16 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,6 +58,7 @@ pub struct InstalledApp {
     pub version: String,
     pub kind: AppKind,
     pub executable: ExecutableGeneration,
+    pub wasm_trusted: bool,
     pub provenance: Provenance,
 }
 
@@ -84,6 +87,9 @@ pub enum RegistryError {
     UnknownEntryFlags {
         index: usize,
         bits: u16,
+    },
+    TrustedWasmFlagOnElf {
+        index: usize,
     },
     UnknownKind {
         index: usize,
@@ -158,6 +164,7 @@ pub enum MutationError {
         package: ExecutableFormat,
         generation: ExecutableFormat,
     },
+    ExecutableNotWasm,
     InvalidGenerationFilename,
     GenerationFilenameCollision,
 }
@@ -237,7 +244,13 @@ impl InstalledRegistry {
             bytes.extend_from_slice(&(entry.version.len() as u16).to_le_bytes());
             bytes.extend_from_slice(&(entry.executable.filename.len() as u16).to_le_bytes());
             bytes.extend_from_slice(&(entry.kind as u16).to_le_bytes());
-            bytes.extend_from_slice(&0u16.to_le_bytes());
+            let flags = if entry.wasm_trusted {
+                debug_assert_eq!(entry.executable.format, ExecutableFormat::Wasm);
+                ENTRY_FLAG_WASM_TRUSTED
+            } else {
+                0
+            };
+            bytes.extend_from_slice(&flags.to_le_bytes());
             bytes.extend_from_slice(&PROVENANCE_PACKAGE.to_le_bytes());
             bytes.extend_from_slice(&(entry.executable.format as u16).to_le_bytes());
             bytes.extend_from_slice(&entry.executable.length.to_le_bytes());
@@ -303,6 +316,21 @@ impl InstalledRegistry {
         check_target_id(app_id, reserved_system_ids)?;
         let index = self.find(app_id).map_err(|_| MutationError::NotInstalled)?;
         Ok(self.entries.remove(index))
+    }
+
+    pub fn set_wasm_trusted(
+        &mut self,
+        app_id: &str,
+        trusted: bool,
+        reserved_system_ids: &[&str],
+    ) -> Result<(), MutationError> {
+        check_target_id(app_id, reserved_system_ids)?;
+        let index = self.find(app_id).map_err(|_| MutationError::NotInstalled)?;
+        if self.entries[index].executable.format != ExecutableFormat::Wasm {
+            return Err(MutationError::ExecutableNotWasm);
+        }
+        self.entries[index].wasm_trusted = trusted;
+        Ok(())
     }
 
     fn find(&self, app_id: &str) -> Result<usize, usize> {
@@ -400,6 +428,7 @@ fn owned_entry(
         version: String::from(package.version),
         kind: package.kind,
         executable,
+        wasm_trusted: false,
         provenance,
     }
 }
@@ -432,9 +461,14 @@ fn parse_entry(
         value: kind_value,
     })?;
     let flags = read_u16(bytes, cursor + 10);
-    if flags != 0 {
-        return Err(RegistryError::UnknownEntryFlags { index, bits: flags });
+    let unknown_flags = flags & !ENTRY_FLAGS_KNOWN;
+    if unknown_flags != 0 {
+        return Err(RegistryError::UnknownEntryFlags {
+            index,
+            bits: unknown_flags,
+        });
     }
+    let wasm_trusted = flags & ENTRY_FLAG_WASM_TRUSTED != 0;
     let provenance_kind = read_u16(bytes, cursor + 12);
     if provenance_kind != PROVENANCE_PACKAGE {
         return Err(RegistryError::UnknownProvenance {
@@ -455,6 +489,9 @@ fn parse_entry(
             kind,
             format,
         });
+    }
+    if wasm_trusted && format != ExecutableFormat::Wasm {
+        return Err(RegistryError::TrustedWasmFlagOnElf { index });
     }
     let executable_length = read_u64(bytes, cursor + 16);
     if executable_length == 0 || executable_length > MAX_EXECUTABLE_LEN as u64 {
@@ -516,6 +553,7 @@ fn parse_entry(
                 digest: executable_digest,
                 length: executable_length,
             },
+            wasm_trusted,
             provenance: Provenance { package_digest },
         },
         entry_end,

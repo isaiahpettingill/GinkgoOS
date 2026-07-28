@@ -36,6 +36,15 @@ pub const MAX_DOCUMENT_PATH_BYTES: usize = 512;
 pub const MAX_TERMINAL_STARTUP_ARGUMENTS: usize = 32;
 /// Maximum combined UTF-8 byte length of terminal startup arguments.
 pub const MAX_TERMINAL_STARTUP_ARGUMENT_BYTES: usize = 16 * 1024;
+/// Fixed byte length of an encoded [`WasmRuntimeConfig`].
+pub const WASM_RUNTIME_CONFIG_SIZE: usize = 8;
+/// Magic bytes identifying an encoded [`WasmRuntimeConfig`].
+pub const WASM_RUNTIME_CONFIG_MAGIC: [u8; 4] = *b"GKWR";
+/// Current wire version for [`WasmRuntimeConfig`].
+pub const WASM_RUNTIME_CONFIG_VERSION: u16 = 1;
+
+const WASM_RUNTIME_CONFIG_TRUSTED_FLAG: u16 = 1 << 0;
+const WASM_RUNTIME_CONFIG_KNOWN_FLAGS: u16 = WASM_RUNTIME_CONFIG_TRUSTED_FLAG;
 
 const TRANSACTION_ID: u64 = 0;
 const CONSOLE_ATTACHMENT_COUNT: usize = 0;
@@ -72,6 +81,87 @@ pub struct TerminalStartupCommand {
     pub version: u16,
     pub app_id: String,
     pub arguments: Vec<String>,
+}
+
+/// Runtime policy encoded for a WASM application.
+///
+/// Absence of encoded configuration is not represented here. Callers must choose their own
+/// policy when no configuration bytes are available.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WasmRuntimeConfig {
+    /// Whether the WASM application may run with trusted runtime privileges.
+    pub trusted: bool,
+}
+
+/// Failure while decoding the fixed-size [`WasmRuntimeConfig`] wire format.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WasmRuntimeConfigCodecError {
+    WrongLength { expected: usize, received: usize },
+    WrongMagic { received: [u8; 4] },
+    UnsupportedVersion { expected: u16, received: u16 },
+    UnknownFlags { received: u16 },
+}
+
+/// Encodes a [`WasmRuntimeConfig`] into its fixed-size, versioned wire format.
+pub const fn encode_wasm_runtime_config(
+    config: WasmRuntimeConfig,
+) -> [u8; WASM_RUNTIME_CONFIG_SIZE] {
+    let flags = if config.trusted {
+        WASM_RUNTIME_CONFIG_TRUSTED_FLAG
+    } else {
+        0
+    };
+    let version = WASM_RUNTIME_CONFIG_VERSION.to_le_bytes();
+    let flags = flags.to_le_bytes();
+
+    [
+        WASM_RUNTIME_CONFIG_MAGIC[0],
+        WASM_RUNTIME_CONFIG_MAGIC[1],
+        WASM_RUNTIME_CONFIG_MAGIC[2],
+        WASM_RUNTIME_CONFIG_MAGIC[3],
+        version[0],
+        version[1],
+        flags[0],
+        flags[1],
+    ]
+}
+
+/// Decodes and strictly validates a fixed-size, versioned [`WasmRuntimeConfig`].
+///
+/// An empty slice is rejected like any other wrong-length input. Callers that allow missing
+/// configuration must handle that case before calling this function.
+pub fn decode_wasm_runtime_config(
+    bytes: &[u8],
+) -> Result<WasmRuntimeConfig, WasmRuntimeConfigCodecError> {
+    let bytes: &[u8; WASM_RUNTIME_CONFIG_SIZE] =
+        bytes
+            .try_into()
+            .map_err(|_| WasmRuntimeConfigCodecError::WrongLength {
+                expected: WASM_RUNTIME_CONFIG_SIZE,
+                received: bytes.len(),
+            })?;
+
+    let magic = [bytes[0], bytes[1], bytes[2], bytes[3]];
+    if magic != WASM_RUNTIME_CONFIG_MAGIC {
+        return Err(WasmRuntimeConfigCodecError::WrongMagic { received: magic });
+    }
+
+    let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+    if version != WASM_RUNTIME_CONFIG_VERSION {
+        return Err(WasmRuntimeConfigCodecError::UnsupportedVersion {
+            expected: WASM_RUNTIME_CONFIG_VERSION,
+            received: version,
+        });
+    }
+
+    let flags = u16::from_le_bytes([bytes[6], bytes[7]]);
+    if flags & !WASM_RUNTIME_CONFIG_KNOWN_FLAGS != 0 {
+        return Err(WasmRuntimeConfigCodecError::UnknownFlags { received: flags });
+    }
+
+    Ok(WasmRuntimeConfig {
+        trusted: flags & WASM_RUNTIME_CONFIG_TRUSTED_FLAG != 0,
+    })
 }
 
 /// Strict terminal protocol framing, attachment, or payload validation failure.
@@ -406,6 +496,93 @@ mod tests {
 
     fn replace_u64(message: &mut [u8], offset: usize, value: u64) {
         message[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn wasm_runtime_config_encodes_the_exact_versioned_layout() {
+        assert_eq!(
+            encode_wasm_runtime_config(WasmRuntimeConfig { trusted: false }),
+            [b'G', b'K', b'W', b'R', 1, 0, 0, 0]
+        );
+        assert_eq!(
+            encode_wasm_runtime_config(WasmRuntimeConfig { trusted: true }),
+            [b'G', b'K', b'W', b'R', 1, 0, 1, 0]
+        );
+    }
+
+    #[test]
+    fn wasm_runtime_config_round_trips_each_supported_flag_value() {
+        for config in [
+            WasmRuntimeConfig { trusted: false },
+            WasmRuntimeConfig { trusted: true },
+        ] {
+            assert_eq!(
+                decode_wasm_runtime_config(&encode_wasm_runtime_config(config)),
+                Ok(config)
+            );
+        }
+    }
+
+    #[test]
+    fn wasm_runtime_config_decoder_rejects_every_wrong_length_including_empty() {
+        let encoded = encode_wasm_runtime_config(WasmRuntimeConfig { trusted: false });
+        for length in 0..WASM_RUNTIME_CONFIG_SIZE {
+            assert_eq!(
+                decode_wasm_runtime_config(&encoded[..length]),
+                Err(WasmRuntimeConfigCodecError::WrongLength {
+                    expected: WASM_RUNTIME_CONFIG_SIZE,
+                    received: length,
+                })
+            );
+        }
+
+        let mut oversized = [0; WASM_RUNTIME_CONFIG_SIZE + 1];
+        oversized[..WASM_RUNTIME_CONFIG_SIZE].copy_from_slice(&encoded);
+        assert_eq!(
+            decode_wasm_runtime_config(&oversized),
+            Err(WasmRuntimeConfigCodecError::WrongLength {
+                expected: WASM_RUNTIME_CONFIG_SIZE,
+                received: WASM_RUNTIME_CONFIG_SIZE + 1,
+            })
+        );
+    }
+
+    #[test]
+    fn wasm_runtime_config_decoder_rejects_wrong_magic() {
+        let mut encoded = encode_wasm_runtime_config(WasmRuntimeConfig { trusted: false });
+        encoded[..4].copy_from_slice(b"BAD!");
+
+        assert_eq!(
+            decode_wasm_runtime_config(&encoded),
+            Err(WasmRuntimeConfigCodecError::WrongMagic { received: *b"BAD!" })
+        );
+    }
+
+    #[test]
+    fn wasm_runtime_config_decoder_reads_version_as_little_endian() {
+        let mut encoded = encode_wasm_runtime_config(WasmRuntimeConfig { trusted: false });
+        encoded[4..6].copy_from_slice(&0x0201u16.to_le_bytes());
+
+        assert_eq!(
+            decode_wasm_runtime_config(&encoded),
+            Err(WasmRuntimeConfigCodecError::UnsupportedVersion {
+                expected: WASM_RUNTIME_CONFIG_VERSION,
+                received: 0x0201,
+            })
+        );
+    }
+
+    #[test]
+    fn wasm_runtime_config_decoder_rejects_unknown_flags() {
+        for flags in [0x0002u16, 0x8000, 0xffff] {
+            let mut encoded = encode_wasm_runtime_config(WasmRuntimeConfig { trusted: false });
+            encoded[6..8].copy_from_slice(&flags.to_le_bytes());
+
+            assert_eq!(
+                decode_wasm_runtime_config(&encoded),
+                Err(WasmRuntimeConfigCodecError::UnknownFlags { received: flags })
+            );
+        }
     }
 
     #[test]

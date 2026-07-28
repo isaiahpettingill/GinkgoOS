@@ -40,7 +40,7 @@
 //! GKI header (12 bytes): magic "GKI\\0" | format_version u16 | flags u16 | count u32
 //! each entry (fixed header followed by strings):
 //!   app_id_len u16 | display_name_len u16 | app_version_len u16 | filename_len u16
-//!   app_kind u16 | flags u16 | provenance_kind u16
+//!   app_kind u16 | flags u16 (bit 0 = trusted WASM) | provenance_kind u16
 //!   executable_format u16 (ELF = 0, WASM = 1) | executable_len u64
 //!   executable_digest [u8; 32] | package_digest [u8; 32]
 //!   app_id | display_name | app_version | generation_filename
@@ -450,14 +450,28 @@ mod tests {
                 &[],
             )
             .unwrap();
+        assert!(!registry.get("tools.script").unwrap().wasm_trusted);
+        assert_eq!(&registry.encode()[12 + 10..12 + 12], &[0, 0]);
+
+        registry
+            .set_wasm_trusted("tools.script", true, &[])
+            .unwrap();
         let encoded = registry.encode();
+        assert_eq!(&encoded[4..6], &REGISTRY_VERSION.to_le_bytes());
+        assert_eq!(&encoded[12 + 10..12 + 12], &[1, 0]);
         assert_eq!(&encoded[12 + 14..12 + 16], &[1, 0]);
         let parsed = InstalledRegistry::parse(&encoded).unwrap();
-        assert_eq!(
-            parsed.get("tools.script").unwrap().executable.format,
-            ExecutableFormat::Wasm
-        );
+        let installed = parsed.get("tools.script").unwrap();
+        assert_eq!(installed.executable.format, ExecutableFormat::Wasm);
+        assert!(installed.wasm_trusted);
         assert_eq!(parsed, registry);
+        assert_eq!(parsed.encode(), encoded);
+
+        registry
+            .set_wasm_trusted("tools.script", false, &[])
+            .unwrap();
+        assert!(!registry.get("tools.script").unwrap().wasm_trusted);
+        assert_eq!(&registry.encode()[12 + 10..12 + 12], &[0, 0]);
 
         let mut unknown = encoded.clone();
         unknown[12 + 14..12 + 16].copy_from_slice(&2u16.to_le_bytes());
@@ -476,6 +490,128 @@ mod tests {
                 format: ExecutableFormat::Wasm,
             })
         );
+    }
+
+    #[test]
+    fn registry_rejects_unknown_entry_flags_and_trusted_elf() {
+        let bytes = package("legacy.app", "1.0.0", b"elf");
+        let package = Package::parse(&bytes).unwrap();
+        let mut registry = InstalledRegistry::new();
+        registry
+            .install(
+                &package,
+                generation(package.app_id, 1, package.executable.len()),
+                Provenance {
+                    package_digest: [2; 32],
+                },
+                &[],
+            )
+            .unwrap();
+        let encoded = registry.encode();
+
+        let mut unknown = encoded.clone();
+        unknown[12 + 10..12 + 12].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(
+            InstalledRegistry::parse(&unknown),
+            Err(RegistryError::UnknownEntryFlags { index: 0, bits: 2 })
+        );
+
+        let mut trusted_elf = encoded;
+        trusted_elf[12 + 10..12 + 12].copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(
+            InstalledRegistry::parse(&trusted_elf),
+            Err(RegistryError::TrustedWasmFlagOnElf { index: 0 })
+        );
+    }
+
+    #[test]
+    fn wasm_trust_mutation_failures_are_atomic_and_updates_revoke_trust() {
+        let wasm_bytes = encoded_package_with_format(
+            "tools.script",
+            "Script",
+            "1.0.0",
+            AppKind::Command,
+            ExecutableFormat::Wasm,
+            b"wasm",
+            &[],
+        );
+        let wasm = Package::parse(&wasm_bytes).unwrap();
+        let elf_bytes = package("tools.elf", "1.0.0", b"elf");
+        let elf = Package::parse(&elf_bytes).unwrap();
+        let mut registry = InstalledRegistry::new();
+        registry
+            .install(
+                &wasm,
+                generation_with_format(
+                    wasm.app_id,
+                    ExecutableFormat::Wasm,
+                    1,
+                    wasm.executable.len(),
+                ),
+                Provenance {
+                    package_digest: [2; 32],
+                },
+                &[],
+            )
+            .unwrap();
+        registry
+            .install(
+                &elf,
+                generation(elf.app_id, 3, elf.executable.len()),
+                Provenance {
+                    package_digest: [4; 32],
+                },
+                &[],
+            )
+            .unwrap();
+        registry.set_wasm_trusted(wasm.app_id, true, &[]).unwrap();
+        let before = registry.encode();
+
+        assert_eq!(
+            registry.set_wasm_trusted(wasm.app_id, false, &[wasm.app_id]),
+            Err(MutationError::ReservedSystemId)
+        );
+        assert_eq!(registry.encode(), before);
+        assert_eq!(
+            registry.set_wasm_trusted("missing.app", true, &[]),
+            Err(MutationError::NotInstalled)
+        );
+        assert_eq!(registry.encode(), before);
+        assert_eq!(
+            registry.set_wasm_trusted(elf.app_id, true, &[]),
+            Err(MutationError::ExecutableNotWasm)
+        );
+        assert_eq!(registry.encode(), before);
+
+        let update_bytes = encoded_package_with_format(
+            wasm.app_id,
+            "Script",
+            "2.0.0",
+            AppKind::Command,
+            ExecutableFormat::Wasm,
+            b"new wasm",
+            &[],
+        );
+        let update = Package::parse(&update_bytes).unwrap();
+        registry
+            .update(
+                &update,
+                generation_with_format(
+                    update.app_id,
+                    ExecutableFormat::Wasm,
+                    5,
+                    update.executable.len(),
+                ),
+                Provenance {
+                    package_digest: [6; 32],
+                },
+                &[],
+            )
+            .unwrap();
+        let installed = registry.get(wasm.app_id).unwrap();
+        assert_eq!(installed.version, "2.0.0");
+        assert!(!installed.wasm_trusted);
+        assert_eq!(&registry.encode()[12 + 10..12 + 12], &[0, 0]);
     }
 
     #[test]

@@ -20,7 +20,7 @@ use ginkgo_program_registry::Registry as ProgramRegistry;
 use ginkgo_shell_language::{
     CallMode, Host, Integer as INT, Interpreter, List as Array, Map, Value as Dynamic,
 };
-use ginkgo_terminal_protocol::ConsoleMessage;
+use ginkgo_terminal_protocol::{encode_wasm_runtime_config, ConsoleMessage, WasmRuntimeConfig};
 use ginkgo_userspace::{
     application_data_create, channel_create, filesystem_create_directory, filesystem_get_info,
     filesystem_get_metadata, filesystem_open, filesystem_open_directory, filesystem_read,
@@ -31,7 +31,7 @@ use ginkgo_userspace::{
     FilesystemInfoFlags, FilesystemMetadata, FilesystemOpenFlags, FilesystemRenameFlags, Handle,
     HandleDisposition, ProcessFault, ProcessInfo, ProcessState, ProcessTerminationCause, Rights,
     Status, SystemPowerAction, SystemPowerFlags, SystemPowerState, DEADLINE_INFINITE,
-    PROCESS_MAX_ARGS, PROCESS_MAX_STARTUP_BYTES,
+    FILESYSTEM_IO_MAX_BYTES, PROCESS_MAX_ARGS, PROCESS_MAX_STARTUP_BYTES,
 };
 
 use crate::{
@@ -147,6 +147,8 @@ static COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec::shell("edit", &[], 1, Some(1)),
     CommandSpec::shell("install", &["install_package"], 1, Some(1)),
     CommandSpec::shell("uninstall", &["uninstall_app"], 1, Some(1)),
+    CommandSpec::shell("trust", &[], 1, Some(1)),
+    CommandSpec::shell("untrust", &[], 1, Some(1)),
     CommandSpec::shell("package", &["pack"], 2, Some(6)),
     CommandSpec::shell("unpackage", &["unpack"], 2, Some(2)),
     CommandSpec::no_arguments("installed", &["list_installed"]),
@@ -945,6 +947,12 @@ fn dispatch_command(host: &mut HostState, name: &str, arguments: Array) -> Dynam
             Ok(()) => Dynamic::from(true),
             Err(error) => command_error(host, name, error),
         },
+        "trust" | "untrust" => {
+            match set_installed_wasm_trust(host.filesystem, &values[0], name == "trust") {
+                Ok(()) => Dynamic::from(true),
+                Err(error) => command_error(host, name, error),
+            }
+        }
         "package" => match package_command(host.filesystem, &host.current_directory, &values) {
             Ok(()) => Dynamic::from(true),
             Err(error) => command_error(host, name, error),
@@ -1052,6 +1060,12 @@ fn command_help(command: Option<&str>) -> String {
         ),
         Some("uninstall" | "uninstall_app") => String::from(
             "uninstall <app-id>\n    Remove an installed non-system application. App data is preserved.",
+        ),
+        Some("trust") => String::from(
+            "trust <app-id>\n    Let this installed WASM generation use kernel process limits instead of WASM fuel and store limits.",
+        ),
+        Some("untrust") => String::from(
+            "untrust <app-id>\n    Restore WASM fuel and store limits for future launches.",
         ),
         Some("package" | "pack") => String::from(
             "package <executable>, <output.gkp>, <app-id>, <display-name>, <version>[, command|graphical]\npackage <source-directory>, <output.gkp>\n    Create a GKP directly or rebuild an unpacked editable package directory.",
@@ -1903,6 +1917,7 @@ fn create_installed_process(
     let expected_length = installed.executable.length;
     let expected_digest = installed.executable.digest;
     let format = installed.executable.format;
+    let wasm_trusted = installed.wasm_trusted;
     let argument_blob = encode_arguments(&path, arguments)
         .map_err(|error| format!("invalid arguments: {}", error))?;
 
@@ -1978,7 +1993,12 @@ fn create_installed_process(
                 HandleDisposition::duplicate(random, WASM_RANDOM_RIGHTS),
                 HandleDisposition::move_handle(application_data, Rights::READ),
             ];
-            let result = process_create(runtime, &argument_blob, &startup_handles, &[]);
+            let runtime_config = wasm_trusted
+                .then(|| encode_wasm_runtime_config(WasmRuntimeConfig { trusted: true }));
+            let config = runtime_config
+                .as_ref()
+                .map_or(&[][..], |config| &config[..]);
+            let result = process_create(runtime, &argument_blob, &startup_handles, config);
             let _ = handle_close(runtime);
             if result.is_err() {
                 let _ = handle_close(module);
@@ -2528,6 +2548,14 @@ fn uninstall_app(root: Handle, app_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn set_installed_wasm_trust(root: Handle, app_id: &str, trusted: bool) -> Result<(), String> {
+    let mut registry = load_registry(root)?;
+    registry
+        .set_wasm_trusted(app_id, trusted, PROTECTED_SYSTEM_IDS)
+        .map_err(|error| format!("registry trust change rejected: {:?}", error))?;
+    publish_registry(root, &registry).map_err(|(error, _)| error)
+}
+
 fn purge_app_data(root: Handle, app_id: &str) -> Result<(), String> {
     validate_mutable_app_id(app_id)?;
     let path = app_data_path(app_id);
@@ -2702,6 +2730,7 @@ fn installed_array(registry: &InstalledRegistry) -> Array {
                 "package_sha256".into(),
                 Dynamic::from(digest_hex(&entry.provenance.package_digest)),
             );
+            map.insert("wasm_trusted".into(), Dynamic::from(entry.wasm_trusted));
             Dynamic::from(map)
         })
         .collect()
@@ -2836,7 +2865,10 @@ fn read_bounded(root: Handle, path: &str, maximum: usize) -> Result<Vec<u8>, Sta
         let mut bytes = vec![0; length];
         let mut offset = 0;
         while offset < bytes.len() {
-            let count = filesystem_read(file, offset as u64, &mut bytes[offset..])?;
+            let chunk_end = offset
+                .saturating_add(FILESYSTEM_IO_MAX_BYTES)
+                .min(bytes.len());
+            let count = filesystem_read(file, offset as u64, &mut bytes[offset..chunk_end])?;
             if count == 0 {
                 break;
             }

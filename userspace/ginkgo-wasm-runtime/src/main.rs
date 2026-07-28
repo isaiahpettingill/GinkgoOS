@@ -6,7 +6,9 @@ extern crate alloc;
 use alloc::{format, string::String, vec, vec::Vec};
 use core::{mem::MaybeUninit, slice, str};
 
-use ginkgo_terminal_protocol::{decode_console_message, encode_console_message, ConsoleMessage};
+use ginkgo_terminal_protocol::{
+    decode_console_message, decode_wasm_runtime_config, encode_console_message, ConsoleMessage,
+};
 use ginkgo_userspace::{
     channel_read, channel_write, filesystem_create_directory, filesystem_get_metadata,
     filesystem_open, filesystem_open_directory, filesystem_read, filesystem_read_directory2,
@@ -136,6 +138,8 @@ struct Startup<'a> {
     bytes: &'a [u8],
     argc: usize,
     argv_offset: usize,
+    config_offset: usize,
+    config_length: usize,
     handles_offset: usize,
     handle_count: usize,
 }
@@ -208,6 +212,19 @@ extern "C" fn process_main(address: u64, length: u64, zero0: u64, zero1: u64) ->
     let console = startup.handle(CONSOLE_HANDLE).unwrap_or(Handle::INVALID);
     let preopen = startup.handle(PREOPEN_HANDLE);
     let random = startup.handle(RANDOM_HANDLE);
+    let trusted = if startup.config().is_empty() {
+        false
+    } else {
+        match decode_wasm_runtime_config(startup.config()) {
+            Ok(config) => config.trusted,
+            Err(_) => {
+                let _ = handle_close(module_file);
+                close_optional(preopen);
+                close_optional(random);
+                exit_error(console, "invalid WASM runtime configuration", 126)
+            }
+        }
+    };
     let arguments = match startup.arguments() {
         Some(arguments) => arguments,
         None => {
@@ -228,7 +245,7 @@ extern "C" fn process_main(address: u64, length: u64, zero0: u64, zero1: u64) ->
         }
     };
 
-    let code = match run_module(&module_bytes, arguments, console, preopen, random) {
+    let code = match run_module(&module_bytes, arguments, console, preopen, random, trusted) {
         Ok(code) => code,
         Err(message) => exit_error(console, &message, 126),
     };
@@ -261,10 +278,13 @@ impl<'a> Startup<'a> {
             bytes,
             argc: usize::try_from(read_u32(bytes, 12)?).ok()?,
             argv_offset: usize::try_from(read_u32(bytes, 16)?).ok()?,
+            config_offset: usize::try_from(read_u32(bytes, 28)?).ok()?,
+            config_length: usize::try_from(read_u32(bytes, 32)?).ok()?,
             handles_offset: usize::try_from(read_u32(bytes, 36)?).ok()?,
             handle_count: usize::try_from(read_u32(bytes, 40)?).ok()?,
         };
         checked_range(startup.argv_offset, startup.argc.checked_mul(4)?, length)?;
+        checked_range(startup.config_offset, startup.config_length, length)?;
         checked_range(
             startup.handles_offset,
             startup.handle_count.checked_mul(4)?,
@@ -297,6 +317,10 @@ impl<'a> Startup<'a> {
             arguments.push(nul_terminated);
         }
         Some(arguments)
+    }
+
+    fn config(&self) -> &'a [u8] {
+        &self.bytes[self.config_offset..self.config_offset + self.config_length]
     }
 
     fn handle(&self, index: usize) -> Option<Handle> {
@@ -338,6 +362,7 @@ fn run_module(
     console: Handle,
     preopen: Option<Handle>,
     random: Option<Handle>,
+    trusted: bool,
 ) -> Result<i32, String> {
     let mut config = Config::default();
     let stack_limits = match StackLimits::new(1024, 64 * 1024, 1024) {
@@ -351,7 +376,7 @@ fn run_module(
     config
         .set_stack_limits(stack_limits)
         .enforced_limits(EnforcedLimits::default())
-        .consume_fuel(true)
+        .consume_fuel(!trusted)
         .wasm_memory64(false)
         .wasm_multi_memory(false)
         .wasm_custom_page_sizes(false)
@@ -397,10 +422,12 @@ fn run_module(
     );
     let module =
         Module::new(&engine, bytes).map_err(|error| format!("invalid WASM module: {error}"))?;
-    store.limiter(|state| &mut state.limits);
-    store
-        .set_fuel(EXECUTION_FUEL)
-        .map_err(|error| format!("cannot set WASM fuel: {error}"))?;
+    if !trusted {
+        store.limiter(|state| &mut state.limits);
+        store
+            .set_fuel(EXECUTION_FUEL)
+            .map_err(|error| format!("cannot set WASM fuel: {error}"))?;
+    }
     let mut linker = Linker::new(&engine);
     register_wasi(&mut linker).map_err(|error| format!("cannot register WASIp1: {error}"))?;
     let instance = linker

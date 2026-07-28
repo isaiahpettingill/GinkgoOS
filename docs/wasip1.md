@@ -55,7 +55,7 @@ The current runtime does not provide realtime or process CPU clocks, file timest
 
 ## Limits and isolation
 
-Each invocation runs in its own normal-class Ginkgo process. The runtime applies these additional guest limits:
+Each invocation runs in its own normal-class Ginkgo process. Untrusted and direct-path modules use these additional guest limits:
 
 - module bytes: 64 MiB
 - linear memory: 256 MiB
@@ -67,6 +67,8 @@ Each invocation runs in its own normal-class Ginkgo process. The runtime applies
 - Wasm call depth: 1,024
 - execution fuel: 500,000,000 units
 - memory64, multi-memory, custom page sizes, tail calls, and SIMD: disabled or unavailable in the pinned build
+
+An installed WASM generation may be explicitly marked with `trust <app-id>`. Trusted launches disable fuel and the wasmi store memory/table/instance limiter, but retain kernel scheduling, private-page, virtual-memory, VMA, channel-traffic, module-byte, stack, descriptor, and capability limits. `untrust <app-id>` restores interpreter limits for future launches. Updates revoke trust, and direct paths always remain constrained.
 
 Every guest-memory pointer and length is bounds checked before host access. A malformed module, invalid pointer, trap, missing import, or exhausted fuel terminates only the runtime process and reports an error through the terminal channel. Process teardown reclaims the interpreter, module, guest memory, and startup handles.
 
